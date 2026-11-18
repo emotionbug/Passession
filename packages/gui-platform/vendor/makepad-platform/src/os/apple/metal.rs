@@ -300,7 +300,7 @@ impl Cx {
         
         let dpi_factor = self.passes[pass_id].dpi_factor.unwrap();
         
-        let pass_rect = self.get_pass_rect(pass_id, if mode.is_drawable().is_some() {1.0}else {dpi_factor}).unwrap();
+        let pass_rect = self.get_pass_rect(pass_id, dpi_factor).unwrap();
         
         self.passes[pass_id].set_ortho_matrix(
             pass_rect.pos, 
@@ -329,26 +329,6 @@ impl Cx {
                 }];
             }
         } 
-        else if let Some(drawable) = mode.is_drawable() {
-            let first_texture: ObjcId = unsafe {msg_send![drawable, texture]};
-            let color_attachments: ObjcId = unsafe {msg_send![render_pass_descriptor, colorAttachments]};
-            let color_attachment: ObjcId = unsafe {msg_send![color_attachments, objectAtIndexedSubscript: 0]};
-            
-            let () = unsafe {msg_send![
-                color_attachment,
-                setTexture: first_texture
-            ]};
-            let color = self.passes[pass_id].clear_color;
-            unsafe {
-                let () = msg_send![color_attachment, setLoadAction: MTLLoadAction::Clear];
-                let () = msg_send![color_attachment, setClearColor: MTLClearColor {
-                    red: color.x as f64,
-                    green: color.y as f64,
-                    blue: color.z as f64,
-                    alpha: color.w as f64
-                }];
-            }
-        }
         else {
             for (index, color_texture) in self.passes[pass_id].color_textures.iter().enumerate() {
                 let color_attachments: ObjcId = unsafe {msg_send![render_pass_descriptor, colorAttachments]};
@@ -488,62 +468,48 @@ impl Cx {
                 };
                 self.commit_command_buffer(screenshot, Some(stdin_frame), command_buffer, gpu_read_guards);
             }
-            DrawPassMode::Drawable(drawable) => {
-                let first_texture: ObjcId = unsafe {msg_send![drawable, texture]};
-                let () = unsafe {msg_send![command_buffer, presentDrawable: drawable]};
-                let screenshot = self.build_screenshot_struct(metal_cx, command_buffer, 0, pass_width as usize, pass_height as usize, first_texture, None);
-                self.commit_command_buffer(screenshot, None, command_buffer, gpu_read_guards);
-            }
-            DrawPassMode::Resizing(drawable) => {
-                let first_texture: ObjcId = unsafe {msg_send![drawable, texture]};
-                let screenshot = self.build_screenshot_struct(metal_cx, command_buffer, 0, pass_width as usize, pass_height as usize, first_texture, None);
-                self.commit_command_buffer(screenshot, None, command_buffer, gpu_read_guards);
-                let () = unsafe {msg_send![command_buffer, waitUntilScheduled]};
-                let () = unsafe {msg_send![drawable, present]};
-            }
         }
         let () = unsafe {msg_send![pool, release]};
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn surface_viewport(&self, pass_id: PassId, size: [i32; 2]) -> Option<crate::makepad_math::Rect> {
-        let rect = self.get_pass_rect(pass_id, 1.0)?;
-        let dpi = self.passes[pass_id].dpi_factor?;
-        ((rect.size.x * dpi - f64::from(size[0])).abs() <= 1e-6
-            && (rect.size.y * dpi - f64::from(size[1])).abs() <= 1e-6).then_some(rect)
-    }
-
-    #[cfg(target_os = "macos")]
     pub(crate) fn draw_surface_pass(
         &mut self, pass_id: PassId, metal_cx: &MetalCx, presenter: &mut SurfacePresenter,
-        slot: usize, size: [i32; 2], pass_rect: crate::makepad_math::Rect,
+        slot: usize, size: [i32; 2], sync: bool,
     ) -> Result<(), &'static str> {
+        let pass_rect = self.get_pass_rect(pass_id, 1.0).ok_or("missing Metal window pass bounds")?;
         let pass = &mut self.passes[pass_id];
         let Some(root) = pass.main_draw_list_id else { return Err("missing Metal window draw list"); };
         let Some(dpi) = pass.dpi_factor else { return Err("missing Metal window scale"); };
-        let (Some(depth_texture), &PassClearDepth::ClearWith(depth)) = (&pass.depth_texture, &pass.clear_depth) else {
-            return Err("window depth must be cleared each frame");
+        let (init_depth, depth) = match pass.clear_depth {
+            PassClearDepth::InitWith(value) => (true, value),
+            PassClearDepth::ClearWith(value) => (false, value),
         };
-        if !(0.0..=1.0).contains(&depth) { return Err("window depth clear value out of range"); }
-        let depth_id = depth_texture.texture_id();
-        let depth_texture = &mut self.textures[depth_id];
-        if !depth_texture.update_depth_stencil(metal_cx, size[0] as usize, size[1] as usize)
-            || !depth_texture.alloc.as_ref().is_some_and(|alloc| {
-                matches!(alloc.pixel, TexturePixel::D32) && [alloc.width, alloc.height] == size.map(|v| v as usize)
-            })
-        {
-            return Err("window Depth32Float attachment unavailable");
-        }
-        let initial_depth = depth_texture.take_initial();
-        let depth_target = depth_texture.os.texture.as_ref().unwrap().as_id();
-        let depth_valid = !initial_depth
-            && presenter.depth_baseline() == Some((depth_id, depth_texture.visual_revision));
-        depth_texture.mark_content_changed();
-        let depth_baseline = (depth_id, depth_texture.visual_revision);
+        let depth = if depth.is_finite() { depth.clamp(0.0, 1.0) } else { 1.0 };
+        let mut depth_baseline = None;
+        let mut depth_valid = false;
+        let (depth_target, preserve_depth) = if let Some(texture) = &pass.depth_texture {
+            let id = texture.texture_id();
+            let texture = &mut self.textures[id];
+            if !texture.update_depth_stencil(metal_cx, size[0] as usize, size[1] as usize)
+                || !texture.alloc.as_ref().is_some_and(|alloc| {
+                    matches!(alloc.pixel, TexturePixel::D32) && [alloc.width, alloc.height] == size.map(|v| v as usize)
+                })
+            {
+                return Err("window Depth32Float attachment unavailable");
+            }
+            let initial = texture.take_initial();
+            depth_valid = !initial && presenter.depth_baseline() == Some((id, texture.visual_revision));
+            texture.mark_content_changed();
+            depth_baseline = Some((id, texture.visual_revision));
+            (texture.os.texture.as_ref().unwrap().as_id(), init_depth && depth_valid)
+        } else {
+            (presenter.fallback_depth().ok_or("window depth allocation failed")?, false)
+        };
         let color = pass.clear_color;
         pass.set_ortho_matrix(pass_rect.pos, pass_rect.size);
         pass.set_dpi_factor(dpi);
-        let full = force_full_redraw();
+        let full = sync || force_full_redraw() || !presenter.partial_available() || init_depth;
         let logical = if full {
             DamageRect::full(size)
         } else {
@@ -552,11 +518,9 @@ impl Cx {
             ])
         };
         let screenshot_requested = self.screenshot_requests.iter().any(|request| request.kind_id == 0);
-        let Some(mut paint) = presenter.prepare(
+        let mut paint = presenter.prepare(
             slot, logical, depth_baseline, full || !depth_valid || screenshot_requested, self.frame_trace.is_some(),
-        ) else {
-            return Err("Metal scissored clear or oracle allocation failed");
-        };
+        );
         let command: ObjcId = unsafe { msg_send![metal_cx.command_queue, commandBuffer] };
         if command == nil { return Err("Metal command buffer unavailable"); }
         let desc: ObjcId = unsafe { msg_send![class!(MTLRenderPassDescriptor), renderPassDescriptor] };
@@ -574,7 +538,7 @@ impl Cx {
                 red: color.x as f64, green: color.y as f64, blue: color.z as f64, alpha: color.w as f64
             }];
             let () = msg_send![depth_attachment, setTexture: depth_target];
-            let () = msg_send![depth_attachment, setLoadAction: load];
+            let () = msg_send![depth_attachment, setLoadAction: if preserve_depth { MTLLoadAction::Load } else { load }];
             let () = msg_send![depth_attachment, setStoreAction: MTLStoreAction::Store];
             let () = msg_send![depth_attachment, setClearDepth: depth as f64];
         }
@@ -617,13 +581,28 @@ impl Cx {
             let () = unsafe { msg_send![encoder, endEncoding] };
             if !oracle.encode_readback(command, paint.texture, size) { return Err("Metal oracle blit unavailable"); }
         }
+        if paint.storage == MTLStorageMode::Managed {
+            // A discrete GPU's managed texture can have a separate GPU copy.
+            // Synchronize the IOSurface backing before handing it to CA.
+            unsafe {
+                let blit: ObjcId = msg_send![command, blitCommandEncoder];
+                if blit == nil { return Err("Metal IOSurface synchronization unavailable"); }
+                let () = msg_send![blit, synchronizeResource: paint.texture];
+                let () = msg_send![blit, endEncoding];
+            }
+        }
         let screenshot = if screenshot_requested {
             self.build_screenshot_struct(metal_cx, command, 0, size[0] as usize, size[1] as usize, paint.texture, None)
         } else {
             None
         };
         self.passes[pass_id].paint_dirty = false;
-        self.commit_metal_command(screenshot, None, command, paint.guards, Some(paint.completion));
+        self.commit_metal_command(screenshot, None, command, paint.guards, Some((paint.completion, !sync)));
+        if sync {
+            // Metal waits for both the GPU and its completion handlers. The
+            // resize callback will publish in the enclosing AppKit transaction.
+            let () = unsafe { msg_send![command, waitUntilCompleted] };
+        }
         Ok(())
     }
 
@@ -695,7 +674,7 @@ impl Cx {
         stdin_frame: Option<PresentableDraw>,
         command_buffer: ObjcId,
         gpu_read_guards: Vec<MetalRwLockGpuReadGuard>,
-        #[cfg(target_os = "macos")] surface_completion: Option<Arc<SurfaceCompletion>>,
+        #[cfg(target_os = "macos")] surface_completion: Option<(Arc<SurfaceCompletion>, bool)>,
     ) {
         let gpu_read_guards = Mutex::new(Some(gpu_read_guards));
         let screenshot_info =  Mutex::new(screenshot_info);
@@ -753,8 +732,8 @@ impl Cx {
                 
                 let guards = gpu_read_guards.lock().unwrap().take().unwrap();
                 #[cfg(target_os = "macos")]
-                if let Some(completion) = &surface_completion {
-                    completion.complete(completed, guards);
+                if let Some((completion, wake)) = &surface_completion {
+                    completion.complete(completed, guards, *wake);
                     return;
                 }
                 drop(guards);
@@ -840,17 +819,6 @@ pub enum DrawPassMode {
     Texture,
     MTKView(ObjcId),
     StdinMain(PresentableDraw, usize),
-    Drawable(ObjcId),
-    Resizing(ObjcId)
-}
-
-impl DrawPassMode {
-    fn is_drawable(&self) -> Option<ObjcId> {
-        match self {
-            Self::Drawable(obj) | Self::Resizing(obj) => Some(*obj),
-            Self::StdinMain(_,_) | Self::Texture | Self::MTKView(_) => None
-        }
-    }
 }
 
 pub struct MetalCx {

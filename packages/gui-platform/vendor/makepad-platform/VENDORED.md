@@ -200,35 +200,46 @@ EGL vendor. Windows reports DXGI adapter description, D3D feature level and WARP
 selection; Metal reports the selected device name. The same info reaches the
 existing client diagnostics report and flags known CPU renderers.
 
-## Opt-in macOS IOSurface presentation
+## macOS IOSurface presentation
 
-`PASEO_METAL_SURFACE_PRESENT=1` enables an experimental, unified-memory macOS
-window presenter. `os/apple/macos/metal_surface.rs` wraps three row-aligned
-BGRA IOSurfaces as shared `BGRA8Unorm` Metal render targets. No drawable copy is
-used for display. `CAMetalLayer` continues to be the default and handles live
-resize, incompatible viewports, and unsupported or failed presenters. iOS
-continues to use its own `MTKView` path.
+`os/apple/macos/metal_surface.rs` owns the macOS window presenter. It wraps
+three row-aligned BGRA IOSurfaces as `BGRA8Unorm` Metal render targets.
+Unified-memory GPUs use shared storage without a presentation copy; discrete
+GPUs use managed storage and synchronize it before publication. iOS
+continues to use `MTKView`.
 
-The existing drawable layer leaves `colorspace` nil (no color matching).
-The plain CALayer's IOSurfaces carry `kIOSurfaceColorSpace` set to the serialized
-device RGB color space, preserving the same unmanaged premultiplied SDR values.
+The plain CALayer's IOSurfaces carry `kIOSurfaceColorSpace` set to serialized
+device RGB, preserving the unmanaged premultiplied SDR values originally
+displayed by the untagged Metal drawable layer.
 Labeling those values with the calibrated window/screen profile caused visible
 color changes on a P3 Mac display; leaving the IOSurface untagged did too. The
 native probe matched the nil-colorspace drawable with explicit device RGB.
-Windows spanning different displays still need native testing. `contentsScale`
-is the native backing scale; the unflipped hosted view uses top-left gravity and unflipped
-texture contents. Size, scale, display/profile changes, fullscreen and wake
-discard the ring; a new Metal device also gets new textures and clear state.
+`contentsScale` is the native backing scale. The unflipped hosted view uses
+top-left gravity and unflipped texture contents. Size, scale, display/profile
+changes, fullscreen and wake discard the ring; a new Metal device also gets
+new textures and clear state.
 
 One window frame can be in flight. The Metal completion handler releases GPU
-reads and posts a coalesced main-thread wake; scheduling alone does not guarantee
-that Core Animation can read the pixels. The main thread assigns distinct
+reads and posts a coalesced main-thread wake on steady-state frames.
+Scheduling alone is not a texture fence. The main thread assigns distinct
 surface contents in a disabled-actions `CATransaction`. The newest submitted
 front is reserved; older fronts are quarantined until a successor reports use
 and a fresh `IOSurfaceIsInUse` check on the old surface is clear. If no buffer
 is free, repaint work coalesces and reuse is retried at display cadence, not
 in a spin loop. If a visible window cannot reclaim a buffer for 250 ms, the
-presenter abandons its ring without reusing any uncertain buffer.
+presenter replaces its ring without reusing any uncertain buffer. Allocation
+or command failure keeps the last contents (without stretching), logs once
+per failure streak, and retries a full repair on a later paint.
+
+During live resize, `setFrameSize:` brackets the native geometry change
+and synchronous render/publish in one AppKit transaction. A size change
+creates a new ring and fully redraws the window. Slots allocate on demand, so
+a size displayed only once doesn't allocate the other two. `waitUntilCompleted`
+fences the GPU before setting contents; neither a second run-loop turn nor a
+display-link tick is needed. This blocks the main thread for allocation,
+encoding and GPU completion, so large windows can resize slower. The old
+ring is discarded, not reused: Metal retains in-flight textures and Core
+Animation retains submitted contents for as long as either needs them.
 
 The backend-neutral `damage.rs` history is shared with EGL. Only a successfully
 published frame advances the logical scene and history. A partial repair loads
@@ -237,7 +248,8 @@ items without changing their order or depth bias. The pass-owned depth buffer
 must still represent the previous scene outside the repair; a changed depth
 resource forces full repair. The optional Metal pixel oracle uses independent
 scratch attachments, the same encoder inputs, and fenced readback; it rejects
-the candidate and switches to the full drawable path on mismatch. See
+the candidate and disables partial repair for that window on mismatch.
+`PASEO_FULL_REDRAW=1` also disables partial repair without changing presenters. See
 [development](../../../../docs/development.md#macos-iosurface-verification)
 for switches, Mac runtime scenarios, and timing/trace fields.
 

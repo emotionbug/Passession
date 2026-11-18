@@ -192,10 +192,6 @@ impl MacosWindow {
             
             let () = msg_send![pool, release];
         }
-        
-        self.do_callback(
-            MacosEvent::WindowResizeLoopStart(self.window_id)
-        );
     }
     
     pub fn end_live_resize(&mut self) {
@@ -205,9 +201,12 @@ impl MacosWindow {
                 self.live_resize_timer = nil;
             }
         }
-        self.do_callback(
-            MacosEvent::WindowResizeLoopStop(self.window_id)
-        );
+        self.send_resize_event();
+    }
+
+    pub(super) fn in_live_resize(&self) -> bool {
+        let active: BOOL = unsafe { msg_send![self.view, inLiveResize] };
+        active == YES
     }
     
     pub fn close_window(&mut self) {
@@ -343,9 +342,19 @@ impl MacosWindow {
         self.send_change_event();
     }
 
+    pub(super) fn send_resize_event(&mut self) {
+        let geometry = self.get_window_geom();
+        if self.last_window_geom.as_ref().is_some_and(|old| old.inner_size == geometry.inner_size) {
+            return;
+        }
+        self.send_window_geom(geometry);
+    }
+
     pub fn send_change_event(&mut self) {
-        //return;
-        let new_geom = self.get_window_geom();
+        self.send_window_geom(self.get_window_geom());
+    }
+
+    fn send_window_geom(&mut self, new_geom: WindowGeom) {
         let old_geom = if let Some(old_geom) = &self.last_window_geom {
             old_geom.clone()
         }
@@ -361,8 +370,6 @@ impl MacosWindow {
             }),
         );
         self.do_callback(MacosEvent::Paint);
-        // we should schedule a timer for +16ms another Paint
-        
     }
     
     pub fn send_got_focus_event(&mut self) {

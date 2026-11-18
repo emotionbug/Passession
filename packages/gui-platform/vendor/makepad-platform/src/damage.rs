@@ -66,6 +66,8 @@ impl DamageRect {
             && self.y0.max(other.y0) < self.y1.min(other.y1)
     }
 
+    /// Origin and size, as EGL damage and Metal scissors take them.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
     pub fn egl(self) -> [i32; 4] {
         [self.x0, self.y0, self.x1 - self.x0, self.y1 - self.y0]
     }

@@ -232,17 +232,14 @@ impl MacosApp {
             
             let () = msg_send![ns_app, setDelegate: app_delegate_instance];
             let () = msg_send![ns_app, setActivationPolicy: NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular as i64];
-            if super::metal_surface::enabled() {
-                // Posted by completion handlers even as windows are closed; retain
-                // the shared wake event for the lifetime of the AppKit process.
-                let ready: ObjcId = msg_send![new_frame_event(SURFACE_READY_SUBTYPE), retain];
-                SURFACE_READY_EVENT.store(ready, Ordering::Release);
-                let workspace: ObjcId = msg_send![class!(NSWorkspace), sharedWorkspace];
-                let center: ObjcId = msg_send![workspace, notificationCenter];
-                let () = msg_send![center, addObserver: app_delegate_instance
-                    selector: sel!(surfaceWorkspaceDidWake:)
-                    name: str_to_nsstring("NSWorkspaceDidWakeNotification") object: nil];
-            }
+            // Completion handlers can still post during window teardown.
+            let ready: ObjcId = msg_send![new_frame_event(SURFACE_READY_SUBTYPE), retain];
+            SURFACE_READY_EVENT.store(ready, Ordering::Release);
+            let workspace: ObjcId = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let center: ObjcId = msg_send![workspace, notificationCenter];
+            let () = msg_send![center, addObserver: app_delegate_instance
+                selector: sel!(surfaceWorkspaceDidWake:)
+                name: str_to_nsstring("NSWorkspaceDidWakeNotification") object: nil];
             
             
             // Construct the bits that are shared between windows

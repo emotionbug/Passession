@@ -174,8 +174,7 @@ pub fn define_macos_window_delegate() -> *const Class {
     }
     
     extern "C" fn window_did_resize(this: &Object, _: Sel, _: ObjcId) {
-        let _cw = get_cocoa_window(this);
-        //cw.send_change_event();
+        get_cocoa_window(this).send_resize_event();
     }
     
     extern "C" fn window_will_start_live_resize(this: &Object, _: Sel, _: ObjcId) {
@@ -678,6 +677,26 @@ pub fn define_cocoa_view_class() -> *const Class {
         let cw = get_cocoa_window(this);
         cw.send_change_event();
     }
+
+    extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
+        unsafe {
+            let superclass = superclass(this);
+            let active: BOOL = msg_send![this, inLiveResize];
+            let layer: ObjcId = msg_send![this, layer];
+            let delegate: ObjcId = msg_send![layer, delegate];
+            if active == YES && std::ptr::eq(delegate, this) {
+                // Couple the new view geometry and completed IOSurface to this
+                // AppKit resize step. AppKit may also call displayLayer:; the
+                // second notification has no new geometry to repaint.
+                super::metal_surface::transaction(|| {
+                    let () = msg_send![super (this, superclass), setFrameSize: size];
+                    get_cocoa_window(this).send_resize_event();
+                });
+            } else {
+                let () = msg_send![super (this, superclass), setFrameSize: size];
+            }
+        }
+    }
     
     extern "C" fn dragging_session_ended_at_point_operation(this: &Object, _: Sel, _session: ObjcId, _point: NSPoint, _operation: NSDragOperation) {
         let window = get_cocoa_window(this);
@@ -816,6 +835,7 @@ pub fn define_cocoa_view_class() -> *const Class {
         decl.add_method(sel!(dealloc), dealloc as extern "C" fn(&Object, Sel));
         decl.add_method(sel!(initWithPtr:), init_with_ptr as extern "C" fn(&Object, Sel, *mut c_void) -> ObjcId);
         decl.add_method(sel!(drawRect:), draw_rect as extern "C" fn(&Object, Sel, NSRect));
+        decl.add_method(sel!(setFrameSize:), set_frame_size as extern "C" fn(&Object, Sel, NSSize));
         decl.add_method(sel!(resetCursorRects), reset_cursor_rects as extern "C" fn(&Object, Sel));
         decl.add_method(sel!(hasMarkedText), has_marked_text as extern "C" fn(&Object, Sel) -> BOOL);
         decl.add_method(sel!(markedRange), marked_range as extern "C" fn(&Object, Sel) -> NSRange);

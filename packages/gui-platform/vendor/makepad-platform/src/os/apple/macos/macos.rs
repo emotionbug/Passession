@@ -1,4 +1,4 @@
-use super::metal_surface::{self, Acquire, SurfaceKey, SurfacePresenter};
+use super::metal_surface::{SurfaceKey, SurfacePresenter};
 
 use {
     std::{
@@ -56,112 +56,36 @@ use {
 pub struct MetalWindow {
     pub window_id: WindowId,
     pub window_geom: WindowGeom,
-    cal_size: DVec2,
-    ca_layer: RcObjcId,
-    surface: Option<Box<SurfacePresenter>>,
-    surface_attached: bool,
+    surface: SurfacePresenter,
     backing_generation: u64,
     pub cocoa_window: Box<MacosWindow>,
-    pub is_resizing: bool
 }
 
 impl MetalWindow {
     pub (crate) fn new(
         window_id: WindowId,
-        metal_cx: &MetalCx,
         inner_size: DVec2,
         position: Option<DVec2>,
         title: &str
     ) -> MetalWindow {
         
-        let ca_layer: ObjcId = unsafe {msg_send![class!(CAMetalLayer), new]};
-        let ca_layer_owner = RcObjcId::from_owned(NonNull::new(ca_layer).unwrap());
-        
         let mut cocoa_window = Box::new(MacosWindow::new(window_id));
         
         cocoa_window.init(title, inner_size, position);
-        unsafe {
-            let () = msg_send![ca_layer, setDevice: metal_cx.device];
-            let () = msg_send![ca_layer, setPixelFormat: MTLPixelFormat::BGRA8Unorm];
-            let () = msg_send![ca_layer, setPresentsWithTransaction: NO];
-            let () = msg_send![ca_layer, setMaximumDrawableCount: 3];
-            let () = msg_send![ca_layer, setDisplaySyncEnabled: YES];
-            let () = msg_send![ca_layer, setNeedsDisplayOnBoundsChange: YES];
-            let () = msg_send![ca_layer, setAutoresizingMask: (1 << 4) | (1 << 1)];
-            let () = msg_send![ca_layer, setAllowsNextDrawableTimeout: NO];
-            let () = msg_send![ca_layer, setDelegate: cocoa_window.view];
-            let () = msg_send![ca_layer, setBackgroundColor: CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0)];
-            
-            let view = cocoa_window.view;
-            let () = msg_send![view, setWantsBestResolutionOpenGLSurface: YES];
-            let () = msg_send![view, setWantsLayer: YES];
-            let () = msg_send![view, setLayerContentsPlacement: 11];
-            let () = msg_send![view, setLayer: ca_layer];
-        }
+        let surface = SurfacePresenter::new(cocoa_window.view);
         
         MetalWindow {
-            is_resizing: false,
             window_id,
-            cal_size: DVec2::default(),
-            ca_layer: ca_layer_owner,
-            surface: SurfacePresenter::new(cocoa_window.view).map(Box::new),
-            surface_attached: false,
+            surface,
             backing_generation: cocoa_window.backing_generation,
             window_geom: cocoa_window.get_window_geom(),
             cocoa_window
         }
     }
-    
-    pub (crate) fn start_resize(&mut self) {
-        self.is_resizing = true;
-        if let Some(surface) = &mut self.surface { surface.invalidate(); }
-        let () = unsafe {msg_send![self.ca_layer.as_id(), setPresentsWithTransaction: YES]};
-    }
-    
-    pub (crate) fn stop_resize(&mut self) {
-        self.is_resizing = false;
-        let () = unsafe {msg_send![self.ca_layer.as_id(), setPresentsWithTransaction: NO]};
-    }
-    
-    pub (crate) fn resize_core_animation_layer(&mut self, _metal_cx: &MetalCx) -> bool {
-        let cal_size = DVec2 {
-            x: self.window_geom.inner_size.x * self.window_geom.dpi_factor,
-            y: self.window_geom.inner_size.y * self.window_geom.dpi_factor
-        };
-        if self.cal_size != cal_size {
-            self.cal_size = cal_size;
-            unsafe {
-                let () = msg_send![self.ca_layer.as_id(), setDrawableSize: CGSize {width: cal_size.x, height: cal_size.y}];
-                let () = msg_send![self.ca_layer.as_id(), setContentsScale: self.window_geom.dpi_factor];
-            }
-            true
-        }
-        else {
-            false
-        }
-    }
-
-    fn use_drawable_layer(&mut self) {
-        if !self.surface_attached { return; }
-        let view = self.cocoa_window.view;
-        metal_surface::transaction(|| unsafe {
-            let layer: ObjcId = msg_send![view, layer];
-            let () = msg_send![layer, setContents: nil];
-            let bounds: NSRect = msg_send![view, bounds];
-            let () = msg_send![self.ca_layer.as_id(), setFrame: bounds];
-            let () = msg_send![view, setLayer: self.ca_layer.as_id()];
-        });
-        self.surface_attached = false;
-    }
 
     fn visible(&self) -> bool {
         let state: usize = unsafe { msg_send![self.cocoa_window.window, occlusionState] };
         state & (1 << 1) != 0 // NSWindowOcclusionStateVisible
-    }
-
-    fn disable_surface(&mut self, reason: &str) {
-        eprintln!("paseo_metal_surface fallback: {reason}");
-        self.surface = None;
     }
 
     fn surface_key(&self, device: ObjcId) -> SurfaceKey {
@@ -176,8 +100,6 @@ impl MetalWindow {
     
 }
  
-
-const KEEP_ALIVE_COUNT: usize = 5;
 
 impl Cx {
     pub(crate) fn macos_update_text_input(&mut self, area: Area, editor: u64, text: &str, start: usize, end: usize) {
@@ -251,43 +173,31 @@ impl Cx {
                 CxPassParent::Window(window_id) => {
                     if let Some(metal_window) = metal_windows.iter_mut().find( | w | w.window_id == window_id) {
                         self.passes[*pass_id].set_time(time_now);
-                        if metal_window.surface.is_some() && !metal_window.is_resizing {
-                            let key = metal_window.surface_key(metal_cx.device);
-                            if key.size.iter().any(|&axis| axis <= 0) { continue; }
-                            let visible = metal_window.visible();
-                            let surface = metal_window.surface.as_mut().unwrap();
-                            if let Some(viewport) = self.surface_viewport(*pass_id, key.size) {
-                                match surface.acquire(
-                                    key, display_tick, visible, self.frame_trace.as_deref(),
-                                ) {
-                                    Acquire::Deferred => continue,
-                                    Acquire::Fallback(reason) => metal_window.disable_surface(reason),
-                                    Acquire::Buffer(slot) => match self.draw_surface_pass(*pass_id, metal_cx, surface, slot, key.size, viewport) {
-                                        Ok(()) => {
-                                            rendered += 1;
-                                            continue;
-                                        }
-                                        Err(reason) => metal_window.disable_surface(reason),
-                                    },
-                                }
-                            } else {
-                                // Fractional view geometry can round differently from the
-                                // drawable viewport. Keep the existing path until they agree.
-                                surface.invalidate();
+                        let key = metal_window.surface_key(metal_cx.device);
+                        if key.size.iter().any(|&axis| axis <= 0) { continue; }
+                        let visible = metal_window.visible();
+                        let sync = metal_window.cocoa_window.in_live_resize();
+                        let surface = &mut metal_window.surface;
+                        let slot = match surface.acquire(key, display_tick, visible, self.frame_trace.as_deref()) {
+                            Ok(Some(slot)) => slot,
+                            Ok(None) => continue,
+                            Err(reason) => {
+                                surface.retry_frame(key, reason);
+                                continue;
                             }
-                        }
-                        metal_window.use_drawable_layer();
-                        metal_window.resize_core_animation_layer(metal_cx);
-                        let drawable: ObjcId = unsafe {msg_send![metal_window.ca_layer.as_id(), nextDrawable]};
-                        if drawable == nil { continue; }
-                        let mode = if metal_window.is_resizing {
-                            DrawPassMode::Resizing(drawable)
-                        } else {
-                            DrawPassMode::Drawable(drawable)
                         };
-                        self.draw_pass(*pass_id, metal_cx, mode);
-                        if let Some(trace) = &self.frame_trace { trace.drawable_presented(); }
-                        rendered += 1;
+                        let result = self.draw_surface_pass(*pass_id, metal_cx, surface, slot, key.size, sync);
+                        if result.is_ok() { rendered += 1; }
+                        let result = result.and_then(|()| {
+                            if sync {
+                                surface.present(metal_window.cocoa_window.view, self.frame_trace.as_deref())?;
+                            }
+                            Ok(())
+                        });
+                        if let Err(reason) = result {
+                            surface.retry_frame(key, reason);
+                            self.passes[*pass_id].paint_dirty = true;
+                        }
                     }
                 }
                 CxPassParent::Pass(_) => {
@@ -312,18 +222,16 @@ impl Cx {
     fn present_surface_windows(&mut self, windows: &mut [MetalWindow]) -> bool {
         let mut repaint = false;
         for window in windows {
-            let Some(surface) = &mut window.surface else { continue; };
             let pass = self.windows[window.window_id].main_pass_id;
-            match surface.present(window.cocoa_window.view, self.frame_trace.as_deref()) {
+            match window.surface.present(window.cocoa_window.view, self.frame_trace.as_deref()) {
                 Ok(false) => (),
                 Ok(true) => {
-                    window.surface_attached = true;
                     repaint |= pass.is_some_and(|pass| self.passes[pass].paint_dirty);
                 }
                 Err(reason) => {
-                    window.disable_surface(reason);
+                    window.surface.retry_present(reason);
                     if let Some(pass) = pass {
-                        self.repaint_pass(pass);
+                        self.passes[pass].paint_dirty = true;
                         repaint = true;
                     }
                 }
@@ -350,41 +258,16 @@ impl Cx {
         metal_cx: &mut MetalCx,
         metal_windows: &mut Vec<MetalWindow>
     ) -> EventFlow {
-        if let  EventFlow::Exit = self.handle_platform_ops(metal_windows, metal_cx){
+        if let EventFlow::Exit = self.handle_platform_ops(metal_windows) {
             self.call_event_handler(&Event::Shutdown);
             return EventFlow::Exit
         }
-        // send a mouse up when dragging starts
         match &event {
-            MacosEvent::MouseDown(_) |
-            MacosEvent::MouseMove(_) |
-            MacosEvent::MouseUp(_) |
-            MacosEvent::Scroll(_) |
-            MacosEvent::KeyDown(_, _) |
-            MacosEvent::KeyUp(_, _) |
-            MacosEvent::TextInput(_, _) |
-            MacosEvent::TextIme(_, _, _) => {
-                self.os.keep_alive_counter = KEEP_ALIVE_COUNT;
-            }
             MacosEvent::Timer(te) => {
                 if te.timer_id == 0 {
                     if self.screenshot_requests.len()>0{
                         self.repaint_windows();
                     }
-                    if self.os.keep_alive_counter>0 {
-                        self.os.keep_alive_counter -= 1;
-                        // The legacy drawable needs extra flips after input. A retained
-                        // CALayer already keeps its last contents, and manufacturing paint
-                        // requests here would force damage to full after every keystroke.
-                        for window in metal_windows.iter() {
-                            if window.surface.is_none() || window.is_resizing {
-                                if let Some(pass) = self.windows[window.window_id].main_pass_id {
-                                    self.repaint_pass(pass);
-                                }
-                            }
-                        }
-                    }
-                    
                     // check signals
                     if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_media_signals();
@@ -418,20 +301,8 @@ impl Cx {
                 self.set_window_keyboard_focus(window_id, false);
                 self.call_event_handler(&Event::AppLostFocus);
             }
-            MacosEvent::WindowResizeLoopStart(window_id) => {
-                if let Some(window) = metal_windows.iter_mut().find( | w | w.window_id == window_id) {
-                    window.start_resize();
-                }
-            }
-            MacosEvent::WindowResizeLoopStop(window_id) => {
-                if let Some(window) = metal_windows.iter_mut().find( | w | w.window_id == window_id) {
-                    window.stop_resize();
-                    if window.surface.is_some() {
-                        if let Some(pass) = self.windows[window_id].main_pass_id { self.repaint_pass(pass); }
-                    }
-                }
-            }
             MacosEvent::WindowGeomChange(mut re) => { // do this here because mac
+                let mut resize = false;
                 if let Some(window) = metal_windows.iter_mut().find( | w | w.window_id == re.window_id) {
                     self.windows[re.window_id].os_dpi_factor = Some(re.new_geom.dpi_factor);
                     if let Some(dpi_override) = self.windows[re.window_id].dpi_override {
@@ -445,16 +316,15 @@ impl Cx {
                     let backing_changed = window.backing_generation != window.cocoa_window.backing_generation;
                     window.backing_generation = window.cocoa_window.backing_generation;
                     if size_changed || mode_changed || backing_changed {
-                        if let Some(surface) = &mut window.surface {
-                            surface.invalidate();
-                            if let Some(pass) = self.windows[re.window_id].main_pass_id { self.repaint_pass(pass); }
-                        }
+                        window.surface.invalidate();
+                        if let Some(pass) = self.windows[re.window_id].main_pass_id { self.repaint_pass(pass); }
                     }
                     window.window_geom = re.new_geom.clone();
                     self.windows[re.window_id].window_geom = re.new_geom.clone();
                     
                     // redraw just this windows root draw list
                     if size_changed {
+                        resize = window.cocoa_window.in_live_resize();
                         if let Some(main_pass_id) = self.windows[re.window_id].main_pass_id {
                             self.redraw_pass_and_child_passes(main_pass_id);
                         }
@@ -462,6 +332,9 @@ impl Cx {
                 }
                 // ok lets not redraw all, just this window
                 self.call_event_handler(&Event::WindowGeomChange(re));
+                if resize {
+                    return self.paint_macos(metal_windows, metal_cx, false);
+                }
             }
             MacosEvent::WindowClosed(wc) => {
                 // lets remove the window from the set
@@ -473,7 +346,7 @@ impl Cx {
                 self.os.ime_cancel.retain(|id| *id != window_id);
                 self.os.ime_notify.retain(|(window, _, _)| *window != window_id);
                 if let Some(index) = metal_windows.iter().position( | w | w.window_id == window_id) {
-                    metal_windows[index].use_drawable_layer();
+                    metal_windows[index].surface.detach();
                     metal_windows.remove(index);
                     if metal_windows.len() == 0 {
                         self.call_event_handler(&Event::Shutdown);
@@ -493,31 +366,13 @@ impl Cx {
             MacosEvent::SurfaceWake => {
                 with_macos_app(|app| app.set_animation_screen(None));
                 for window in metal_windows.iter_mut() {
-                    if let Some(surface) = &mut window.surface {
-                        surface.invalidate();
-                        if let Some(pass) = self.windows[window.window_id].main_pass_id { self.repaint_pass(pass); }
-                    }
+                    window.surface.invalidate();
+                    if let Some(pass) = self.windows[window.window_id].main_pass_id { self.repaint_pass(pass); }
                 }
                 return self.cocoa_event_callback(MacosEvent::Paint, metal_cx, metal_windows);
             }
             MacosEvent::Paint | MacosEvent::DisplayFrame => {
-                if matches!(event, MacosEvent::DisplayFrame) && !self.new_next_frames.is_empty() {
-                    self.call_next_frame_event(with_macos_app(|app| app.time_now()));
-                }
-                if self.need_redrawing() {
-                    self.call_draw_event();
-                    self.mtl_compile_shaders(&metal_cx);
-                }
-                self.handle_repaint(metal_windows, metal_cx, matches!(event, MacosEvent::DisplayFrame));
-                let screen = (!self.new_next_frames.is_empty())
-                    .then(|| Self::animation_screen(metal_windows))
-                    .or_else(|| metal_windows.iter().find_map(|window| {
-                        let surface = window.surface.as_ref()?;
-                        (surface.needs_display_tick() && window.visible())
-                            .then(|| unsafe { msg_send![window.cocoa_window.window, screen] })
-                    }));
-                with_macos_app(|app| app.set_animation_screen(screen));
-                return EventFlow::Wait;
+                return self.paint_macos(metal_windows, metal_cx, matches!(event, MacosEvent::DisplayFrame));
             }
             MacosEvent::MouseDown(mut e) => {
                 self.dpi_override_scale(&mut e.abs, e.window_id);
@@ -620,6 +475,25 @@ impl Cx {
        // }
     }
 
+    fn paint_macos(&mut self, windows: &mut [MetalWindow], metal_cx: &mut MetalCx, display_tick: bool) -> EventFlow {
+        if display_tick && !self.new_next_frames.is_empty() {
+            self.call_next_frame_event(with_macos_app(|app| app.time_now()));
+        }
+        if self.need_redrawing() {
+            self.call_draw_event();
+            self.mtl_compile_shaders(metal_cx);
+        }
+        self.handle_repaint(windows, metal_cx, display_tick);
+        let screen = (!self.new_next_frames.is_empty())
+            .then(|| Self::animation_screen(windows))
+            .or_else(|| windows.iter().find_map(|window| {
+                (window.surface.needs_display_tick() && window.visible())
+                    .then(|| unsafe { msg_send![window.cocoa_window.window, screen] })
+            }));
+        with_macos_app(|app| app.set_animation_screen(screen));
+        EventFlow::Wait
+    }
+
     fn animation_screen(windows: &[MetalWindow]) -> ObjcId {
         unsafe {
             let mut first = nil;
@@ -645,7 +519,7 @@ impl Cx {
         *pos = self.windows[window_id].remap_dpi_override(*pos)
     }
     
-    fn handle_platform_ops(&mut self, metal_windows: &mut Vec<MetalWindow>, metal_cx: &MetalCx)->EventFlow {
+    fn handle_platform_ops(&mut self, metal_windows: &mut Vec<MetalWindow>) -> EventFlow {
         for window_id in std::mem::take(&mut self.os.ime_cancel) {
             if let Some(window) = metal_windows.iter_mut().find(|w| w.window_id == window_id) {
                 window.cocoa_window.discard_marked_text();
@@ -662,7 +536,6 @@ impl Cx {
                     let window = &mut self.windows[window_id];
                     let metal_window = MetalWindow::new(
                         window_id,
-                        &metal_cx,
                         window.create_inner_size.unwrap_or(dvec2(800., 600.)),
                         window.create_position,
                         &window.create_title
@@ -859,7 +732,6 @@ pub struct CxOs {
     pub(crate) text_inputs: Vec<(WindowId, Rc<RefCell<crate::ime_composer::ImeComposer>>)>,
     pub(crate) ime_cancel: Vec<WindowId>,
     pub(crate) ime_notify: Vec<(WindowId, Area, TextImeEvent)>,
-    pub (crate) keep_alive_counter: usize,
     passes_todo: Vec<PassId>,
     pub (crate) media: CxAppleMedia,
     pub (crate) bytes_written: usize,

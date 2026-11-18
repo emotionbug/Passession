@@ -24,8 +24,6 @@ use crate::{
 pub enum MacosEvent {
     AppGotFocus(WindowId),
     AppLostFocus(WindowId),
-    WindowResizeLoopStart(WindowId),
-    WindowResizeLoopStop(WindowId),
     WindowGeomChange(WindowGeomChangeEvent),
     WindowClosed(WindowClosedEvent),
     Paint,

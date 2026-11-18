@@ -1,7 +1,7 @@
 //! Main-thread ownership of retained Metal window buffers.
 use super::macos_app::post_surface_ready;
 use crate::{
-    damage::{force_full_redraw, DamageFrame, DamageHistory, DamageRect},
+    damage::{DamageFrame, DamageHistory, DamageRect},
     frame_trace::FrameTrace,
     makepad_math::Vec4,
     os::apple::{
@@ -53,11 +53,6 @@ extern "C" {
     static kCAGravityTopLeft: ObjcId;
 }
 
-static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("PASEO_METAL_SURFACE_PRESENT").is_some_and(|value| value == "1")
-});
-
-pub(super) fn enabled() -> bool { *ENABLED }
 static ORACLE: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("PASEO_DAMAGE_ORACLE").is_some_and(|value| value == "1")
 });
@@ -125,11 +120,16 @@ pub(crate) struct SurfacePresenter {
     /// Retry surface ownership only at the display cadence, not on every paint/timer.
     waiting_since: Option<Instant>,
     deferred: bool,
+    retry: Option<(SurfaceKey, Instant)>,
+    partial_failure: bool,
 }
 
 struct Ring {
     key: SurfaceKey,
-    surfaces: [Surface; 3],
+    storage: MTLStorageMode,
+    surfaces: [Option<Surface>; 3],
+    descriptor: RcObjcId,
+    profile: OwnedCf,
     next: usize,
     front: Option<usize>,
     presented: u64,
@@ -138,6 +138,7 @@ struct Ring {
     depth_baseline: Option<(TextureId, u64)>,
     completion: Arc<SurfaceCompletion>,
     oracle: Option<Oracle>,
+    fallback_depth: Option<RcObjcId>,
 }
 
 #[derive(Clone, Copy)]
@@ -147,7 +148,7 @@ struct Pending {
     logical: DamageRect,
     repair: DamageRect,
     oracle: bool,
-    depth_baseline: (TextureId, u64),
+    depth_baseline: Option<(TextureId, u64)>,
     started: Option<Instant>,
 }
 
@@ -161,35 +162,36 @@ struct CompletionState {
 }
 
 impl SurfaceCompletion {
-    pub(crate) fn complete(&self, success: bool, mut guards: Vec<MetalRwLockGpuReadGuard>) {
+    pub(crate) fn complete(&self, success: bool, mut guards: Vec<MetalRwLockGpuReadGuard>, wake: bool) {
         guards.clear(); // Release GPU reads before allowing further work on the UI thread.
         *self.0.lock().unwrap() = CompletionState { success: Some(success), guards };
-        post_surface_ready();
+        if wake { post_surface_ready(); }
     }
 }
 
-pub(crate) enum Acquire {
-    Buffer(usize),
-    Deferred,
-    Fallback(&'static str),
-}
-
 impl SurfacePresenter {
-    pub(crate) fn new(delegate: ObjcId) -> Option<Self> {
-        if !*ENABLED { return None; }
-        let layer = unsafe { RcObjcId::from_owned(NonNull::new(msg_send![class!(CALayer), new])?) };
-        unsafe {
-            let () = msg_send![layer.as_id(), setDelegate: delegate];
-            // The hosted NSView is unflipped: Core Animation's top/left is max Y/min X.
-            // Texture row zero is already the top of the image; do not flip the contents.
+    pub(crate) fn new(view: ObjcId) -> Self {
+        let layer = unsafe {
+            let layer = RcObjcId::from_owned(NonNull::new(msg_send![class!(CALayer), new]).unwrap());
+            let () = msg_send![layer.as_id(), setDelegate: view];
+            // Keep stale contents at native size if rendering must be retried.
             let () = msg_send![layer.as_id(), setContentsGravity: kCAGravityTopLeft];
             let () = msg_send![layer.as_id(), setNeedsDisplayOnBoundsChange: YES];
             let () = msg_send![layer.as_id(), setAutoresizingMask: (1usize << 4) | (1 << 1)];
-        }
-        Some(Self {
+            if let Some(background) = NonNull::new(CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0)) {
+                let background = OwnedCf(background);
+                let () = msg_send![layer.as_id(), setBackgroundColor: background.as_id()];
+            }
+            let () = msg_send![view, setLayer: layer.as_id()];
+            let () = msg_send![view, setWantsLayer: YES];
+            let () = msg_send![view, setLayerContentsPlacement: 11usize]; // TopLeft
+            layer
+        };
+        Self {
             layer, clear: None, ring: None, history: DamageHistory::default(),
             scene: DamageFrame::default(), waiting_since: None, deferred: false,
-        })
+            retry: None, partial_failure: false,
+        }
     }
 
     pub(crate) fn invalidate(&mut self) {
@@ -202,28 +204,64 @@ impl SurfacePresenter {
         self.deferred = false;
     }
 
+    pub(crate) fn retry_frame(&mut self, key: SurfaceKey, reason: &'static str) {
+        if self.retry.is_none() {
+            eprintln!("paseo_metal_surface retry: {reason}");
+        }
+        self.retry = Some((key, Instant::now() + Duration::from_millis(16)));
+        if let Some(ring) = &mut self.ring {
+            ring.pending = None;
+            ring.depth_baseline = None;
+        }
+        self.history.invalidate();
+        self.scene.invalidate();
+    }
+
+    pub(crate) fn retry_present(&mut self, reason: &'static str) {
+        self.retry_frame(self.ring.as_ref().unwrap().key, reason);
+    }
+
+    fn disable_partial(&mut self, reason: &'static str) {
+        if !std::mem::replace(&mut self.partial_failure, true) {
+            eprintln!("paseo_metal_surface full repair: {reason}");
+        }
+    }
+
+    pub(crate) fn partial_available(&self) -> bool { !self.partial_failure }
+
+    pub(crate) fn fallback_depth(&mut self) -> Option<ObjcId> {
+        let ring = self.ring.as_mut().unwrap();
+        if ring.fallback_depth.is_none() {
+            unsafe {
+                let descriptor = texture_descriptor(ring.key.size, MTLPixelFormat::Depth32Float, MTLStorageMode::Private);
+                ring.fallback_depth = Some(RcObjcId::from_owned(NonNull::new(msg_send![
+                    ring.key.device, newTextureWithDescriptor: descriptor
+                ])?));
+            }
+        }
+        ring.fallback_depth.as_ref().map(RcObjcId::as_id)
+    }
+
+    pub(crate) fn detach(&self) {
+        transaction(|| unsafe {
+            let () = msg_send![self.layer.as_id(), setDelegate: nil];
+            let () = msg_send![self.layer.as_id(), setContents: nil];
+        });
+    }
+
     pub(crate) fn needs_display_tick(&self) -> bool { self.waiting_since.is_some() }
 
     pub(crate) fn acquire(
         &mut self, key: SurfaceKey, display_tick: bool,
         visible: bool, trace: Option<&FrameTrace>,
-    ) -> Acquire {
+    ) -> Result<Option<usize>, &'static str> {
+        if self.retry.is_some_and(|(failed_key, ready)| failed_key == key && Instant::now() < ready) {
+            return Ok(None);
+        }
         if self.ring.as_ref().is_none_or(|ring| ring.key != key) {
             self.invalidate();
-            if key.screen == nil {
-                // A hidden or not-yet-mapped window has no known backing profile.
-                return Acquire::Deferred;
-            }
-            let Some(ring) = Ring::new(key) else {
-                return Acquire::Fallback("IOSurface allocation or device RGB profile unsupported");
-            };
-            if !force_full_redraw() && self.clear.as_ref().is_none_or(|clear| clear.device != key.device) {
-                let Some(clear) = RepairClear::new(key.device) else {
-                    return Acquire::Fallback("Metal scissored clear unavailable");
-                };
-                self.clear = Some(clear);
-            }
-            self.ring = Some(ring);
+            if key.screen == nil { return Ok(None); }
+            self.ring = Some(Ring::new(key).ok_or("IOSurface ring allocation failed")?);
         }
         let ring = self.ring.as_mut().unwrap();
         if ring.pending.is_some() {
@@ -231,46 +269,48 @@ impl SurfacePresenter {
                 self.deferred = true;
                 if let Some(trace) = trace { trace.surface_deferred(false); }
             }
-            return Acquire::Deferred;
+            return Ok(None);
         }
         if let Some(start) = self.waiting_since {
             if !visible {
                 self.waiting_since = Some(Instant::now());
-                return Acquire::Deferred;
+                return Ok(None);
             }
-            if !display_tick { return Acquire::Deferred; }
-            // If CA never acknowledges an attachment, don't hang a visible window.
-            // Fall back without ever writing to a surface we couldn't reclaim.
+            if !display_tick { return Ok(None); }
             if start.elapsed() > Duration::from_millis(250) {
-                return Acquire::Fallback("Core Animation did not release a reusable surface");
+                // Replace the ring without touching any quarantined slot. CA
+                // still owns the old contents until it releases them itself.
+                self.ring = None;
+                return Err("Core Animation did not release a reusable surface");
             }
         }
         if let Some(front) = ring.front {
-            let front = &ring.surfaces[front];
+            let front = ring.surfaces[front].as_ref().unwrap();
             if front.presented > ring.observed && front.in_use() {
                 ring.observed = front.presented;
             }
         }
         for offset in 0..ring.surfaces.len() {
             let index = (ring.next + offset) % ring.surfaces.len();
-            let surface = &ring.surfaces[index];
             // A newer front must have registered use before a previous front can
             // be reclaimed. A false use count alone can mean CA hasn't latched it
             // yet. Once a successor is in use, CA no longer needs to acquire any
             // older content from this layer; ongoing use is still checked below.
             if Some(index) != ring.front
-                && (surface.presented == 0 || surface.presented < ring.observed)
-                && !surface.in_use()
+                && ring.surfaces[index].as_ref().is_none_or(|surface| {
+                    (surface.presented == 0 || surface.presented < ring.observed) && !surface.in_use()
+                })
             {
+                ring.ensure_surface(index).ok_or("IOSurface slot allocation failed")?;
                 ring.next = (index + 1) % ring.surfaces.len();
                 self.waiting_since = None;
                 self.deferred = false;
-                return Acquire::Buffer(index);
+                return Ok(Some(index));
             }
         }
         self.waiting_since.get_or_insert_with(Instant::now);
         if let Some(trace) = trace { trace.surface_deferred(true); }
-        Acquire::Deferred
+        Ok(None)
     }
 
     pub(crate) fn scene_mut(&mut self) -> &mut DamageFrame { &mut self.scene }
@@ -280,32 +320,48 @@ impl SurfacePresenter {
     }
 
     pub(crate) fn prepare(
-        &mut self, slot: usize, logical: DamageRect, depth_baseline: (TextureId, u64), full_repair: bool, trace: bool,
-    ) -> Option<SurfacePaint<'_>> {
-        let ring = self.ring.as_mut().unwrap();
-        let full = DamageRect::full(ring.key.size);
-        let presented = ring.surfaces[slot].presented;
+        &mut self, slot: usize, logical: DamageRect, depth_baseline: Option<(TextureId, u64)>,
+        full_repair: bool, trace: bool,
+    ) -> SurfacePaint<'_> {
+        let ring = self.ring.as_ref().unwrap();
+        let key = ring.key;
+        let full = DamageRect::full(key.size);
+        let presented = ring.surfaces[slot].as_ref().unwrap().presented;
         let age = if presented == 0 { 0 } else { i32::try_from(ring.presented - presented + 1).unwrap_or(0) };
-        let repair = if full_repair {
+        let mut repair = if full_repair || !self.partial_available() {
             full
         } else {
             self.history.repair(age, logical).unwrap_or(full)
         };
-        let partial = repair != full;
-        if partial && *ORACLE && ring.oracle.is_none() {
-            ring.oracle = Some(Oracle::new(ring.key.device, ring.key.size)?);
+        if repair != full && self.clear.as_ref().is_none_or(|clear| clear.device != key.device) {
+            self.clear = RepairClear::new(key.device);
+            if self.clear.is_none() {
+                self.disable_partial("Metal scissored clear unavailable");
+                repair = full;
+            }
         }
+        if repair != full && *ORACLE && self.ring.as_ref().unwrap().oracle.is_none() {
+            let oracle = Oracle::new(key.device, key.size);
+            if oracle.is_none() {
+                self.disable_partial("Metal damage oracle allocation failed");
+                repair = full;
+            }
+            self.ring.as_mut().unwrap().oracle = oracle;
+        }
+        let ring = self.ring.as_mut().unwrap();
+        let partial = repair != full;
         let oracle = if partial { ring.oracle.as_ref() } else { None };
         ring.pending = Some(Pending {
             slot, age, logical, repair, oracle: oracle.is_some(), depth_baseline, started: trace.then(Instant::now),
         });
-        Some(SurfacePaint {
-            texture: ring.surfaces[slot].texture.as_id(),
+        SurfacePaint {
+            texture: ring.surfaces[slot].as_ref().unwrap().texture.as_id(),
+            storage: ring.storage,
             repair: partial.then(|| (&self.scene, repair, self.clear.as_ref().unwrap())),
             oracle,
             completion: Arc::clone(&ring.completion),
             guards: std::mem::take(&mut ring.completion.0.lock().unwrap().guards),
-        })
+        }
     }
 
     /// Call only on AppKit's thread. A command buffer's *scheduled* notification
@@ -317,11 +373,14 @@ impl SurfacePresenter {
         self.deferred = false;
         if !success { return Err("Metal window command buffer failed"); }
         if frame.oracle {
-            ring.oracle.as_ref().unwrap().check(ring.presented + 1, ring.key.size, frame)?;
+            if let Err(reason) = ring.oracle.as_ref().unwrap().check(ring.presented + 1, ring.key.size, frame) {
+                self.partial_failure = true;
+                return Err(reason);
+            }
         } else if *ORACLE {
             eprintln!("paseo_metal_damage frame={} result=full age={} size={:?}", ring.presented + 1, frame.age, ring.key.size);
         }
-        let surface = &mut ring.surfaces[frame.slot];
+        let surface = ring.surfaces[frame.slot].as_mut().unwrap();
         transaction(|| unsafe {
             if ring.front.is_none() {
                 let () = msg_send![self.layer.as_id(), setContentsScale: ring.key.scale];
@@ -329,19 +388,14 @@ impl SurfacePresenter {
                 let () = msg_send![self.layer.as_id(), setFrame: bounds];
             }
             let () = msg_send![self.layer.as_id(), setContents: surface.io.as_id()];
-            let current: ObjcId = msg_send![view, layer];
-            if current != self.layer.as_id() {
-                let background: ObjcId = msg_send![current, backgroundColor];
-                let () = msg_send![self.layer.as_id(), setBackgroundColor: background];
-                let () = msg_send![view, setLayer: self.layer.as_id()];
-            }
         });
         ring.presented += 1;
         surface.presented = ring.presented;
         ring.front = Some(frame.slot);
         self.scene.commit();
-        ring.depth_baseline = Some(frame.depth_baseline);
+        ring.depth_baseline = frame.depth_baseline;
         self.history.push(frame.logical);
+        self.retry = None;
         if let (Some(trace), Some(started)) = (trace, frame.started) {
             trace.surface_presented(ring.key.size, frame.repair, started.elapsed());
         }
@@ -362,21 +416,33 @@ pub(crate) fn transaction(update: impl FnOnce()) {
 impl Ring {
     fn new(key: SurfaceKey) -> Option<Self> {
         unsafe {
+            if key.size.iter().any(|&axis| !(1..=16384).contains(&axis)) { return None; }
             let unified: BOOL = msg_send![key.device, hasUnifiedMemory];
-            if unified != YES || key.size.iter().any(|&axis| !(1..=16384).contains(&axis)) { return None; }
+            let storage = if unified == YES { MTLStorageMode::Shared } else { MTLStorageMode::Managed };
             // Match CAMetalLayer.colorspace == nil: the shader's SDR channel
             // values are unmanaged device RGB. A calibrated window/screen profile
             // reinterprets those values and visibly changes colors on a P3 screen.
             let space = OwnedCf(NonNull::new(CGColorSpaceCreateDeviceRGB())?);
             let profile = OwnedCf(NonNull::new(CGColorSpaceCopyPropertyList(space.as_id()))?);
-            let descriptor = texture_descriptor(key.size, MTLPixelFormat::BGRA8Unorm, MTLStorageMode::Shared);
-            let make = || Surface::new(key.device, key.size, profile.as_id(), descriptor);
+            let descriptor = RcObjcId::from_unowned(NonNull::new(texture_descriptor(
+                key.size, MTLPixelFormat::BGRA8Unorm, storage,
+            ))?);
             Some(Self {
-                key, surfaces: [make()?, make()?, make()?], next: 0, front: None,
+                key, storage, profile, descriptor, surfaces: [None, None, None], next: 0, front: None,
                 presented: 0, observed: 0, pending: None, depth_baseline: None,
-                completion: Arc::default(), oracle: None,
+                completion: Arc::default(), oracle: None, fallback_depth: None,
             })
         }
+    }
+
+    fn ensure_surface(&mut self, index: usize) -> Option<&Surface> {
+        let slot = &mut self.surfaces[index];
+        if slot.is_none() {
+            // Resize steps typically publish only once at a given size. Allocate
+            // the next slot only if another frame actually needs that backing.
+            *slot = Some(Surface::new(self.key.device, self.key.size, self.profile.as_id(), self.descriptor.as_id())?);
+        }
+        slot.as_ref()
     }
 }
 
@@ -399,7 +465,7 @@ mod tests {
             let device = RcObjcId::from_owned(
                 NonNull::new(MTLCreateSystemDefaultDevice()).expect("Native Metal device required"),
             );
-            let ring = Ring::new(SurfaceKey {
+            let mut ring = Ring::new(SurfaceKey {
                 device: device.as_id(), size: [4, 4], scale: 1.0, screen: nil,
             }).expect("Create IOSurface ring");
             let expected_space = OwnedCf(NonNull::new(CGColorSpaceCreateDeviceRGB()).unwrap());
@@ -408,7 +474,8 @@ mod tests {
             )).unwrap());
             // Inspect the serialized metadata on every real IOSurface. Shader
             // readback alone cannot detect a compositor color-space conversion.
-            for surface in &ring.surfaces {
+            for index in 0..ring.surfaces.len() {
+                let surface = ring.ensure_surface(index).expect("Allocate IOSurface slot");
                 let profile = OwnedCf(NonNull::new(IOSurfaceCopyValue(
                     surface.io.as_id(), kIOSurfaceColorSpace,
                 )).expect("IOSurface color-space metadata"));
@@ -427,6 +494,7 @@ mod tests {
 
 pub(crate) struct SurfacePaint<'a> {
     pub(crate) texture: ObjcId,
+    pub(crate) storage: MTLStorageMode,
     pub(crate) repair: Option<(&'a DamageFrame, DamageRect, &'a RepairClear)>,
     pub(crate) oracle: Option<&'a Oracle>,
     pub(crate) completion: Arc<SurfaceCompletion>,

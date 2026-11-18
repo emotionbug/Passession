@@ -186,9 +186,9 @@ check the active X11 display; two short-lived probe windows appear in sequence.
 ### Window damage verification
 
 Set `PASEO_FULL_REDRAW=1` before launching the app to bypass retained window
-damage on EGL and Windows or force full repair on the opt-in macOS presenter.
-On X11 `render_frames` counts repaint iterations
-with work; a frame can include several `render_passes` during a transition.
+damage on EGL and Windows or force full repair on macOS. On X11 `render_frames`
+counts repaint iterations with work; a frame can include several
+`render_passes` during a transition.
 `render_ms / render_frames` includes time spent in presentation and should
 not be interpreted as GPU execution time.
 
@@ -218,51 +218,50 @@ wall-clock timings. Do not use oracle readbacks to measure cost.
 
 #### macOS IOSurface verification
 
-Run these separately on a Mac (quit the development client between runs).
-`dev app` isolates client state from the installed app; use a development
-daemon (`cargo xtask dev daemon` on port 6768) and a disposable test session.
+IOSurface is the default macOS presenter. Quit the development client between
+runs. `dev app` isolates client state; use a development daemon (`cargo xtask
+dev daemon` on port 6768) and a disposable test session.
 
 ```sh
 # Same-frame pixel check (not a performance run)
-PASEO_METAL_SURFACE_PRESENT=1 PASEO_DAMAGE_ORACLE=1 PASEO_FRAME_TRACE=1 \
+env -u PASEO_FULL_REDRAW PASEO_DAMAGE_ORACLE=1 PASEO_FRAME_TRACE=1 \
   cargo xtask dev app 2>&1 | tee /tmp/paseo-metal-oracle.log
-# Compare retained repair, full repair on the same presenter, and stock CAMetalLayer
-PASEO_METAL_SURFACE_PRESENT=1 PASEO_DAMAGE_ORACLE=0 PASEO_FRAME_TRACE=1 \
+# Time the default and forced-full repair modes without oracle readback.
+env -u PASEO_FULL_REDRAW -u PASEO_DAMAGE_ORACLE PASEO_FRAME_TRACE=1 \
   cargo xtask dev app 2>&1 | tee /tmp/paseo-metal-partial.log
-PASEO_METAL_SURFACE_PRESENT=1 PASEO_FULL_REDRAW=1 PASEO_FRAME_TRACE=1 \
+env -u PASEO_DAMAGE_ORACLE PASEO_FULL_REDRAW=1 PASEO_FRAME_TRACE=1 \
   cargo xtask dev app 2>&1 | tee /tmp/paseo-metal-full.log
-PASEO_METAL_SURFACE_PRESENT=0 PASEO_FRAME_TRACE=1 \
-  cargo xtask dev app 2>&1 | tee /tmp/paseo-metal-stock.log
 ```
 
-For the pixel check, start with `PASEO_FULL_REDRAW` unset. Exercise an idle
-window and a running spinner; type, scroll, open and close a sheet, and trigger
-compact navigation transitions at narrow width. Repeat through interactive
-resize, native fullscreen, moving between displays with different DPI and
-profiles, occlusion/minimize/restore, and sleep/wake. Include a ProMotion
-display at 120 Hz if available. Check for stale rectangles, orientation,
-premultiplied alpha, color parity with stock Metal (including on a wide-gamut
-screen), tearing, and stalls. Check a Studio screenshot if available.
+In the oracle run, exercise an idle window and a running spinner; type, scroll,
+open and close a sheet, and trigger compact navigation at narrow width. Drag
+the window edges and corners slowly and quickly, including across the compact
+breakpoint. Look for stretched or stale frames, jumps, or black flashes while
+the pointer is still down. Enter and exit native fullscreen and move the window
+between different DPI/profile displays; verify it stays sharp, oriented, and
+the same color. Also check occlusion/minimize/restore and sleep/wake. Repeat at
+120 Hz if available and check a Studio screenshot.
 
 Report the Mac/GPU, macOS, display size/scale/refresh and profile, `result=equal`
 counts by age (including age >1), `result=mismatch` counts and the first
-mismatch line, and any `paseo_metal_surface fallback` lines. A run with only
-`result=full` does not exercise partial repair. A mismatch is never presented:
-the window switches back to the full drawable path.
+mismatch line, and any `paseo_metal_surface retry` or `full repair` diagnostics.
+A run with only `result=full` does not exercise partial repair. Live resize
+renders and publishes full frames synchronously; verify the oracle returns to
+`result=equal` on later partial frames after resize, fullscreen, and display
+changes. A mismatch is never presented; the window rerenders in full on the
+same presenter and disables partial repair for the rest of that window's life.
 
 For the timed runs, report per scenario `surface_presents`,
 `surface_repair_pct` (mean repaired pixel area), `surface_reuse_waits`,
-`surface_deferred`, `surface_publish_ms / surface_presents` (encode start to
-Core Animation commit, not scanout), `texture_upload_bytes`, and
-`drawable_presents`. Compute the macOS presentation-submission rate as
-`(surface_presents + drawable_presents) / interval`. Live resize deliberately
-uses the drawable path, so `surface_presents` alone undercounts updates during
-resize. `render_frames` can include offscreen work; neither counter measures
-actual scanout. Compare actual input-to-display latency against stock with a high-speed
-camera or Instruments; record GPU time, memory and energy if available.
-The expected added latency is at most one refresh in steady state, with no
-intentional extra display tick; a saturated GPU/compositor can coalesce work.
-Cross-compilation does not establish runtime correctness or that latency.
+`surface_deferred`, `surface_publish_ms / surface_presents` (encoding through
+Core Animation commit), and `texture_upload_bytes`. The submission rate is
+`surface_presents / interval`, including live resize; neither that rate nor
+`render_frames` measures scanout. Compare steady-state and live-resize rates
+between the two timed modes and against the prior build if available. Live
+resize waits on the UI thread for GPU completion and needs a fresh surface
+at each new size; at high resolutions this can lower throughput. Use Instruments
+or a high-speed camera for true GPU time and display latency. The steady-state
+path has no intentional extra display tick after completion.
 
 ### UI motion
 

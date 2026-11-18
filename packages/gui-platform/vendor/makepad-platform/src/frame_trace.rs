@@ -45,7 +45,6 @@ struct Sample {
     render_time: Duration,
     texture_uploads: usize,
     texture_upload_bytes: u64,
-    drawable_presents: usize,
     surface_presents: usize,
     surface_repair_pct_sum: f64,
     surface_reuse_waits: usize,
@@ -118,6 +117,8 @@ impl FrameTrace {
         *self.sample.lock().unwrap().next_frame_requests.entry(owner).or_default() += 1;
     }
 
+    /// Native render/present time; reported by the X11 and macOS window loops.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn render(&self, passes: usize, elapsed: Duration) {
         let mut sample = self.sample.lock().unwrap();
         sample.render_passes += passes;
@@ -129,11 +130,6 @@ impl FrameTrace {
         let mut sample = self.sample.lock().unwrap();
         sample.texture_uploads += 1;
         sample.texture_upload_bytes += width as u64 * height as u64 * bytes_per_pixel as u64;
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn drawable_presented(&self) {
-        self.sample.lock().unwrap().drawable_presents += 1;
     }
 
     #[cfg(target_os = "macos")]
@@ -192,13 +188,13 @@ impl Sample {
         let draw_time = self.events.get("Draw").map_or(Duration::ZERO, |cost| cost.time);
         let all_event_time: Duration = self.events.values().map(|cost| cost.time).sum();
         eprintln!(
-            "PASEO_FRAME_TRACE t={:.3}s interval={:.3}s draw={} render_passes={} render_frames={} next_frame={} timer={} signal={} actions={}/{} event_ms={:.3} draw_ms={:.3} render_ms={:.3} texture_uploads={} texture_upload_bytes={} surface_presents={} surface_repair_pct={:.2} surface_reuse_waits={} surface_deferred={} surface_publish_ms={:.3} drawable_presents={} events=[{}] timers=[{}] next_frame_requests=[{}] layers=[{}] redraw=[{}]",
+            "PASEO_FRAME_TRACE t={:.3}s interval={:.3}s draw={} render_passes={} render_frames={} next_frame={} timer={} signal={} actions={}/{} event_ms={:.3} draw_ms={:.3} render_ms={:.3} texture_uploads={} texture_upload_bytes={} surface_presents={} surface_repair_pct={:.2} surface_reuse_waits={} surface_deferred={} surface_publish_ms={:.3} events=[{}] timers=[{}] next_frame_requests=[{}] layers=[{}] redraw=[{}]",
             since_start.as_secs_f64(), interval.as_secs_f64(), event("Draw"), self.render_passes, self.render_frames,
             event("NextFrame"), event("Timer"), event("Signal"), event("Actions"), self.actions,
             ms(all_event_time - draw_time), ms(draw_time), ms(self.render_time),
             self.texture_uploads, self.texture_upload_bytes,
             self.surface_presents, self.surface_repair_pct_sum / self.surface_presents.max(1) as f64,
-            self.surface_reuse_waits, self.surface_deferred, ms(self.surface_publish_time), self.drawable_presents,
+            self.surface_reuse_waits, self.surface_deferred, ms(self.surface_publish_time),
             series(self.events.iter().map(|(name, cost)| format!("{name}={cost}"))),
             series(self.timers.iter().map(|(owner, cost)| {
                 owner.map_or_else(|| format!("unknown={cost}"), |owner| format!("{owner}={cost}"))
