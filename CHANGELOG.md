@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.41 - 2026-11-18
+
 ### Added
 
 - Show a tray icon while the daemon runs. It shows the daemon's version and address, stays after Passession closes, and its menu opens Passession or stops the daemon; stopping takes a second click to confirm, because it can interrupt running agents. On Linux the icon needs a StatusNotifier host (KDE, or GNOME with the AppIndicator extension) and appears as soon as one starts; SSH sessions and containers show no icon. Turn it off with `paseo daemon config set daemon.tray false`, or pass `--no-tray` to one `paseo daemon run`.

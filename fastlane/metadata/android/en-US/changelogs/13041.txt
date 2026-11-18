@@ -1,0 +1,4 @@
+Added
+- Desktop: the daemon shows a tray icon while it runs. No changes on Android.
+
+Full notes: https://github.com/emotionbug/Passession/releases
