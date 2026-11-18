@@ -10,6 +10,14 @@ use crate::{
 };
 use std::cell::Cell;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn log_oracle(args: std::fmt::Arguments<'_>) {
+    #[cfg(target_os = "android")]
+    crate::log!("{}", args);
+    #[cfg(target_os = "linux")]
+    eprintln!("{args}");
+}
+
 /// Whether every window frame must repaint in full.
 ///
 /// Android defaults to full redraws: on an Adreno phone (OnePlus 15) partial
@@ -175,6 +183,34 @@ mod history_tests {
         history.push(rect(10));
         assert_eq!(history.repair(2, rect(11)), Some(rect(10).union(rect(11))));
     }
+
+    #[test]
+    fn collection_explains_full_frames_without_changing_the_repair() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let pass = crate::pass::Pass::new_with_name(&mut cx, "damage test");
+        let list = cx.draw_lists.alloc();
+        let (pass, list) = (pass.pass_id(), list.id());
+        let mut scene = DamageFrame::default();
+        let size = [24, 24];
+        let clear = [0; 5];
+
+        let (logical, reason) = scene.collect_inner::<true>(&cx, pass, list, size, clear);
+        assert_eq!(logical, scene.collect(&cx, pass, list, size, clear));
+        assert_eq!(logical, DamageRect::full(size));
+        assert!(matches!(reason, Some(FullDamageReason::NoBaseline)));
+        scene.commit();
+
+        let (_, reason) = scene.collect_inner::<true>(&cx, pass, list, size, clear);
+        assert!(matches!(reason, Some(FullDamageReason::EmptyDamage)));
+
+        cx.passes[pass].dont_clear = true;
+        let (_, reason) = scene.collect_inner::<true>(&cx, pass, list, size, clear);
+        assert!(matches!(reason, Some(FullDamageReason::PaintStateChanged)));
+        scene.commit();
+
+        let (_, reason) = scene.collect_inner::<true>(&cx, pass, list, size, clear);
+        assert!(matches!(reason, Some(FullDamageReason::LoadExistingColor)));
+    }
 }
 
 const PASS_VIEW_FLOATS: usize = std::mem::size_of::<PassUniforms>() / 4 - 2; // exclude time and padding
@@ -230,6 +266,40 @@ struct Item {
     bounds: Option<DamageRect>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FullDamageReason {
+    NoBaseline,
+    PaintStateChanged,
+    LoadExistingColor,
+    ExternalTexture,
+    TimeUniform,
+    UnknownBounds,
+    EmptyDamage,
+    SceneCoverage,
+}
+
+struct CollectedDamage {
+    rect: DamageRect,
+    reason: Option<FullDamageReason>,
+}
+
+impl CollectedDamage {
+    fn full<const EXPLAIN: bool>(&mut self, full: DamageRect, reason: FullDamageReason) {
+        if EXPLAIN && self.rect != full {
+            self.reason = Some(reason);
+        }
+        self.rect = full;
+    }
+
+    fn add<const EXPLAIN: bool>(&mut self, bounds: Option<DamageRect>, full: DamageRect) {
+        if let Some(bounds) = bounds {
+            self.rect = self.rect.union(bounds);
+        } else {
+            self.full::<EXPLAIN>(full, FullDamageReason::UnknownBounds);
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DamageFrame {
     previous_state: Option<PaintState>,
@@ -252,7 +322,33 @@ impl DamageFrame {
         self.pending.get(index).and_then(|item| item.bounds).is_some_and(|bounds| !bounds.intersects(repair))
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn log_pixel(&self, cx: &Cx, frame: u64, (x, y): (i32, i32), repair: DamageRect) {
+        let pixel = DamageRect { x0: x, y0: y, x1: x + 1, y1: y + 1 };
+        for (index, item) in self.pending.iter().enumerate() {
+            let old = self.previous.get(index);
+            if item.bounds.is_none_or(|bounds| bounds.intersects(pixel))
+                || old.is_some_and(|old| old.bounds.is_none_or(|bounds| bounds.intersects(pixel)))
+            {
+                let state = item.state;
+                let shader = &cx.draw_shaders[state.shader.draw_shader_id];
+                log_oracle(format_args!("paseo_damage item frame={frame} ordinal={index} list={:?} slot={} shader={}:{} bounds={:?} old_bounds={:?} changed={} culled={}",
+                    state.list, state.slot, shader.type_name, shader.class_prop, item.bounds, old.map(|old| old.bounds),
+                    old.is_none_or(|old| old.state != state), self.should_cull(index, repair)));
+            }
+        }
+    }
+
     pub fn collect(&mut self, cx: &Cx, pass: PassId, root: DrawListId, size: [i32; 2], clear: [u32; 5]) -> DamageRect {
+        self.collect_inner::<false>(cx, pass, root, size, clear).0
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn collect_detailed(&mut self, cx: &Cx, pass: PassId, root: DrawListId, size: [i32; 2], clear: [u32; 5]) -> (DamageRect, Option<FullDamageReason>) {
+        self.collect_inner::<true>(cx, pass, root, size, clear)
+    }
+
+    fn collect_inner<const EXPLAIN: bool>(&mut self, cx: &Cx, pass: PassId, root: DrawListId, size: [i32; 2], clear: [u32; 5]) -> (DamageRect, Option<FullDamageReason>) {
         let draw_pass = &cx.passes[pass];
         let state = PaintState {
             size,
@@ -266,23 +362,37 @@ impl DamageFrame {
         };
         let full = DamageRect::full(size);
         let has_baseline = self.previous_state.as_ref() == Some(&state);
-        let mut damage = if has_baseline { DamageRect::default() } else { full };
+        let mut damage = CollectedDamage {
+            rect: if has_baseline { DamageRect::default() } else { full },
+            reason: (EXPLAIN && !has_baseline).then_some(if self.previous_state.is_some() {
+                FullDamageReason::PaintStateChanged
+            } else {
+                FullDamageReason::NoBaseline
+            }),
+        };
         self.pending.clear();
-        self.collect_list(cx, pass, root, full, has_baseline, &mut damage, &mut 0.0);
+        self.collect_list::<EXPLAIN>(cx, pass, root, full, has_baseline, &mut damage, &mut 0.0);
         if has_baseline {
             // Order is significant even if only depth bias changed. Comparison at the
             // paint ordinal conservatively damages the entire changed part of the sequence.
             for old in self.previous.iter().skip(self.pending.len()) {
-                damage = damage.union(old.bounds.unwrap_or(full));
+                damage.add::<EXPLAIN>(old.bounds, full);
             }
         }
         self.pending_state = Some(state);
         // A repaint request with no tracked mutation can have come from a native or
         // other untracked source. Do not assume it is a no-op.
-        if draw_pass.dont_clear || damage.is_empty() { full } else { damage }
+        if draw_pass.dont_clear {
+            damage.full::<EXPLAIN>(full, FullDamageReason::LoadExistingColor);
+        } else if damage.rect.is_empty() {
+            damage.full::<EXPLAIN>(full, FullDamageReason::EmptyDamage);
+        }
+        let reason = (EXPLAIN && damage.rect == full)
+            .then_some(damage.reason.unwrap_or(FullDamageReason::SceneCoverage));
+        (damage.rect, reason)
     }
 
-    fn collect_list(&mut self, cx: &Cx, pass_id: PassId, id: DrawListId, full: DamageRect, has_baseline: bool, damage: &mut DamageRect, zbias: &mut f32) {
+    fn collect_list<const EXPLAIN: bool>(&mut self, cx: &Cx, pass_id: PassId, id: DrawListId, full: DamageRect, has_baseline: bool, damage: &mut CollectedDamage, zbias: &mut f32) {
         let list = &cx.draw_lists[id];
         let view = View::from(&list.draw_list_uniforms);
         let pass = &cx.passes[pass_id];
@@ -292,7 +402,7 @@ impl DamageFrame {
         for slot in 0..list.draw_items.len() {
             let item = &list.draw_items[slot];
             if let Some(child) = item.sub_list() {
-                self.collect_list(cx, pass_id, child, full, has_baseline, damage, zbias);
+                self.collect_list::<EXPLAIN>(cx, pass_id, child, full, has_baseline, damage, zbias);
                 continue;
             }
             let Some(call) = item.draw_call() else { continue; };
@@ -325,17 +435,21 @@ impl DamageFrame {
             } else {
                 old.unwrap().bounds
             };
-            if external || shader.mapping.uses_time {
-                *damage = full;
+            if external {
+                damage.full::<EXPLAIN>(full, FullDamageReason::ExternalTexture);
+            } else if shader.mapping.uses_time {
+                damage.full::<EXPLAIN>(full, FullDamageReason::TimeUniform);
             } else if changed {
-                *damage = damage.union(bounds.unwrap_or(full));
-                if let Some(old) = old { *damage = damage.union(old.bounds.unwrap_or(full)); }
+                damage.add::<EXPLAIN>(bounds, full);
+                if let Some(old) = old { damage.add::<EXPLAIN>(old.bounds, full); }
             }
             unknown_in_list |= bounds.is_none();
             list_changed |= changed;
             self.pending.push(Item { state, bounds });
         }
-        if unknown_in_list && list_changed { *damage = full; }
+        if unknown_in_list && list_changed {
+            damage.full::<EXPLAIN>(full, FullDamageReason::UnknownBounds);
+        }
     }
 }
 

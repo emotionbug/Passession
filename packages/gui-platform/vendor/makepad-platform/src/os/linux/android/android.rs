@@ -1373,6 +1373,7 @@ impl CxAndroidDisplay {
         if self.surface.is_null() {
             return None;
         }
+        self.damage.release_oracle(&self.libgl);
         let result = (self.libegl.eglMakeCurrent.unwrap())(
             self.egl_display, egl_sys::EGL_NO_SURFACE, egl_sys::EGL_NO_SURFACE, egl_sys::EGL_NO_CONTEXT,
         );

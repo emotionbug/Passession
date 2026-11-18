@@ -383,7 +383,6 @@ impl OpenglCx {
     }
 }
 
-#[derive(Clone)]
 pub struct OpenglWindow {
     pub first_draw: bool,
     pub window_id: WindowId,

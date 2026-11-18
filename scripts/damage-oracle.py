@@ -84,7 +84,8 @@ destroy_image = x('XDestroyImage', I, c.POINTER(XImage))
 
 
 class Display:
-    def __init__(self):
+    def __init__(self, dpr):
+        self.dpr = dpr
         self.d = open_display(None)
         if not self.d:
             raise RuntimeError('Cannot open DISPLAY')
@@ -143,7 +144,11 @@ class Display:
             raise RuntimeError('App is not on the target screen')
         return x.value, y.value
 
+    def pixels(self, x, y):
+        return round(x * self.dpr), round(y * self.dpr)
+
     def geometry(self, width, height):
+        width, height = self.pixels(width, height)
         resize(self.d, self.window, 60, 65, width, height)
         raise_window(self.d, self.window)
         sync(self.d, 0)
@@ -161,6 +166,7 @@ class Display:
         sync(self.d, 0)
 
     def input(self, kind, x=0, y=0, detail=0, state=0):
+        x, y = self.pixels(x, y)
         # Address the fixture directly. XTEST requires compositor cooperation
         # on Xwayland and would also move the user's real pointer.
         ox, oy = self.origin()
@@ -174,6 +180,8 @@ class Display:
     def click(self, x, y, button=1):
         self.move(x, y)
         self.input(4, x, y, button)
+        if button == 1:
+            time.sleep(0.025)
         self.input(5, x, y, button, 1 << (7 + button))
 
     def wheel(self, x, y, button, count, interval=0.015):
@@ -181,14 +189,20 @@ class Display:
             self.click(x, y, button)
             time.sleep(interval)
 
-    def fling(self, x, y):
+    def fling(self, x, y, direction=-1):
         self.move(x, y)
+        self.touch(x, y, [(0, 0), *((1, direction * i * 28) for i in range(1, 10)), (2, direction * 270)])
+
+    def tap(self, x, y):
+        self.touch(x, y, [(0, 0), (2, 0)])
+
+    def touch(self, x, y, positions):
         atom = intern_atom(self.d, b'PASEO_DAMAGE_ORACLE_TOUCH', 1)
         if not atom:
             raise RuntimeError('The debug client does not expose the damage oracle touch mover')
-        for phase, distance in [(0, 0), *((1, i * 28) for i in range(1, 10)), (2, 270)]:
+        for phase, distance in positions:
             event = XEvent(client=ClientMessage(33, 0, 1, self.d, self.window, atom, 32,
-                                                (c.c_long * 5)(phase, x, y - distance, 0, 0)))
+                                                (c.c_long * 5)(phase, *self.pixels(x, y + distance), 0, 0)))
             self.send(event)
             time.sleep(0.014)
 
@@ -226,7 +240,7 @@ def write_json(path, data):
     path.write_text(json.dumps(data))
 
 
-def seed(home, project):
+def seed(home, project, compact):
     config = {'version': 1, 'daemon': {'listen': '127.0.0.1:0', 'relay': {'enabled': False}, 'mcp': {'enabled': False}, 'pluginsEnabled': False, 'enableTerminalAgentHooks': False}, 'agents': {'providers': {p: {'enabled': p == 'omp'} for p in ('omp', 'claude', 'codex', 'copilot', 'opencode', 'pi', 'mock-slow')}}}
     write_json(home / 'config.json', config)
     (home / 'server-id').write_text(SERVER + '\n')
@@ -236,7 +250,11 @@ def seed(home, project):
     for i in range(52):
         identity = PARENT if i == 0 else f'damage-sidebar-{i:02}'
         title = 'Damage parent transcript' if i == 0 else f'Damage row {i:02}'
-        write_json(home / f'agents/damage/{identity}.json', {'id': identity, 'provider': 'omp', 'cwd': str(project), 'title': title, 'workspaceId': 'damage-work', 'lastStatus': 'idle', **dates})
+        agent = {'id': identity, 'provider': 'omp', 'cwd': str(project), 'title': title, 'workspaceId': 'damage-work', 'lastStatus': 'idle', **dates}
+        if i == 0 and compact:
+            agent['provider'] = 'mock'
+            agent['config'] = {'provider': 'mock', 'cwd': str(project), 'model': 'five-minute-stream'}
+        write_json(home / f'agents/damage/{identity}.json', agent)
     now = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     descriptor = {'id': CHILD, 'parentAgentId': PARENT, 'title': 'Damage child transcript', 'description': 'Synthetic data', 'status': 'running', 'createdAt': now, 'updatedAt': now}
     index = home / f'agent-subagents/{PARENT}/index.sqlite3'
@@ -246,11 +264,11 @@ def seed(home, project):
         db.execute('INSERT INTO identity VALUES (1, ?)', (PARENT,))
         db.execute('INSERT INTO children VALUES (?, ?)', (CHILD, json.dumps(descriptor)))
     identity = json.dumps([PARENT, CHILD], separators=(',', ':'))
-    transcript(home / f'agent-timelines/{PARENT}.sqlite3', PARENT, now)
-    transcript(index.parent / (sha256(identity.encode()).hexdigest() + '.sqlite3'), identity, now)
+    transcript(home / f'agent-timelines/{PARENT}.sqlite3', PARENT, now, add_tasks=compact)
+    transcript(index.parent / (sha256(CHILD.encode()).hexdigest() + '.sqlite3'), identity, now)
 
 
-def transcript(path, identity, timestamp):
+def transcript(path, identity, timestamp, *, add_tasks=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as db:
         db.executescript('''
@@ -267,6 +285,11 @@ def transcript(path, identity, timestamp):
         db.execute('INSERT INTO timeline_metadata VALUES (1, 1, ?, ?, 145, 0)', (identity, 'damage-fixture'))
         for i in range(1, 145):
             message = {'type': 'user_message' if i % 4 == 1 else 'assistant_message', 'text': f'Fixture paint row {i}: retained text and **styled text**.', 'messageId': f'damage-{i}'}
+            if add_tasks and i == 143:
+                message = {'type': 'todo', 'provider': 'omp', 'items': [
+                    {'text': 'Verify partial redraw', 'completed': False},
+                    {'text': 'Seed the fixture', 'completed': True},
+                ]}
             db.execute('INSERT INTO timeline_rows VALUES (?, ?)', (i - 1, json.dumps({'seq': i, 'seqStart': i, 'seqEnd': i, 'sourceSeqRanges': [{'startSeq': i, 'endSeq': i}], 'timestamp': timestamp, 'item': message})))
 
 
@@ -287,21 +310,55 @@ def phase(name, log, display, run, output, settle=0.65):
         if before == image.tobytes():
             print(f'{name}: unchanged final pixels', flush=True)
     text = slog(log, start)
-    oracle = re.findall(r'result=(full|equal|mismatch)', text)
+    oracle = re.findall(r'^paseo_damage frame=\d+ result=(full|equal|mismatch|error)', text, re.M)
     # The first one-second bucket can begin before this phase.
     buckets = re.findall(r'PASEO_FRAME_TRACE .*?render_frames=(\d+).*?render_ms=([\d.]+)', text)[1:]
     frames = sum(int(count) for count, _ in buckets)
     timing = (f'{sum(float(ms) for _, ms in buckets) / frames:.3f} ms/frame'
               if frames else 'no complete timing samples')
     print(f'{name}: {len(oracle)} presentations, {oracle.count("equal")} partial matches, '
+          f'{oracle.count("mismatch")} mismatches, {oracle.count("error")} oracle errors, '
           f'{frames} timed frames, {timing}', flush=True)
-    if 'mismatch' in oracle:
-        raise AssertionError(f'Pixel mismatch in {name}')
 
 
 def exercise(log, d, args):
     def step(name, func, settle=0.65):
         phase(name, log, d, func, args.screenshots, settle)
+
+    if args.compact:
+        def back():
+            d.click(30, 34)
+        row_x, row_y = args.compact_row or (175, 395)
+        def push():
+            d.click(row_x, row_y)
+        step('compact-parent-stream', lambda: d.move(240, 365), 3.2)
+        for n in range(1, 4):
+            step(f'compact-pop-{n}', back, 0.9)
+            step(f'compact-push-{n}', push, 0.9)
+        step('chat-fling', lambda: d.fling(220, 230, direction=1), 1.4)
+        step('chat-fling-reset', lambda: d.wheel(220, 400, 5, 30))
+        step('composer-focus', lambda: (d.tap(140, 690), d.key('d')))
+        step('composer-blur', lambda: (d.key('BackSpace'), d.click(180, 69)))
+        step('subagent-sheet-open', lambda: d.tap(*args.compact_pill))
+        step('child-sheet-open', lambda: d.tap(*args.compact_child), 1.7)
+        step('child-chat-fling', lambda: d.fling(210, 230, direction=1), 1.4)
+        step('child-sheet-close', lambda: d.key('Escape'))
+        step('subagent-sheet-reopen', lambda: d.tap(*args.compact_pill))
+        step('subagent-sheet-close', lambda: d.key('Escape'))
+        step('tasks-sheet-open', lambda: d.tap(*args.tasks))
+        step('tasks-sheet-close', lambda: d.key('Escape'))
+        step('compact-pop', back)
+        step('sidebar-fling', lambda: d.fling(145, 610), 1.4)
+        step('sidebar-reset', lambda: d.wheel(145, 440, 4, 35, 0.004))
+        step('settings-open', lambda: d.tap(*args.settings))
+        step('settings-fling', lambda: d.fling(215, 620), 1.4)
+        step('settings-close', lambda: d.key('Escape'))
+        step('live-session-push', push)
+        step('live-session-stream', lambda: d.move(220, 360), 3.2)
+        step('live-chat-fling', lambda: d.fling(220, 230, direction=1), 1.4)
+        step('live-composer-focus', lambda: d.tap(140, 690))
+        step('live-session-pop', back)
+        return
 
     d.geometry(850, 900)
     time.sleep(0.7)
@@ -331,7 +388,7 @@ def exercise(log, d, args):
     step('popover-close', lambda: d.key('Escape'))
     step('resize-compact', lambda: d.geometry(420, 760))
     step('compact-pop', lambda: d.click(30, 34))
-    step('compact-push', lambda: d.click(*args.compact_row))
+    step('compact-push', lambda: d.click(*(args.compact_row or (175, 437))))
     step('compact-escape-pop', lambda: d.key('Escape'))
 
 
@@ -366,6 +423,7 @@ def run(args, case):
     env['PASEO_DAMAGE_ORACLE_TOUCH'] = '1'
     if not args.profile:
         env['PASEO_VERIFY_DAMAGE'] = '1'
+        env['PASEO_DAMAGE_DUMP_DIR'] = str(case)
     if args.full:
         env['PASEO_FULL_REDRAW'] = '1'
     settings = {'daemon': {'startDaemonIfNotRunning': False}}
@@ -375,17 +433,21 @@ def run(args, case):
     env['PASEO_DESKTOP_RUNTIME'] = str(manifest)
     project = case / 'project'
     subprocess.run(['git', 'init', '-q', str(project)], check=True, env=env)
-    seed(case / 'paseo', project)
+    seed(case / 'paseo', project, args.compact)
     log = case / 'app.log'
     app = None
-    display = Display()
+    display = Display(args.dpr)
     with (case / 'daemon-cli.log').open('w') as cli_log:
         def cli(*arguments, check=True):
             subprocess.run([args.cli, *arguments, '--home', env['PASEO_HOME'], '--json'], timeout=20, env=env, cwd=project, check=check, stdout=cli_log, stderr=cli_log)
 
         try:
             cli('daemon', 'start')
-            cli('run', '--provider', 'mock', '--title', 'Damage live spinner', '--cwd', str(project), '--detach', 'Hold this synthetic turn indefinitely')
+            prompt = 'Hold this synthetic turn indefinitely'
+            if args.compact:
+                cli('send', PARENT, '--no-wait', prompt)
+            else:
+                cli('run', '--provider', 'mock', '--title', 'Damage live spinner', '--cwd', str(project), '--detach', prompt)
             with log.open('w') as output:
                 app = subprocess.Popen([args.app, f'paseo://h/{SERVER}/agent/{PARENT}'], cwd=args.app.parent, env=env, stdout=output, stderr=output)
             for _ in range(250):
@@ -397,16 +459,19 @@ def run(args, case):
                 time.sleep(0.04)
             if not display.window:
                 raise RuntimeError('Fixture window did not appear')
-            display.geometry(850, 900)
+            display.geometry(*(420, 760) if args.compact else (850, 900))
             # Give daemon attach, font discovery, and initial shaders time to settle.
             time.sleep(2.0)
             exercise(log, display, args)
             text = log.read_text(errors='replace')
+            print(f'Total: {text.count("result=equal")} partial matches, {text.count("result=mismatch")} mismatches, '
+                  f'{text.count("result=full")} full fallbacks', flush=True)
+            if 'result=error' in text:
+                raise AssertionError('Framebuffer oracle error (see app log)')
             if 'result=mismatch' in text:
                 raise AssertionError('Framebuffer pixel mismatch (see app log)')
             if not args.profile and not args.full and 'result=equal' not in text:
                 raise AssertionError('Only full fallbacks observed; no damage pixels were verified')
-            print(f'Total: {text.count("result=equal")} comparable partial frames, {text.count("result=full")} full fallbacks', flush=True)
         finally:
             display.restore()
             if app and app.poll() is None:
@@ -417,8 +482,20 @@ def run(args, case):
                     app.kill()
                     app.wait()
             cli('daemon', 'stop', check=False)
-            if args.log:
-                args.log.write_text((log.read_text(errors='replace') if log.exists() else '') + '\n' + (case / 'daemon-cli.log').read_text(errors='replace'))
+            text = log.read_text(errors='replace') if log.exists() else ''
+            failed = 'result=mismatch' in text or 'result=error' in text
+            diagnostics = args.screenshots or ROOT / 'target' / f'{case.name}-mismatches'
+            if failed:
+                diagnostics.mkdir(parents=True, exist_ok=True)
+                print(f'Framebuffer diagnostics: {diagnostics}', flush=True)
+            log_path = args.log or (diagnostics / 'app.log' if failed else None)
+            if log_path:
+                log_path.write_text(text + '\n' + (case / 'daemon-cli.log').read_text(errors='replace'))
+            for raw in case.glob('*.rgba'):
+                _, size, _ = raw.stem.split('-')
+                width, height = map(int, size.split('x'))
+                image = Image.frombytes('RGBA', (width, height), raw.read_bytes(), 'raw', 'RGBA', 0, -1)
+                image.save(diagnostics / f'{raw.stem}.png')
 
 
 def point(value):
@@ -433,7 +510,13 @@ def main():
     parser.add_argument('--pill', type=point, default=(385, 671))
     parser.add_argument('--child', type=point, default=(430, 868))
     parser.add_argument('--wide-pill', type=point, default=(385, 688))
-    parser.add_argument('--compact-row', type=point, default=(175, 437))
+    parser.add_argument('--compact-row', type=point)
+    parser.add_argument('--compact-pill', type=point, default=(143, 630))
+    parser.add_argument('--compact-child', type=point, default=(132, 721))
+    parser.add_argument('--tasks', type=point, default=(50, 630))
+    parser.add_argument('--settings', type=point, default=(395, 735))
+    parser.add_argument('--compact', action='store_true', help='Exercise compact chat, sheets and Settings')
+    parser.add_argument('--dpr', type=float, default=1, help='Window and input scale matching the display Xft.dpi / 96')
     parser.add_argument('--log', type=Path)
     parser.add_argument('--screenshots', type=Path)
     parser.add_argument('--profile', action='store_true', help='Do not read back; repeat the sheet transition for timings')

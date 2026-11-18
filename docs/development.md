@@ -194,11 +194,11 @@ several `render_passes` during a transition.
 `render_ms / render_frames` includes time spent in presentation and should
 not be interpreted as GPU execution time.
 
-Android repaints in full by default. To test partial repair on a device,
-run `adb shell setprop debug.paseo.partial_redraw 1` (and
-`adb shell setprop debug.paseo.verify_damage 1` for the pixel oracle, whose
-`paseo_damage` lines go to logcat), then force-stop and reopen the app. Set
-the properties back to `0` afterwards.
+Android repaints in full by default. To exercise actual EGL partial
+presentation, run `adb shell setprop debug.paseo.partial_redraw 1`, then
+force-stop and reopen. To compare logical damage instead, also set
+`debug.paseo.verify_damage` to `1` and read `paseo_damage` lines in logcat.
+The oracle bypasses EGL damage hints. Reset both properties afterwards.
 
 On Linux, build a debug client and daemon. The pixel oracle requires Python
 with Pillow, X11, and a private `dbus-run-session`:
@@ -214,13 +214,16 @@ xvfb-run -a -s '-screen 0 1280x1000x24 -nolisten tcp' \
 The harness uses an ephemeral loopback daemon and temporary HOME, Paseo,
 and XDG state. Omit `xvfb-run` to exercise the actual X11 driver; the test
 briefly focuses and operates only its own window. `--screenshots DIR` saves
-that window's scripted UI stages. The app's `PASEO_VERIFY_DAMAGE=1`
-oracle compares each partial frame's pre-swap RGBA pixels against a full
-render of the *same* retained frame, with the same animation time. It
-presents the full reference if the pixels differ. Full fallbacks already
-execute the reference path; the harness fails if it only observed those.
-An opt-in debug-only X11 event feeds the fixture's touchscreen gesture
-through the regular `TouchUpdate` and inertia paths.
+the scripted UI stages. Use `--compact` for a 420×760 logical-pixel window
+with a live mock stream, touch flings, navigation, and sheets; set `--dpr`
+to match the X11 display's `Xft.dpi / 96` when testing display scaling.
+The app's `PASEO_VERIFY_DAMAGE=1` oracle copies the previous full frame from
+an FBO and applies this frame's logical damage. It compares that candidate
+with a full render of the same scene, independent of EGL buffer age. It
+always presents the full reference and continues after a mismatch. The
+log distinguishes EGL repair fallbacks from full logical damage; the
+harness fails if no partial frames were compared. On mismatch, it retains
+diagnostics and the first few candidate/reference PNG pairs.
 Use `--profile` and then `--profile --full` for uncaptured spinner and sheet
 wall-clock timings. Do not use oracle readbacks to measure cost.
 

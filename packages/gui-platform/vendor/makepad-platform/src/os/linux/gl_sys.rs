@@ -64,6 +64,8 @@ pub const ONE: GLenum = 1;
 pub const ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
 pub const BLEND: GLenum = 0x0BE2;
 pub const FRAMEBUFFER: GLenum = 0x8D40;
+pub const FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
+pub const READ_FRAMEBUFFER: GLenum = 0x8CA8;
 pub const COLOR_BUFFER_BIT: GLenum = 0x00004000;
 pub const DEPTH_BUFFER_BIT: GLenum = 0x00000100;
 pub const RENDERBUFFER: GLenum = 0x8D41;
@@ -91,6 +93,7 @@ pub const TEXTURE_BORDER_COLOR: GLenum = 0x1004;
 pub const DEBUG_OUTPUT: GLenum = 0x92E0;
 
 pub const RGBA: GLenum = 0x1908;
+pub const RGBA8: GLenum = 0x8058;
 pub const BGRA: GLenum = 0x80E1;
 pub const RED: GLenum = 0x1903;
 pub const RG: GLenum =  0x8227;
@@ -191,6 +194,8 @@ pub type TglColorMask = unsafe extern "C" fn(r: GLboolean, g:GLboolean, b:GLbool
 pub type TglDepthMask = unsafe extern "C" fn(d: GLboolean);
 pub type TglScissor = unsafe extern "C" fn(x:GLint, y:GLint, width:GLsizei, height:GLsizei);
 pub type TglReadPixels = unsafe extern "C" fn(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, *mut raw::c_void);
+pub type TglCheckFramebufferStatus = unsafe extern "C" fn(GLenum) -> GLenum;
+pub type TglBlitFramebuffer = unsafe extern "C" fn(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLenum, GLenum);
 
 pub type TglInvalidateFramebuffer = unsafe extern "C" fn(target:GLenum, num_attachments:GLsizei, attachments: *const GLenum);
 pub type TglDebugMessageCallback = unsafe extern "C" fn(ptr: TglDebugMessageCallbackFn, param: *const raw::c_void);
@@ -288,6 +293,8 @@ pub struct LibGl{
     pub glDepthMask: TglDepthMask,
     pub glScissor: TglScissor,
     pub glReadPixels: TglReadPixels,
+    pub glCheckFramebufferStatus: TglCheckFramebufferStatus,
+    pub glBlitFramebuffer: Option<TglBlitFramebuffer>,
     pub glInvalidateFramebuffer: TglInvalidateFramebuffer,
     pub glDebugMessageCallback: TglDebugMessageCallback,
     pub glGetDebugMessageLog: TglGetDebugMessageLog,
@@ -409,6 +416,8 @@ impl LibGl{
             glDepthMask: load!(loadfn, TglDepthMask, "glDepthMask")?,
             glScissor: load!(loadfn, TglScissor, "glScissor")?,
             glReadPixels: load!(loadfn, TglReadPixels, "glReadPixels")?,
+            glCheckFramebufferStatus: load!(loadfn, TglCheckFramebufferStatus, "glCheckFramebufferStatus", "glCheckFramebufferStatusEXT")?,
+            glBlitFramebuffer: load!(loadfn, TglBlitFramebuffer, "glBlitFramebuffer").ok(),
             glInvalidateFramebuffer: load!(loadfn, TglInvalidateFramebuffer, "glInvalidateFramebuffer")?,
             glDebugMessageCallback: load!(loadfn, TglDebugMessageCallback, "glDebugMessageCallback")?,
             glGetDebugMessageLog: load!(loadfn, TglGetDebugMessageLog, "glGetDebugMessageLog")?,

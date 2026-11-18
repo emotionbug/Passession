@@ -140,6 +140,7 @@ impl Cx {
                 // lets remove the window from the set
                 self.windows[window_id].is_created = false;
                 if let Some(index) = opengl_windows.iter().position( | w | w.window_id == window_id) {
+                    opengl_windows[index].damage.release_oracle(self.os.gl());
                     opengl_windows.remove(index);
                     if opengl_windows.len() == 0 {
                         xlib_app.terminate_event_loop();
@@ -339,6 +340,7 @@ impl Cx {
                     self.call_event_handler(&Event::WindowClosed(WindowClosedEvent { window_id }));
                     if let Some(index) = opengl_windows.iter().position( | w | w.window_id == window_id) {
                         self.windows[window_id].is_created = false;
+                        opengl_windows[index].damage.release_oracle(self.os.gl());
                         opengl_windows[index].xlib_window.close_window();
                         opengl_windows.remove(index);
                         if opengl_windows.len() == 0 {
