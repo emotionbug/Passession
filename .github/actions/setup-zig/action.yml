@@ -7,12 +7,19 @@ description: >
   finished builds and its Ghostty clone.
   Replaces mlugg/setup-zig, whose releases still target the deprecated
   Node.js 20 runtime. Native Release inlines the same steps (it builds older
-  tags); keep both in sync, including cache paths and key formats, so a
-  matching cache-key shares Native Release's entries.
+  tags); keep the paths and key formats in sync with Native Release and the
+  save-zig-cache action. Call save-zig-cache after the build.
 inputs:
   cache-key:
     description: Job-specific component of the Zig and Ghostty cache key.
     required: true
+outputs:
+  zig-key:
+    description: Primary Zig build cache key to save if not already present.
+    value: ${{ steps.zig-cache.outputs.cache-hit != 'true' && steps.zig-cache.outputs.cache-primary-key || '' }}
+  source-key:
+    description: Primary Ghostty clone cache key to save if not already present.
+    value: ${{ steps.ghostty-src.outputs.cache-hit != 'true' && steps.ghostty-src.outputs.cache-primary-key || '' }}
 runs:
   using: composite
   steps:
@@ -55,7 +62,8 @@ runs:
         echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global-cache" >> "$GITHUB_ENV"
         echo "GHOSTTY_CACHE_DIR=$RUNNER_TEMP/ghostty-cache" >> "$GITHUB_ENV"
         "$RUNNER_TEMP/$name/zig" version
-    - uses: actions/cache@v6
+    - uses: actions/cache/restore@v6
+      id: zig-cache
       with:
         path: |
           ${{ runner.temp }}/zig-global-cache
@@ -65,7 +73,8 @@ runs:
         restore-keys: |
           zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-key }}-
     # Target-independent, so one entry per runner OS serves every workflow.
-    - uses: actions/cache@v6
+    - uses: actions/cache/restore@v6
+      id: ghostty-src
       with:
         path: ${{ runner.temp }}/ghostty-cache/ghostty-src
         key: ghostty-src-${{ runner.os }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}

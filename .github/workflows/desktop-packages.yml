@@ -57,13 +57,14 @@ jobs:
           go-version-file: packages/tailnet/native/go.mod
           cache-dependency-path: packages/tailnet/native/go.sum
       - uses: ./.github/actions/setup-zig
+        id: zig
         if: contains(fromJSON(steps.plan.outputs.build), 'app') || contains(fromJSON(steps.plan.outputs.build), 'daemon')
         with:
           cache-key: native-release-linux-x64
       - name: Install native prerequisites only for changed artifacts
         if: contains(fromJSON(steps.plan.outputs.build), 'app') || contains(fromJSON(steps.plan.outputs.build), 'daemon') || steps.plan.outputs.package == 'true'
         run: |
-          sudo apt-get update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
           sudo apt-get install -y pkg-config libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libwayland-dev libxss1 libsm6 libice6 dpkg-dev xdg-utils patchelf
       - name: Provision pinned AppImage tools only for repackaging
         if: steps.plan.outputs.package == 'true'
@@ -75,6 +76,11 @@ jobs:
         run: cargo xtask components build --plan artifacts/component-plan.json --target linux-x64
         env:
           GH_TOKEN: ${{ github.token }}
+      - uses: ./.github/actions/save-zig-cache
+        if: steps.zig.outputs.zig-key != '' || steps.zig.outputs.source-key != ''
+        with:
+          zig-key: ${{ steps.zig.outputs.zig-key }}
+          source-key: ${{ steps.zig.outputs.source-key }}
       - uses: actions/upload-artifact@v7
         if: steps.plan.outputs.no_changes != 'true'
         with:

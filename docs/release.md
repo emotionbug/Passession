@@ -154,6 +154,8 @@ Caches contain inputs and intermediate state, not release authority. Newly compi
 - `native-packaging-<os>-<platform>-<arch>-<inputs>` exists only for Linux desktop (pinned AppImage tools, re-verified by SHA-256 before use; keyed on `xtask/src/assets.rs`) and Android (the unpacked pinned Gradle distribution and `~/.gradle/caches`; keyed on the `GRADLE_VERSION`/`GRADLE_SHA256` pins and the Gradle build files). The downloaded Gradle archive is not cached.
 - Keys contain no run IDs. The Zig, Go, Rust and packaging entries fall back to the previous entry through restore keys when their inputs change. Rust caches save only from the default branch.
 
+Release cross-compiles use the runner’s `GHOSTTY_CACHE_DIR`, separate from the provisioned SDK. CI saves a missed Zig build cache only when the build produced cached files, and saves the source cache only when the Ghostty checkout exists.
+
 `xtask` runs in the dev profile; root `Cargo.toml` optimizes only its SHA-256 and ZIP/gzip crates in that profile. The bytes it writes do not depend on how it was compiled, and the release profile is unchanged.
 
 Workflow artifact uploads are temporary: both Native Release and Native Desktop Packages retain them for **7 days**. Recover within that window or rebuild the exact authorized source; expired uploads cannot support `publish-only`. This retention does not delete published GitHub Release assets.

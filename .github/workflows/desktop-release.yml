@@ -183,11 +183,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: ${{ matrix.finalizer && matrix.triple || matrix.platform == 'android' && matrix.triple || matrix.platform == 'ios' && matrix.triple || '' }}
-      # libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2. This
-      # job builds older tags too, so it cannot rely on the local
-      # .github/actions/setup-zig existing in the checked-out source; keep the
-      # official archive digests (https://ziglang.org/download/index.json) in
-      # sync with that action.
       - uses: actions/setup-go@v6
         if: contains(matrix.components, 'tailnet') || contains(matrix.components, 'update-helper')
         with:
@@ -206,6 +201,10 @@ jobs:
           key: go-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-${{ hashFiles('packages/tailnet/native/**', 'packages/app-updater/**', 'xtask/src/tailnet.rs', 'xtask/src/app_updater.rs') }}
           restore-keys: |
             go-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-
+      # libghostty-vt-sys builds Ghostty with Zig 0.15.2. This job builds older
+      # tags too, so inline setup-zig and save-zig-cache instead of relying on
+      # the checked-out source to have them. Keep the official archive digests
+      # (https://ziglang.org/download/index.json), paths and keys in sync.
       - name: Install Zig 0.15.2
         if: matrix.finalizer || contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
         shell: bash
@@ -251,21 +250,27 @@ jobs:
       # and the finished build's installed outputs (install-<GHOSTTY_COMMIT>-*),
       # which a warm run copies instead of running Zig. build.rs pins
       # GHOSTTY_COMMIT, so its hash covers the commit.
-      - uses: actions/cache@v6
-        if: matrix.finalizer || contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
+      # Cross builds used to write these files into the toolchain cache; do
+      # not reuse the old cross keys, which can contain only the global cache.
+      - name: Restore Zig build cache
+        uses: actions/cache/restore@v6
+        id: zig-cache
+        if: contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
         with:
           path: |
             ${{ runner.temp }}/zig-global-cache
             ${{ runner.temp }}/ghostty-cache/zig-cache-*
             ${{ runner.temp }}/ghostty-cache/install-*
-          key: zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
+          key: zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.finalizer && 'cross-' || '' }}${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
           restore-keys: |
-            zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-
+            zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.finalizer && 'cross-' || '' }}${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-
       # The Ghostty clone is target-independent: one entry per runner OS,
       # shared with CI and Native Desktop Packages. build.rs reuses it only when
       # HEAD is the pinned GHOSTTY_COMMIT and the tree is clean, else reclones.
-      - uses: actions/cache@v6
-        if: matrix.finalizer || contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
+      - name: Restore Ghostty source cache
+        uses: actions/cache/restore@v6
+        id: ghostty-src
+        if: contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
         with:
           path: ${{ runner.temp }}/ghostty-cache/ghostty-src
           key: ghostty-src-${{ runner.os }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
@@ -279,7 +284,7 @@ jobs:
       - name: Install cross compiler prerequisites
         if: matrix.finalizer
         run: |
-          sudo apt-get update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
           sudo apt-get install -y clang-18 llvm-18
       - uses: actions/cache@v6
         if: matrix.finalizer
@@ -289,7 +294,13 @@ jobs:
       - name: Provision pinned cross toolchain
         if: matrix.finalizer
         shell: bash
-        run: cargo xtask cross-tools "$TARGET_ID" --root "$HOME/.cache/paseo-cross/$TARGET_ID" --github-env "$GITHUB_ENV"
+        run: |
+          root="$HOME/.cache/paseo-cross/$TARGET_ID"
+          cargo xtask cross-tools "$TARGET_ID" --root "$root" --github-env "$GITHUB_ENV"
+          # Let cross builds inherit the same GHOSTTY_CACHE_DIR that the
+          # workflow restores and saves, not a path in the toolchain cache.
+          jq 'del(.env.GHOSTTY_CACHE_DIR)' "$root/cross.json" > "$root/cross.json.tmp"
+          mv "$root/cross.json.tmp" "$root/cross.json"
       # Packaging downloads: the pinned AppImage tools (Linux desktop), the
       # pinned Gradle distribution and Gradle's dependency cache (Android).
       # The key covers only the inputs that select that content; xtask
@@ -324,7 +335,7 @@ jobs:
       - name: Install Linux native build prerequisites
         if: matrix.platform == 'linux' && (matrix.package || contains(matrix.components, 'app') || contains(matrix.components, 'daemon'))
         run: |
-          sudo apt-get update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
           sudo apt-get install -y pkg-config libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libwayland-dev libxss1 libsm6 libice6 dpkg-dev xdg-utils patchelf
       - name: Provision pinned AppImage tools
         if: matrix.package && matrix.platform == 'linux'
@@ -428,6 +439,39 @@ jobs:
           APPLE_TEAM_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_TEAM_ID || '' }}
           WIN_CSC_LINK: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_LINK || '' }}
           WIN_CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
+      - name: Check for Zig and Ghostty cache payloads
+        id: zig-payload
+        if: >
+          (steps.zig-cache.outputs.cache-primary-key != '' && steps.zig-cache.outputs.cache-hit != 'true') ||
+          (steps.ghostty-src.outputs.cache-primary-key != '' && steps.ghostty-src.outputs.cache-hit != 'true')
+        shell: bash
+        run: |
+          # A warm Cargo build can skip Ghostty entirely. A global cache
+          # alone does not contain the target-specific Ghostty build.
+          for dir in "$GHOSTTY_CACHE_DIR"/{zig-cache-,install-}*; do
+            if [[ -d "$dir" && -n "$(find "$dir" -type f -print -quit)" ]]; then
+              echo "zig=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+          if [[ -f "$GHOSTTY_CACHE_DIR/ghostty-src/build.zig" ]]; then
+            echo "source=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save Zig build cache
+        uses: actions/cache/save@v6
+        if: steps.zig-payload.outputs.zig == 'true' && steps.zig-cache.outputs.cache-primary-key != '' && steps.zig-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ runner.temp }}/zig-global-cache
+            ${{ runner.temp }}/ghostty-cache/zig-cache-*
+            ${{ runner.temp }}/ghostty-cache/install-*
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
+      - name: Save Ghostty source cache
+        uses: actions/cache/save@v6
+        if: steps.zig-payload.outputs.source == 'true' && steps.ghostty-src.outputs.cache-primary-key != '' && steps.ghostty-src.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/ghostty-cache/ghostty-src
+          key: ${{ steps.ghostty-src.outputs.cache-primary-key }}
       - name: Record exact source, run and artifact hashes
         if: ${{ !matrix.finalizer }}
         run: cargo xtask release record

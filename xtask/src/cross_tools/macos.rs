@@ -1,40 +1,33 @@
 //! The caller authenticates the complete pinned package before entering this parser.
 //! Only its XAR Payload is unpacked: pbzx -> bounded XZ chunks -> streaming odc cpio.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use flate2::bufread::ZlibDecoder;
 use lzma_rust2::XzReader;
 use std::{
     fs::File,
-    io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Take},
-    path::Path,
+    io::{self, Cursor, Read, Take},
 };
+
+#[cfg(unix)]
+use std::path::Path;
 
 const MAX_TOC_COMPRESSED: u64 = 1024 * 1024;
 const MAX_TOC_XML: u64 = 4 * 1024 * 1024;
 const MAX_CHUNK: u64 = 16 * 1024 * 1024;
 const MAX_CPIO_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_PATH_BYTES: usize = 4096;
-const MAX_METADATA_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_ENTRIES: usize = 100_000;
 
 /// Extract the authenticated CLTools package into a directory that must not exist.
 /// Does not execute installer scripts, change ownership, or preserve privileged bits.
+#[cfg(unix)]
 pub(super) fn extract_sdk(archive: &Path, destination: &Path) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = (archive, destination);
-        bail!("Apple SDK extraction requires a Unix host (SDK symlinks must be preserved)");
-    }
-    #[cfg(unix)]
-    {
-        let mut file = File::open(archive).context("Opening authenticated Apple SDK package")?;
-        let (offset, length) = payload_range(&mut file).context("Reading Apple XAR Payload")?;
-        file.seek(SeekFrom::Start(offset))?;
-        let payload = PbzxReader::new(file.take(length))?;
-        unix::extract_cpio(BufReader::with_capacity(64 * 1024, payload), destination)
-            .context("Extracting Apple SDK cpio payload")
-    }
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let mut file = File::open(archive).context("Opening authenticated Apple SDK package")?;
+    let (offset, length) = payload_range(&mut file).context("Reading Apple XAR Payload")?;
+    file.seek(SeekFrom::Start(offset))?;
+    let payload = PbzxReader::new(file.take(length))?;
+    unix::extract_cpio(BufReader::with_capacity(64 * 1024, payload), destination)
+        .context("Extracting Apple SDK cpio payload")
 }
 
 fn be_u64(bytes: &[u8]) -> u64 {
@@ -268,20 +261,10 @@ impl<R: Read> Read for PbzxReader<R> {
     }
 }
 
-fn octal(bytes: &[u8]) -> Result<u64> {
-    ensure!(!bytes.is_empty(), "Empty cpio octal field");
-    bytes.iter().try_fold(0u64, |value, &digit| {
-        ensure!((b'0'..=b'7').contains(&digit), "Malformed cpio octal field");
-        value
-            .checked_mul(8)
-            .and_then(|v| v.checked_add(u64::from(digit - b'0')))
-            .context("cpio octal field overflow")
-    })
-}
-
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use anyhow::bail;
     use std::{
         collections::{HashMap, VecDeque},
         ffi::{CStr, CString},
@@ -295,6 +278,22 @@ mod unix {
         },
         path::{Component, PathBuf},
     };
+
+    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_PATH_BYTES: usize = 4096;
+    const MAX_METADATA_BYTES: u64 = 32 * 1024 * 1024;
+    const MAX_ENTRIES: usize = 100_000;
+
+    fn octal(bytes: &[u8]) -> Result<u64> {
+        ensure!(!bytes.is_empty(), "Empty cpio octal field");
+        bytes.iter().try_fold(0u64, |value, &digit| {
+            ensure!((b'0'..=b'7').contains(&digit), "Malformed cpio octal field");
+            value
+                .checked_mul(8)
+                .and_then(|v| v.checked_add(u64::from(digit - b'0')))
+                .context("cpio octal field overflow")
+        })
+    }
 
     fn safe_path(name: &str) -> Result<&Path> {
         ensure!(
@@ -632,7 +631,7 @@ mod tests {
 
     #[test]
     fn xar_rejects_bad_headers_truncated_tocs_and_heap_ranges() {
-        use std::io::Write;
+        use std::io::{Seek, Write};
         let xml = toc(
             "<offset>0</offset><length>12</length><size>12</size><encoding style=\"application/octet-stream\"/>",
         );

@@ -1,0 +1,39 @@
+name: Save Zig and Ghostty caches
+description: Save existing Zig build outputs and the Ghostty source clone after a build.
+inputs:
+  zig-key:
+    description: Primary Zig build cache key from setup-zig, empty on an exact hit.
+    required: false
+  source-key:
+    description: Primary Ghostty source cache key from setup-zig, empty on an exact hit.
+    required: false
+runs:
+  using: composite
+  steps:
+    - id: payload
+      shell: bash
+      run: |
+        # A warm Cargo build can skip Ghostty entirely. A global cache
+        # alone does not contain the target-specific Ghostty build.
+        for dir in "$GHOSTTY_CACHE_DIR"/{zig-cache-,install-}*; do
+          if [[ -d "$dir" && -n "$(find "$dir" -type f -print -quit)" ]]; then
+            echo "zig=true" >> "$GITHUB_OUTPUT"
+            break
+          fi
+        done
+        if [[ -f "$GHOSTTY_CACHE_DIR/ghostty-src/build.zig" ]]; then
+          echo "source=true" >> "$GITHUB_OUTPUT"
+        fi
+    - uses: actions/cache/save@v6
+      if: inputs.zig-key != '' && steps.payload.outputs.zig == 'true'
+      with:
+        path: |
+          ${{ runner.temp }}/zig-global-cache
+          ${{ runner.temp }}/ghostty-cache/zig-cache-*
+          ${{ runner.temp }}/ghostty-cache/install-*
+        key: ${{ inputs.zig-key }}
+    - uses: actions/cache/save@v6
+      if: inputs.source-key != '' && steps.payload.outputs.source == 'true'
+      with:
+        path: ${{ runner.temp }}/ghostty-cache/ghostty-src
+        key: ${{ inputs.source-key }}

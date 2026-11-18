@@ -56,12 +56,15 @@ jobs:
             packages/tailnet/native/go.sum
             packages/app-updater/go.sum
       - uses: ./.github/actions/setup-zig
+        id: zig
         if: steps.plan.outputs.rust == 'true' && steps.plan.outputs.native == 'true'
         with:
           cache-key: tests-linux-x64
       - name: Install affected GUI build libraries
         if: steps.plan.outputs.gui == 'true'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libwayland-dev
+        run: |
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
+          sudo apt-get install -y pkg-config libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libwayland-dev
       - name: Test embedded Tailscale against isolated local control and DERP
         if: steps.plan.outputs.tailnet == 'true'
         working-directory: packages/tailnet/native
@@ -108,6 +111,11 @@ jobs:
           while IFS= read -r package; do args+=(-p "$package"); done < <(jq -r '.[]' <<< "$PACKAGES")
           test ${#args[@]} -gt 0
           cargo test --locked --all-targets "${args[@]}"
+      - uses: ./.github/actions/save-zig-cache
+        if: steps.zig.outputs.zig-key != '' || steps.zig.outputs.source-key != ''
+        with:
+          zig-key: ${{ steps.zig.outputs.zig-key }}
+          source-key: ${{ steps.zig.outputs.source-key }}
       - name: Record successful no-effect check
         if: steps.plan.outputs.native == 'false' && steps.plan.outputs.rust == 'false'
         run: echo 'No affected compile or native inputs; required tests check succeeds without native work.'

@@ -1,4 +1,5 @@
 //! Pinned Linux desktop SDKs and explicit, target-specific compiler wrappers.
+#[cfg(any(unix, test))]
 mod macos;
 
 use crate::{assets, common::*};
@@ -15,6 +16,9 @@ use std::{
     process::Command,
 };
 use walkdir::WalkDir;
+
+#[cfg(unix)]
+use macos::extract_sdk as extract_apple_sdk;
 
 const XWIN_ARCHIVE: &str = "xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz";
 const XWIN_SHA256: &str = "d870eb4b2f390878af6da1ccd3cf321d22fcb72720984853b4be732ae597fc88";
@@ -462,7 +466,7 @@ fn apple(
     let destination = root.join("sdk-16.4");
     if !prepared(&destination, SDK_SHA256)? {
         remove_if_exists(&destination)?;
-        macos::extract_sdk(&archive, &destination)?;
+        extract_apple_sdk(&archive, &destination)?;
         remember(&destination, SDK_SHA256)?;
     }
     let sdk = destination.join("Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk");
@@ -507,6 +511,11 @@ fn apple(
         &root.join("ghostty-macos"),
     )?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn extract_apple_sdk(_: &Path, _: &Path) -> Result<()> {
+    bail!("Apple SDK extraction requires a Unix host (SDK symlinks must be preserved)");
 }
 
 #[cfg(test)]

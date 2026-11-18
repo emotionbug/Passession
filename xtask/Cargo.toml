@@ -15,13 +15,11 @@ dirs = "6"
 flate2 = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
-lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
 paseo-client = { path = "../packages/client" }
 paseo-protocol = { path = "../packages/protocol" }
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }
-roxmltree = "0.20"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,3 +36,9 @@ zip = { version = "4", default-features = false, features = ["deflate-flate2-zli
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
+roxmltree = "0.20"
+
+[target.'cfg(not(unix))'.dev-dependencies]
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
+roxmltree = "0.20"
