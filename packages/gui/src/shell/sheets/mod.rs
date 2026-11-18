@@ -638,20 +638,9 @@ pub fn draw_widget(cx: &mut Cx2d, scope: &mut Scope, widget: &WidgetRef, r: Rect
     cx.end_turtle();
 }
 
-thread_local! {
-    static SPINNING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// A small indeterminate ring (`CircularProgressIndicator`); keeps the sheet animating.
+/// A small indeterminate ring (`CircularProgressIndicator`).
 pub fn spinner(ui: &mut Ui, cx: &mut Cx2d, r: Rect, color: Vec4) {
-    let rotation = (cx.seconds_since_app_start() * std::f64::consts::TAU) % std::f64::consts::TAU;
-    ui.painter.ring(cx, r, color, 1.5, 0.25, rotation);
-    SPINNING.with(|s| s.set(true));
-}
-
-/// Overlays: whether a spinner was drawn since the last call.
-pub fn take_spinning() -> bool {
-    SPINNING.with(|s| s.replace(false))
+    ui.painter.spinner(cx, r, color, [1.5, 0.25], 1_000.0);
 }
 
 /// Original menu-style sheet row (`_item`): 16px leading slot, label, optional trailing glyph;

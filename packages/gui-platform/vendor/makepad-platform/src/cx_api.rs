@@ -23,6 +23,15 @@ use {
         rc::Rc,
     },
 };
+
+/// Application-defined timer destination. The group routes to a service or
+/// window; the target identifies an owner inside that group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerOwner {
+    pub group: u64,
+    pub target: u64,
+}
+
 pub enum OpenUrlInPlace{
     Yes,
     No
@@ -453,9 +462,44 @@ impl Cx {
         self.fingers.sweep_unlock(value);
     }
 
+    /// Set the destination inherited by timers created in this dispatch/draw scope.
+    pub fn set_timer_owner(&mut self, owner: Option<TimerOwner>) -> Option<TimerOwner> {
+        std::mem::replace(&mut self.timer_owner, owner)
+    }
+
+    pub fn with_timer_owner<R>(&mut self, owner: TimerOwner, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.set_timer_owner(Some(owner));
+        let result = f(self);
+        self.set_timer_owner(previous);
+        result
+    }
+
+    /// Further narrow the inherited destination to a particular widget or store entry.
+    pub fn set_timer_target(&mut self, target: u64) -> Option<TimerOwner> {
+        if let Some(owner) = &mut self.timer_owner {
+            let previous = *owner;
+            owner.target = target;
+            Some(previous)
+        } else {
+            None
+        }
+    }
+
+    /// Look up the timer's recipient, consuming a one-shot registration.
+    pub fn take_timer_owner(&mut self, timer_id: u64) -> Option<TimerOwner> {
+        let &(owner, repeats) = self.timer_owners.get(&timer_id)?;
+        if !repeats {
+            self.timer_owners.remove(&timer_id);
+        }
+        Some(owner)
+    }
+
     #[track_caller]
     pub fn start_timeout(&mut self, interval: f64) -> Timer {
         self.timer_id += 1;
+        if let Some(owner) = self.timer_owner {
+            self.timer_owners.insert(self.timer_id, (owner, false));
+        }
         if let Some(trace) = &mut self.frame_trace {
             trace.start_timer(self.timer_id, std::panic::Location::caller(), false);
         }
@@ -470,6 +514,9 @@ impl Cx {
     #[track_caller]
     pub fn start_interval(&mut self, interval: f64) -> Timer {
         self.timer_id += 1;
+        if let Some(owner) = self.timer_owner {
+            self.timer_owners.insert(self.timer_id, (owner, true));
+        }
         if let Some(trace) = &mut self.frame_trace {
             trace.start_timer(self.timer_id, std::panic::Location::caller(), true);
         }
@@ -483,6 +530,7 @@ impl Cx {
 
     pub fn stop_timer(&mut self, timer: Timer) {
         if timer.0 != 0 {
+            self.timer_owners.remove(&timer.0);
             if let Some(trace) = &mut self.frame_trace {
                 trace.stop_timer(timer.0);
             }

@@ -98,9 +98,6 @@ pub struct CommandCenterPanel {
     compact: bool,
     #[rust]
     pending_effects: Vec<UiEffect>,
-    /// Relative times refresh every minute while the palette is open.
-    #[rust]
-    clock: Timer,
     /// Files state revision (material file icons decode off the GUI thread).
     #[rust]
     files_revision: u64,
@@ -178,7 +175,7 @@ pub struct WaMatchText {
     #[rust]
     spans: Vec<MatchSpan>,
     #[rust]
-    tail: String,
+    activity_at: Option<i64>,
 }
 
 impl Widget for WaMatchText {
@@ -196,14 +193,31 @@ impl Widget for WaMatchText {
         if self.list.begin(cx, Walk::abs_rect(r)).is_err() {
             return DrawStep::done();
         }
+        let tail = if self.activity_at.is_some() {
+            let now = chrono::Utc::now();
+            crate::common::clock::register_relative_time(
+                cx,
+                r,
+                self.activity_at,
+                now.timestamp_millis(),
+            );
+            let time = time_ago(self.activity_at, now);
+            if !time.is_empty() && self.spans.iter().any(|span| !span.text.is_empty()) {
+                format!("\u{a0}· {time}")
+            } else {
+                time
+            }
+        } else {
+            String::new()
+        };
         // Opens the box batch before any text so marks paint under their glyphs.
         self.painter
             .capture_box(cx, r, Vec4::default(), Vec4::default(), 0.0, 0.0);
         let spec = TextSpec::new(Font::Regular, t.ui_size(self.size), p.foreground);
-        let tail_w = if self.tail.is_empty() {
+        let tail_w = if tail.is_empty() {
             0.0
         } else {
-            self.painter.measure(cx, spec, &self.tail).x
+            self.painter.measure(cx, spec, &tail).x
         };
         let limit = r.pos.x + (r.size.x - tail_w).max(0.0);
         let mut x = r.pos.x;
@@ -268,8 +282,7 @@ impl Widget for WaMatchText {
         }
         self.spans = spans;
         let _ = clipped;
-        if !self.tail.is_empty() {
-            let tail = self.tail.clone();
+        if !tail.is_empty() {
             self.painter.text_in(
                 cx,
                 rect(x, r.pos.y, tail_w + 1.0, r.size.y),
@@ -296,12 +309,12 @@ impl WaMatchTextRef {
         }
     }
 
-    pub fn set(&self, cx: &mut Cx, spans: Vec<MatchSpan>, tail: &str) {
+    fn set(&self, cx: &mut Cx, spans: Vec<MatchSpan>, activity_at: Option<i64>) {
         if let Some(mut inner) = self.borrow_mut()
-            && (inner.spans != spans || inner.tail != tail)
+            && (inner.spans != spans || inner.activity_at != activity_at)
         {
             inner.spans = spans;
-            inner.tail = tail.to_owned();
+            inner.activity_at = activity_at;
             inner.redraw(cx);
         }
     }
@@ -473,36 +486,6 @@ impl CommandCenterPanel {
 
     fn target(ctx: &UiContext) -> Option<PanelTarget> {
         ctx.layout.selected_target().cloned()
-    }
-
-    fn refresh_relative_times(&self, cx: &mut Cx) {
-        let Some(projection) = &self.projection else {
-            return;
-        };
-        let list = self.view.portal_list(id!(list));
-        let now = chrono::Utc::now();
-        for (index, row) in projection.rows.iter().enumerate() {
-            let ListRow::Result(result) = row else {
-                continue;
-            };
-            if result.kind != Kind::Agent {
-                continue;
-            }
-            let Some((_, item)) = list.get_item(index) else {
-                continue;
-            };
-            let time = time_ago(result.activity_at, now);
-            let tail = if time.is_empty() || result.subtitle.is_empty() {
-                time
-            } else {
-                format!("\u{a0}· {time}")
-            };
-            item.wa_match_text(id!(subtitle)).set(
-                cx,
-                vec![MatchSpan::new(&result.subtitle, &self.query, true)],
-                &tail,
-            );
-        }
     }
 
     fn refresh_file_icons(&self, cx: &mut Cx) {
@@ -1550,8 +1533,6 @@ impl CommandCenterPanel {
             self.view.wa_modal(id!(modal)).close(cx);
             cx.stop_timer(self.file_timer);
             self.file_timer = Timer::default();
-            cx.stop_timer(self.clock);
-            self.clock = Timer::default();
         }
     }
 
@@ -1693,7 +1674,6 @@ impl CommandCenterPanel {
             return;
         };
         list.set_item_range(cx, 0, projection.rows.len());
-        let now = chrono::Utc::now();
         let inset = results::row_inset(ctx_compact);
         while let Some(index) = list.next_visible_item(cx) {
             let Some(row) = projection.rows.get(index) else {
@@ -1750,37 +1730,28 @@ impl CommandCenterPanel {
                                 });
                                 spans.push(MatchSpan::new(&result.subtitle, query, true));
                             }
-                            title.set(cx, spans, "");
+                            title.set(cx, spans, None);
                         }
                         Kind::Agent => {
-                            title.set(cx, vec![MatchSpan::new(&result.title, query, false)], "");
-                            // The timestamp is its own text so a long subtitle truncates without
-                            // pushing it out of view, and it is never matched.
-                            let time = time_ago(result.activity_at, now);
-                            let tail = if time.is_empty() {
-                                String::new()
-                            } else if result.subtitle.is_empty() {
-                                time
-                            } else {
-                                format!("\u{a0}· {time}")
-                            };
+                            title.set(cx, vec![MatchSpan::new(&result.title, query, false)], None);
+                            // Never match or truncate the relative timestamp.
                             item.wa_match_text(id!(subtitle)).set(
                                 cx,
                                 vec![MatchSpan::new(&result.subtitle, query, true)],
-                                &tail,
+                                result.activity_at,
                             );
                         }
                         Kind::Action => {
                             // A one-line action keeps the 20px line; with a subtitle 18 + 16.
                             let single = result.subtitle.is_empty();
                             title.set_line_height(cx, if single { 20.0 } else { 18.0 });
-                            title.set(cx, vec![MatchSpan::new(&result.title, query, false)], "");
+                            title.set(cx, vec![MatchSpan::new(&result.title, query, false)], None);
                             let subtitle = item.wa_match_text(id!(subtitle));
                             subtitle.set_visible(cx, !single);
                             subtitle.set(
                                 cx,
                                 vec![MatchSpan::new(&result.subtitle, query, true)],
-                                "",
+                                None,
                             );
                             let shortcut = item.widget(id!(shortcut));
                             shortcut.set_visible(cx, !result.shortcut.is_empty());
@@ -2141,9 +2112,6 @@ impl Widget for CommandCenterPanel {
                 self.file_timer = Timer::default();
                 self.run_file_search(ctx);
             }
-            if self.clock.is_event(event).is_some() {
-                self.refresh_relative_times(cx);
-            }
             if self.relayout.is_event(event).is_some() {
                 self.view.widget(id!(list)).redraw(cx);
             }
@@ -2367,8 +2335,6 @@ impl CommandCenterPanelRef {
         }
         inner.view.wa_input(id!(query)).set_text(cx, "");
         inner.view.wa_modal(id!(modal)).open(cx);
-        cx.stop_timer(inner.clock);
-        inner.clock = cx.start_interval(60.0);
         inner.view.redraw(cx);
     }
 

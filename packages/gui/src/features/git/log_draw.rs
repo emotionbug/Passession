@@ -510,7 +510,6 @@ impl LogView {
         self.availability = self.state.availability(ui);
         self.begin_frame();
         self.hits.clear();
-        self.spinning = false;
         self.icons_pending = false;
         for scroller in [
             &mut self.list,
@@ -525,7 +524,7 @@ impl LogView {
         let colors = palette();
         if self.begin_part(cx, paint, LogPart::Background, area, area, 0) {
             paint.fill(cx, area, colors.surface0);
-            self.end_part(cx, paint, LogPart::Background);
+            self.end_part(cx, LogPart::Background);
         }
         let state = match self.state.availability(ui) {
             Availability::Disconnected => Some(("unplug", "workspace.git.log.states.disconnected")),
@@ -570,7 +569,7 @@ impl LogView {
         let part = LogPart::Divider(id);
         if self.begin_part(cx, paint, part, area, clip, 0) {
             paint.fill(cx, area, palette().border);
-            self.end_part(cx, paint, part);
+            self.end_part(cx, part);
         }
     }
 
@@ -591,7 +590,7 @@ impl LogView {
         let key = paint_inputs((icon, copy, error, &actions, spinner, self.phone));
         if self.begin_part(cx, paint, part, area, area, key) {
             self.message_contents(cx, paint, area, icon, copy, error, actions, spinner);
-            self.end_part(cx, paint, part);
+            self.end_part(cx, part);
         }
     }
 
@@ -611,14 +610,7 @@ impl LogView {
         let center_x = area.pos.x + area.size.x / 2.0;
         let mut y = area.pos.y + (area.size.y * 0.2).min(64.0);
         if spinner {
-            paint.spinner(
-                cx,
-                dvec2(center_x, y + 12.0),
-                24.0,
-                colors.muted,
-                cx.seconds_since_app_start(),
-            );
-            self.spinning = true;
+            paint.spinner(cx, dvec2(center_x, y + 12.0), 24.0, colors.muted);
             y += 24.0 + 12.0;
         } else if let Some(icon) = icon {
             paint.icon(cx, icon, 24.0, colors.muted, dvec2(center_x, y + 12.0));
@@ -771,9 +763,7 @@ impl LogView {
                 dvec2(right - size / 2.0, center_y),
                 toolbar_icon_size(compact),
                 colors.extra_muted,
-                cx.seconds_since_app_start(),
             );
-            self.spinning = true;
             return right - size - toolbar_gap(compact, 4.0);
         }
         let hovered = self.is_hovered(&LogHit::Refresh);
@@ -888,7 +878,7 @@ impl LogView {
                 &message,
                 (right - 6.0 - x).max(0.0),
             );
-            self.end_part(cx, paint, LogPart::Banner);
+            self.end_part(cx, LogPart::Banner);
         }
         rect(
             area.pos.x,
@@ -1056,7 +1046,7 @@ impl LogView {
                 paint.fill(cx, line, colors.border_accent);
             }
             self.hits.push(frame, hit);
-            self.end_part(cx, paint, part);
+            self.end_part(cx, part);
         }
         if !wide && self.drawer_open {
             self.draw_drawer(cx, paint, inputs.branch, body);
@@ -1074,7 +1064,7 @@ impl LogView {
         if self.begin_part(cx, paint, LogPart::Drawer, body, body, 0) {
             paint.fill(cx, body, vec4(0.0, 0.0, 0.0, 0.22));
             self.hits.push(body, LogHit::DrawerBackdrop);
-            self.end_part(cx, paint, LogPart::Drawer);
+            self.end_part(cx, LogPart::Drawer);
         }
         let width = self
             .sizes
@@ -1255,7 +1245,7 @@ impl LogView {
                 self.hits.push(clear, LogHit::ClearPath);
             }
         }
-        self.end_part(cx, paint, LogPart::Toolbar);
+        self.end_part(cx, LogPart::Toolbar);
     }
 
     /// Whether `filter` selects this branches-panel row.
@@ -1289,7 +1279,7 @@ impl LogView {
                 LogHit::BranchSearchClear,
                 false,
             );
-            self.end_part(cx, paint, LogPart::BranchesChrome);
+            self.end_part(cx, LogPart::BranchesChrome);
         }
         let field = rect(area.pos.x + 8.0, area.pos.y + 8.0, area.size.x - 16.0, 26.0);
         let list = rect(
@@ -1588,7 +1578,7 @@ impl LogView {
                     );
                 }
             }
-            self.end_part(cx, paint, part);
+            self.end_part(cx, part);
         }
         paint.end_clip(cx);
         self.ref_rows = rows;
@@ -1642,14 +1632,7 @@ impl LogView {
             right = button.pos.x - 4.0;
         }
         if busy {
-            paint.spinner(
-                cx,
-                dvec2(right - 6.0, center_y),
-                12.0,
-                colors.muted,
-                cx.seconds_since_app_start(),
-            );
-            self.spinning = true;
+            paint.spinner(cx, dvec2(right - 6.0, center_y), 12.0, colors.muted);
             right -= 18.0;
         } else if let Some((note, color)) = trailing {
             let size = ui_px(11.0);
@@ -1726,7 +1709,7 @@ impl LogView {
                         None,
                     );
                 }
-                self.end_part(cx, paint, LogPart::Skeleton);
+                self.end_part(cx, LogPart::Skeleton);
             }
             return true;
         }
@@ -1827,11 +1810,9 @@ impl LogView {
                 dvec2(band.pos.x + band.size.x / 2.0, center_y),
                 16.0,
                 colors.muted,
-                cx.seconds_since_app_start(),
             );
-            self.spinning = true;
         }
-        self.end_part(cx, paint, part);
+        self.end_part(cx, part);
     }
 
     /// Asks for the next page while the end is within two screens.
@@ -1913,7 +1894,7 @@ impl LogView {
                     );
                 }
             }
-            self.end_part(cx, paint, LogPart::TableHeader);
+            self.end_part(cx, LogPart::TableHeader);
         }
         let body = rect(
             area.pos.x,
@@ -2045,6 +2026,7 @@ impl LogView {
                     &date,
                     date_w - 8.0,
                 );
+                crate::common::clock::register_relative_time(cx, date_cell, commit.author_ms, now);
             }
             // Always 8 digits: the column is measured for them (git's `%h` grows in big repositories).
             let hash = commit.sha.get(..8).unwrap_or(&commit.sha);
@@ -2059,7 +2041,7 @@ impl LogView {
                 hash,
                 hash_w - 8.0,
             );
-            self.end_part(cx, paint, part);
+            self.end_part(cx, part);
         }
         if footer > 0.0 {
             let top = body.pos.y + count as f64 * row_h - offset;
@@ -2237,7 +2219,7 @@ impl LogView {
                 &title,
                 area.size.x - 24.0,
             );
-            self.end_part(cx, paint, LogPart::FilesHeader);
+            self.end_part(cx, LogPart::FilesHeader);
         }
         let list = rect(
             area.pos.x,
@@ -2262,7 +2244,7 @@ impl LogView {
                     &t("workspace.git.log.details.noFiles"),
                     list.size.x - 24.0,
                 );
-                self.end_part(cx, paint, LogPart::FilesEmpty);
+                self.end_part(cx, LogPart::FilesEmpty);
             }
             self.files.set(list, 0.0);
             return;
@@ -2292,7 +2274,7 @@ impl LogView {
                 paint.fill(cx, band, colors.sidebar_hover);
             }
             self.file_line(cx, paint, band, file, band.pos.x + 10.0);
-            self.end_part(cx, paint, part);
+            self.end_part(cx, part);
         }
         paint.end_clip(cx);
     }
@@ -2378,7 +2360,7 @@ impl LogView {
         let end = self.commit_text(cx, paint, commit, area, area.pos.y + 12.0 - offset, false);
         paint.end_clip(cx);
         self.info.set(area, end + offset - area.pos.y + 12.0);
-        self.end_part(cx, paint, LogPart::Info);
+        self.end_part(cx, LogPart::Info);
     }
 
     /// The commit's message and metadata from `y` inside `area` (hits clipped
@@ -2677,7 +2659,7 @@ impl LogView {
                 (clear.pos.x - 4.0 - x).max(0.0),
             );
             self.hits.push(clear, LogHit::ClearFilters);
-            self.end_part(cx, paint, LogPart::Summary);
+            self.end_part(cx, LogPart::Summary);
         }
         rect(
             area.pos.x,
@@ -2788,7 +2770,7 @@ impl LogView {
                     self.hits.push(target, LogHit::ClearBranch);
                 }
             }
-            self.end_part(cx, paint, LogPart::PhoneToolbar);
+            self.end_part(cx, LogPart::PhoneToolbar);
         }
         let below = rect(
             area.pos.x,
@@ -2889,6 +2871,12 @@ impl LogView {
                 .map(|ms| relative_time(ms, now))
                 .unwrap_or_default();
             let meta_line = format!("{} · {} · {}", commit.author_name, date, short(&commit.sha));
+            crate::common::clock::register_relative_time(
+                cx,
+                rect(x0, line2, (right - x0).max(0.0), meta_h),
+                commit.author_ms,
+                now,
+            );
             paint.text_centered(
                 cx,
                 Font::Regular,
@@ -2905,7 +2893,7 @@ impl LogView {
                 rect(x0, top + row_h - 1.0, band.size.x - (x0 - band.pos.x), 1.0),
                 with_alpha(colors.border, 0.6),
             );
-            self.end_part(cx, paint, part);
+            self.end_part(cx, part);
         }
         if footer > 0.0 {
             let top = body.pos.y + count as f64 * row_h - offset;
@@ -2958,7 +2946,7 @@ impl LogView {
                 &title,
                 (bar.pos.x + bar.size.x - 12.0 - x).max(0.0),
             );
-            self.end_part(cx, paint, LogPart::PhoneCommitToolbar);
+            self.end_part(cx, LogPart::PhoneCommitToolbar);
         }
         let body = rect(
             area.pos.x,
@@ -3012,7 +3000,7 @@ impl LogView {
                 if self.begin_part(cx, paint, LogPart::PhoneInfo, body, body, 0) {
                     y = self.commit_text(cx, paint, commit, body, text_top, true);
                     self.phone_info_height = y - text_top;
-                    self.end_part(cx, paint, LogPart::PhoneInfo);
+                    self.end_part(cx, LogPart::PhoneInfo);
                 }
                 y += 8.0;
                 self.draw_divider(cx, paint, 6, rect(body.pos.x, y, body.size.x, 1.0), body);
@@ -3035,7 +3023,7 @@ impl LogView {
                         &header,
                         body.size.x - 32.0,
                     );
-                    self.end_part(cx, paint, LogPart::PhoneFilesHeader);
+                    self.end_part(cx, LogPart::PhoneFilesHeader);
                 }
                 y += header_h;
                 self.list_files(commit);
@@ -3054,7 +3042,7 @@ impl LogView {
                             &t("workspace.git.log.details.noFiles"),
                             body.size.x - 32.0,
                         );
-                        self.end_part(cx, paint, LogPart::FilesEmpty);
+                        self.end_part(cx, LogPart::FilesEmpty);
                     }
                     y += PHONE_FILE_ROW_HEIGHT;
                 }
@@ -3079,7 +3067,7 @@ impl LogView {
                         paint.fill(cx, band, colors.selected);
                     }
                     self.file_line(cx, paint, band, file, band.pos.x + 16.0);
-                    self.end_part(cx, paint, part);
+                    self.end_part(cx, part);
                 }
                 y = start + commit.files.len() as f64 * PHONE_FILE_ROW_HEIGHT + 16.0;
                 paint.end_clip(cx);

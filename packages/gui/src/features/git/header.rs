@@ -57,10 +57,6 @@ pub struct GitActionsButton {
     pressed: Option<Part>,
     #[rust]
     primary_width: f64,
-    #[rust]
-    phase: f64,
-    #[rust]
-    next_frame: NextFrame,
 }
 
 impl Drop for GitActionsButton {
@@ -99,16 +95,12 @@ impl Widget for GitActionsButton {
         let Some(ui) = scope.data.get_mut::<UiContext>() else {
             return;
         };
-        with_store(|store| store.begin_event(cx, event, ui));
         self.ensure_bound(cx, ui);
         if let Event::Actions(actions) = event
             && actions
                 .iter()
                 .any(|a| a.downcast_ref::<GitStoreChanged>().is_some())
         {
-            self.redraw(cx);
-        }
-        if self.next_frame.is_event(event).is_some() {
             self.redraw(cx);
         }
         if let Some(result) = self.overlay.poll() {
@@ -302,15 +294,12 @@ impl Widget for GitActionsButton {
         let alpha = if primary.disabled { 0.6 } else { 1.0 };
         let center_y = frame.pos.y + height / 2.0;
         if pending {
-            self.phase = cx.seconds_since_app_start();
             self.paint.spinner(
                 cx,
                 dvec2(primary_rect.pos.x + primary_width / 2.0, center_y),
                 14.0,
                 colors.foreground,
-                self.phase,
             );
-            self.next_frame = cx.new_next_frame();
         } else {
             let mut x = primary_rect.pos.x + if compact { 12.0 } else { 8.0 };
             // The last action failed: an alert in place of the action's icon until a success.
@@ -443,10 +432,6 @@ pub struct OpenInButton {
     hovered: Option<Part>,
     #[rust]
     pressed: Option<Part>,
-    #[rust]
-    phase: f64,
-    #[rust]
-    next_frame: NextFrame,
 }
 
 impl Drop for OpenInButton {
@@ -654,7 +639,6 @@ impl Widget for OpenInButton {
         let Some(ui) = scope.data.get_mut::<UiContext>() else {
             return;
         };
-        with_store(|store| store.begin_event(cx, event, ui));
         self.ensure_bound(cx, ui);
         if let Event::Actions(actions) = event {
             for action in actions.iter() {
@@ -665,9 +649,6 @@ impl Widget for OpenInButton {
                     self.on_platform(cx, ui, platform_action);
                 }
             }
-        }
-        if self.next_frame.is_event(event).is_some() {
-            self.redraw(cx);
         }
         if let Some(OverlayResult::Chose(ChoosePurpose, id)) = self.overlay.poll() {
             // The menu only chooses the preferred target; the primary half opens it.
@@ -798,15 +779,8 @@ impl Widget for OpenInButton {
             self.paint.fill(cx, primary_rect, colors.surface2);
         }
         if self.opening {
-            self.phase = cx.seconds_since_app_start();
-            self.paint.spinner(
-                cx,
-                primary_rect.center(),
-                14.0,
-                colors.foreground,
-                self.phase,
-            );
-            self.next_frame = cx.new_next_frame();
+            self.paint
+                .spinner(cx, primary_rect.center(), 14.0, colors.foreground);
         } else if let Some(path) = primary.svg.as_deref().and_then(icon_path) {
             self.brand_icon.svg_path = ArcStringMut::Arc(path);
             self.brand_icon.color = colors.muted;

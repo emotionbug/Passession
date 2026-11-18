@@ -88,7 +88,8 @@ bypass that timer. This yields between batches even while a producer keeps refil
 including when no window is drawing. It does not drop canonical events or impose a byte/time
 budget on an individual event.
 
-Timeline sessions apply matching events in order, then publish one projection after the batch.
+Timeline sessions apply matching events in order. Publish one projection per
+dirty session after the batch; an unrelated UI event does not visit retained histories.
 Fold text and sequence ranges append in place while privately owned, using copy-on-write when
 an older screen snapshot still references the row. Hidden controllers can reconcile without
 painting; `PortalList` limits mounted rows and row UI state remains outside recycled items.

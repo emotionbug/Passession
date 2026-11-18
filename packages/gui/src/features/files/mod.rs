@@ -370,7 +370,7 @@ impl Widget for FilesPanel {
         if let Some(ui) = scope.data.get::<UiContext>() {
             let area = self.area;
             if let Some(explorer) = self.explorer.as_mut() {
-                explorer.draw(cx, &mut self.kit, rect, ui, area);
+                explorer.draw(cx, &mut self.kit, rect, ui);
             } else if let Some(file) = self.file.as_mut() {
                 file.draw(cx, &mut self.kit, rect, ui, area);
             } else {
@@ -384,6 +384,11 @@ impl Widget for FilesPanel {
 }
 
 impl FilesPanelRef {
+    pub(crate) fn has_visibility_wake(&self, event: &Event) -> bool {
+        self.borrow()
+            .is_some_and(|panel| panel.next_frame.is_event(event).is_some())
+    }
+
     pub fn set_target(&self, cx: &mut Cx, target: FilesTarget) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.explicit = true;

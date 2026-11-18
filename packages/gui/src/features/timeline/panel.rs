@@ -428,7 +428,6 @@ struct ChromeLayer {
     list: DrawList2d,
     canvas: Canvas,
     area: Area,
-    animating: bool,
     visited: bool,
 }
 
@@ -438,7 +437,6 @@ impl ChromeLayer {
             list: DrawList2d::new(cx),
             canvas: Canvas::default(),
             area: Area::Empty,
-            animating: false,
             visited: false,
         }
     }
@@ -468,9 +466,9 @@ impl ChromeLayer {
             now: now_seconds(),
             area: self.area,
             animating: false,
+            indicators: None,
         };
         let result = paint(cx, &mut d);
-        self.animating = d.animating;
         self.list.end(cx);
         Some(result)
     }
@@ -479,7 +477,6 @@ impl ChromeLayer {
         if !std::mem::take(&mut self.visited) {
             self.list.release(cx);
             self.canvas.hits.clear();
-            self.animating = false;
         }
     }
 }
@@ -543,8 +540,6 @@ pub struct ChatPanel {
     painted_look: Option<Look>,
     #[rust]
     non_ready_indicator: Option<DVec2>,
-    #[rust]
-    modal_animating: bool,
     #[rust(DrawList2d::new(cx))]
     modal_content_list: DrawList2d,
     #[rust(DrawList2d::new(cx))]
@@ -613,8 +608,9 @@ pub struct ChatPanel {
     content_rect: Rect,
     #[rust]
     composer_h: f64,
+    /// Display-rate motion only during a modal sheet transition.
     #[rust]
-    next_frame: NextFrame,
+    transition_frame: NextFrame,
     /// A row jump (seqStart, offset below the row top, find match) whose row
     /// is not in the stream model yet: applied after the next model rebuild.
     #[rust]
@@ -818,12 +814,10 @@ impl ChatPanel {
         self.redraw_modal(cx);
     }
 
-    fn finish_chrome(&mut self, cx: &mut Cx2d) -> bool {
-        let mut animating = false;
+    fn finish_chrome(&mut self, cx: &mut Cx2d) {
         self.overlay_canvas.begin(self.content_rect.pos);
         for layer in &mut self.chrome_layers {
             layer.finish_frame(cx);
-            animating |= layer.animating;
             let offset = layer.canvas.origin - self.content_rect.pos;
             self.overlay_canvas.hits.extend(
                 layer
@@ -833,7 +827,6 @@ impl ChatPanel {
                     .map(|(rect, hit)| (rect.translate(offset), hit.clone())),
             );
         }
-        animating
     }
 
     // ── target and activity ─────────────────────────────────────────────
@@ -994,6 +987,7 @@ impl ChatPanel {
     /// The tab menu picked a conversation action; runs with the next event.
     pub fn run_conversation_action(&mut self, cx: &mut Cx, action: &str) {
         self.pending_actions.push(action.to_owned());
+        SignalToUI::set_ui_signal();
         self.area.redraw(cx);
     }
 
@@ -3547,15 +3541,8 @@ impl Widget for ChatPanel {
             return;
         }
         let composer_visible = self.visible && self.composer_shown();
-        if self.visible && self.next_frame.is_event(event).is_some() {
-            for layer in &self.chrome_layers {
-                if layer.animating {
-                    layer.list.redraw(cx);
-                }
-            }
-            if self.modal_animating {
-                self.redraw_modal(cx);
-            }
+        if self.visible && self.modal.is_some() && self.transition_frame.is_event(event).is_some() {
+            self.redraw_modal(cx);
         }
         if self
             .timeline_texture_wait
@@ -3893,7 +3880,6 @@ impl Widget for ChatPanel {
         let p = look.palette;
         self.kit.begin_layer(cx);
         self.kit.rect(cx, rect, p.surface0, 0.0);
-        let mut animating = false;
         let target = self.target.clone().unwrap_or_default();
         let non_ready = self.non_ready();
         if let Some(view) = non_ready {
@@ -3924,11 +3910,8 @@ impl Widget for ChatPanel {
             self.composer_list.release(cx);
             self.find_list.release(cx);
             self.modal_content_list.release(cx);
-            animating |= self.finish_chrome(cx);
+            self.finish_chrome(cx);
             cx.end_turtle_with_area(&mut self.area);
-            if animating {
-                self.next_frame = cx.new_next_frame();
-            }
             return DrawStep::done();
         }
         let compact = look.compact;
@@ -3986,6 +3969,7 @@ impl Widget for ChatPanel {
                 now: now_seconds(),
                 area: self.area,
                 animating: false,
+                indicators: None,
             };
             d.measure(|d| {
                 let facts_h = facts
@@ -4278,9 +4262,7 @@ impl Widget for ChatPanel {
         }
         if outline_shown {
             chrome_part!(RAIL, stream_rect, |cx, d| {
-                if self.rail.draw(cx, d, stream_rect, prompts_active) {
-                    d.animating = true;
-                }
+                self.rail.draw(cx, d, stream_rect, prompts_active);
             });
         }
         if tracks_visible {
@@ -4393,7 +4375,7 @@ impl Widget for ChatPanel {
         if covered {
             self.cover_list.end(cx);
         }
-        animating |= self.finish_chrome(cx);
+        self.finish_chrome(cx);
         let find_field_rect = self.find_field_rect;
 
         // ── the find field ──────────────────────────────────────────────
@@ -4455,7 +4437,7 @@ impl Widget for ChatPanel {
                 cx.begin_turtle(Walk::abs_rect(bounds), Layout::default());
                 self.modal_kit.begin_layer(cx);
                 self.modal_canvas.begin(bounds.pos);
-                self.modal_animating = self.draw_modal(
+                let moving = self.draw_modal(
                     cx,
                     scope,
                     look,
@@ -4470,8 +4452,10 @@ impl Widget for ChatPanel {
                     .then_some(texture_revision);
                 cx.end_turtle_with_area(&mut self.modal_area);
                 self.modal_content_list.end(cx);
+                if moving {
+                    self.transition_frame = cx.new_next_frame();
+                }
             }
-            animating |= self.modal_animating;
             if let (Some(popup), Some(Modal::Track(panel))) = (&self.track_popover, &self.modal) {
                 popup.drawn(self.track_anchors[*panel as usize], self.track_popover_area);
             } else if self.input_is_modal() {
@@ -4482,7 +4466,6 @@ impl Widget for ChatPanel {
         } else {
             self.modal_canvas.begin(rect.pos);
             self.modal_content_list.release(cx);
-            self.modal_animating = false;
         }
         cx.end_turtle_with_area(&mut self.area);
 
@@ -4522,9 +4505,6 @@ impl Widget for ChatPanel {
             if let Some(duration) = toast.duration {
                 self.toast_timer = cx.start_timeout(duration);
             }
-        }
-        if animating {
-            self.next_frame = cx.new_next_frame();
         }
         DrawStep::done()
     }
@@ -4861,7 +4841,9 @@ impl ChatPanel {
                     },
                     HitTarget::Copy { key, text } => {
                         cx.copy_to_clipboard(&text);
-                        self.modal_state.copied.insert(key, now_seconds());
+                        self.modal_state
+                            .copied
+                            .insert(key, std::time::Instant::now());
                     }
                     HitTarget::Toggle(key) => self.modal_state.toggle(&key),
                     HitTarget::OpenFile(path) => {
@@ -5353,6 +5335,7 @@ impl ChatPanel {
                     now: now_seconds(),
                     area: self.area,
                     animating: false,
+                    indicators: None,
                 };
                 let popover = tracks::draw_panel(
                     cx,
@@ -5390,6 +5373,7 @@ impl ChatPanel {
                     now: now_seconds(),
                     area: self.area,
                     animating: false,
+                    indicators: None,
                 };
                 let kind_ref = kind.as_str();
                 super::tool_sheet::paint_detail_sheet(
@@ -5421,6 +5405,7 @@ impl ChatPanel {
                     now: now_seconds(),
                     area: self.area,
                     animating: false,
+                    indicators: None,
                 };
                 usage_sheet(cx, &mut d, &agent, rect, bottom_inset);
                 animating |= d.animating;
@@ -5471,6 +5456,7 @@ impl ChatPanel {
                     now: now_seconds(),
                     area: self.area,
                     animating: false,
+                    indicators: None,
                 };
                 lightbox(cx, &mut d, rect, texture, *scale, *offset);
                 animating |= d.animating;
@@ -5487,6 +5473,7 @@ impl ChatPanel {
                     now: now_seconds(),
                     area: self.area,
                     animating: false,
+                    indicators: None,
                 };
                 d.kit.rect(cx, rect, rgba(0x73000000), 0.0);
                 d.canvas.add_hit(rect, HitTarget::Chrome("scrim".into()));
@@ -5500,6 +5487,18 @@ impl ChatPanel {
                     TRANSPARENT,
                     0.0,
                 );
+                if p.surface0.w >= 1.0 {
+                    // Rounded corners and the translucent top scrim do not occlude.
+                    crate::common::clock::occlude(
+                        cx,
+                        rect_xywh(
+                            sheet.pos.x,
+                            sheet.pos.y + 16.0,
+                            sheet.size.x,
+                            sheet.size.y - 16.0,
+                        ),
+                    );
+                }
                 d.canvas
                     .add_hit(sheet, HitTarget::Chrome("sheet:body".into()));
                 // SheetContents header: provider icon, label, open-as-tab, close.
@@ -5865,7 +5864,6 @@ fn lightbox(
                 &text,
                 None,
             );
-            d.animating = true;
         }
     }
     let mut x = rect.pos.x + rect.size.x - 8.0;

@@ -47,7 +47,6 @@ struct PrPart {
     regions: Vec<(Rect, String)>,
     bodies: Vec<(String, Rect)>,
     height: f64,
-    spinning: bool,
     children: Vec<String>,
 }
 
@@ -113,8 +112,6 @@ pub struct PrView {
     heights: HashMap<String, f64>,
     parts: HashMap<String, PrPart>,
     dirty_parts: HashSet<String>,
-    animated_parts: HashSet<String>,
-    active_parts: Vec<String>,
     child_parts: Vec<Vec<String>>,
     region_owners: HashMap<String, String>,
     visible_parts: HashSet<String>,
@@ -128,7 +125,6 @@ pub struct PrView {
     timeline_counts: (usize, usize, usize),
     timeline_entries_key: Option<(i64, u64)>,
     check_index: usize,
-    pub spinning: bool,
     /// Image acquisitions register the retained body/avatar list directly.
     /// Kept false: unrelated image-cache revisions never repaint the PR pane.
     pub images_pending: bool,
@@ -202,24 +198,17 @@ impl PrView {
             let previous_height = part.height;
             let region_start = self.regions.len();
             let body_start = self.body_rects.len();
-            let spinning = self.spinning;
-            self.spinning = false;
-            self.animated_parts.remove(&key);
-            self.active_parts.push(key.clone());
             part.children.clear();
             self.child_parts.push(std::mem::take(&mut part.children));
             part.height = draw(self, cx, paint);
-            self.active_parts.pop();
             part.children = self.child_parts.pop().unwrap_or_default();
-            part.spinning = self.spinning;
-            self.spinning |= spinning;
             part.regions.clear();
             part.regions
                 .extend_from_slice(&self.regions[region_start..]);
             part.bodies.clear();
             part.bodies
                 .extend_from_slice(&self.body_rects[body_start..]);
-            part.layer.end(cx, &self.hits, paint);
+            part.layer.end(cx, &self.hits);
             if key.starts_with("entry:") && previous_height != part.height {
                 // Borders precede Markdown measurement. Repaint this row once
                 // with its settled height, including after an image changes it.
@@ -228,7 +217,6 @@ impl PrView {
         } else {
             self.regions.extend_from_slice(&part.regions);
             self.body_rects.extend_from_slice(&part.bodies);
-            self.spinning |= part.spinning;
         }
         if key.starts_with("entry:") {
             for (_, id) in &part.regions {
@@ -307,16 +295,6 @@ impl PrView {
         }
     }
 
-    pub fn animate(&mut self, cx: &mut Cx) {
-        for key in &self.animated_parts {
-            if self.visible_parts.contains(key)
-                && let Some(part) = self.parts.get(key)
-            {
-                part.layer.invalidate(cx);
-            }
-        }
-    }
-
     pub fn invalidate_media(&mut self, _cx: &mut Cx) {
         // images::image and Markdown's Draw::result_owner register exact lists.
     }
@@ -351,8 +329,6 @@ impl PrView {
             heights: HashMap::new(),
             parts: HashMap::new(),
             dirty_parts: HashSet::new(),
-            animated_parts: HashSet::new(),
-            active_parts: Vec::new(),
             region_owners: HashMap::new(),
             visible_parts: HashSet::new(),
             checkout_revision: None,
@@ -366,7 +342,6 @@ impl PrView {
             timeline_entries_key: None,
             child_parts: Vec::new(),
             check_index: 0,
-            spinning: false,
             images_pending: false,
         }
     }
@@ -656,7 +631,7 @@ impl PrView {
                             HitTarget::Toggle(key) => body.state.toggle(&key),
                             HitTarget::Copy { key, text } => {
                                 cx.copy_to_clipboard(&text);
-                                body.state.copied.insert(key, now_seconds());
+                                body.state.copied.insert(key, std::time::Instant::now());
                             }
                             _ => {}
                         }
@@ -1045,7 +1020,6 @@ impl PrView {
         self.visible_parts.clear();
         self.regions.clear();
         self.region_owners.clear();
-        self.spinning = false;
         self.images_pending = false;
         self.viewport = area;
         self.retain(cx, paint, "background", area, 0, |_, cx, paint| {
@@ -1203,44 +1177,18 @@ impl PrView {
             });
         }
         self.parts.retain(|key, _| self.visible_parts.contains(key));
-        self.animated_parts
-            .retain(|key| self.visible_parts.contains(key));
-    }
-
-    /// Original `useSkeletonPulse`: block opacity 0.4 ↔ 0.8, linear, 1s each
-    /// way. Requests frames only while a skeleton is drawn.
-    fn pulse_fill(&mut self, cx: &mut Cx2d) -> Vec4 {
-        self.spinning = true;
-        if let Some(key) = self.active_parts.last() {
-            self.animated_parts.insert(key.clone());
-        }
-        let phase = cx.seconds_since_app_start() % 2.0;
-        let t = if phase < 1.0 { phase } else { 2.0 - phase };
-        with_alpha(palette().surface2, (0.4 + 0.4 * t) as f32)
     }
 
     /// Original `_PaneSkeleton`.
     fn skeleton(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect) {
         let colors = palette();
-        let fill = self.pulse_fill(cx);
+        let fill = colors.surface2;
         let x = area.pos.x;
         let w = area.size.x;
         let mut y = area.pos.y + 16.0;
-        paint.rounded(
-            cx,
-            rect(x + 16.0, y, (w - 32.0) * 0.75, 16.0),
-            fill,
-            2.0,
-            None,
-        );
+        paint.pulse(cx, rect(x + 16.0, y, (w - 32.0) * 0.75, 16.0), fill, 2.0);
         y += 24.0;
-        paint.rounded(
-            cx,
-            rect(x + 16.0, y, (w - 32.0) * 0.4, 12.0),
-            fill,
-            2.0,
-            None,
-        );
+        paint.pulse(cx, rect(x + 16.0, y, (w - 32.0) * 0.4, 12.0), fill, 2.0);
         y += 28.0;
         let toolbar_area = rect(x, y, w, 36.0);
         self.retain(
@@ -1254,8 +1202,8 @@ impl PrView {
                 0.0
             },
         );
-        paint.rounded(cx, rect(x + 12.0, y + 6.0, 96.0, 24.0), fill, 8.0, None);
-        paint.rounded(cx, rect(x + 116.0, y + 6.0, 96.0, 24.0), fill, 8.0, None);
+        paint.pulse(cx, rect(x + 12.0, y + 6.0, 96.0, 24.0), fill, 8.0);
+        paint.pulse(cx, rect(x + 116.0, y + 6.0, 96.0, 24.0), fill, 8.0);
         y += 36.0 + 8.0;
         let label_area = rect(x, y, w, 32.0);
         self.retain(
@@ -1278,13 +1226,12 @@ impl PrView {
         );
         y += 32.0;
         for _ in 0..3 {
-            paint.rounded(cx, rect(x + 12.0, y + 9.0, 14.0, 14.0), fill, 7.0, None);
-            paint.rounded(
+            paint.pulse(cx, rect(x + 12.0, y + 9.0, 14.0, 14.0), fill, 7.0);
+            paint.pulse(
                 cx,
                 rect(x + 34.0, y + 10.0, (w - 46.0) * 0.6, 12.0),
                 fill,
                 2.0,
-                None,
             );
             y += 36.0;
         }
@@ -1301,22 +1248,15 @@ impl PrView {
         w: f64,
         mut y: f64,
     ) -> f64 {
-        let fill = self.pulse_fill(cx);
+        let fill = palette().surface2;
         for _ in 0..3 {
-            paint.rounded(cx, rect(x + 12.0, y + 3.0, 20.0, 20.0), fill, 10.0, None);
-            paint.rounded(
-                cx,
-                rect(x + 40.0, y, (w - 52.0) * 0.7, 12.0),
-                fill,
-                2.0,
-                None,
-            );
-            paint.rounded(
+            paint.pulse(cx, rect(x + 12.0, y + 3.0, 20.0, 20.0), fill, 10.0);
+            paint.pulse(cx, rect(x + 40.0, y, (w - 52.0) * 0.7, 12.0), fill, 2.0);
+            paint.pulse(
                 cx,
                 rect(x + 40.0, y + 16.0, (w - 52.0) * 0.45, 10.0),
                 fill,
                 2.0,
-                None,
             );
             y += 26.0 + 12.0;
         }
@@ -1400,14 +1340,7 @@ impl PrView {
                 if host::supports(ui, &pane.target.server_id, "checkoutRefresh") {
                     let right = band.pos.x + band.size.x - 12.0;
                     if pane.refreshing(store) {
-                        paint.spinner(
-                            cx,
-                            dvec2(right - 10.0, center_y),
-                            14.0,
-                            colors.muted,
-                            cx.seconds_since_app_start(),
-                        );
-                        pane.spinning = true;
+                        paint.spinner(cx, dvec2(right - 10.0, center_y), 14.0, colors.muted);
                     } else {
                         let hovered = pane.hovered == Some(PrHit::Refresh);
                         let button = toolbar_button(
@@ -2615,16 +2548,15 @@ impl PrView {
             area: Area::Empty,
             owner: None,
             animating: false,
+            indicators: None,
         };
         let height = md::draw(
             cx, &mut d, &mut opts, body, pos.x, pos.y, width, false, false,
         );
-        // Copy-glyph feedback and loading images animate through frames.
-        self.spinning |= d.animating;
-        if d.animating
-            && let Some(key) = self.active_parts.last()
-        {
-            self.animated_parts.insert(key.clone());
+        if d.animating {
+            let mut redraw = Area::Empty;
+            cx.add_rect_area(&mut redraw, rect(pos.x, pos.y, width, height));
+            crate::common::clock::register_every(cx, redraw, crate::common::clock::MOTION_PERIOD);
         }
         // Material's default selection colour: colorScheme.primary at 40%.
         let selection = with_alpha(look.palette.primary, 0.4);

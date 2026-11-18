@@ -6,6 +6,7 @@
 //! permission responses) is posted as a [`ChatRowEvent`].
 
 use super::canvas::*;
+use super::indicator::Indicators;
 use super::paint::{Draw, RowState, now_seconds};
 use super::permission;
 use super::rows::{RowContext, RowItem, RowKind, draw_row};
@@ -17,6 +18,7 @@ use makepad_widgets::scroll_bars::TouchScroll;
 use makepad_widgets::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 live_design! {
     use link::theme::*;
@@ -71,7 +73,7 @@ pub struct RowModel {
 struct RowCache {
     measurement: Option<Measurement>,
     paint_dirty: bool,
-    animating: bool,
+    layout_pending: bool,
     viewport: Option<Rect>,
 }
 
@@ -93,7 +95,6 @@ impl RowCache {
         self.measurement
             .filter(|measured| {
                 !dirty
-                    && !self.animating
                     && measured.width == width
                     && measured.theme_epoch == theme_epoch
                     && measured.revision == revision
@@ -130,6 +131,10 @@ pub struct ChatRow {
     answer: WidgetRef,
     #[rust(DrawList2d::new(cx))]
     draw_list: DrawList2d,
+    #[rust(DrawList2d::new(cx))]
+    composition: DrawList2d,
+    #[rust]
+    indicators: Indicators,
     #[rust]
     canvas: Canvas,
     #[rust]
@@ -150,8 +155,6 @@ pub struct ChatRow {
     drag_start: (DVec2, f64),
     #[rust]
     touch_scroll: TouchScroll,
-    #[rust]
-    next_frame: NextFrame,
     #[rust]
     last_width: f64,
     #[rust]
@@ -227,12 +230,13 @@ impl ChatRow {
                 area: self.area,
                 owner: Some(self.draw_list.id()),
                 animating: false,
+                indicators: None,
             };
             let height = draw_row(cx, &mut d, &model.ctx, &model.item, 0.0, 0.0, width).0;
-            self.cache.animating = d.animating;
+            self.cache.layout_pending = d.animating;
             height
         };
-        let height = state.preparing_height(height, width, self.cache.animating);
+        let height = state.preparing_height(height, width, self.cache.layout_pending);
         state.preparing = false;
         self.kit.dry = kit_dry;
         self.canvas.dry = canvas_dry;
@@ -437,7 +441,6 @@ impl ChatRow {
         let Some(model) = self.model.clone() else {
             return true;
         };
-        let now = now_seconds();
         if super::mermaid::tap(&mut model.state.borrow_mut(), target) {
             self.area.redraw(cx);
             return true;
@@ -447,7 +450,7 @@ impl ChatRow {
                 let mut state = model.state.borrow_mut();
                 if key.starts_with("stamp:") {
                     // The elapsed label shows its end time while revealed.
-                    state.copied.insert(key.clone(), now);
+                    state.copied.insert(key.clone(), Instant::now());
                 } else {
                     state.toggle(key);
                 }
@@ -455,7 +458,11 @@ impl ChatRow {
             }
             HitTarget::Copy { key, text } => {
                 cx.copy_to_clipboard(text);
-                model.state.borrow_mut().copied.insert(key.clone(), now);
+                model
+                    .state
+                    .borrow_mut()
+                    .copied
+                    .insert(key.clone(), Instant::now());
                 if let Some(ui) = scope.data.get_mut::<UiContext>() {
                     ui.effects.extend(
                         ui.tab_key
@@ -702,9 +709,6 @@ impl Widget for ChatRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if self.handle_selection_event(cx, event) {
             return;
-        }
-        if self.next_frame.is_event(event).is_some() {
-            self.area.redraw(cx);
         }
         if !self.area.is_valid(cx) {
             self.touch_scroll.reset();
@@ -955,15 +959,22 @@ impl Widget for ChatRow {
         let dirty = cx.will_redraw(&mut self.draw_list, walk);
         let repaint = dirty
             || self.cache.paint_dirty
-            || self.cache.animating
             || self.cache.viewport != self.canvas.viewport
             || self.touch_selection
             || self.answer_field.is_some()
             || cx.text_actions_active(self.area);
-        if self.draw_list.begin_maybe(cx, repaint).is_err() {
+        let compose = repaint || cx.will_redraw(&mut self.composition, walk);
+        if self.composition.begin_maybe(cx, compose).is_err() {
             cx.walk_turtle(walk);
             return DrawStep::done();
         }
+        if self.draw_list.begin_maybe(cx, repaint).is_err() {
+            cx.walk_turtle(walk);
+            self.indicators.draw(cx, &mut self.kit);
+            self.composition.end(cx);
+            return DrawStep::done();
+        }
+        self.indicators.begin();
         let model = model.clone();
         cx.begin_turtle(walk, Layout::default());
         let origin = cx.turtle().pos();
@@ -990,6 +1001,7 @@ impl Widget for ChatRow {
                 area: self.area,
                 owner: Some(self.draw_list.id()),
                 animating: false,
+                indicators: Some(&mut self.indicators),
             };
             let (h, field) = draw_row(
                 cx,
@@ -1096,6 +1108,8 @@ impl Widget for ChatRow {
                 .draw(cx, self.area, viewport, a, b, anchor == cursor, false);
         }
         self.draw_list.end(cx);
+        self.indicators.draw(cx, &mut self.kit);
+        self.composition.end(cx);
         if !self.selection_handles.is_dragging()
             && (self.show_actions || cx.text_actions_active(self.area))
         {
@@ -1112,9 +1126,9 @@ impl Widget for ChatRow {
         }
         self.cache.paint_dirty = false;
         self.cache.viewport = self.canvas.viewport;
-        self.cache.animating |= animating;
-        if self.cache.animating {
-            self.next_frame = cx.new_next_frame();
+        if self.cache.layout_pending || animating {
+            let area = self.area;
+            crate::common::clock::register_every(cx, area, crate::common::clock::MOTION_PERIOD);
         }
         DrawStep::done()
     }
@@ -1188,12 +1202,37 @@ mod cache_tests {
     }
 
     #[test]
-    fn pacing_and_recycled_models_cannot_freeze_a_cached_row() {
+    fn indicator_clock_paint_keeps_cached_row_height() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_draw::live_design(&mut cx);
+        makepad_draw::shader::draw_trapezoid::DrawTrapezoidVector::register_main_module(&mut cx);
+        cx.live_expand();
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(640.0, 112.0));
+        let mut row = DrawList2d::new(&mut cx);
+        let mut body = DrawList2d::new(&mut cx);
+        let mut indicator = DrawList2d::new(&mut cx);
+        {
+            let initial = DrawEvent::default();
+            let mut draw = makepad_widgets::makepad_draw::CxDraw::new(&mut cx, &initial);
+            draw.begin_pass(&pass, Some(1.0));
+            row.begin_always(&mut draw);
+            body.begin_always(&mut draw);
+            body.end(&mut draw);
+            indicator.begin_always(&mut draw);
+            indicator.end(&mut draw);
+            row.end(&mut draw);
+            draw.end_pass(&pass);
+        }
+        let tick = DrawEvent {
+            draw_lists: vec![indicator.id()],
+            ..Default::default()
+        };
+        assert!(tick.draw_list_will_redraw(&cx, row.id()));
+        let body_dirty = tick.draw_list_will_redraw(&cx, body.id());
         let mut cache = settled();
-        cache.animating = true;
-        assert_eq!(cache.height(640.0, 3, 7, false), None);
-        cache.animating = false;
-        assert_eq!(cache.height(640.0, 3, 7, false), Some(112.0));
+        assert_eq!(cache.height(640.0, 3, 7, body_dirty), Some(112.0));
+        assert_eq!(cache.height(640.0, 3, 7, true), None);
         cache.invalidate();
         assert_eq!(cache.height(640.0, 3, 7, false), None);
         assert!(cache.paint_dirty);

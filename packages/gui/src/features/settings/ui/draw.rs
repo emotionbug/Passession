@@ -315,16 +315,6 @@ impl RetainedPaint {
         }
     }
 
-    pub fn animate(&self, cx: &mut Cx) {
-        for group in self.groups.values() {
-            for op in &group.ops {
-                if op.input.kind == 1 && op.input.args[3] != 0.0 {
-                    op.list.redraw(cx);
-                }
-            }
-        }
-    }
-
     pub fn end_frame(&mut self) {
         self.groups.retain(|_, group| {
             group.ops.truncate(group.used);

@@ -173,8 +173,6 @@ pub struct PanelState {
     pub tooltip_timer: Timer,
     pub tooltip: Option<(String, Rect)>,
     pub tooltip_pending: Option<(String, Rect)>,
-    pub next_frame: NextFrame,
-    pub spin: f64,
     pub input_scroll: f64,
     pub input_manual_scroll: bool,
     pub input_natural: f64,
@@ -408,15 +406,6 @@ impl Widget for ComposerPanel {
         }
         if self.st.tooltip_timer.is_event(event).is_some() {
             self.st.tooltip = self.st.tooltip_pending.take();
-            self.draw_bg.redraw(cx);
-        }
-        if let Some(frame) = self
-            .st
-            .next_frame
-            .is_event(event)
-            .filter(|_| !self.st.hidden)
-        {
-            self.st.spin = frame.time;
             self.draw_bg.redraw(cx);
         }
 

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::common::overlay::{self, MenuEntry, MenuItem};
 use crate::common::paint::{Font, HitMap};
-use crate::common::{FileLinkIntent, PanelTarget, TabPlacement, UiContext, UiEffect, clock};
+use crate::common::{FileLinkIntent, PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::theme::{self, Palette, Typography, with_alpha};
 
 use super::editor::buffer::{find_matches, match_len};
@@ -1952,7 +1952,7 @@ impl FileView {
         };
         let snapshot_ready = matches!(status, Snapshot::Ready(_));
         if !snapshot_ready {
-            self.draw_load_state(cx, kit, area, &status, Look { p: &p, ty: &ty }, widget_area);
+            self.draw_load_state(cx, kit, area, &status, Look { p: &p, ty: &ty });
             self.draw_transfers(cx, kit, area, &p, &ty);
             return;
         }
@@ -2084,9 +2084,7 @@ impl FileView {
                     rect(right - 14.0, bar.pos.y, 14.0, toolbar_h),
                     14.0,
                     p.muted,
-                    clock::phase(900),
                 );
-                clock::register(cx, widget_area);
                 right -= 14.0 + 8.0;
             }
             if *model_status == FileEditorStatus::Dirty {
@@ -2283,11 +2281,10 @@ impl FileView {
         area: Rect,
         status: &Snapshot,
         look: Look,
-        widget_area: Area,
     ) {
         let Look { p, ty } = look;
         match status {
-            Snapshot::Loading => self.loading(cx, kit, area, p, ty, widget_area),
+            Snapshot::Loading => self.loading(cx, kit, area, p, ty),
             Snapshot::Missing => self.center_state(
                 cx,
                 kit,
@@ -2325,15 +2322,7 @@ impl FileView {
         }
     }
 
-    fn loading(
-        &mut self,
-        cx: &mut Cx2d,
-        kit: &mut Kit,
-        area: Rect,
-        p: &Palette,
-        ty: &Typography,
-        widget_area: Area,
-    ) {
+    fn loading(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, p: &Palette, ty: &Typography) {
         let cy = area.pos.y + area.size.y / 2.0;
         ui::spinner(
             cx,
@@ -2341,9 +2330,7 @@ impl FileView {
             rect(area.pos.x + area.size.x / 2.0 - 10.0, cy - 26.0, 20.0, 20.0),
             20.0,
             p.muted,
-            clock::phase(900),
         );
-        clock::register(cx, widget_area);
         let base = ty.ui_size(14.0);
         kit.text_in(
             cx,
@@ -2380,7 +2367,7 @@ impl FileView {
                 return;
             };
             if loading {
-                return self.loading(cx, kit, area, &p, &ty, widget_area);
+                return self.loading(cx, kit, area, &p, &ty);
             }
             if let Some(error) = error {
                 return self.center_state(
@@ -2393,16 +2380,7 @@ impl FileView {
                 );
             }
             if let Some(bytes) = value {
-                self.draw_image(
-                    cx,
-                    kit,
-                    area,
-                    bytes,
-                    mime.as_deref().unwrap_or(""),
-                    &p,
-                    &ty,
-                    widget_area,
-                );
+                self.draw_image(cx, kit, area, bytes, mime.as_deref().unwrap_or(""), &p, &ty);
             }
             return;
         }
@@ -2437,7 +2415,7 @@ impl FileView {
         if let Some((status, error)) = model {
             match status {
                 FileEditorStatus::Loading => {
-                    return self.loading(cx, kit, area, &p, &ty, widget_area);
+                    return self.loading(cx, kit, area, &p, &ty);
                 }
                 FileEditorStatus::Failed => {
                     let message = error.unwrap_or_else(|| t("panels.file.failedToLoad"));
@@ -2459,7 +2437,7 @@ impl FileView {
             }
         } else if let Some((loading, error)) = reader {
             if loading {
-                return self.loading(cx, kit, area, &p, &ty, widget_area);
+                return self.loading(cx, kit, area, &p, &ty);
             }
             if let Some(error) = error {
                 return self.center_state(
@@ -2563,7 +2541,6 @@ impl FileView {
         mime: &str,
         p: &Palette,
         ty: &Typography,
-        widget_area: Area,
     ) {
         let key = format!("{}\u{0}file\u{0}{:p}", self.owner, Arc::as_ptr(&bytes));
         if self.zoom.key != key {
@@ -2601,7 +2578,7 @@ impl FileView {
             Some(ImageSlot::Failed(error)) => {
                 self.center_state(cx, kit, area, &[(error, p.danger)], &[], Look { p, ty })
             }
-            _ => self.loading(cx, kit, area, p, ty, widget_area),
+            _ => self.loading(cx, kit, area, p, ty),
         }
     }
 
@@ -3154,18 +3131,7 @@ pub fn draw_transfer_cards<H: Clone + PartialEq>(
             2.0,
         );
     } else {
-        let phase = clock::phase(1200);
-        kit.fill(
-            cx,
-            rect(
-                bar.pos.x + bar.size.x * phase * 0.7,
-                bar.pos.y,
-                bar.size.x * 0.3,
-                4.0,
-            ),
-            p.accent,
-            2.0,
-        );
+        kit.loading_bar(cx, bar, p.accent);
     }
     y += 4.0 + 12.0;
     let button_label = l("Cancel");

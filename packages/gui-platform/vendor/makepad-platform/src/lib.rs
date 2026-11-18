@@ -137,7 +137,7 @@ pub use {
     },
     crate::{
         os::*,
-        cx_api::{CxOsApi,OpenUrlInPlace, CxOsOp},
+        cx_api::{CxOsApi,OpenUrlInPlace, CxOsOp, TimerOwner},
         media_api::CxMediaApi,
         scope::*,
         draw_list::{

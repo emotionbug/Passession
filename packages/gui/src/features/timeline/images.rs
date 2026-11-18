@@ -447,6 +447,7 @@ fn evict(images: &mut Images, keep: &str) {
         forget(images, &victim);
         if let Some(owners) = images.waiting.remove(&victim) {
             images.retry.extend(owners);
+            SignalToUI::set_ui_signal();
         }
     }
 }

@@ -29,15 +29,6 @@ impl View {
         }
     }
 
-    fn animate(&mut self, cx: &mut Cx) {
-        match self {
-            View::Changes(view) => view.animate(cx),
-            View::Pr(view) => view.animate(cx),
-            View::Log(view) => view.animate(cx),
-            View::Commit(_) => {}
-        }
-    }
-
     fn invalidate_media(&mut self, cx: &mut Cx) {
         match self {
             View::Changes(view) => view.invalidate_media(cx),
@@ -79,8 +70,6 @@ pub struct GitPanel {
     visible: bool,
     #[rust]
     view: Option<View>,
-    #[rust]
-    next_frame: NextFrame,
     /// The visibility last applied to the view (hidden views release subscriptions).
     #[rust]
     applied_visible: Option<bool>,
@@ -148,14 +137,7 @@ impl Widget for GitPanel {
         let Some(ui) = scope.data.get_mut::<UiContext>() else {
             return;
         };
-        with_store(|store| store.begin_event(cx, event, ui));
         self.ensure_view(cx, ui);
-        if self.visible && self.next_frame.is_event(event).is_some() {
-            self.paint.animate(cx);
-            if let Some(view) = &mut self.view {
-                view.animate(cx);
-            }
-        }
         // Decoded file icons and avatar images bump their caches' revisions
         // (on Signal, possibly after this widget saw it), so compare on every event.
         let revision = (
@@ -285,16 +267,13 @@ impl Widget for GitPanel {
             bg: overlay_bg,
             input,
         };
-        paint.begin_frame();
         paint.begin_clip(cx, rect);
-        let spinning = with_store(|store| match view {
+        with_store(|store| match view {
             View::Changes(changes) => {
                 changes.draw(cx, ui, store, paint, &mut parts, rect, compact);
-                changes.spinning
             }
             View::Pr(pr) => {
                 pr.draw(cx, ui, store, paint, rect, chat_kit);
-                pr.spinning
             }
             View::Log(log) => {
                 let mut inputs = LogInputs {
@@ -302,19 +281,12 @@ impl Widget for GitPanel {
                     branch: branch_input,
                 };
                 log.draw(cx, ui, paint, &mut inputs, rect, compact);
-                log.spinning
             }
             View::Commit(commit) => {
                 commit.draw(cx, ui, paint, commit_input, rect, compact);
-                commit.spinning
             }
         });
         paint.end_clip(cx);
-        paint.end_frame(cx);
-        // Spinners animate only while something is pending and the tab is drawn.
-        if spinning && self.visible {
-            self.next_frame = cx.new_next_frame();
-        }
         DrawStep::done()
     }
 }

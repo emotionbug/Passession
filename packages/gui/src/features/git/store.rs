@@ -4,10 +4,8 @@
 //! (`CheckoutInvalidations`), review drafts (`ReviewDraft` registry) and the
 //! unsupported-timeline registry.
 //!
-//! Every git root calls [`GitStore::begin_event`] first in `handle_event`; the
-//! store applies a core batch once (keyed by `cx.event_id()`), so retained and
-//! visible roots never double-apply a push. When the store changes it posts
-//! [`GitStoreChanged`], so every root re-syncs in the follow-up dispatch.
+//! The app applies core batches, review answers and owned timers before
+//! dispatching the event. [`GitStoreChanged`] wakes roots after local changes.
 
 use super::host;
 use super::json::{flag, object, text};
@@ -202,7 +200,6 @@ enum StoreTimer {
 #[derive(Default)]
 pub struct GitStore {
     core: Option<CoreHandle>,
-    processed_event: u64,
     notified_event: u64,
     pub revision: u64,
     connected: HashMap<String, bool>,
@@ -212,9 +209,10 @@ pub struct GitStore {
     drafts: HashMap<String, ReviewDraft>,
     unsupported_timelines: HashSet<String>,
     pending: HashMap<RequestId, Pending>,
-    timers: Vec<(Timer, StoreTimer)>,
+    timers: HashMap<u64, StoreTimer>,
     failures: HashMap<CheckoutKey, ActionFailure>,
     review: Option<Review>,
+    review_window: String,
 }
 
 impl GitStore {
@@ -233,17 +231,14 @@ impl GitStore {
         }
     }
 
-    /// Applies the current core batch once per Makepad event, then timers.
-    pub fn begin_event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext) {
+    /// Applies one core batch, any queued review answers and a store-owned tick.
+    pub fn handle_event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext) {
         if self.core.is_none() {
             self.core = Some(ui.core.clone());
         }
-        if let Some(index) = self
-            .timers
-            .iter()
-            .position(|(timer, _)| timer.is_event(event).is_some())
+        if let Event::Timer(timer) = event
+            && let Some(job) = self.timers.remove(&timer.timer_id)
         {
-            let (_, job) = self.timers.remove(index);
             match job {
                 StoreTimer::ActionIdle { key, action_id } => {
                     if self.action_status.remove(&(key, action_id)).is_some() {
@@ -257,10 +252,9 @@ impl GitStore {
                 self.on_review_answer(cx, ui, id, &args);
             }
         }
-        if ui.events.is_empty() || self.processed_event == cx.event_id() {
+        if ui.events.is_empty() {
             return;
         }
-        self.processed_event = cx.event_id();
         let events = std::mem::take(&mut ui.events);
         for core_event in &events {
             match core_event {
@@ -688,8 +682,14 @@ impl GitStore {
         if self.action_status(host_id, cwd, action_id) == ActionStatus::Pending {
             return;
         }
-        self.timers.retain(|(_, job)| match job {
-            StoreTimer::ActionIdle { key, action_id: id } => !(key == &checkout && id == action_id),
+        self.timers.retain(|timer, job| match job {
+            StoreTimer::ActionIdle { key, action_id: id }
+                if key == &checkout && id == action_id =>
+            {
+                cx.stop_timer(Timer(*timer));
+                false
+            }
+            _ => true,
         });
         let run = ActionRun {
             host: host_id.to_owned(),
@@ -734,14 +734,15 @@ impl GitStore {
                 self.failures.remove(&checkout);
                 self.invalidate(cx, &run.host, &run.cwd);
                 self.set_action_status(cx, &checkout, &run.action_id, ActionStatus::Success);
-                let timer = cx.start_timeout(1.0);
-                self.timers.push((
-                    timer,
+                let timer =
+                    cx.with_timer_owner(crate::common::GIT_TIMERS, |cx| cx.start_timeout(1.0));
+                self.timers.insert(
+                    timer.0,
                     StoreTimer::ActionIdle {
                         key: checkout.clone(),
                         action_id: run.action_id.clone(),
                     },
-                ));
+                );
                 if let Some(label) = run.success_label {
                     ui.toast(label, false);
                 }
@@ -851,6 +852,7 @@ impl GitStore {
             true,
         );
         self.review = Some(Review::PrText { plan, base, prompt });
+        self.review_window.clone_from(&ui.window_id);
         self.changed(cx);
     }
 
@@ -876,6 +878,7 @@ impl GitStore {
         let Some(answer) = answer else { return };
         match review {
             Review::PrText { plan, base, .. } => {
+                std::mem::swap(&mut ui.window_id, &mut self.review_window);
                 let (title, body) = split_title_body(&answer);
                 let prompt = Self::open_review_prompt(
                     ui,
@@ -886,6 +889,7 @@ impl GitStore {
                     &t("workspace.git.actions.review.createPr"),
                     false,
                 );
+                std::mem::swap(&mut ui.window_id, &mut self.review_window);
                 self.review = Some(Review::PrBase {
                     plan,
                     title,

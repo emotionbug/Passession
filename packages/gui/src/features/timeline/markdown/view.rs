@@ -2008,8 +2008,6 @@ fn code_source(
         );
         (laid, found, Substr::from(text))
     };
-    let copied = d.state.copied_now(&key, d.now);
-    d.animating |= copied;
     if mobile {
         // CodeBlockContainerView: bordered header (language, copy), divider,
         // horizontally scrolling non-wrapping pane at the paragraph line height.
@@ -2042,13 +2040,7 @@ fn code_source(
             Some((w - 2.0 * inset - header).max(1.0)),
         );
         let copy = rect_xywh(x + w - inset + 1.0 - header, y, header, divider);
-        d.kit.icon(
-            cx,
-            if copied { "check" } else { "copy" },
-            copy,
-            (code_size * 1.08).ceil(),
-            secondary,
-        );
+        d.copy_icon(cx, &key, copy, (code_size * 1.08).ceil(), secondary);
         d.canvas.add_hit(
             copy,
             HitTarget::Copy {
@@ -2118,9 +2110,9 @@ fn code_source(
     let copy = rect_xywh(x + w - 30.0, y + 8.0, 22.0, 22.0);
     if visible {
         let hovered = d.state.hover_hit.as_deref() == Some(key.as_str());
-        d.kit.icon(
+        d.copy_icon(
             cx,
-            if copied { "check" } else { "copy" },
+            &key,
             copy,
             14.0,
             if hovered { p.foreground } else { p.muted },

@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::{StatusBucket, agent_live_status_bucket, paint_status_badge};
-use crate::common::{PanelTarget, Route, UiContext, clock, icons, json as j, layer, tr, tr_args};
+use crate::common::{PanelTarget, Route, UiContext, icons, json as j, layer, tr, tr_args};
 use crate::shell::hosts::{self, Host};
 use crate::shell::layout::{Axis, CompactDestination, Node};
 use crate::shell::ui::{Ui, Variant};
@@ -190,7 +190,11 @@ fn in_workspace(tab: Option<&PanelTarget>, workspace: &PanelTarget) -> bool {
 
 /// Supporting views belong to the selected session's host and directory at every width.
 pub fn explorer_keys(shell: &PaseoShell) -> (Vec<String>, Option<String>) {
-    let layout = &shell.data.layout;
+    explorer_keys_for(&shell.data)
+}
+
+pub(super) fn explorer_keys_for(data: &super::Data) -> (Vec<String>, Option<String>) {
+    let layout = &data.layout;
     let mut keys = layout.explorer_tabs.clone();
     let mut selected = layout.selected_explorer.clone();
     if let Some(workspace) = layout.selected() {
@@ -206,8 +210,7 @@ pub fn explorer_keys(shell: &PaseoShell) -> (Vec<String>, Option<String>) {
 }
 
 /// Tabs whose roots are on screen this frame (`_RetainedPanel.active`).
-pub fn visible_tabs(shell: &PaseoShell) -> HashSet<String> {
-    let data = &shell.data;
+pub(super) fn visible_tabs(data: &super::Data, explorer: Option<&str>) -> HashSet<String> {
     let layout = &data.layout;
     let mut out = HashSet::new();
     if data.page.is_some()
@@ -224,9 +227,9 @@ pub fn visible_tabs(shell: &PaseoShell) -> HashSet<String> {
         }
         if (layout.compact_destination == CompactDestination::Explorer
             || data.chrome.explorer_position > 0.0)
-            && let (_, Some(key)) = explorer_keys(shell)
+            && let Some(key) = explorer
         {
-            out.insert(key);
+            out.insert(key.to_owned());
         }
         return out;
     }
@@ -242,9 +245,9 @@ pub fn visible_tabs(shell: &PaseoShell) -> HashSet<String> {
             }
         }
         if layout.explorer_visible
-            && let (_, Some(key)) = explorer_keys(shell)
+            && let Some(key) = explorer
         {
-            out.insert(key);
+            out.insert(key.to_owned());
         }
     }
     out
@@ -252,11 +255,22 @@ pub fn visible_tabs(shell: &PaseoShell) -> HashSet<String> {
 
 /// The focused root: compact explorer → explorer tab; else the focused pane's tab.
 pub fn focused_tab(shell: &PaseoShell) -> Option<String> {
-    let layout = &shell.data.layout;
-    if shell.data.compact {
+    let explorer = if shell.data.compact
+        && shell.data.layout.compact_destination == CompactDestination::Explorer
+    {
+        explorer_keys(shell).1
+    } else {
+        None
+    };
+    focused_tab_for(&shell.data, explorer.as_deref())
+}
+
+pub(super) fn focused_tab_for(data: &super::Data, explorer: Option<&str>) -> Option<String> {
+    let layout = &data.layout;
+    if data.compact {
         return match layout.compact_destination {
             CompactDestination::Sidebar => None,
-            CompactDestination::Explorer => explorer_keys(shell).1,
+            CompactDestination::Explorer => explorer.map(str::to_owned),
             CompactDestination::Agent => layout.focused().selected.clone(),
         };
     }
@@ -1144,6 +1158,8 @@ fn place_root(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, key: &st
         match panels::mount(cx, &shell.templates, &target) {
             Some(panel) => {
                 shell.data.panels.insert(key.to_string(), panel);
+                shell.data.dispatch_layout = None;
+                SignalToUI::set_ui_signal();
             }
             None => {
                 draw_error(
@@ -1181,6 +1197,8 @@ fn paint_root(
     let Some(panel) = shell.data.panels.get_mut(key) else {
         return;
     };
+    let previous = cx.set_timer_target(panel.widget.widget_uid().0);
+    shell.data.visibility_sync_pending |= !panel.visible;
     panels::set_activity(cx, panel, true, focused);
     // A notification route asked to show what this session waits on.
     if shell.data.reveal_attention.as_deref() == Some(key) {
@@ -1225,14 +1243,20 @@ fn paint_root(
         ui.target = None;
         ui.tab_key = None;
     }
+    cx.set_timer_owner(previous);
 }
 
 /// Roots that were visible last frame but are hidden now get `set_visible(false)`.
-pub fn sync_hidden(shell: &mut PaseoShell, cx: &mut Cx) {
-    let visible = visible_tabs(shell);
+pub(super) fn sync_hidden(shell: &mut PaseoShell, cx: &mut Cx) {
+    let layout = shell.dispatch_layout();
+    if !std::mem::take(&mut shell.data.visibility_sync_pending) {
+        return;
+    }
     for (key, panel) in shell.data.panels.iter_mut() {
-        if !visible.contains(key) {
+        if panel.visible && !layout.visible.contains(key) {
+            let previous = cx.set_timer_target(panel.widget.widget_uid().0);
             panels::set_activity(cx, panel, false, false);
+            cx.set_timer_owner(previous);
         }
     }
 }
@@ -1710,17 +1734,14 @@ pub fn tab_icon(
                 .is_some()
                 .then(|| agent_live_status_bucket(agent));
             let p = ui.p;
-            if paint_status_badge(
+            paint_status_badge(
                 ui.painter,
                 cx,
                 r,
                 bucket.filter(|b| *b != StatusBucket::Done),
                 &p,
                 p.surface0,
-            ) {
-                let area = ui.painter.draw_box.area();
-                clock::register(cx, area);
-            }
+            );
             return;
         }
     }
@@ -1769,7 +1790,9 @@ fn paint_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect)
     ) {
         open_batches(shell, cx, r);
         cx.begin_turtle(Walk::abs_rect(r), Layout::default());
+        let previous = cx.set_timer_target(widget.widget_uid().0);
         widget.draw_walk_all(cx, scope, Walk::fill());
+        cx.set_timer_owner(previous);
         cx.end_turtle();
         shell
             .layers
@@ -1905,7 +1928,6 @@ pub(crate) fn sidebar_visible(shell: &PaseoShell) -> bool {
 
 /// Pointer handling for chrome ids recorded in `shell.data.hits`.
 pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-    sync_hidden(shell, cx);
     let sidebar_visible = sidebar_visible(shell);
     if !sidebar_visible {
         shell.data.sidebar.stop_motion();

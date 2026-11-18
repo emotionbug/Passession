@@ -89,14 +89,14 @@ pub fn icon_button(
 }
 
 /// A spinner in an icon slot (`TreeLoadingIcon`, toolbar refresh while refreshing).
-pub fn spinner(cx: &mut Cx2d, kit: &mut Kit, frame: Rect, size: f64, color: Vec4, phase: f64) {
+pub fn spinner(cx: &mut Cx2d, kit: &mut Kit, frame: Rect, size: f64, color: Vec4) {
     let r = rect(
         frame.pos.x + (frame.size.x - size) / 2.0,
         frame.pos.y + (frame.size.y - size) / 2.0,
         size,
         size,
     );
-    kit.spinner(cx, r, color, phase);
+    kit.spinner(cx, r, color);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

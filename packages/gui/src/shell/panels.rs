@@ -270,6 +270,13 @@ pub fn set_activity(cx: &mut Cx, panel: &mut Panel, visible: bool, focused: bool
             RootKind::Git => panel.widget.as_git_panel().set_visible(cx, visible),
             RootKind::Creation | RootKind::Workspace => {}
         }
+        if matches!(
+            panel.kind,
+            RootKind::Logs | RootKind::Terminal | RootKind::Git
+        ) {
+            // Applying observation/attachment changes requires UiContext.
+            SignalToUI::set_ui_signal();
+        }
     }
     if panel.focused != focused {
         panel.focused = focused;

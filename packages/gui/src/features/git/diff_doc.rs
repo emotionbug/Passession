@@ -282,8 +282,6 @@ pub struct DiffDoc {
     anchored_scroll_y: f64,
     /// Files whose placeholders were drawn near the viewport this frame.
     pub wanted: Vec<String>,
-    /// A loading placeholder was painted (the panel requests the next frame).
-    pub spinning: bool,
     /// Selectable texts drawn this frame.
     pieces: Vec<Piece>,
     /// Paths in document order at the last draw (piece file indices).
@@ -373,7 +371,6 @@ impl Default for DiffDoc {
             anchor: None,
             anchored_scroll_y: 0.0,
             wanted: Vec::new(),
-            spinning: false,
             pieces: Vec::new(),
             order: Vec::new(),
             split: false,
@@ -418,8 +415,8 @@ impl DocPresentation {
         false
     }
 
-    fn end(&mut self, cx: &mut Cx2d, paint: &GitPaint, hits: &Hits<DocHit>, pieces: &[Piece]) {
-        self.layer.end(cx, hits, paint);
+    fn end(&mut self, cx: &mut Cx2d, hits: &Hits<DocHit>, pieces: &[Piece]) {
+        self.layer.end(cx, hits);
         self.pieces.clear();
         self.pieces.extend_from_slice(&pieces[self.piece_mark..]);
     }
@@ -439,12 +436,6 @@ impl DiffDoc {
             self.drag_pointer
                 .map(|point| (point.x.to_bits(), point.y.to_bits())),
         ))
-    }
-
-    pub fn animating_selection(&self) -> bool {
-        self.drag_pointer.is_some_and(|point| {
-            point.y < self.viewport.pos.y || point.y > self.viewport.pos.y + self.viewport.size.y
-        })
     }
 
     fn row_selection(&self, file: usize, row: usize) -> Option<(TextPos, TextPos)> {
@@ -1100,7 +1091,7 @@ impl DiffDoc {
         }
         if self.background.begin(cx, area, 0, &mut self.hits, paint) {
             paint.fill(cx, area, colors.surface0);
-            self.background.end(cx, &self.hits, paint);
+            self.background.end(cx, &self.hits);
         }
         let mut files: Vec<&Value> = input.files.iter().collect();
         files.sort_by(|a, b| compare_diff_paths(text(a, "path"), text(b, "path")));
@@ -1110,7 +1101,6 @@ impl DiffDoc {
                 && input.patches.contains_key(path)
                 && model.revision == input.patch_revision
         });
-        self.spinning = false;
         // Selection context of this frame: pieces register as they are drawn.
         self.pieces.clear();
         let order: Vec<String> = files.iter().map(|f| text(f, "path").to_owned()).collect();
@@ -1287,7 +1277,7 @@ impl DiffDoc {
             if presentation.begin(cx, paint, header, key, &mut self.hits, &mut self.pieces) {
                 self.draw_header(cx, paint, file_index, file, path, header, area);
                 self.draw_selection(cx, paint, true, presentation.piece_mark);
-                presentation.end(cx, paint, &self.hits, &self.pieces);
+                presentation.end(cx, &self.hits, &self.pieces);
             }
             self.presentations.insert(id, presentation);
         }
@@ -1305,7 +1295,7 @@ impl DiffDoc {
             .begin(cx, area, bars_key, &mut self.hits, paint)
         {
             self.draw_scrollbars(cx, paint, area, input.wrap);
-            self.scrollbar_layer.end(cx, &self.hits, paint);
+            self.scrollbar_layer.end(cx, &self.hits);
         }
         self.presentations
             .retain(|_, presentation| presentation.visited);
@@ -1323,7 +1313,9 @@ impl DiffDoc {
                     self.selection = Some((anchor, pos));
                 }
             }
-            self.spinning = true;
+            let mut redraw = Area::Empty;
+            cx.add_rect_area(&mut redraw, area);
+            crate::common::clock::register_every(cx, redraw, crate::common::clock::MOTION_PERIOD);
         }
     }
 
@@ -1551,7 +1543,6 @@ impl DiffDoc {
                 dvec2(band.pos.x + 6.0, band.pos.y + lh / 2.0),
                 12.0,
                 colors.muted,
-                cx.seconds_since_app_start(),
             );
             paint.end_clip(cx);
             paint.text_centered(
@@ -1565,7 +1556,6 @@ impl DiffDoc {
                 "Loading patch",
                 band.size.x - 20.0,
             );
-            self.spinning = true;
             self.wanted.push(path.to_owned());
             return;
         };
@@ -1800,7 +1790,7 @@ impl DiffDoc {
                 }
             }
             self.draw_selection(cx, paint, false, presentation.piece_mark);
-            presentation.end(cx, paint, &self.hits, &self.pieces);
+            presentation.end(cx, &self.hits, &self.pieces);
             self.presentations.insert(id, presentation);
         }
         self.models.insert(path.to_owned(), model);

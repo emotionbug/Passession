@@ -8,6 +8,7 @@ use {
             LiveId,
         },
         draw_list::DrawListId,
+        pass::CxPassParent,
         cx::Cx
     }
 };
@@ -151,6 +152,37 @@ impl Area {
             },
             _ => false,
         }
+    }
+
+    /// Whether retained paint for this area is still connected to a live pass.
+    /// A child's own redraw id can remain valid after an ancestor hides it.
+    pub fn is_attached(&self, cx: &Cx) -> bool {
+        if !self.is_valid(cx) {
+            return false;
+        }
+        let Some(mut id) = self.draw_list_id() else {
+            return false;
+        };
+        while let Some(list) = cx.draw_lists.checked_index(id) {
+            let Some(parent_id) = list.codeflow_parent_id else {
+                return list.pass_id.is_some_and(|pass| {
+                    let pass = &cx.passes[pass];
+                    pass.main_draw_list_id == Some(id)
+                        && match pass.parent {
+                            CxPassParent::Window(window) => cx.windows.is_created(window),
+                            _ => true,
+                        }
+                });
+            };
+            let Some(parent) = cx.draw_lists.checked_index(parent_id) else {
+                return false;
+            };
+            if list.codeflow_parent_redraw_id != parent.redraw_id {
+                return false;
+            }
+            id = parent_id;
+        }
+        false
     }
 
     // returns the final screen rect

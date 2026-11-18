@@ -1007,9 +1007,17 @@ impl Widget for PButton {
                 icon_size,
             );
             if self.busy {
-                self.painter
+                let area = self
+                    .painter
                     .ring(cx, icon_rect, fg, 1.5, 0.25, clock::phase(900));
-                clock::register(cx, self.area);
+                clock::spin(
+                    cx,
+                    area,
+                    live_id!(rotation),
+                    clock::RING_CADENCE,
+                    900.0,
+                    0.0,
+                );
             } else {
                 let icon = self.icon.as_ref().to_string();
                 self.painter.icon(cx, icon_rect, &icon, icon_size, fg);
@@ -1892,7 +1900,7 @@ pub const STATUS_RING_STROKE: f64 = 1.5;
 pub const STATUS_RING_SIZE: f64 =
     STATUS_FILLED_DOT_SIZE + (STATUS_RING_GAP + STATUS_RING_STROKE) * 2.0;
 pub const STATUS_RING_FRAME_SIZE: f64 = STATUS_RING_SIZE + 2.0;
-const RING_PERIOD_MS: u128 = 900;
+const RING_PERIOD_MS: f64 = 900.0;
 
 /// `StatusRing`: a 6px dot inside a 1.5px ring whose quarter turns every 900ms.
 pub fn paint_status_ring(
@@ -1916,19 +1924,26 @@ pub fn paint_status_ring(
         0.0,
     );
     // Flutter arcs start at -π/2 (12 o'clock); the shader's angle 0 is 3 o'clock.
-    painter.ring(
+    let area = painter.ring(
         cx,
         r,
         theme::with_alpha(p.running, 0.9),
         STATUS_RING_STROKE,
         0.25,
-        clock::phase(RING_PERIOD_MS) - 0.25,
+        clock::rotation(RING_PERIOD_MS, -0.25),
+    );
+    clock::spin(
+        cx,
+        area,
+        live_id!(rotation),
+        clock::RING_CADENCE,
+        RING_PERIOD_MS,
+        -0.25,
     );
     painter.dot(cx, center, STATUS_FILLED_DOT_SIZE, p.running);
 }
 
 /// `StatusIcon` overlay drawn at the bottom-right corner of an icon of `icon_rect`.
-/// Returns true when it animates (the caller registers its area with the clock).
 pub fn paint_status_badge(
     painter: &mut Painter,
     cx: &mut Cx2d,
@@ -1936,16 +1951,15 @@ pub fn paint_status_badge(
     bucket: Option<StatusBucket>,
     p: &Palette,
     backdrop: Vec4,
-) -> bool {
+) {
     if bucket == Some(StatusBucket::Running) {
         let center = icon_rect.pos
             + icon_rect.size
             + dvec2(2.0 - STATUS_DOT_SIZE * 0.5, 2.0 - STATUS_DOT_SIZE * 0.5);
         paint_status_ring(painter, cx, center, p, Some(backdrop));
-        return true;
+        return;
     }
     paint_static_status_badge(painter, cx, icon_rect, bucket, p, backdrop);
-    false
 }
 
 /// Static variant for retained panels that should not schedule another frame.
@@ -2020,7 +2034,6 @@ impl Widget for StatusMark {
         match self.bucket {
             Some(StatusBucket::Running) => {
                 paint_status_ring(&mut self.painter, cx, center, &p, None);
-                clock::register(cx, self.area);
             }
             Some(bucket) => {
                 if let Some(color) = status_dot_color(&p, bucket, self.show_done_as_inactive) {
@@ -2072,9 +2085,17 @@ impl Widget for Spinner {
             TextRole::Body => p.muted,
             role => role.color(&p),
         };
-        self.painter
+        let area = self
+            .painter
             .ring(cx, r, color, self.stroke, 0.3, clock::phase(900));
-        clock::register(cx, self.area);
+        clock::spin(
+            cx,
+            area,
+            live_id!(rotation),
+            clock::RING_CADENCE,
+            900.0,
+            0.0,
+        );
         DrawStep::done()
     }
 }

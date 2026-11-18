@@ -18,6 +18,7 @@ pub mod ui;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use makepad_widgets::event::TouchState;
 use makepad_widgets::*;
@@ -29,8 +30,10 @@ use crate::common::overlay::{self as overlay_api, OVERLAY_ACTION, OverlayRequest
 use crate::common::paint::{HitMap, Painter};
 use crate::common::state_delta::StateDelta;
 use crate::common::{
-    MAIN_WINDOW_ID, PanelActivity, Route, UiCommand, UiContext, json as j, set_compact_layout, tr,
+    LayoutSnapshot, MAIN_WINDOW_ID, PanelActivity, Route, UiCommand, UiContext, json as j,
+    set_compact_layout, tr, with_widget_timer,
 };
+use crate::features::files::FilesPanelWidgetRefExt;
 use crate::theme;
 
 use layout::{CompactDestination, Layout};
@@ -265,6 +268,33 @@ pub enum Pending {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DispatchRevision {
+    layout: u64,
+    compact: bool,
+    page: bool,
+    explorer_moving: bool,
+}
+
+struct DispatchLayout {
+    revision: DispatchRevision,
+    snapshot: Rc<LayoutSnapshot>,
+    visible: HashSet<String>,
+    focused: Option<String>,
+    explorer: Option<String>,
+    mounted: Vec<String>,
+    hidden_files: Vec<String>,
+    timer_roots: HashMap<u64, usize>,
+}
+
+impl DispatchLayout {
+    fn timer_root(&self, target: u64) -> Option<&String> {
+        self.timer_roots
+            .get(&target)
+            .map(|&index| &self.mounted[index])
+    }
+}
+
 #[derive(Default)]
 pub struct Data {
     pub window_id: String,
@@ -277,6 +307,9 @@ pub struct Data {
     pub page_serial: u64,
     /// Mounted roots by tab key (Flutter `_activated` + retained panels).
     pub panels: HashMap<String, panels::Panel>,
+    dispatch_layout: Option<Rc<DispatchLayout>>,
+    layout_snapshot: Option<(u64, Rc<LayoutSnapshot>)>,
+    visibility_sync_pending: bool,
     pub page_root: Option<(Page, WidgetRef)>,
     pub command_center: Option<WidgetRef>,
     pub command_center_open: bool,
@@ -516,6 +549,8 @@ impl PaseoShell {
         let saved = ui.state.layouts.get(id).cloned().unwrap_or(Value::Null);
         if saved.is_object() {
             self.data.layout = Layout::restore(&saved);
+            self.data.dispatch_layout = None;
+            self.data.layout_snapshot = None;
         }
         self.data.layout.dirty = false;
         for key in ui.terminal_terminations.tab_keys(&self.data.layout) {
@@ -715,7 +750,12 @@ impl PaseoShell {
         SignalToUI::set_ui_signal();
     }
 
-    /// Dispatches `event` to every mounted root with its own route/target/activity.
+    fn dispatch_layout(&mut self) -> Rc<DispatchLayout> {
+        self.data.dispatch_layout()
+    }
+
+    /// Dispatches one timer owner, visible roots, or retained consumers of
+    /// lifecycle/async events. A tab hidden on this frame still owns its work.
     fn dispatch_panels(
         &mut self,
         cx: &mut Cx,
@@ -723,28 +763,66 @@ impl PaseoShell {
         scope: &mut Scope,
         window_modal: bool,
     ) {
+        let Some(ui) = Self::ui(scope) else { return };
+        let timer_target = ui.timer_target;
+        if timer_target == Some(0) {
+            return;
+        }
+        let batch = !ui.events.is_empty();
+        let deliver_hidden = batch
+            || matches!(
+                event,
+                Event::Signal
+                    | Event::Actions(_)
+                    | Event::Startup
+                    | Event::Shutdown
+                    | Event::Foreground
+                    | Event::Background
+                    | Event::Resume
+                    | Event::Pause
+                    | Event::AppGotFocus
+                    | Event::AppLostFocus
+                    | Event::KeyFocus(_)
+                    | Event::KeyFocusLost(_)
+                    | Event::DragEnd
+                    | Event::LiveEdit
+            );
+        if timer_target.is_none()
+            && !deliver_hidden
+            && !crate::common::is_user_input(event)
+            && !matches!(
+                event,
+                Event::NextFrame(_) | Event::Trigger(_) | Event::VirtualKeyboard(_)
+            )
+        {
+            return;
+        }
         let requires_visibility = crate::common::is_user_input(event);
         // The compact sidebar replaces the pane. Its controls must not reach
         // retained conversation/new-session editors underneath.
         if requires_visibility && self.data.compact && chrome::sidebar_visible(self) {
             return;
         }
-        let commands = if matches!(event, Event::Signal) {
+        let mut commands = if matches!(event, Event::Signal) {
             std::mem::take(&mut self.data.commands)
         } else {
             Vec::new()
         };
         let mut unhandled: Vec<UiCommand> = Vec::new();
-        let mut keys: Vec<String> = self.data.panels.keys().cloned().collect();
+        let layout = self.dispatch_layout();
         let command_center_input = requires_visibility && self.data.command_center_open;
         let explorer_input = requires_visibility
             && !command_center_input
             && self.data.compact
             && self.data.chrome.explorer_position > 0.0;
-        if explorer_input {
-            let selected = chrome::explorer_keys(self).1;
-            keys.retain(|key| selected.as_ref() == Some(key));
-        }
+        let modal_tab = window_modal
+            .then(|| {
+                layout
+                    .visible
+                    .iter()
+                    .find(|key| overlay_api::window_modal_accepts_tab(&self.data.window_id, key))
+            })
+            .flatten();
         let page_accepts_input = !command_center_input
             && !explorer_input
             && (!window_modal
@@ -752,24 +830,34 @@ impl PaseoShell {
                     &self.data.window_id,
                     overlay_api::PAGE_OWNER,
                 ));
-        if window_modal {
-            // Snapshot before dispatch: closing a sheet must not pass its
-            // dismissal input through to another pane in the same event.
-            keys.retain(|key| overlay_api::window_modal_accepts_tab(&self.data.window_id, key));
-        }
-        let visible = chrome::visible_tabs(self);
-        let focused = chrome::focused_tab(self);
+        let all = (timer_target.is_none() && deliver_hidden).then_some(&layout.mounted);
+        let visible = (timer_target.is_none() && !deliver_hidden).then_some(&layout.visible);
+        // File observation suspension is scheduled by set_visible(false) even
+        // though the root just stopped painting. Only its own wake is relevant.
+        let hidden_files = matches!(event, Event::NextFrame(_)).then_some(&layout.hidden_files);
+        let keys = timer_target
+            .and_then(|target| layout.timer_root(target))
+            .into_iter()
+            .chain(all.into_iter().flatten())
+            .chain(visible.into_iter().flatten())
+            .chain(hidden_files.into_iter().flatten());
         let app_active = !self.data.app_inactive;
         let compact = self.data.compact;
-        let window_id = self.data.window_id.clone();
-        let snapshot = std::rc::Rc::new(self.data.layout.snapshot());
-        let mut routed: HashSet<String> = HashSet::new();
+        let window_id = &self.data.window_id;
         for key in keys {
-            let Some(panel) = self.data.panels.get(&key) else {
+            let Some(panel) = self.data.panels.get(key) else {
                 continue;
             };
-            let is_visible = visible.contains(&key);
-            if command_center_input || (requires_visibility && !is_visible) {
+            let is_visible = layout.visible.contains(key);
+            if command_center_input
+                || (explorer_input && layout.explorer.as_ref() != Some(key))
+                || (window_modal && modal_tab != Some(key))
+                || (requires_visibility && !is_visible)
+                || (!deliver_hidden
+                    && !is_visible
+                    && timer_target.is_none()
+                    && !panel.widget.as_files_panel().has_visibility_wake(event))
+            {
                 continue;
             }
             let widget = panel.widget.clone();
@@ -781,22 +869,16 @@ impl PaseoShell {
                 ui.tab_key = Some(key.clone());
                 ui.activity = PanelActivity {
                     visible: is_visible,
-                    focused: is_visible && focused.as_deref() == Some(key.as_str()),
+                    focused: is_visible && layout.focused.as_ref() == Some(key),
                     app_active,
                 };
                 ui.compact = compact;
-                ui.window_id = window_id.clone();
-                ui.layout = snapshot.clone();
-                ui.commands = commands
-                    .iter()
-                    .filter(|c| c.tab_key == key)
-                    .cloned()
-                    .collect();
-                if !ui.commands.is_empty() {
-                    routed.insert(key.clone());
-                }
+                ui.window_id.clone_from(window_id);
+                ui.layout = Rc::clone(&layout.snapshot);
+                ui.commands
+                    .extend(commands.extract_if(.., |command| &command.tab_key == key));
             }
-            widget.handle_event(cx, event, scope);
+            with_widget_timer(cx, &widget, |cx| widget.handle_event(cx, event, scope));
             if let Some(ui) = Self::ui(scope) {
                 unhandled.extend(ui.commands.drain(..).filter(|c| !c.handled));
                 ui.target = None;
@@ -807,38 +889,40 @@ impl PaseoShell {
         // Pages and the command center (no tab key; owner "page").
         if page_accepts_input
             && !(requires_visibility && self.data.command_center_open)
-            && let Some((page, widget)) = self.data.page_root.clone()
+            && let Some((page, widget)) = &self.data.page_root
+            && timer_target.is_none_or(|target| target == widget.widget_uid().0)
         {
             if let Some(ui) = Self::ui(scope) {
-                ui.route = commands::page_route(&page);
-                ui.commands = commands
-                    .iter()
-                    .filter(|c| c.tab_key == overlay_api::PAGE_OWNER)
-                    .cloned()
-                    .collect();
+                ui.route = commands::page_route(page);
+                ui.layout = Rc::clone(&layout.snapshot);
+                ui.commands.extend(
+                    commands.extract_if(.., |command| command.tab_key == overlay_api::PAGE_OWNER),
+                );
             }
-            widget.handle_event(cx, event, scope);
+            with_widget_timer(cx, widget, |cx| widget.handle_event(cx, event, scope));
             if let Some(ui) = Self::ui(scope) {
                 ui.commands.clear();
             }
-            routed.insert(overlay_api::PAGE_OWNER.to_string());
         }
-        if (!requires_visibility || self.data.command_center_open)
+        if (self.data.command_center_open
+            || timer_target.is_some()
+            || batch
+            || matches!(
+                event,
+                Event::KeyFocus(_) | Event::KeyFocusLost(_) | Event::Actions(_)
+            ))
             && (!window_modal || command_center_input)
-            && let Some(widget) = self.data.command_center.clone()
+            && let Some(widget) = &self.data.command_center
+            && timer_target.is_none_or(|target| target == widget.widget_uid().0)
         {
             if let Some(ui) = Self::ui(scope) {
                 ui.route = Route::CommandCenter;
-                ui.layout = snapshot.clone();
+                ui.layout = Rc::clone(&layout.snapshot);
                 ui.compact = compact;
             }
-            widget.handle_event(cx, event, scope);
+            with_widget_timer(cx, widget, |cx| widget.handle_event(cx, event, scope));
         }
-        for command in commands {
-            if !routed.contains(&command.tab_key) {
-                unhandled.push(command);
-            }
-        }
+        unhandled.extend(commands);
         if let Some(ui) = Self::ui(scope) {
             for command in unhandled {
                 if command.action == OVERLAY_ACTION {
@@ -846,6 +930,72 @@ impl PaseoShell {
                 }
                 commands::execute(self, cx, ui, &command.action, &command.args);
             }
+        }
+    }
+
+    fn dispatch_header(
+        &self,
+        cx: &mut Cx,
+        event: &Event,
+        scope: &mut Scope,
+        timer_target: Option<u64>,
+    ) {
+        for widget in [
+            &self.data.search,
+            &self.data.header_git,
+            &self.data.header_open_in,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if timer_target.is_none_or(|target| target == widget.widget_uid().0) {
+                with_widget_timer(cx, widget, |cx| widget.handle_event(cx, event, scope));
+            }
+        }
+    }
+
+    fn finish_dispatch(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        scope: &mut Scope,
+        overlay_key: (usize, Option<u64>),
+    ) {
+        if let Some(ui) = Self::ui(scope) {
+            sidebar::handle_actions(self, cx, event, ui);
+            if let Some(host_id) = self.data.sidebar.expand_host.take() {
+                sidebar::expand(ui, &format!("host:{host_id}"));
+            }
+            self.apply_effects(cx, ui);
+            self.schedule_save(cx);
+            if self.is_main() {
+                let layout = self.dispatch_layout();
+                let target = layout
+                    .focused
+                    .as_deref()
+                    .and_then(|key| self.data.layout.target(key));
+                self.data
+                    .activity
+                    .update_view(ui, target, !self.data.app_inactive);
+            }
+        }
+        crate::features::timeline::store::set_window_visible(
+            cx,
+            &self.data.window_id,
+            window_state(&self.data.window_id) == Some(WindowState::Visible),
+        );
+        // Commands above can change the destination. Arm motion in the same event,
+        // and consume animation frames even when a modal temporarily owns input.
+        self.data.overlays.sync_focus(cx);
+        chrome::animate_explorer(self, cx, event);
+        chrome::sync_hidden(self, cx);
+        overlay_api::shield_content(cx, &self.data.window_id, self.data.overlays.area, false);
+        if self.data.layout.revision != self.data.presented_layout {
+            self.data.presented_layout = self.data.layout.revision;
+            self.invalidate_layout(cx);
+        }
+        if self.data.overlays.presentation_key() != overlay_key {
+            self.invalidate_region(cx, ShellRegion::Overlays);
         }
     }
 }
@@ -856,7 +1006,7 @@ impl Widget for PaseoShell {
         let shell_modal = self.data.overlays.is_modal();
         let command_center = self.data.command_center_open;
         let overlay_key = self.data.overlays.presentation_key();
-        // Every window's events reach every shell: only this window's geometry is recorded.
+        // Only the matching native window can receive a geometry event.
         if let Event::WindowGeomChange(e) = event
             && Some(e.window_id) == self.data.os_window
         {
@@ -871,9 +1021,15 @@ impl Widget for PaseoShell {
             return;
         };
         set_compact_layout(self.data.compact);
-        ui.window_id = self.data.window_id.clone();
+        ui.window_id.clone_from(&self.data.window_id);
         ui.compact = self.data.compact;
         self.restore(ui);
+        if let Some(target) = ui.timer_target.filter(|target| *target != 0) {
+            self.dispatch_panels(cx, event, scope, false);
+            self.dispatch_header(cx, event, scope, Some(target));
+            self.finish_dispatch(cx, event, scope, overlay_key);
+            return;
+        }
         if self.is_main() {
             self.data.activity.handle_event(cx, event, ui);
             if self.data.activity.take_notify_failure() {
@@ -996,54 +1152,19 @@ impl Widget for PaseoShell {
         {
             handled.set(true);
         }
-        if !(locked || window_modal || explorer_input || key_consumed || input && command_center) {
-            if let Some(search) = self.data.search.clone() {
-                search.handle_event(cx, event, scope);
-            }
-            for widget in [
-                self.data.header_git.clone(),
-                self.data.header_open_in.clone(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                widget.handle_event(cx, event, scope);
-            }
+        if !(matches!(event, Event::Timer(_))
+            || locked
+            || window_modal
+            || explorer_input
+            || key_consumed
+            || input && command_center)
+        {
+            self.dispatch_header(cx, event, scope, None);
         }
         if !modal && !popover_key {
             chrome::handle_event(self, cx, event, scope);
         }
-        if let Some(ui) = Self::ui(scope) {
-            sidebar::handle_actions(self, cx, event, ui);
-            if let Some(host_id) = self.data.sidebar.expand_host.take() {
-                sidebar::expand(ui, &format!("host:{host_id}"));
-            }
-            self.apply_effects(cx, ui);
-            self.schedule_save(cx);
-            let target = chrome::focused_target(self).cloned();
-            if self.is_main() {
-                let visible = !self.data.app_inactive;
-                self.data.activity.update_view(ui, target.as_ref(), visible);
-            }
-        }
-        crate::features::timeline::store::set_window_visible(
-            cx,
-            &self.data.window_id,
-            window_state(&self.data.window_id) == Some(WindowState::Visible),
-        );
-        // Commands above can change the destination. Arm motion in the same event,
-        // and consume animation frames even when a modal temporarily owns input.
-        self.data.overlays.sync_focus(cx);
-        chrome::animate_explorer(self, cx, event);
-        overlay_api::shield_content(cx, &self.data.window_id, self.data.overlays.area, false);
-        // Any recorded layout change (tabs, focus, splits, destinations) is shell chrome.
-        if self.data.layout.revision != self.data.presented_layout {
-            self.data.presented_layout = self.data.layout.revision;
-            self.invalidate_layout(cx);
-        }
-        if self.data.overlays.presentation_key() != overlay_key {
-            self.invalidate_region(cx, ShellRegion::Overlays);
-        }
+        self.finish_dispatch(cx, event, scope, overlay_key);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -1061,6 +1182,8 @@ impl Widget for PaseoShell {
         set_compact_layout(compact);
         if let Some(ui) = Self::ui(scope) {
             ui.compact = compact;
+            ui.window_id.clone_from(&self.data.window_id);
+            ui.layout = Rc::clone(&self.dispatch_layout().snapshot);
         }
         chrome::draw(self, cx, scope, rect);
         // The Command Center (its own overlay draw list) above the content; the shell overlay
@@ -1073,7 +1196,9 @@ impl Widget for PaseoShell {
                 ui.compact = compact;
             }
             cx.begin_turtle(Walk::abs_rect(rect), makepad_widgets::Layout::default());
+            let previous = cx.set_timer_target(widget.widget_uid().0);
             widget.draw_all(cx, scope);
+            cx.set_timer_owner(previous);
             cx.end_turtle();
         }
         overlays::draw(self, cx, scope, rect);
@@ -1142,5 +1267,78 @@ pub fn response_message(result: &Result<Value, CoreError>) -> Option<String> {
 impl Data {
     pub fn compact_destination(&self) -> CompactDestination {
         self.layout.compact_destination
+    }
+
+    fn dispatch_layout(&mut self) -> Rc<DispatchLayout> {
+        let revision = DispatchRevision {
+            layout: self.layout.revision,
+            compact: self.compact,
+            page: self.page.is_some(),
+            explorer_moving: self.chrome.explorer_position > 0.0,
+        };
+        if let Some(layout) = &self.dispatch_layout
+            && layout.revision == revision
+        {
+            return Rc::clone(layout);
+        }
+        let explorer = chrome::explorer_keys_for(self).1;
+        let visible = chrome::visible_tabs(self, explorer.as_deref());
+        let focused = chrome::focused_tab_for(self, explorer.as_deref());
+        let mut mounted = Vec::with_capacity(self.panels.len());
+        let mut timer_roots = HashMap::with_capacity(self.panels.len());
+        let mut hidden_files = Vec::new();
+        for (key, panel) in &self.panels {
+            timer_roots.insert(panel.widget.widget_uid().0, mounted.len());
+            mounted.push(key.clone());
+            if panel.kind == panels::RootKind::Files && !visible.contains(key) {
+                hidden_files.push(key.clone());
+            }
+        }
+        let snapshot = match &self.layout_snapshot {
+            Some((revision, snapshot)) if *revision == self.layout.revision => Rc::clone(snapshot),
+            _ => {
+                let snapshot = Rc::new(self.layout.snapshot());
+                self.layout_snapshot = Some((self.layout.revision, Rc::clone(&snapshot)));
+                snapshot
+            }
+        };
+        let layout = Rc::new(DispatchLayout {
+            revision,
+            snapshot,
+            visible,
+            focused,
+            explorer,
+            mounted,
+            hidden_files,
+            timer_roots,
+        });
+        self.dispatch_layout = Some(Rc::clone(&layout));
+        self.visibility_sync_pending = true;
+        layout
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_layout_reuses_snapshot_until_revision_changes() {
+        let mut window = Data::default();
+        let before = window.dispatch_layout();
+        assert!(Rc::ptr_eq(&before, &window.dispatch_layout()));
+        window.compact = true;
+        let compact = window.dispatch_layout();
+        assert!(!Rc::ptr_eq(&before, &compact));
+        assert!(Rc::ptr_eq(&before.snapshot, &compact.snapshot));
+        window.dispatch_layout = None; // mount/unmount invalidates the root map
+        assert!(Rc::ptr_eq(
+            &before.snapshot,
+            &window.dispatch_layout().snapshot
+        ));
+        window.layout.revision += 1;
+        let after = window.dispatch_layout();
+        assert!(!Rc::ptr_eq(&before.snapshot, &after.snapshot));
+        assert!(Rc::ptr_eq(&after, &window.dispatch_layout()));
     }
 }

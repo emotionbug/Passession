@@ -250,7 +250,7 @@ pub struct SettingsPanel {
     /// The region the current touch gesture started on.
     #[rust]
     touch_region: Option<Region>,
-    /// Requested only while a spinner was drawn last frame.
+    /// One follow-up layout when a sheet's measured size changes.
     #[rust]
     next_frame: NextFrame,
     #[rust]
@@ -602,8 +602,6 @@ impl Widget for SettingsPanel {
             dirty = true;
         }
         if self.next_frame.is_event(event).is_some() {
-            self.draws.retained.animate(cx);
-            self.overlay_draws.retained.animate(cx);
             dirty |= std::mem::take(&mut self.remeasure);
         }
         if self.tip_timer.is_event(event).is_some() && self.st.tip.take().is_some() {
@@ -905,7 +903,6 @@ impl Widget for SettingsPanel {
         let wide_header_h = 36.0_f64.max(ty.ui_size(14.0) * 1.4 + 16.0);
         let mut content_h = 0.0;
         let mut sidebar_h = 0.0;
-        let mut animating = false;
         // An embedded editor draws no page, only its sheets.
         if !self.sheet_only {
             {
@@ -1010,7 +1007,6 @@ impl Widget for SettingsPanel {
                         self.regions.push((Region::Content, detail));
                     }
                 }
-                animating = kit.animating;
             }
             self.st.content_h = content_h;
             self.st.sidebar_h = sidebar_h;
@@ -1181,12 +1177,10 @@ impl Widget for SettingsPanel {
                         }
                     }
                 }
-                animating |= kit.animating;
                 cx.end_pass_sized_turtle();
                 self.layer_lists[index].end(cx);
             }
             // A redraw requested mid-draw is dropped: re-lay the sheet next frame.
-            animating |= remeasure;
             self.remeasure = remeasure;
         }
         for sheet in self.st.sheets.iter_mut() {
@@ -1203,8 +1197,7 @@ impl Widget for SettingsPanel {
         self.fields.end_frame(cx);
         self.draws.retained.end_frame();
         self.overlay_draws.retained.end_frame();
-        // Spinners animate only while one is on screen; a resized sheet re-lays once.
-        if animating {
+        if self.remeasure {
             self.next_frame = cx.new_next_frame();
         }
         DrawStep::done()

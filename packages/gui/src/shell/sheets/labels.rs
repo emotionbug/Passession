@@ -277,10 +277,14 @@ impl Sheet for LabelsSheet {
             }
             if self.busy && self.labels.is_empty() {
                 // LinearProgressIndicator(minHeight: 2).
-                let t = (cx.seconds_since_app_start() % 1.5) / 1.5;
                 ui.fill(cx, rect(x, y, w, 2.0), p.surface2, 0.0);
-                ui.fill(cx, rect(x + w * t * 0.7, y, w * 0.3, 2.0), p.accent, 0.0);
-                crate::shell::sheets::SPINNING.with(|s| s.set(true));
+                ui.painter.loading_bar(
+                    cx,
+                    rect(x, y, w, 2.0),
+                    p.accent,
+                    1500.0,
+                    crate::common::clock::MOTION_PERIOD,
+                );
                 y += 2.0;
             }
         }

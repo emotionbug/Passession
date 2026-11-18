@@ -782,7 +782,7 @@ impl Widget for WaButton {
                 } else {
                     icon_rect
                 };
-                self.painter.ring(
+                let area = self.painter.ring(
                     cx,
                     ring,
                     content,
@@ -794,7 +794,14 @@ impl Widget for WaButton {
                     0.25,
                     clock::phase(900),
                 );
-                clock::register(cx, self.area);
+                clock::spin(
+                    cx,
+                    area,
+                    live_id!(rotation),
+                    clock::RING_CADENCE,
+                    900.0,
+                    0.0,
+                );
             } else if let Some(status) = self.dot {
                 self.painter.dot(
                     cx,

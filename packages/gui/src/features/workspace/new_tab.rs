@@ -423,7 +423,7 @@ impl Widget for WaAttachmentPill {
                 self.paint_texts(cx, body, title_spec, sub_spec, &title, &subtitle);
             }
             PillBody::Pending { title, subtitle } => {
-                self.painter.ring(
+                let area = self.painter.ring(
                     cx,
                     rect(body.pos.x + 12.0, body.pos.y + 15.0, 18.0, 18.0),
                     p.muted,
@@ -431,7 +431,14 @@ impl Widget for WaAttachmentPill {
                     0.3,
                     clock::phase(900),
                 );
-                clock::register(cx, self.area);
+                clock::spin(
+                    cx,
+                    area,
+                    live_id!(rotation),
+                    clock::RING_CADENCE,
+                    900.0,
+                    0.0,
+                );
                 self.paint_texts(cx, body, title_spec, sub_spec, &title, &subtitle);
             }
             PillBody::Empty => {}

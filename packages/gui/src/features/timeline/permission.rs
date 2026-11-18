@@ -334,13 +334,11 @@ fn card_button(
         1.0,
     );
     if responding {
-        d.kit.spinner(
+        d.spinner(
             cx,
             rect_xywh(r.center().x - 8.0, r.center().y - 8.0, 16.0, 16.0),
             fg,
-            super::paint::now_seconds() % 1.0,
         );
-        d.animating = true;
     } else {
         let start = x + (bw - (14.0 + 8.0 + text.x)) * 0.5;
         let color = with_alpha(fg, fg.w * alpha);

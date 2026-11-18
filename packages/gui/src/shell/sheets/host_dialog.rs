@@ -1778,7 +1778,7 @@ pub struct PairingSheet {
     offer: Option<Value>,
     enabling: bool,
     enable_error: Option<String>,
-    copied_at: Option<f64>,
+    copied_until: Option<std::time::Instant>,
     qr: Option<Result<Vec<Vec<bool>>, String>>,
     status: hosts::Status,
     features: Value,
@@ -1795,7 +1795,7 @@ impl PairingSheet {
             offer: None,
             enabling: false,
             enable_error: None,
-            copied_at: None,
+            copied_until: None,
             qr: None,
             status: hosts::Status::Disconnected,
             features: Value::Null,
@@ -2040,14 +2040,9 @@ impl PairingSheet {
         }
         y += side + 16.0;
         // Link box + copy button.
-        let copied = self
-            .copied_at
-            .is_some_and(|t| cx.seconds_since_app_start() - t < 2.0);
-        if copied {
-            crate::shell::sheets::SPINNING.with(|s| s.set(true));
-        } else {
-            self.copied_at = None;
-        }
+        let now = std::time::Instant::now();
+        self.copied_until = self.copied_until.filter(|&expiry| expiry > now);
+        let copied = self.copied_until.is_some();
         let label = tr(if copied {
             "pairing.device.copied"
         } else {
@@ -2072,6 +2067,11 @@ impl PairingSheet {
             ControlSize::Sm,
             interactive,
         );
+        if let Some(expiry) = self.copied_until {
+            let mut area = Area::Empty;
+            cx.add_rect_area(&mut area, rect(x, y, w, 34.0));
+            crate::common::clock::register_until(cx, area, expiry);
+        }
         y += 34.0 + 16.0;
         y += alert(
             ui,
@@ -2169,7 +2169,7 @@ impl Sheet for PairingSheet {
         }
     }
 
-    fn click(&mut self, cx: &mut Cx, id: &str, ops: &mut SheetOps) -> SheetFlow {
+    fn click(&mut self, _cx: &mut Cx, id: &str, ops: &mut SheetOps) -> SheetFlow {
         match id {
             "retry" => self.load(ops),
             "docs" => {
@@ -2196,7 +2196,8 @@ impl Sheet for PairingSheet {
             "copy" => {
                 if let Some(url) = self.offer.as_ref().map(|o| j::text(o, "url").to_string()) {
                     platform::copy_text(url);
-                    self.copied_at = Some(cx.seconds_since_app_start());
+                    self.copied_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                 }
             }
             _ => {}

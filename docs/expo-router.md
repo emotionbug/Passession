@@ -12,6 +12,13 @@ Sessions are direct sidebar and Command Center targets. Existing internal direct
 
 Feature dispatch receives the owning panel's `UiContext.route`, `target`, `tab_key`, activity and window ID. Never resolve a split pane's action through the focused pane of another window. Moving or resizing a panel changes presentation, not its remote identity. Persist window layout through the core storage boundary described in [data model](data-model.md#client-side-stores).
 
+Cache dispatch geometry and mounted keys by the window's layout and presentation
+inputs. Route a timer using its registration, including for a retained hidden
+owner. Do not use broad timer delivery to propagate data: dispatch the core
+batch or post a worker wake instead. Hidden roots still receive core batches,
+worker signals and action results, app/window focus and lifecycle, key-focus and
+drag cleanup, live edits, and the file's own observation-suspension frame.
+
 Creation completion replaces the originating New Session tab in its main pane. Do not open the result through the currently focused pane or a desktop activation route: receipt updates can arrive after focus moves elsewhere. Keep the form recoverable until its destination exists, including a requested terminal response. Restored creation/session tabs leave the supporting Explorer; retired working Changes tabs are dropped without removing sessions or historical commit views.
 
 ## Compact behavior

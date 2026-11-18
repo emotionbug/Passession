@@ -70,6 +70,15 @@ pub fn paint_detail_sheet(
         TRANSPARENT,
         0.0,
     );
+    if !d.dry() && p.surface2.w >= 1.0 {
+        let body = rect_xywh(
+            sheet.pos.x,
+            sheet.pos.y + 16.0,
+            sheet.size.x,
+            (rest * eased - 16.0).max(0.0),
+        );
+        crate::common::clock::occlude(cx, body);
+    }
     d.canvas
         .add_hit(sheet, HitTarget::Chrome("sheet:body".into()));
     // Gorhom handle: 32x4 zinc-600 with 10px insets.
@@ -130,17 +139,7 @@ pub fn paint_detail_sheet(
             36.0,
             36.0,
         );
-        let copied = d.state.copied_now(COPY_KEY, d.now);
-        if copied {
-            d.animating = true;
-        }
-        d.kit.icon(
-            cx,
-            if copied { "check" } else { "copy" },
-            copy,
-            18.0,
-            p.muted,
-        );
+        d.copy_icon(cx, COPY_KEY, copy, 18.0, p.muted);
         d.canvas.add_hit(
             copy,
             HitTarget::Copy {
@@ -265,6 +264,7 @@ struct Standalone {
     /// Drawn fully open (the open animation finished).
     settled: bool,
     state: RowState,
+    paint: Option<DrawList2d>,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     bar_drag: Option<super::scrollbar::BarDrag>,
     tap: TapTarget<HitTarget>,
@@ -311,6 +311,7 @@ pub fn show_tool_call_sheet(
             opened: now_seconds(),
             settled: false,
             state: RowState::default(),
+            paint: None,
             touch_scroll: Default::default(),
             bar_drag: None,
             tap: TapTarget::default(),
@@ -521,7 +522,10 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
                     }
                     Some(HitTarget::Copy { key, text }) => {
                         cx.copy_to_clipboard(&text);
-                        layer.sheets[index].state.copied.insert(key, now_seconds());
+                        layer.sheets[index]
+                            .state
+                            .copied
+                            .insert(key, std::time::Instant::now());
                         cx.redraw_area(layer.area);
                     }
                     Some(HitTarget::Toggle(key)) => {
@@ -576,10 +580,13 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
         // The layer's capture area is its own full-window turtle (stable across
         // redraws, unlike the first instance of a primitive drawn many times).
         cx.begin_turtle(Walk::abs_rect(window), Layout::default());
-        kit.begin_layer(cx);
         let now = now_seconds();
         let mut animating = false;
         for sheet in &mut layer.sheets {
+            // Each sheet owns its own cover and paint order.
+            let paint = sheet.paint.get_or_insert_with(|| DrawList2d::new(cx));
+            paint.begin_always(cx);
+            kit.begin_layer(cx);
             // Lower sheets paint normally, but only the top sheet contributes input.
             layer.canvas.begin(window.pos);
             let progress = ((now - sheet.opened) / OPEN_SECS).clamp(0.0, 1.0);
@@ -607,6 +614,7 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
                 area: layer.area,
                 owner: None,
                 animating: false,
+                indicators: None,
             };
             // An overlay root: it reaches the window's bottom edge and owns the system-bar padding.
             let bottom_inset = crate::shell::platform::safe_insets().bottom;
@@ -637,6 +645,7 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
                     )
                 },
             );
+            paint.end(cx);
             animating |= d.animating;
             // Settled once a frame was drawn with the open animation finished.
             if progress >= 1.0 {
@@ -683,6 +692,7 @@ mod tests {
             opened: 0.0,
             settled: false,
             state: RowState::default(),
+            paint: None,
             touch_scroll: Default::default(),
             bar_drag: None,
             tap: TapTarget::default(),

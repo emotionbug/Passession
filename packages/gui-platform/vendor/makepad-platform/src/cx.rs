@@ -78,6 +78,8 @@ pub struct Cx {
     pub (crate) repaint_id: u64,
     pub (crate) event_id: u64,
     pub (crate) timer_id: u64,
+    pub(crate) timer_owner: Option<crate::cx_api::TimerOwner>,
+    pub(crate) timer_owners: HashMap<u64, (crate::cx_api::TimerOwner, bool)>,
     pub (crate) next_frame_id: u64,
     pub(crate) frame_trace: Option<Box<crate::frame_trace::FrameTrace>>,
     
@@ -289,6 +291,8 @@ impl Cx {
             event_id: 1,
             repaint_id: 1,
             timer_id: 1,
+            timer_owner: None,
+            timer_owners: HashMap::new(),
             next_frame_id: 1,
             frame_trace: crate::frame_trace::FrameTrace::new(),
             

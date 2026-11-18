@@ -155,6 +155,25 @@ fewer actual draws or events. This is wall-clock timing, not a CPU profile.
 Without the opt-in, no reporter starts and the hooks do not sample clocks or
 collect data.
 
+### Indicator redraws
+
+Draw time-dependent GUI indicators through `common::clock`. Register a
+painted area at its next visible content boundary (`register_until`) or
+use `register_every` for finite visual steps; never register while measuring.
+The clock owns one timeout. Status rings tick at 8 Hz; transient loading
+motion can tick at 30 Hz. Repeating motion is capped at 4 Hz when unfocused
+and stops when the app is backgrounded or the indicator is detached, clipped
+out, or fully covered. Record guaranteed opaque cover rectangles with
+`occlude` in the surface's retained draw list;
+translucent scrims and rounded corners are not covers.
+
+Use the painter's retained spinner for rotating arcs: it changes only
+the shader instance and does not invalidate the widget or its layout.
+When an indicator must change text or geometry, retain it separately
+from expensive layout (e.g. a timeline row's Markdown); expire copy
+feedback once, not on every frame. Use `NextFrame` only for actual
+interaction or bounded layout/motion such as an opening sheet.
+
 ## Checks
 
 See [testing](testing.md) for Rust, GUI, SDK, and real-runtime checks. Run the appropriate checks only when authorized by the assignment. A CI job definition, compilation, or a unit test is not an actual platform smoke test.

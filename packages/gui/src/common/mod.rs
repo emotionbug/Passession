@@ -73,6 +73,36 @@ pub fn live_design(cx: &mut Cx) {
     provider_icon::live_design(cx);
 }
 
+/// Process-wide services use these timer groups. Window groups are their
+/// top-level widget UIDs; a target of zero denotes the window's own chrome.
+pub(crate) const APP_TIMERS: TimerOwner = TimerOwner {
+    group: 1,
+    target: 0,
+};
+pub(crate) const TIMELINE_TIMERS: TimerOwner = TimerOwner {
+    group: 2,
+    target: 0,
+};
+pub(crate) const FILE_TIMERS: TimerOwner = TimerOwner {
+    group: 3,
+    target: 0,
+};
+pub(crate) const GIT_TIMERS: TimerOwner = TimerOwner {
+    group: 4,
+    target: 0,
+};
+
+pub(crate) fn with_widget_timer<R>(
+    cx: &mut Cx,
+    widget: &WidgetRef,
+    f: impl FnOnce(&mut Cx) -> R,
+) -> R {
+    let previous = cx.set_timer_target(widget.widget_uid().0);
+    let result = f(cx);
+    cx.set_timer_owner(previous);
+    result
+}
+
 /// User input has a visible/topmost owner. Focus transitions and background work
 /// remain broadcast so retained roots can release state and finish their work.
 pub(crate) fn is_user_input(event: &Event) -> bool {
@@ -88,6 +118,7 @@ pub(crate) fn is_user_input(event: &Event) -> bool {
             | Event::KeyDown(_)
             | Event::KeyUp(_)
             | Event::TextInput(_)
+            | Event::TextPasteShortcut(_)
             | Event::TextIme(_)
             | Event::TextCopy(_)
             | Event::TextCut(_)
@@ -118,6 +149,7 @@ pub struct UiContext {
     pub layout: Rc<LayoutSnapshot>,
     pub server_infos: Rc<HashMap<String, Value>>,
     pub(crate) terminal_terminations: crate::shell::commands::TerminalTerminations,
+    pub(crate) timer_target: Option<u64>,
 }
 
 impl UiContext {
@@ -138,6 +170,7 @@ impl UiContext {
             layout: Rc::new(LayoutSnapshot::default()),
             server_infos: Rc::new(HashMap::new()),
             terminal_terminations: Default::default(),
+            timer_target: None,
         }
     }
 

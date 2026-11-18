@@ -738,7 +738,7 @@ impl<P> OverlayHost<P> {
             SheetKind::Tree { .. } => self.draw_tree(cx, paint, window, compact),
         };
         self.icons_pending = icons_pending;
-        self.presentation.end(cx, &self.hits, paint);
+        self.presentation.end(cx, &self.hits);
         cx.end_pass_sized_turtle();
         list.end(cx);
         icons_pending

@@ -1071,6 +1071,7 @@ pub(crate) fn apply_terminal_terminations(shell: &mut PaseoShell, cx: &mut Cx, u
 fn remove_tab(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, key: &str) {
     let target = shell.data.layout.target(key).cloned();
     if let Some(panel) = shell.data.panels.remove(key) {
+        shell.data.dispatch_layout = None;
         panels::release(cx, ui, &panel, &mut shell.data.focus_scope);
     }
     shell.data.layout.close_tab(key);
@@ -1260,6 +1261,9 @@ pub fn page_route(page: &Page) -> Route {
 }
 
 pub fn show_page(shell: &mut PaseoShell, cx: &mut Cx, page: Page) {
+    if let Some(mut history) = shell.data.history.take() {
+        history.close(cx);
+    }
     if let Page::Sessions {
         host_id,
         all_hosts,
@@ -1309,7 +1313,9 @@ pub(crate) fn show_sessions(
 pub fn close_page(shell: &mut PaseoShell, cx: &mut Cx) {
     shell.data.page = None;
     shell.data.page_root = None;
-    shell.data.history = None;
+    if let Some(mut history) = shell.data.history.take() {
+        history.close(cx);
+    }
     shell.invalidate_layout(cx);
 }
 
@@ -1848,6 +1854,7 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
                 return;
             }
             if let Some(panel) = shell.data.panels.remove(&tab_key) {
+                shell.data.dispatch_layout = None;
                 panels::release(cx, ui, &panel, &mut shell.data.focus_scope);
             }
             shell.data.dirty.remove(&tab_key);

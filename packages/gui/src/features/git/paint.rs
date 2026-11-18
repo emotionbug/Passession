@@ -71,13 +71,16 @@ pub struct GitPaint {
     #[live]
     pub manual_gear: DrawIcon,
     #[rust]
-    spinners: Vec<Spinner>,
-    #[rust]
     clips: Vec<Rect>,
-    #[rust]
-    spinner_list: Option<DrawList2d>,
-    #[rust]
-    retained_frame: bool,
+}
+
+fn pulse_opacity(wall_ms: u128) -> f32 {
+    let step = (wall_ms % 2_000) as f32 / 1_000.0;
+    0.8 - 0.4 * (step - 1.0).abs()
+}
+
+fn update_pulse(cx: &mut Cx, area: Area, wall_ms: u128) -> bool {
+    crate::common::clock::write_instance(cx, area, live_id!(opacity), pulse_opacity(wall_ms))
 }
 
 pub fn transparent() -> Vec4 {
@@ -299,28 +302,24 @@ impl GitPaint {
             .ring(cx, area, color, stroke, progress, start as f64 + 0.5);
     }
 
-    /// A turning partial ring; callers request frames only while pending.
-    pub fn spinner(&mut self, cx: &mut Cx2d, center: DVec2, size: f64, color: Vec4, phase: f64) {
+    pub fn spinner(&mut self, cx: &mut Cx2d, center: DVec2, size: f64, color: Vec4) {
         let area = rect(center.x - size / 2.0, center.y - size / 2.0, size, size);
-        // Header controls already own small, independently redrawn areas. Only
-        // panel frames defer indicators out of their retained content regions.
-        if !self.retained_frame {
-            self.painter.ring(
-                cx,
-                area,
-                color,
-                (size / 9.0).max(1.5),
-                0.7,
-                (phase * 0.8).fract(),
-            );
-            return;
-        }
-        self.spinners.push(Spinner {
-            area,
-            color,
-            clip: self.clips.last().copied(),
-            phase_offset: phase - cx.seconds_since_app_start(),
-        });
+        self.painter
+            .spinner(cx, area, color, [(size / 9.0).max(1.5), 0.7], 1250.0);
+    }
+
+    pub fn pulse(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4, radius: f64) {
+        use crate::common::clock;
+        let previous = self.painter.draw_box.opacity;
+        self.painter.draw_box.opacity = pulse_opacity(clock::now_ms());
+        self.painter.fill(cx, rect, color, radius);
+        self.painter.draw_box.opacity = previous;
+        clock::sample(
+            cx,
+            self.painter.draw_box.area(),
+            clock::MOTION_PERIOD,
+            update_pulse,
+        );
     }
 
     /// Single-line size of `text`.
@@ -531,65 +530,14 @@ impl GitPaint {
         self.clips.pop();
         cx.end_turtle();
     }
-
-    /// Spinner animation is a sibling of the retained presentation, not a reason
-    /// to rebuild the toolbar, rows or document that contains the indicator.
-    pub fn animate(&self, cx: &mut Cx) {
-        if !self.spinners.is_empty()
-            && let Some(list) = &self.spinner_list
-        {
-            list.redraw(cx);
-        }
-    }
-
-    pub fn begin_frame(&mut self) {
-        self.retained_frame = true;
-        self.spinners.clear();
-        self.clips.clear();
-    }
-
-    pub fn end_frame(&mut self, cx: &mut Cx2d) {
-        let list = self.spinner_list.get_or_insert_with(|| DrawList2d::new(cx));
-        list.begin_always(cx);
-        let phase = cx.seconds_since_app_start();
-        for spinner in &self.spinners {
-            if let Some(clip) = spinner.clip {
-                cx.begin_turtle(Walk::abs_rect(clip), Layout::default());
-            }
-            self.painter.ring(
-                cx,
-                spinner.area,
-                spinner.color,
-                (spinner.area.size.x / 9.0).max(1.5),
-                0.7,
-                ((phase + spinner.phase_offset) * 0.8).fract(),
-            );
-            if spinner.clip.is_some() {
-                cx.end_turtle();
-            }
-        }
-        list.end(cx);
-        self.retained_frame = false;
-    }
 }
 
-#[derive(Clone)]
-struct Spinner {
-    area: Rect,
-    color: Vec4,
-    clip: Option<Rect>,
-    phase_offset: f64,
-}
-
-/// One independently retained Git presentation, including its hit geometry and
-/// deferred animation. Inputs describe presentation, not the event that reached it.
+/// One independently retained Git presentation, including its hit geometry.
 pub struct Retained<T> {
     list: Option<DrawList2d>,
     inputs: u64,
     hit_mark: usize,
-    spinner_mark: usize,
     hits: Vec<(Rect, Option<Rect>, T)>,
-    spinners: Vec<Spinner>,
     clip: Option<Rect>,
     epoch: u64,
 }
@@ -600,9 +548,7 @@ impl<T> Default for Retained<T> {
             list: None,
             inputs: 0,
             hit_mark: 0,
-            spinner_mark: 0,
             hits: Vec::new(),
-            spinners: Vec::new(),
             clip: None,
             epoch: 0,
         }
@@ -653,23 +599,18 @@ impl<T: Clone + PartialEq> Retained<T> {
             .is_ok()
         {
             self.hit_mark = hits.items.len();
-            self.spinner_mark = paint.spinners.len();
             return true;
         }
         hits.items.extend_from_slice(&self.hits);
-        paint.spinners.extend_from_slice(&self.spinners);
         false
     }
 
-    pub fn end(&mut self, cx: &mut Cx2d, hits: &Hits<T>, paint: &GitPaint) {
+    pub fn end(&mut self, cx: &mut Cx2d, hits: &Hits<T>) {
         if let Some(list) = &mut self.list {
             list.end(cx);
         }
         self.hits.clear();
         self.hits.extend_from_slice(&hits.items[self.hit_mark..]);
-        self.spinners.clear();
-        self.spinners
-            .extend_from_slice(&paint.spinners[self.spinner_mark..]);
     }
 }
 

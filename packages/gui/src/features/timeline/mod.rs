@@ -20,6 +20,7 @@ pub mod format;
 pub mod highlight;
 pub mod i18n;
 pub mod images;
+pub(crate) mod indicator;
 pub mod json;
 pub mod layout;
 pub mod links;

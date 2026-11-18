@@ -6,12 +6,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use makepad_widgets::*;
 use paseo_gui_core::{CoreError, RequestId};
 use serde_json::{Value, json};
 
+use crate::common::clock;
 use crate::common::overlay::{self as overlay_api, MenuItem, SelectOption, SelectRequest};
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
@@ -67,14 +69,13 @@ const SECTIONS: [(DateSection, &str); 5] = [
 ];
 
 /// Original `deriveDateSectionKey`: calendar days, not elapsed time.
-fn date_section(at: Option<i64>) -> DateSection {
+fn date_section(at: Option<i64>, today: chrono::NaiveDate) -> DateSection {
     let Some(at) = at else {
         return DateSection::Older;
     };
     let Some(local) = Local.timestamp_millis_opt(at).single() else {
         return DateSection::Older;
     };
-    let today = Local::now().date_naive();
     let day = local.date_naive();
     if day >= today {
         return DateSection::Today;
@@ -139,7 +140,6 @@ pub struct HistoryPage {
     search_field: Field,
     search: String,
     debounce: Timer,
-    clock: Timer,
     agents: Vec<HistoryAgent>,
     cursors: HashMap<String, String>,
     /// Reachable hosts whose history request failed.
@@ -165,7 +165,8 @@ pub struct HistoryPage {
     row_layers: HashMap<usize, crate::common::layer::Layer>,
     visible_rows: HashSet<usize>,
     header_bottom: f64,
-    clock_day: chrono::NaiveDate,
+    day_clock: Area,
+    row_clocks: HashMap<usize, Area>,
 }
 
 impl HistoryPage {
@@ -182,7 +183,6 @@ impl HistoryPage {
             search_field: Field::new("", &tr("sessions.searchPlaceholder")).plain(),
             search: String::new(),
             debounce: Timer::default(),
-            clock: Timer::default(),
             agents: Vec::new(),
             cursors: HashMap::new(),
             host_errors: Vec::new(),
@@ -205,7 +205,16 @@ impl HistoryPage {
             row_layers: HashMap::new(),
             visible_rows: HashSet::new(),
             header_bottom: 0.0,
-            clock_day: Local::now().date_naive(),
+            day_clock: Area::Empty,
+            row_clocks: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn close(&mut self, cx: &mut Cx) {
+        cx.stop_timer(self.debounce);
+        clock::cancel(cx, self.day_clock);
+        for (_, area) in self.row_clocks.drain() {
+            clock::cancel(cx, area);
         }
     }
 
@@ -494,8 +503,6 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
     let state = ui.state.clone();
     if !page.started {
         page.started = true;
-        // Relative times keep themselves current.
-        page.clock = cx.start_interval(60.0);
         if !page.selected_host.is_empty() && hosts::host(&state, &page.selected_host).is_none() {
             page.selected_host.clear();
         }
@@ -514,20 +521,6 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
             .is_some_and(|key| key != HistoryPage::hosts_key(&page.reachable_hosts(&state)))
     {
         page.reset();
-    }
-    if page.clock.is_event(event).is_some() {
-        let day = Local::now().date_naive();
-        if day != page.clock_day {
-            page.clock_day = day;
-            page.invalidate(cx);
-            shell.layers.sessions.invalidate(cx);
-        } else {
-            for key in &page.visible_rows {
-                if let Some(layer) = page.row_layers.get(key) {
-                    layer.invalidate(cx);
-                }
-            }
-        }
     }
     if page.debounce.is_event(event).is_some() {
         let next = page.search_field.text().trim().to_string();
@@ -1267,9 +1260,6 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             ),
             p.muted,
         );
-        // Pages animate through the shell's own redraw (no sheet overlay frame driver).
-        crate::shell::sheets::take_spinning();
-        ui.painter.draw_box.area().redraw(cx);
     } else if host_count == 0 {
         let add = tr("settings.addHost");
         empty_state(
@@ -1351,15 +1341,19 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             0.0,
         );
         let agents = &page.agents;
+        let now = Local::now();
+        let today = now.date_naive();
+        let mut has_current_section = false;
         for (section, key) in SECTIONS {
             let mut rows = agents
                 .iter()
                 .enumerate()
-                .filter(|(_, a)| date_section(a.last_activity) == section)
+                .filter(|(_, a)| date_section(a.last_activity, today) == section)
                 .peekable();
             if rows.peek().is_none() {
                 continue;
             }
+            has_current_section |= section != DateSection::Older;
             let section_rect = rect(lx + 12.0, ry + 8.0, lw - 24.0, line_h);
             let section_layer = page.section_layers.entry(key).or_default();
             if section_layer.begin(cx, section_rect, 0, ui.hits, ui.tooltips) {
@@ -1406,11 +1400,32 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                             compact,
                             row_metrics,
                         );
+                        if let Some(delay) =
+                            clock::relative_time_delay(agent.last_activity, now.timestamp_millis())
+                        {
+                            let clock_area = page.row_clocks.entry(index).or_default();
+                            cx.add_rect_area(clock_area, row_rect);
+                            clock::register_until(cx, *clock_area, Instant::now() + delay);
+                        } else if let Some(area) = page.row_clocks.remove(&index) {
+                            clock::cancel(cx, area);
+                        }
                         row_layer.end(cx, ui.hits, ui.tooltips);
                     }
                 }
                 ry += h + 4.0;
             }
+        }
+        if has_current_section
+            && let Some(midnight) = today
+                .succ_opt()
+                .and_then(|tomorrow| tomorrow.and_hms_opt(0, 0, 0))
+            && let Some(delay) = Local
+                .from_local_datetime(&midnight)
+                .earliest()
+                .and_then(|midnight| (midnight - now).to_std().ok())
+        {
+            cx.add_rect_area(&mut page.day_clock, body);
+            clock::register_until(cx, page.day_clock, Instant::now() + delay);
         }
         if page.search_truncated {
             ry += 16.0;
@@ -1450,6 +1465,13 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
     {
         layer.finish_frame(cx);
     }
+    page.row_clocks.retain(|index, area| {
+        let visible = page.visible_rows.contains(index);
+        if !visible {
+            clock::cancel(cx, *area);
+        }
+        visible
+    });
     page.row_layers
         .retain(|index, _| *index < page.agents.len());
     shell.data.history = Some(page);
@@ -1779,7 +1801,7 @@ pub struct ImportSheet {
     catalog_error: Option<String>,
     importing: Option<String>,
     generation: u64,
-    debounce_at: Option<f64>,
+    debounce: Option<(Timer, Instant)>,
     load_now: bool,
     /// Provider filter trigger drawn last frame (window coordinates).
     filter_rect: Rect,
@@ -1807,7 +1829,7 @@ impl ImportSheet {
             catalog_error: None,
             importing: None,
             generation: 0,
-            debounce_at: None,
+            debounce: None,
             load_now: false,
             filter_rect: Rect::default(),
             owner: format!(
@@ -2180,15 +2202,6 @@ impl Sheet for ImportSheet {
             ui.text_centered(cx, rect(x, y, w, line_h), spec, &text);
             y += line_h + 32.0;
         }
-        if self.debounce_at.is_some() {
-            crate::shell::sheets::SPINNING.with(|s| s.set(true));
-        }
-        if let Some(at) = self.debounce_at
-            && cx.seconds_since_app_start() >= at
-        {
-            self.debounce_at = None;
-            self.load_now = true;
-        }
         y - start
     }
 
@@ -2240,7 +2253,21 @@ impl Sheet for ImportSheet {
         if let Some(FieldEvent::Changed(_) | FieldEvent::Returned(_)) =
             self.search.handle_event(cx, event, scope)
         {
-            self.debounce_at = Some(cx.seconds_since_app_start() + 0.3);
+            if let Some((timer, _)) = self.debounce.take() {
+                cx.stop_timer(timer);
+            }
+            self.debounce = Some((
+                cx.start_timeout(0.3),
+                Instant::now() + std::time::Duration::from_millis(300),
+            ));
+        }
+        if self.debounce.is_some_and(|(timer, deadline)| {
+            timer.is_event(event).is_some() || Instant::now() >= deadline
+        }) {
+            if let Some((timer, _)) = self.debounce.take() {
+                cx.stop_timer(timer);
+            }
+            self.load_now = true;
         }
         for (_, args) in overlay_api::take_answers(&self.owner) {
             if let Some(value) = args.get("value").and_then(Value::as_str) {
@@ -2260,6 +2287,12 @@ impl Sheet for ImportSheet {
             self.load(ops);
         }
         SheetFlow::Stay
+    }
+
+    fn closed(&mut self, cx: &mut Cx, _ops: &mut SheetOps) {
+        if let Some((timer, _)) = self.debounce.take() {
+            cx.stop_timer(timer);
+        }
     }
 
     fn on_response(

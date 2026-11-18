@@ -438,8 +438,72 @@ fn sync_tailnet_presence(runtime: &mut Runtime) {
     runtime.tailnet_presence = presence;
 }
 
+fn window_accepts_event(
+    cx: &Cx,
+    event: &Event,
+    group: u64,
+    timer: Option<TimerOwner>,
+    native_window: impl FnOnce() -> Option<WindowId>,
+) -> bool {
+    if matches!(event, Event::Timer(_)) {
+        return timer.is_some_and(|owner| owner.group == group);
+    }
+    let source = match event {
+        Event::WindowGeomChange(e) => Some(e.window_id),
+        Event::WindowCloseRequested(e) => Some(e.window_id),
+        Event::WindowClosed(e) => Some(e.window_id),
+        Event::WindowDragQuery(e) => Some(e.window_id),
+        Event::MouseDown(e) => Some(e.window_id),
+        Event::MouseMove(e) => Some(e.window_id),
+        Event::MouseUp(e) => Some(e.window_id),
+        Event::MouseLeave(e) => Some(e.window_id),
+        Event::TouchUpdate(e) => Some(e.window_id),
+        Event::LongPress(e) => Some(e.window_id),
+        Event::Scroll(e) => Some(e.window_id),
+        _ => None,
+    };
+    if source.is_none()
+        && !event.is_keyboard_input()
+        && !matches!(event, Event::Drag(_) | Event::Drop(_))
+    {
+        return true;
+    }
+    native_window().is_none_or(|id| {
+        source.is_none_or(|source| source == id)
+            && cx.keyboard_event_is_for_window(event, id)
+            && cx.drag_event_is_for_window(event, id)
+    })
+}
+
+fn dispatch_window(
+    cx: &mut Cx,
+    event: &Event,
+    widget: &WidgetRef,
+    timer: Option<TimerOwner>,
+    ui: &mut UiContext,
+    native_window: impl FnOnce() -> Option<WindowId>,
+) {
+    let group = widget.widget_uid().0;
+    if window_accepts_event(cx, event, group, timer, native_window) {
+        ui.timer_target = timer.map(|owner| owner.target);
+        cx.with_timer_owner(TimerOwner { group, target: 0 }, |cx| {
+            widget.handle_event(cx, event, &mut Scope::with_data(ui));
+        });
+    }
+}
+
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        cx.with_timer_owner(common::APP_TIMERS, |cx| self.dispatch_event(cx, event));
+    }
+}
+
+impl App {
+    fn dispatch_event(&mut self, cx: &mut Cx, event: &Event) {
+        let timer = match event {
+            Event::Timer(e) => cx.take_timer_owner(e.timer_id),
+            _ => None,
+        };
         if let Event::Startup = event {
             self.start(cx);
         }
@@ -457,13 +521,25 @@ impl AppMain for App {
         }
         let Some(runtime) = self.runtime.as_mut() else {
             // Startup failed: the shell still renders the error (no core, no dispatch scope).
-            self.ui.handle_event(cx, event, &mut Scope::empty());
+            let owner = TimerOwner {
+                group: self.ui.widget_uid().0,
+                target: 0,
+            };
+            if !matches!(event, Event::Timer(_)) || timer.is_some_and(|t| t.group == owner.group) {
+                cx.with_timer_owner(owner, |cx| {
+                    self.ui.handle_event(cx, event, &mut Scope::empty())
+                });
+            }
             return;
         };
-        if let Some(platform) = runtime.platform.as_mut() {
+        if !matches!(event, Event::Timer(_))
+            && let Some(platform) = runtime.platform.as_mut()
+        {
             platform.handle_event(cx, event);
         }
-        common::clock::handle_event(cx, event);
+        if !matches!(event, Event::Timer(_)) || timer == Some(common::APP_TIMERS) {
+            common::clock::handle_event(cx, event);
+        }
         let appearance_changed = matches!(event, Event::Actions(actions) if actions.iter().any(|action| {
             matches!(
                 action.downcast_ref::<paseo_gui_platform::PlatformAction>(),
@@ -514,15 +590,70 @@ impl AppMain for App {
         if let Event::Signal = event {
             crate::features::composer::poll_background(cx);
         }
-        crate::features::timeline::handle_event(cx, event, &mut runtime.ui);
-        crate::features::files::handle_event(cx, event, &mut runtime.ui);
+        // The continuation timer belongs to the app, not every panel receiving
+        // the batch. Deliver the data as a worker wake, without the raw timer.
+        let widget_event = if core_tick && batch {
+            &Event::Signal
+        } else {
+            event
+        };
+        let widget_timer = if core_tick && batch { None } else { timer };
+        let signal = matches!(widget_event, Event::Signal);
+        let platform_completion = matches!(widget_event, Event::Actions(actions) if actions.iter().any(|action| {
+            matches!(action.downcast_ref::<paseo_gui_platform::PlatformAction>(),
+                Some(paseo_gui_platform::PlatformAction::Completed { .. }))
+        }));
+        let group = timer.map(|owner| owner.group);
+        if batch
+            || signal
+            || platform_completion
+            || group == Some(common::TIMELINE_TIMERS.group)
+            || matches!(
+                event,
+                Event::Foreground | Event::Resume | Event::Background | Event::Pause
+            )
+        {
+            crate::features::timeline::handle_event(cx, widget_event, &mut runtime.ui);
+        }
+        if batch || signal || platform_completion || group == Some(common::FILE_TIMERS.group) {
+            let timer_session = timer
+                .filter(|owner| owner.group == common::FILE_TIMERS.group)
+                .map(|owner| owner.target);
+            crate::features::files::handle_event(cx, widget_event, &mut runtime.ui, timer_session);
+        }
+        if batch || signal || group == Some(common::GIT_TIMERS.group) {
+            crate::features::git::store::with_store(|store| {
+                store.handle_event(cx, widget_event, &mut runtime.ui)
+            });
+        }
 
-        // Main window first, then the others; the first shell consumes global effects.
-        let windows: Vec<WidgetRef> = runtime.windows.iter().map(|(_, w)| w.clone()).collect();
-        self.ui
-            .handle_event(cx, event, &mut Scope::with_data(&mut runtime.ui));
-        for window in &windows {
-            window.handle_event(cx, event, &mut Scope::with_data(&mut runtime.ui));
+        // Main window first: the first dispatched shell consumes global effects.
+        dispatch_window(
+            cx,
+            widget_event,
+            &self.ui,
+            widget_timer,
+            &mut runtime.ui,
+            || {
+                self.ui
+                    .widget(id!(main_window.shell))
+                    .as_paseo_shell()
+                    .os_window()
+            },
+        );
+        for (_, window) in &runtime.windows {
+            dispatch_window(
+                cx,
+                widget_event,
+                window,
+                widget_timer,
+                &mut runtime.ui,
+                || window.widget(id!(shell)).as_paseo_shell().os_window(),
+            );
+        }
+        runtime.ui.timer_target = None;
+        if matches!(event, Event::Draw(_)) {
+            common::clock::finish_draw(cx);
         }
         runtime.ui.events.clear();
         runtime.ui.terminal_terminations.finish_batch();
@@ -561,5 +692,40 @@ impl AppMain for App {
         }
         #[cfg(feature = "desktop-smoke")]
         self.smoke_event(cx, event);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_timer_reaches_only_the_registered_owner() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let owner = TimerOwner {
+            group: 20,
+            target: 42,
+        };
+        let other = TimerOwner {
+            group: 21,
+            target: 42,
+        };
+        let timer = cx.with_timer_owner(owner, |cx| {
+            cx.with_timer_owner(other, |cx| cx.start_timeout(1.0));
+            cx.start_timeout(1.0)
+        });
+        let event = Event::Timer(makepad_widgets::event::TimerEvent {
+            timer_id: timer.0,
+            time: None,
+        });
+        let recipient = cx.take_timer_owner(timer.0);
+        let mut received = Vec::new();
+        for group in [19, 20, 21] {
+            if window_accepts_event(&cx, &event, group, recipient, || None) {
+                received.push(recipient.unwrap());
+            }
+        }
+        assert_eq!(received, [owner]);
+        assert!(cx.take_timer_owner(timer.0).is_none());
     }
 }

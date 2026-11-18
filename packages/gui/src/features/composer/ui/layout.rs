@@ -56,9 +56,8 @@ impl ComposerPanel {
     }
 
     pub(super) fn spinner(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4) {
-        let rotation = (self.st.spin * 1.2).fract();
-        self.painter.ring(cx, r, color, 2.0, 0.7, rotation);
-        self.st.next_frame = cx.new_next_frame();
+        self.painter
+            .spinner(cx, r, color, [2.0, 0.7], 1_000.0 / 1.2);
     }
 
     pub(super) fn draw_composer(

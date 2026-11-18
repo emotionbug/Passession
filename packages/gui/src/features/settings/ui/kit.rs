@@ -384,8 +384,6 @@ pub struct Ui<'u, 'a, 'b> {
     pub y: f64,
     pub w: f64,
     pub compact: bool,
-    /// Set when a spinner was drawn: the panel requests the next frame.
-    pub animating: bool,
     /// Overlay stacking depth of what is drawn (0 page, 1.. overlay layers).
     pub depth: usize,
     /// Alerts drawn so far this frame (stable keys for their selectable titles).
@@ -421,7 +419,6 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             y: 0.0,
             w: 0.0,
             compact,
-            animating: false,
             depth: 0,
             alert_seq: 0,
             card: None,
@@ -499,20 +496,19 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
         let mut input = self.paint_input(1, rect, color);
         input.text = icon.name().into();
         input.args[0] = size;
-        if icon == Icon::Spinner {
-            let (start, sweep) = spinner_arc(spinner_clock());
-            input.args[1] = start;
-            input.args[2] = sweep;
-            input.args[3] = 1.0;
-            self.animating = true;
-        }
-        let (start, sweep) = (input.args[1], input.args[2]);
         let Draws {
             painter, retained, ..
         } = self.d;
         retained.paint(self.cx, self.depth, input, |cx| {
             if icon == Icon::Spinner {
-                painter.ring(cx, rect, color, 1.5, sweep, start);
+                let (start, sweep) = spinner_arc(spinner_clock());
+                let area = painter.ring(cx, rect, color, 1.5, sweep, start);
+                crate::common::clock::sample(
+                    cx,
+                    area,
+                    crate::common::clock::MOTION_PERIOD,
+                    update_spinner,
+                );
             } else {
                 painter.icon(cx, rect, icon.name(), size, color);
             }
@@ -2088,6 +2084,13 @@ fn spinner_clock() -> f64 {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_secs_f64()
+}
+
+fn update_spinner(cx: &mut Cx, area: Area, _wall_ms: u128) -> bool {
+    use crate::common::clock::write_instance;
+    let (start, sweep) = spinner_arc(spinner_clock());
+    write_instance(cx, area, live_id!(rotation), start as f32)
+        && write_instance(cx, area, live_id!(progress), sweep as f32)
 }
 
 /// Flutter `Curves.fastOutSlowIn`: `Cubic(0.4, 0.0, 0.2, 1.0)`.

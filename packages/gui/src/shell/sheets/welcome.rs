@@ -347,9 +347,6 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
         match state {
             LocalDaemon::Starting => {
                 crate::shell::sheets::spinner(&mut ui, cx, glyph, p.muted);
-                // Welcome is a page, not a sheet: it keeps its own spinner frames going.
-                crate::shell::sheets::take_spinning();
-                ui.painter.draw_box.area().redraw(cx);
             }
             _ => ui.icon(cx, glyph, "circle-alert", 16.0, p.danger),
         }

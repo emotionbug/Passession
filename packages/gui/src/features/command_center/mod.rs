@@ -34,7 +34,7 @@ pub fn parse_ms(value: Option<&Value>) -> Option<i64> {
 /// `describeTimeAgo` (`paseoTimeAgo`): never sub-minute, then the date after a week.
 pub fn time_ago(at: Option<i64>, now: DateTime<Utc>) -> String {
     let Some(at) = at else { return String::new() };
-    let elapsed = now.timestamp_millis() - at;
+    let elapsed = now.timestamp_millis().saturating_sub(at);
     if elapsed < 60_000 {
         return l("just now").to_owned();
     }
@@ -54,6 +54,29 @@ pub fn time_ago(at: Option<i64>, now: DateTime<Utc>) -> String {
             crate::common::month_day(t.month0(), t.day())
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::common::clock::relative_time_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn indicator_clock_relative_time_uses_display_granularity() {
+        for (elapsed, delay) in [
+            (59_999, 1),
+            (61_200, 58_800),
+            (3_600_001, 3_599_999),
+            (86_400_007, 86_399_993),
+        ] {
+            assert_eq!(
+                relative_time_delay(Some(0), elapsed),
+                Some(Duration::from_millis(delay))
+            );
+        }
+        assert_eq!(relative_time_delay(Some(0), 7 * 86_400_000), None);
+        assert_eq!(relative_time_delay(None, 1), None);
+    }
 }
 
 /// `shortenPath`: the home directory as `~`.

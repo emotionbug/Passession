@@ -170,17 +170,11 @@ impl Rail {
     }
 
     /// Paints the rail inside `area` (the transcript rect); `active_seq` is the
-    /// prompt being read. Returns true while animating.
-    pub fn draw(
-        &mut self,
-        cx: &mut Cx2d,
-        d: &mut Draw,
-        area: Rect,
-        active_seq: Option<i64>,
-    ) -> bool {
+    /// prompt being read. Intent waits a single deadline; motion ticks only while changing.
+    pub fn draw(&mut self, cx: &mut Cx2d, d: &mut Draw, area: Rect, active_seq: Option<i64>) {
         if !self.visible(area.size.x) {
             self.rail = None;
-            return false;
+            return;
         }
         let p = d.look.palette;
         let now = d.now;
@@ -209,7 +203,7 @@ impl Rail {
         };
         self.anim_at = now;
         self.anim.resize(count, (RESTING_W, RESTING_H));
-        let mut animating = self.intent_deadline.is_some();
+        let mut moving = false;
         let attention = self.hovered;
         for (i, prompt) in self.prompts.iter().enumerate() {
             let active = Some(int_of(get(prompt, "seq"))) == active_seq;
@@ -228,7 +222,7 @@ impl Rail {
             current.0 += (target.0 - current.0) * k;
             current.1 += (target.1 - current.1) * k;
             if (current.0 - target.0).abs() > 0.05 || (current.1 - target.1).abs() > 0.05 {
-                animating = true;
+                moving = true;
             } else {
                 *current = target;
             }
@@ -280,6 +274,13 @@ impl Rail {
             );
             cx.end_turtle();
         }
-        animating
+        use crate::common::clock;
+        if moving {
+            clock::register_every(cx, d.area, clock::MOTION_PERIOD);
+        }
+        if let Some(deadline) = self.intent_deadline {
+            let delay = std::time::Duration::from_secs_f64((deadline - now).max(0.0));
+            clock::register_until(cx, d.area, std::time::Instant::now() + delay);
+        }
     }
 }

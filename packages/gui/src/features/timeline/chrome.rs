@@ -7,7 +7,7 @@
 
 use super::canvas::*;
 use super::i18n::{t, ta};
-use super::paint::{Draw, now_seconds};
+use super::paint::Draw;
 use makepad_widgets::*;
 
 fn base(d: &Draw) -> f64 {
@@ -16,13 +16,11 @@ fn base(d: &Draw) -> f64 {
 
 /// ChromeSpinner (large = 24, default = 16).
 pub fn spinner(cx: &mut Cx2d, d: &mut Draw, center: DVec2, size: f64, color: Vec4) {
-    d.kit.spinner(
+    d.spinner(
         cx,
         rect_xywh(center.x - size * 0.5, center.y - size * 0.5, size, size),
         color,
-        now_seconds() % 1.0,
     );
-    d.animating = true;
 }
 
 /// PaseoButton secondary/sm hit-testing as `HitTarget::Chrome(id)`; returns its size.
@@ -259,6 +257,9 @@ pub fn history_overlay(cx: &mut Cx2d, d: &mut Draw, rect: Rect) {
     // Only controls painted above the cover may remain hit targets.
     d.canvas.hits.clear();
     d.kit.rect(cx, rect, d.look.palette.surface0, 0.0);
+    if !d.dry() && d.look.palette.surface0.w >= 1.0 {
+        crate::common::clock::occlude(cx, rect);
+    }
     spinner(cx, d, rect.center(), 24.0, d.look.palette.muted);
 }
 

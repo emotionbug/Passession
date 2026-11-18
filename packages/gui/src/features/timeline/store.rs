@@ -1,7 +1,7 @@
 //! Module-level replicas survive hidden tabs without retaining daemon viewers.
 //! Each mounted view contributes visibility; the last hidden view starts the
-//! session's subscription grace period. The shell calls [handle_event] once per
-//! Makepad event before widget dispatch.
+//! session's subscription grace period. The app routes core batches, worker
+//! wakes and owned timer events here before widget dispatch.
 
 use super::composer_bridge;
 use super::json::*;
@@ -30,6 +30,8 @@ struct SessionView {
 
 pub struct TimelineStore {
     pub sessions: HashMap<SessionKey, ChatSession>,
+    timer_sessions: HashMap<u64, SessionKey>,
+    dirty_projections: HashSet<SessionKey>,
     hosts: HashMap<String, HostRecord>,
     requests: HashMap<RequestId, RequestRoute>,
     core: Option<CoreHandle>,
@@ -77,6 +79,8 @@ impl TimelineStore {
     fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            timer_sessions: HashMap::new(),
+            dirty_projections: HashSet::new(),
             hosts: HashMap::new(),
             requests: HashMap::new(),
             core: None,
@@ -172,15 +176,26 @@ impl TimelineStore {
         let create_handoff = !key.is_subagent()
             && composer_bridge::create_handoff_active(&key.host_id, &key.agent_id);
         let session = self.sessions.get_mut(key)?;
+        let projection_pending = session.projection_pending();
         let mut io = Io {
             cx,
             core: &core,
             server_info: &server_info,
             requests: &mut self.requests,
+            timer_sessions: &mut self.timer_sessions,
             effects,
             create_handoff,
         };
         let result = f(session, &mut io);
+        match (projection_pending, session.projection_pending()) {
+            (false, true) => {
+                self.dirty_projections.insert(key.clone());
+            }
+            (true, false) => {
+                self.dirty_projections.remove(key);
+            }
+            _ => {}
+        }
         if session.ended_create_handoff {
             session.ended_create_handoff = false;
             if !key.is_subagent() {
@@ -188,6 +203,23 @@ impl TimelineStore {
             }
         }
         Some(result)
+    }
+
+    fn flush_projections(&mut self) {
+        for key in self.dirty_projections.drain() {
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.project();
+            }
+        }
+    }
+
+    fn on_timer(&mut self, cx: &mut Cx, effects: &mut Vec<UiEffect>, event: &Event, timer_id: u64) {
+        if let Some(key) = self.timer_sessions.remove(&timer_id) {
+            self.with_session(cx, effects, &key, |session, io| session.on_timer(io, event));
+            // Wake presenters after a store-owned tick without delivering the raw
+            // timer to them. The retry may publish a new snapshot/loading status.
+            makepad_widgets::SignalToUI::set_ui_signal();
+        }
     }
 
     /// A panel shows this conversation: create its replica on first sight.
@@ -291,6 +323,7 @@ impl TimelineStore {
         let mut effects = Vec::new();
         self.with_session(cx, &mut effects, key, |session, io| session.dispose(io));
         if self.sessions.remove(key).is_some() {
+            self.dirty_projections.remove(key);
             self.requests.retain(|_, route| route.key != *key);
             if !key.is_subagent() {
                 composer_bridge::clear_create_handoff(&key.host_id, &key.agent_id);
@@ -328,7 +361,7 @@ impl TimelineStore {
             CoreEvent::HostEvent { host_id, event } => {
                 let ty = str_of(get(event, "type"));
                 if ty == "host.identity_changed" || ty == "host.merged" {
-                    self.remap_host(event);
+                    self.remap_host(cx, event);
                     return;
                 }
                 if ty == "agent.provider_subagents.update" {
@@ -391,7 +424,7 @@ impl TimelineStore {
     }
 
     /// The core re-keys a host whose server id became known (or merged).
-    fn remap_host(&mut self, event: &Value) {
+    fn remap_host(&mut self, cx: &mut Cx, event: &Value) {
         let payload = get(event, "payload");
         let (Some(previous), Some(next)) = (
             non_empty_str(get(payload, "previousHostId")),
@@ -422,6 +455,21 @@ impl TimelineStore {
                 let mut next_key = key.clone();
                 next_key.host_id = next.to_owned();
                 session.key = next_key.clone();
+                if let Some(replaced) = self.sessions.get(&next_key) {
+                    for timer in replaced.timers() {
+                        self.timer_sessions.remove(&timer.0);
+                        cx.stop_timer(timer);
+                    }
+                }
+                for timer in session.timers() {
+                    if !timer.is_empty() {
+                        self.timer_sessions.insert(timer.0, next_key.clone());
+                    }
+                }
+                self.dirty_projections.remove(&next_key);
+                if self.dirty_projections.remove(&key) {
+                    self.dirty_projections.insert(next_key.clone());
+                }
                 for route in self.requests.values_mut() {
                     if route.key == key {
                         route.key = next_key.clone();
@@ -433,8 +481,12 @@ impl TimelineStore {
     }
 }
 
-/// Shell hook: once per Makepad event, before widget dispatch.
+/// Once per relevant application event, before widget dispatch.
 pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
+    if let Event::Timer(timer) = event {
+        with_store(|store| store.on_timer(cx, &mut ui.effects, event, timer.timer_id));
+        return;
+    }
     super::mermaid::handle_event(cx, event);
     if ui
         .events
@@ -465,17 +517,6 @@ pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
         }
         super::images::handle_event(cx, event, &image_responses);
         match event {
-            Event::Timer(_) => {
-                let keys: Vec<SessionKey> = store
-                    .sessions
-                    .iter()
-                    .filter(|(_, session)| session.owns_timer(event))
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in keys {
-                    store.with_session(cx, &mut effects, &key, |s, io| s.on_timer(io, event));
-                }
-            }
             Event::Foreground | Event::Resume | Event::Background | Event::Pause => {
                 let visible = matches!(event, Event::Foreground | Event::Resume);
                 if store.app_visible != visible {
@@ -493,12 +534,10 @@ pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
             }
             _ => {}
         }
-        for session in store.sessions.values_mut() {
-            session.flush_projection();
-        }
+        store.flush_projections();
         // Notices from action results surface as the panel toast; sync
         // failures stay in the callout. Nothing else is pushed globally.
-        ui.effects.extend(effects);
+        ui.effects = effects;
     });
 }
 
@@ -581,8 +620,35 @@ mod hidden_subagent_tests {
     fn hidden_provider_subagents_follow_a_rekeyed_host() {
         let mut store = TimelineStore::new();
         store.hide_subagents("address", "parent", ["a"]);
-        store.remap_host(&json!({"type": "host.identity_changed", "payload": {"previousHostId": "address", "hostId": "server"}}));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        store.remap_host(&mut cx, &json!({"type": "host.identity_changed", "payload": {"previousHostId": "address", "hostId": "server"}}));
         assert!(store.subagent_hidden("server", "parent", "a"));
         assert!(!store.subagent_hidden("address", "parent", "a"));
+    }
+
+    #[test]
+    fn dispatch_flushes_only_dirty_sessions_once() {
+        let mut store = TimelineStore::new();
+        let dirty = SessionKey {
+            host_id: "host".into(),
+            agent_id: "dirty".into(),
+            subagent_id: None,
+        };
+        let clean = SessionKey {
+            agent_id: "clean".into(),
+            ..dirty.clone()
+        };
+        for key in [&dirty, &clean] {
+            store
+                .sessions
+                .insert(key.clone(), ChatSession::new(key.clone(), true));
+        }
+        let dirty_version = store.sessions[&dirty].version;
+        let clean_version = store.sessions[&clean].version;
+        store.dirty_projections.insert(dirty.clone());
+        store.flush_projections();
+        store.flush_projections();
+        assert_eq!(store.sessions[&dirty].version, dirty_version + 1);
+        assert_eq!(store.sessions[&clean].version, clean_version);
     }
 }

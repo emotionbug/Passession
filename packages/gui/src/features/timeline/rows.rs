@@ -9,6 +9,7 @@ use super::canvas::*;
 use super::details::draw_details;
 use super::format;
 use super::i18n::{t, ta};
+use super::indicator::Indicator;
 use super::json::*;
 use super::layout::{StreamRow, TurnTiming, parse_time};
 use super::markdown::{self, FindMark, MdOpts};
@@ -23,6 +24,7 @@ use paseo_gui_core::CoreHandle;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 pub const STREAM_METADATA_SIZE: f64 = 13.0;
 
@@ -395,13 +397,11 @@ pub fn draw_row(
         RowKind::HistoryStart { loading } => {
             // HistoryStartSlot: a 48px slot with a spinner while paging.
             if *loading {
-                d.kit.spinner(
+                d.spinner(
                     cx,
                     rect_xywh(x + w * 0.5 - 9.0, y + 15.0, 18.0, 18.0),
                     look.palette.muted,
-                    super::paint::now_seconds() % 1.0,
                 );
-                d.animating = true;
             }
             (48.0, None)
         }
@@ -955,16 +955,12 @@ fn user_message(
         if show {
             let mut rx = x + w + 4.0;
             let copy_key = format!("copy:{id}");
-            let copied = d.state.copied_now(&copy_key, d.now);
-            if copied {
-                d.animating = true;
-            }
             rx -= 22.0;
             let copy = rect_xywh(rx, ry + 1.0, 22.0, 22.0);
             let hovered = d.state.hover_hit.as_deref() == Some(copy_key.as_str());
-            d.kit.icon(
+            d.copy_icon(
                 cx,
-                if copied { "check" } else { "copy" },
+                &copy_key,
                 copy,
                 14.0,
                 if hovered { p.foreground } else { p.muted },
@@ -1154,13 +1150,11 @@ fn compaction(cx: &mut Cx2d, d: &mut Draw, item: &Value, x: f64, y: f64, w: f64)
     );
     let glyph_color = p.muted;
     if status == "loading" {
-        d.kit.spinner(
+        d.spinner(
             cx,
             rect_xywh(mx, cy + (row_h - 16.0) * 0.5, 16.0, 16.0),
             glyph_color,
-            super::paint::now_seconds() % 1.0,
         );
-        d.animating = true;
     } else {
         d.kit.icon(
             cx,
@@ -1578,41 +1572,28 @@ pub fn draw_badge(
                 * 0.008
             - if badge.label.len() <= 12 { 0.25 } else { 0.0 })
         .clamp(1.0, 2.3);
-        let phase = (d.now % duration) / duration;
         let width = end_x - lx;
         let peak = if look.mobile {
             (width * 0.28).clamp(32.0, 120.0)
         } else {
             (width * 0.22).clamp(42.0, 120.0)
         };
-        let end = if look.mobile { width + peak } else { width };
-        let sweep_x = lx - peak + (end + peak) * phase;
-        let sweep = rect_xywh(
-            sweep_x.max(lx),
-            y,
-            (sweep_x + peak).min(end_x) - sweep_x.max(lx),
-            header_h,
-        );
-        if sweep.size.x > 0.0 {
-            cx.begin_turtle(
-                Walk {
-                    abs_pos: Some(sweep.pos),
-                    margin: Margin::default(),
-                    width: Size::Fixed(sweep.size.x),
-                    height: Size::Fixed(sweep.size.y),
+        if !d.dry() && width > 0.0 {
+            d.indicator(
+                cx,
+                Indicator::Shimmer {
+                    rect: rect_xywh(lx, y, width, header_h),
+                    color: vec4(1.0, 1.0, 1.0, if look.dark() { 0.9 } else { 0.55 }),
+                    duration,
+                    peak,
+                    travel: width + if look.mobile { 2.0 * peak } else { peak },
+                    label,
+                    label_pos,
+                    secondary,
+                    secondary_pos,
                 },
-                Layout::default(),
             );
-            let white = vec4(1.0, 1.0, 1.0, if look.dark() { 0.9 } else { 0.55 });
-            d.kit
-                .draw_laidout(cx, Font::Regular, white, label_pos, &label);
-            if let Some(secondary) = &secondary {
-                d.kit
-                    .draw_laidout(cx, Font::Regular, white, secondary_pos, secondary);
-            }
-            cx.end_turtle();
         }
-        d.animating = true;
     }
     cx.end_turtle();
     if let (Some(path), true) = (&badge.open_file, show_file) {
@@ -1796,36 +1777,6 @@ pub fn embedded_calls(
 
 // ---- Turn footers ----
 
-/// synced-loader.tsx: a 2x3 dot grid stepping through six opacity states
-/// every 950ms, synchronized to wall-clock time.
-fn working_dots(cx: &mut Cx2d, d: &mut Draw, x: f64, y: f64, color: Vec4) {
-    const STATES: [[f32; 6]; 6] = [
-        [1.0, 0.0, 0.78, 0.0, 0.56, 0.34],
-        [0.78, 1.0, 0.56, 0.0, 0.34, 0.0],
-        [0.56, 0.78, 0.34, 1.0, 0.0, 0.0],
-        [0.34, 0.56, 0.0, 0.78, 0.0, 1.0],
-        [0.0, 0.34, 0.0, 0.56, 1.0, 0.78],
-        [0.0, 0.0, 1.0, 0.34, 0.78, 0.56],
-    ];
-    let step = ((crate::common::clock::now_ms() % 950) * 6 / 950) as usize;
-    let size = 14.0;
-    let gap = (size * 0.12f64).round().clamp(1.0, size);
-    let dot = ((size - gap * 2.0) / 3.0).clamp(2.0, size);
-    let ox = x + (size - (dot * 2.0 + gap)) * 0.5;
-    let oy = y + (size - (dot * 3.0 + gap * 2.0)) * 0.5;
-    for (index, alpha) in STATES[step].iter().enumerate() {
-        let dx = (index % 2) as f64 * (dot + gap);
-        let dy = (index / 2) as f64 * (dot + gap);
-        d.kit.rect(
-            cx,
-            rect_xywh(ox + dx, oy + dy, dot, dot),
-            with_alpha(color, color.w * alpha),
-            dot * 0.5,
-        );
-    }
-    d.animating = true;
-}
-
 #[allow(clippy::too_many_arguments)]
 fn footer(
     cx: &mut Cx2d,
@@ -1851,7 +1802,13 @@ fn footer(
         None => {
             let f = &ctx.footer;
             if f.live {
-                working_dots(cx, d, cursor - 2.0, top + 5.0, p.foreground);
+                d.indicator(
+                    cx,
+                    Indicator::Dots {
+                        rect: rect_xywh(cursor - 2.0, top + 5.0, 14.0, 14.0),
+                        color: p.foreground,
+                    },
+                );
             } else {
                 d.kit.icon(
                     cx,
@@ -1885,22 +1842,19 @@ fn footer(
                 cursor += 24.0 + 12.0;
             }
             if let (true, Some(start)) = (f.live, f.started_ms) {
-                let now = crate::common::clock::now_ms() as i64;
-                let text = format::duration(now - start);
-                let s = d.kit.label(
+                d.indicator(
                     cx,
-                    Font::Regular,
-                    look.ui(13.0),
-                    1.3,
-                    p.muted,
-                    dvec2(cursor, top + 4.0),
-                    &text,
-                    None,
+                    Indicator::Elapsed {
+                        rect: rect_xywh(cursor, top + 4.0, (fx + fw - cursor).max(1.0), slot - 4.0),
+                        started_ms: start,
+                        size: look.ui(13.0),
+                        color: p.muted,
+                        note: f
+                            .pending_delivery
+                            .then(|| (t("composer.delivery.agentRunning"), look.ui(12.0))),
+                    },
                 );
-                cursor += s.x + 12.0;
-                d.animating = true;
-            }
-            if !f.live || f.pending_delivery {
+            } else if !f.live || f.pending_delivery {
                 let note = t(if f.live {
                     "composer.delivery.agentRunning"
                 } else {
@@ -1921,15 +1875,11 @@ fn footer(
         Some(host) => {
             // CompletedTurnFooter: copy, fork menu, "Worked for …".
             let copy_key = format!("copy:{id}");
-            let copied = d.state.copied_now(&copy_key, d.now);
-            if copied {
-                d.animating = true;
-            }
             let r = rect_xywh(cursor - 4.0, top + 1.0, 22.0, 22.0);
             let hovered = d.state.hover_hit.as_deref() == Some(copy_key.as_str());
-            d.kit.icon(
+            d.copy_icon(
                 cx,
-                if copied { "check" } else { "copy" },
+                &copy_key,
                 r,
                 14.0,
                 if hovered { p.foreground } else { p.muted },
@@ -1991,21 +1941,45 @@ fn footer(
                 };
                 let reveal_key = format!("stamp:{id}");
                 let swap = !duration.is_empty() && !stamp.is_empty();
-                let revealing = swap && d.state.copied_now(&reveal_key, d.now - 1.5);
-                d.animating |= revealing;
-                let show_stamp = revealing
-                    || (swap && d.state.hover_hit.as_deref() == Some(reveal_key.as_str()));
-                let text = if show_stamp { stamp } else { primary };
-                let s = d.kit.label(
-                    cx,
-                    Font::Regular,
-                    look.ui(13.0),
-                    1.3,
-                    p.muted,
-                    dvec2(cursor, top + 4.0),
-                    &text,
-                    Some((fx + fw - cursor).max(1.0)),
-                );
+                let expiry = swap
+                    .then(|| d.state.copy_expiry(&reveal_key, Duration::from_secs(3)))
+                    .flatten();
+                let hovered = swap && d.state.hover_hit.as_deref() == Some(reveal_key.as_str());
+                let pos = dvec2(cursor, top + 4.0);
+                let max = (fx + fw - cursor).max(1.0);
+                let size = look.ui(13.0);
+                let s = if let (Some(expiry), false) = (expiry, hovered) {
+                    // Keep the input anchor stable as the temporary label swaps.
+                    let a = d
+                        .kit
+                        .measure(cx, Font::Regular, size, 1.3, &stamp, Some(max));
+                    let b = d
+                        .kit
+                        .measure(cx, Font::Regular, size, 1.3, &primary, Some(max));
+                    d.indicator(
+                        cx,
+                        Indicator::Stamp {
+                            rect: rect_xywh(pos.x, pos.y, max, slot - 4.0),
+                            size,
+                            color: p.muted,
+                            primary,
+                            stamp,
+                            expiry,
+                        },
+                    );
+                    dvec2(a.x.max(b.x), a.y.max(b.y))
+                } else {
+                    d.kit.label(
+                        cx,
+                        Font::Regular,
+                        size,
+                        1.3,
+                        p.muted,
+                        pos,
+                        if hovered { &stamp } else { &primary },
+                        Some(max),
+                    )
+                };
                 if swap {
                     d.canvas.add_hit(
                         rect_xywh(cursor, top, s.x, slot),

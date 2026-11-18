@@ -5,7 +5,6 @@
 
 use makepad_widgets::*;
 
-use crate::common::clock;
 use crate::common::paint::{Font, HitMap};
 use crate::theme::{Palette, Typography, fade, with_alpha};
 
@@ -101,7 +100,7 @@ impl ExplorerView {
         }
     }
 
-    /// Draws into `area`; `widget` is the owner's area (animation clock registration).
+    /// Paint the toolbar and visible explorer rows.
     pub fn draw(
         &mut self,
         cx: &mut Cx2d,
@@ -109,7 +108,6 @@ impl ExplorerView {
         area: Rect,
         state: &ExplorerState,
         look: &ExplorerLook,
-        widget: Area,
     ) {
         let p = &look.palette;
         let ty = &look.typography;
@@ -185,9 +183,7 @@ impl ExplorerView {
                 refresh,
                 ui::toolbar_icon_size(look.compact),
                 p.extra_muted,
-                clock::phase(900),
             );
-            clock::register(cx, widget);
         } else {
             let st = self.state_of(&Hot::Refresh, true, false);
             ui::icon_button(cx, kit, refresh, "rotate-cw", st, look.compact, p);
@@ -289,9 +285,7 @@ impl ExplorerView {
                 rect(list.pos.x + list.size.x / 2.0 - 10.0, cy - 24.0, 20.0, 20.0),
                 20.0,
                 p.muted,
-                clock::phase(900),
             );
-            clock::register(cx, widget);
             kit.text_in(
                 cx,
                 rect(list.pos.x, cy + 4.0, list.size.x, base * 1.4),
@@ -318,7 +312,7 @@ impl ExplorerView {
                 0.5,
             );
         } else {
-            self.draw_rows(cx, kit, list, state, look, widget);
+            self.draw_rows(cx, kit, list, state, look);
         }
     }
 
@@ -329,7 +323,6 @@ impl ExplorerView {
         list: Rect,
         state: &ExplorerState,
         look: &ExplorerLook,
-        area: Area,
     ) {
         let p = &look.palette;
         let ty = &look.typography;
@@ -345,7 +338,6 @@ impl ExplorerView {
         let first = ((self.scroll_y - 8.0) / row_h).floor().max(0.0) as usize;
         let last = (first + (list.size.y / row_h).ceil() as usize + 2).min(rows.len());
         let name_color_rest = fade(p.foreground, 0.76);
-        let mut needs_clock = false;
         for (index, row) in rows.iter().enumerate().take(last).skip(first) {
             let y = list.pos.y + 8.0 + index as f64 * row_h - self.scroll_y;
             let r = rect(list.pos.x, y, list.size.x, row_h);
@@ -360,8 +352,7 @@ impl ExplorerView {
             let slot = rect(x, y + (row_h - 16.0) / 2.0, 16.0, 16.0);
             if row.entry.is_directory() {
                 if state.is_loading(&row.entry.path) {
-                    ui::spinner(cx, kit, slot, 14.0, p.muted, clock::phase(900));
-                    needs_clock = true;
+                    ui::spinner(cx, kit, slot, 14.0, p.muted);
                 } else {
                     ui::chevron(cx, kit, slot, state.is_expanded(&row.entry.path), p);
                 }
@@ -388,9 +379,6 @@ impl ExplorerView {
             );
             self.hits.push(r, hot);
             self.row_rects.push((index, r));
-        }
-        if needs_clock {
-            clock::register(cx, area);
         }
         self.hits.set_clip(None);
         if max > 0.0 {

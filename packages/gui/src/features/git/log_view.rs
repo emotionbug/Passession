@@ -274,9 +274,8 @@ struct LogLayer {
     interaction: u64,
     geometry: u64,
     visited: bool,
-    spinning: bool,
     icons_pending: bool,
-    before: (bool, bool),
+    before: bool,
 }
 
 impl LogLayer {
@@ -348,7 +347,6 @@ pub struct LogView {
     pub(super) phone: bool,
     /// Text field style last applied (theme colours, type size, locale).
     pub(super) input_style: String,
-    pub spinning: bool,
     /// A material file icon was still decoding at the last draw.
     pub icons_pending: bool,
     layers: HashMap<LogPart, LogLayer>,
@@ -456,7 +454,6 @@ impl LogView {
             drag: None,
             phone: false,
             input_style: String::new(),
-            spinning: false,
             icons_pending: false,
             layers: HashMap::new(),
             draw_detail_key: 0,
@@ -727,18 +724,6 @@ impl LogView {
         }
     }
 
-    /// Spinners are deferred to the panel's sibling list; only an elapsed date label can age here.
-    pub fn animate(&mut self, cx: &mut Cx) {
-        self.presentation_now = now_ms();
-        for (part, layer) in &self.layers {
-            if matches!(part, LogPart::CommitRow(_))
-                && layer.data != self.part_key(*part, self.draw_detail_key)
-            {
-                layer.paint.invalidate(cx);
-            }
-        }
-    }
-
     pub(super) fn begin_part(
         &mut self,
         cx: &mut Cx2d,
@@ -765,24 +750,20 @@ impl LogView {
             &mut self.hits,
             paint,
         ) {
-            self.spinning |= layer.spinning;
             self.icons_pending |= layer.icons_pending;
             return false;
         }
-        layer.before = (self.spinning, self.icons_pending);
-        self.spinning = false;
+        layer.before = self.icons_pending;
         self.icons_pending = false;
         true
     }
 
-    pub(super) fn end_part(&mut self, cx: &mut Cx2d, paint: &GitPaint, part: LogPart) {
+    pub(super) fn end_part(&mut self, cx: &mut Cx2d, part: LogPart) {
         let layer = self.layers.get_mut(&part).expect("opened Git Log boundary");
-        layer.paint.end(cx, &self.hits, paint);
+        layer.paint.end(cx, &self.hits);
         layer.interaction = layer.interaction(self.hovered.as_ref(), self.pressed.as_ref());
-        layer.spinning = self.spinning;
         layer.icons_pending = self.icons_pending;
-        self.spinning |= layer.before.0;
-        self.icons_pending |= layer.before.1;
+        self.icons_pending |= layer.before;
     }
 
     pub(super) fn begin_frame(&mut self) {

@@ -5,11 +5,13 @@
 //! index shifts when older history is prepended.
 
 use super::canvas::{Canvas, ChatKit};
+use super::indicator::{Indicator, Indicators};
 use super::reveal::Reveal;
 use crate::theme::{Palette, Typography};
 use makepad_widgets::*;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 /// Original Android/iOS renderer branch (`isNative`); desktop follows web.
 pub const MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
@@ -64,7 +66,7 @@ pub struct RowState {
     pub extent_x: HashMap<String, f64>,
     pub extent_y: HashMap<String, f64>,
     /// Copy glyph shows a check for 1.5s (`TurnCopyButton`).
-    pub copied: HashMap<String, f64>,
+    pub copied: HashMap<String, Instant>,
     pub hovered: bool,
     pub hover_link: Option<std::sync::Arc<str>>,
     pub hover_hit: Option<String>,
@@ -155,8 +157,9 @@ impl RowState {
         self.invalidate();
     }
 
-    pub fn copied_now(&self, key: &str, now: f64) -> bool {
-        self.copied.get(key).is_some_and(|at| now - at < 1.5)
+    pub fn copy_expiry(&self, key: &str, hold: Duration) -> Option<Instant> {
+        let expiry = *self.copied.get(key)? + hold;
+        (expiry > Instant::now()).then_some(expiry)
     }
 
     /// The conversation returns to the screen (tab, pane or app shown again):
@@ -178,17 +181,68 @@ pub struct Draw<'a> {
     pub canvas: &'a mut Canvas,
     pub look: Look,
     pub state: &'a mut RowState,
-    /// Seconds (Cx::seconds_since_app_start) for copy feedback / pacing.
+    /// Wall-clock seconds for streaming preparation and motion.
     pub now: f64,
-    /// Area that a pacing/feedback redraw targets.
+    /// Owner area for asynchronous presentation.
     pub area: Area,
     /// Explicit row owner, including measurement before the first area exists.
     pub owner: Option<DrawListId>,
-    /// Whether anything animated was drawn (spinner, pacing, copy check).
+    /// Streaming preparation or sheet motion needs another layout.
     pub animating: bool,
+    pub(crate) indicators: Option<&'a mut Indicators>,
 }
 
 impl Draw<'_> {
+    pub(super) fn indicator(&mut self, cx: &mut Cx2d, indicator: Indicator) {
+        if self.dry() {
+            return;
+        }
+        let inner = self
+            .canvas
+            .clip_stack
+            .last()
+            .map(|r| r.translate(self.canvas.origin));
+        let clip = match (inner, self.canvas.viewport) {
+            (Some(inner), Some(outer)) => Some(inner.clip((outer.pos, outer.pos + outer.size))),
+            (inner, outer) => inner.or(outer),
+        };
+        if let Some(indicators) = &mut self.indicators {
+            indicators.push(cx, indicator, clip);
+        } else {
+            indicator.paint(cx, self.kit, clip, &mut Area::Empty);
+        }
+    }
+
+    pub(super) fn spinner(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4) {
+        self.kit.spinner(cx, rect, color);
+    }
+
+    pub(super) fn copy_icon(
+        &mut self,
+        cx: &mut Cx2d,
+        key: &str,
+        rect: Rect,
+        size: f64,
+        color: Vec4,
+    ) {
+        if self.dry() {
+            return;
+        }
+        if let Some(expiry) = self.state.copy_expiry(key, Duration::from_millis(1500)) {
+            self.indicator(
+                cx,
+                Indicator::Copy {
+                    rect,
+                    size,
+                    color,
+                    expiry,
+                },
+            );
+        } else {
+            self.kit.icon(cx, "copy", rect, size, color);
+        }
+    }
+
     /// Runs `f` as a measuring pass (layout only; nothing drawn/registered).
     pub fn measure<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let (kit, canvas) = (self.kit.dry, self.canvas.dry);

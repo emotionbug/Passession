@@ -253,8 +253,8 @@ pub fn release(owner: &str) {
     SignalToUI::set_ui_signal();
 }
 
-pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
-    with(|s| s.event(cx, event, ui));
+pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext, timer_session: Option<u64>) {
+    with(|s| s.event(cx, event, ui, timer_session));
 }
 
 fn associations(ui: &UiContext) -> Value {
@@ -451,7 +451,13 @@ impl Store {
                 match std::mem::take(&mut entry.session.autosave) {
                     AutosaveRequest::Schedule => {
                         cx.stop_timer(entry.timer);
-                        entry.timer = cx.start_timeout(super::model::AUTOSAVE_DELAY_SECONDS);
+                        let owner = TimerOwner {
+                            target: id,
+                            ..crate::common::FILE_TIMERS
+                        };
+                        entry.timer = cx.with_timer_owner(owner, |cx| {
+                            cx.start_timeout(super::model::AUTOSAVE_DELAY_SECONDS)
+                        });
                     }
                     AutosaveRequest::Cancel => {
                         cx.stop_timer(entry.timer);
@@ -1176,25 +1182,23 @@ impl Store {
     // -----------------------------------------------------------------------------------------
     // Event routing
 
-    fn event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext) {
+    fn event(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        ui: &mut UiContext,
+        timer_session: Option<u64>,
+    ) {
         let mut changed = false;
-        let associations = associations(ui);
-        if let Event::Timer(_) = event {
-            let ids: Vec<u64> = self
-                .sessions
-                .iter()
-                .filter(|(_, e)| e.timer.is_event(event).is_some())
-                .map(|(id, _)| *id)
-                .collect();
-            for id in ids {
-                if let Some(entry) = self.sessions.get_mut(&id) {
-                    entry.timer = Timer::default();
-                    entry
-                        .session
-                        .with_model(&associations, |m, io| m.autosave(io));
-                    changed = true;
-                }
-            }
+        if let Some(entry) = timer_session.and_then(|id| self.sessions.get_mut(&id))
+            && entry.timer.is_event(event).is_some()
+        {
+            entry.timer = Timer::default();
+            entry
+                .session
+                .with_model(&associations(ui), |m, io| m.autosave(io));
+            changed = true;
+            SignalToUI::set_ui_signal();
         }
         if let Event::Actions(actions) = event {
             for action in actions.iter() {

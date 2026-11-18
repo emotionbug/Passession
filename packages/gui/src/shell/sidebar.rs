@@ -14,7 +14,7 @@ use crate::common::paint::{Font, rect};
 use crate::common::widgets::{
     PTextFieldWidgetRefExt, RowMetrics, StatusBucket, agent_live_status_bucket, paint_status_badge,
 };
-use crate::common::{PanelTarget, UiContext, UiEffect, clock, json as j, tr, tr_args};
+use crate::common::{PanelTarget, UiContext, UiEffect, json as j, tr, tr_args};
 use crate::features::workspace::observe::{ObsEvent, Observation};
 use crate::shell::PaseoShell;
 use crate::shell::chrome::make_ui;
@@ -1612,17 +1612,14 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
                     14.0,
                     14.0,
                 );
-                if paint_status_badge(
+                paint_status_badge(
                     ui.painter,
                     cx,
                     glyph,
                     Some(bucket).filter(|b| *b != StatusBucket::Done),
                     &p,
                     backdrop,
-                ) {
-                    let area = ui.painter.draw_box.area();
-                    clock::register(cx, area);
-                }
+                );
                 let title_spec = ui.spec(
                     if attention {
                         Font::Medium

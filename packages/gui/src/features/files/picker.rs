@@ -7,9 +7,9 @@
 
 use makepad_widgets::*;
 
+use crate::common::UiContext;
 use crate::common::overlay::tooltip_at;
 use crate::common::paint::{Font, HitMap};
-use crate::common::{UiContext, clock};
 use crate::theme::{Palette, Typography, fade, with_alpha};
 
 use super::editor::field::{FieldEvent, TextField};
@@ -411,15 +411,7 @@ impl PickerView {
         right -= button;
         let refresh = rect(right, y, button, button);
         if busy {
-            ui::spinner(
-                cx,
-                kit,
-                refresh,
-                if compact { 18.0 } else { 14.0 },
-                p.muted,
-                clock::phase(900),
-            );
-            clock::register(cx, widget);
+            ui::spinner(cx, kit, refresh, if compact { 18.0 } else { 14.0 }, p.muted);
             self.tips.push((Hot::Refresh, refresh));
         } else {
             self.nav_button(
@@ -587,9 +579,7 @@ impl PickerView {
                 rect(list.pos.x + list.size.x / 2.0 - 10.0, cy - 26.0, 20.0, 20.0),
                 20.0,
                 p.muted,
-                clock::phase(900),
             );
-            clock::register(cx, widget);
             kit.text_in(
                 cx,
                 rect(

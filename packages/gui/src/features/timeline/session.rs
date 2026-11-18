@@ -271,6 +271,7 @@ pub struct Io<'a> {
     pub core: &'a CoreHandle,
     pub server_info: &'a Value,
     pub requests: &'a mut HashMap<RequestId, RequestRoute>,
+    pub(super) timer_sessions: &'a mut HashMap<u64, SessionKey>,
     pub effects: &'a mut Vec<UiEffect>,
     pub create_handoff: bool,
 }
@@ -278,6 +279,21 @@ pub struct Io<'a> {
 impl Io<'_> {
     pub fn supports(&self, feature_name: &str) -> bool {
         feature(self.server_info, feature_name)
+    }
+
+    fn start_timeout(&mut self, key: &SessionKey, delay: f64) -> Timer {
+        let timer = self
+            .cx
+            .with_timer_owner(crate::common::TIMELINE_TIMERS, |cx| cx.start_timeout(delay));
+        self.timer_sessions.insert(timer.0, key.clone());
+        timer
+    }
+
+    fn stop_timer(&mut self, timer: Timer) {
+        if !timer.is_empty() {
+            self.timer_sessions.remove(&timer.0);
+            self.cx.stop_timer(timer);
+        }
     }
 }
 
@@ -733,7 +749,7 @@ impl ChatSession {
             return;
         }
         self.subscribed = true;
-        io.cx.stop_timer(self.membership_retry);
+        io.stop_timer(self.membership_retry);
         self.membership_retry = Timer::empty();
         self.membership_delay = None;
         // A fetch that was already in flight at suspension must finish before
@@ -747,20 +763,21 @@ impl ChatSession {
         self.membership_needs_retry = true;
         let delay = next_retry_delay(self.membership_delay);
         self.membership_delay = Some(delay);
-        io.cx.stop_timer(self.membership_retry);
+        io.stop_timer(self.membership_retry);
         self.membership_retry = if self.visibility.suspended {
             Timer::empty()
         } else {
-            io.cx.start_timeout(delay)
+            io.start_timeout(&self.key, delay)
         };
         self.set_error(failure);
     }
 
-    /// Filter before constructing Io: unrelated widget timers need no host snapshot.
-    pub fn owns_timer(&self, event: &makepad_widgets::Event) -> bool {
-        (!self.membership_retry.is_empty() && self.membership_retry.is_event(event).is_some())
-            || (!self.catch_up_retry.is_empty() && self.catch_up_retry.is_event(event).is_some())
-            || (!self.hidden_timer.is_empty() && self.hidden_timer.is_event(event).is_some())
+    pub(crate) fn timers(&self) -> [Timer; 3] {
+        [
+            self.membership_retry,
+            self.catch_up_retry,
+            self.hidden_timer,
+        ]
     }
 
     pub fn on_timer(&mut self, io: &mut Io, event: &makepad_widgets::Event) -> bool {
@@ -797,7 +814,7 @@ impl ChatSession {
         }
         self.connected = ready;
         self.membership_generation += 1;
-        io.cx.stop_timer(self.membership_retry);
+        io.stop_timer(self.membership_retry);
         self.membership_retry = Timer::empty();
         self.membership_delay = None;
         if !ready {
@@ -844,12 +861,12 @@ impl ChatSession {
         }
         let change = self.visibility.update(visible);
         if visible {
-            io.cx.stop_timer(self.hidden_timer);
+            io.stop_timer(self.hidden_timer);
             self.hidden_timer = Timer::empty();
         }
         match change {
             VisibilityChange::Grace => {
-                self.hidden_timer = io.cx.start_timeout(HIDDEN_SUBSCRIPTION_GRACE);
+                self.hidden_timer = io.start_timeout(&self.key, HIDDEN_SUBSCRIPTION_GRACE);
             }
             VisibilityChange::Resume => {
                 self.pending = true;
@@ -879,9 +896,9 @@ impl ChatSession {
         self.subscribed = false;
         self.membership_needs_retry = false;
         self.live_observed = false;
-        io.cx.stop_timer(self.membership_retry);
+        io.stop_timer(self.membership_retry);
         self.membership_retry = Timer::empty();
-        io.cx.stop_timer(self.catch_up_retry);
+        io.stop_timer(self.catch_up_retry);
         self.catch_up_retry = Timer::empty();
         if let Some(id) = self.observation.take() {
             io.requests.remove(&id);
@@ -915,12 +932,12 @@ impl ChatSession {
         self.manual_retry = true;
         self.notify();
         if self.catch_up == Some(CatchUp::Error) {
-            io.cx.stop_timer(self.catch_up_retry);
+            io.stop_timer(self.catch_up_retry);
             self.catch_up_retry = Timer::empty();
             self.start_catch_up(io, false, true);
             return;
         }
-        io.cx.stop_timer(self.membership_retry);
+        io.stop_timer(self.membership_retry);
         self.membership_retry = Timer::empty();
         self.membership_delay = None;
         self.reconcile_membership(io);
@@ -993,7 +1010,7 @@ impl ChatSession {
 
     fn cancel_catch_up(&mut self, io: &mut Io) {
         self.catch_up_generation += 1;
-        io.cx.stop_timer(self.catch_up_retry);
+        io.stop_timer(self.catch_up_retry);
         self.catch_up_retry = Timer::empty();
         self.catch_up = None;
         self.gap_pending = false;
@@ -1029,7 +1046,7 @@ impl ChatSession {
             Some(CatchUp::Complete) if !supersede => return,
             _ => {}
         }
-        io.cx.stop_timer(self.catch_up_retry);
+        io.stop_timer(self.catch_up_retry);
         self.catch_up_retry = Timer::empty();
         if supersede || self.catch_up != Some(CatchUp::Error) {
             self.catch_up_delay = None;
@@ -1280,11 +1297,11 @@ impl ChatSession {
                     let delay = next_retry_delay(self.catch_up_delay);
                     self.catch_up_delay = Some(delay);
                     self.catch_up = Some(CatchUp::Error);
-                    io.cx.stop_timer(self.catch_up_retry);
+                    io.stop_timer(self.catch_up_retry);
                     self.catch_up_retry = if self.visibility.suspended {
                         Timer::empty()
                     } else {
-                        io.cx.start_timeout(delay)
+                        io.start_timeout(&self.key, delay)
                     };
                     log_sync_failure(&self.key, &message);
                     self.set_error(message);
@@ -1894,10 +1911,8 @@ impl ChatSession {
 
     // ── projection ──────────────────────────────────────────────────────
 
-    pub fn flush_projection(&mut self) {
-        if self.projection_pending {
-            self.project();
-        }
+    pub(crate) fn projection_pending(&self) -> bool {
+        self.projection_pending
     }
 
     /// Folds the stored rows not yet projected (all of them after any change
@@ -1959,9 +1974,9 @@ impl ChatSession {
         self.generation += 1;
         self.membership_generation += 1;
         self.catch_up_generation += 1;
-        io.cx.stop_timer(self.membership_retry);
-        io.cx.stop_timer(self.catch_up_retry);
-        io.cx.stop_timer(self.hidden_timer);
+        io.stop_timer(self.membership_retry);
+        io.stop_timer(self.catch_up_retry);
+        io.stop_timer(self.hidden_timer);
         // Releasing the observation ends the selective-delivery demand.
         if let Some(id) = self.observation.take() {
             io.core.cancel_request(&id);
@@ -2007,7 +2022,6 @@ fn log_sync_failure(key: &SessionKey, message: &str) {
 #[cfg(test)]
 mod timer_ownership_tests {
     use super::*;
-    use makepad_widgets::{Event, TimerEvent};
 
     #[test]
     fn hidden_subscription_grace_waits_for_last_visible_view() {
@@ -2039,32 +2053,6 @@ mod timer_ownership_tests {
         views[1] = true;
         assert_eq!(update(&mut visibility, &views), VisibilityChange::Resume);
         assert_eq!(update(&mut visibility, &views), VisibilityChange::None);
-    }
-
-    #[test]
-    fn only_live_session_retry_timers_are_owned() {
-        let key = SessionKey {
-            host_id: "host".into(),
-            agent_id: "agent".into(),
-            subagent_id: None,
-        };
-        let mut session = ChatSession::new(key, true);
-        let tick = |timer_id| {
-            Event::Timer(TimerEvent {
-                time: None,
-                timer_id,
-            })
-        };
-        assert!(!session.owns_timer(&tick(0)));
-        assert!(!session.owns_timer(&Event::Signal));
-        session.membership_retry = Timer(41);
-        session.catch_up_retry = Timer(42);
-        assert!(session.owns_timer(&tick(41)));
-        assert!(session.owns_timer(&tick(42)));
-        assert!(!session.owns_timer(&tick(43)));
-        session.membership_retry = Timer::empty();
-        assert!(!session.owns_timer(&tick(41)));
-        assert!(session.owns_timer(&tick(42)));
     }
 }
 

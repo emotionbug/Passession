@@ -546,6 +546,13 @@ coordinates, so `Drag`/`Drop` are dispatched through `call_window_event_handler`
 other windows from hit-testing them. macOS still broadcasts. X11 now cycles `drag_hits`
 state after each drag event like the other desktops.
 
+## Scoped timer delivery
+
+`Cx` records the destination of timers created inside an app-defined owner
+scope, including timers created by stock widgets during a root's draw or
+event handling. A one-shot is removed on lookup; stopping a timer removes its
+registration too. This does not change the platform event payload or scheduling.
+
 ## Build-warning fixes
 
 These patches only remove compiler warnings; they change no behavior.

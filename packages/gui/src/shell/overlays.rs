@@ -203,6 +203,7 @@ enum ToastPress {
 #[derive(Default)]
 pub struct Overlays {
     pub stack: Vec<Modal>,
+    modal_lists: Vec<DrawList2d>,
     pub hits: HitMap<String>,
     pub pointer: Pointer,
     pub area: Area,
@@ -220,8 +221,8 @@ pub struct Overlays {
     pub locked: bool,
     /// The area the layer's sweep lock was last taken on.
     pub locked_area: Area,
-    /// Next frame while a sheet draws a spinner.
-    pub spin: NextFrame,
+    /// Frames are needed only while a sheet actually slides or fades.
+    transition_frame: NextFrame,
     next_sheet: u64,
     focus: Area,
     focus_returns: Vec<(u64, Area)>,
@@ -652,7 +653,7 @@ pub fn handle_timers(overlays: &mut Overlays, cx: &mut Cx, event: &Event) {
         overlays.tooltip = overlays.tooltip_pending.take();
         overlays.area.redraw(cx);
     }
-    if overlays.spin.is_event(event).is_some() {
+    if overlays.transition_frame.is_event(event).is_some() {
         overlays.area.redraw(cx);
     }
 }
@@ -772,7 +773,12 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, window: Re
     crate::shell::chrome::draw_compact_explorer(shell, cx, scope, window);
 
     let count = shell.data.overlays.stack.len();
-    for index in 0..count {
+    // Covers and indicators in separate sheets must have separate retained
+    // owners so the clock can distinguish paint above from paint below.
+    let mut lists = std::mem::take(&mut shell.data.overlays.modal_lists);
+    lists.resize_with(count, || DrawList2d::new(cx));
+    for (index, list) in lists.iter_mut().enumerate() {
+        list.begin_always(cx);
         let top = index + 1 == count;
         let p = theme::current_palette();
         // Each modal draws above the one below it, text included.
@@ -813,7 +819,9 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, window: Re
                 .push(window, "overlay:backdrop".into());
         }
         draw_modal(shell, cx, scope, index, window, top);
+        list.end(cx);
     }
+    shell.data.overlays.modal_lists = lists;
     // Standalone tool-call sheets (timeline `showToolCallSheet`) above the modal stack.
     crate::features::timeline::draw_tool_call_sheets(cx, &shell.data.window_id, window);
     new_layer(shell, cx);
@@ -1604,6 +1612,12 @@ fn dialog_frame(
             p.surface0,
             16.0,
         );
+        if p.surface0.w >= 1.0 {
+            crate::common::clock::occlude(
+                cx,
+                rect(r.pos.x, r.pos.y + 16.0, r.size.x, r.size.y - 16.0),
+            );
+        }
         ui.sheet_handle(cx, r.pos.x + r.size.x * 0.5, r.pos.y - 4.0);
         (
             r,
@@ -1624,6 +1638,12 @@ fn dialog_frame(
             h,
         );
         ui.painter.outline(cx, r, p.surface1, p.surface2, 1.0, 12.0);
+        if p.surface1.w >= 1.0 {
+            crate::common::clock::occlude(
+                cx,
+                rect(r.pos.x, r.pos.y + 12.0, r.size.x, r.size.y - 24.0),
+            );
+        }
         (r, r)
     };
     // The whole painted surface (the compact handle band and bottom inset included) is inert;
@@ -2055,9 +2075,6 @@ fn draw_sheet(
         h
     };
     cx.end_turtle();
-    if crate::shell::sheets::take_spinning() {
-        shell.data.overlays.spin = cx.new_next_frame();
-    }
     if (height - *content_height).abs() > 0.5 {
         *content_height = height;
         shell.data.overlays.area.redraw(cx);
@@ -2093,7 +2110,7 @@ fn draw_draggable_sheet(
         motion.animate(now, 0.6, 0.25);
     }
     if motion.step(now) {
-        shell.data.overlays.spin = cx.new_next_frame();
+        shell.data.overlays.transition_frame = cx.new_next_frame();
     }
     let insets = crate::shell::platform::safe_insets();
     // `useSafeArea`: never under the top inset.
@@ -2116,6 +2133,17 @@ fn draw_draggable_sheet(
             p.surface0,
             16.0,
         );
+        if p.surface0.w >= 1.0 {
+            crate::common::clock::occlude(
+                cx,
+                rect(
+                    frame.pos.x,
+                    frame.pos.y + 16.0,
+                    frame.size.x,
+                    frame.size.y - 16.0,
+                ),
+            );
+        }
         if top {
             ui.hit(frame, "dialog:surface");
         }
@@ -2202,9 +2230,6 @@ fn draw_draggable_sheet(
         h
     };
     cx.end_turtle();
-    if crate::shell::sheets::take_spinning() {
-        shell.data.overlays.spin = cx.new_next_frame();
-    }
     if (height - *content_height).abs() > 0.5 {
         *content_height = height;
         shell.data.overlays.area.redraw(cx);
@@ -2228,7 +2253,7 @@ fn draw_fade_sheet(
     let opened = *motion.opened.get_or_insert(now);
     let t = ((now - opened) / 0.2).clamp(0.0, 1.0);
     if t < 1.0 {
-        shell.data.overlays.spin = cx.new_next_frame();
+        shell.data.overlays.transition_frame = cx.new_next_frame();
     }
     let insets = crate::shell::platform::safe_insets();
     let bottom = if insets.bottom > 24.0 {
@@ -2259,6 +2284,17 @@ fn draw_fade_sheet(
             p.surface2,
             16.0,
         );
+        if t >= 1.0 && p.surface2.w >= 1.0 {
+            crate::common::clock::occlude(
+                cx,
+                rect(
+                    frame.pos.x,
+                    frame.pos.y + 16.0,
+                    frame.size.x,
+                    frame.size.y - 16.0,
+                ),
+            );
+        }
         if top {
             ui.hit(frame, "dialog:surface");
         }
@@ -2311,6 +2347,9 @@ fn draw_full_screen_sheet(
         let mut ui = overlay_ui(shell);
         let p = ui.p;
         ui.fill(cx, window, p.surface0, 0.0);
+        if p.surface0.w >= 1.0 {
+            crate::common::clock::occlude(cx, window);
+        }
         if top {
             ui.hit(window, "dialog:surface");
         }
@@ -2368,9 +2407,6 @@ fn draw_full_screen_sheet(
         ui.hits.set_clip(None);
     }
     cx.end_turtle();
-    if crate::shell::sheets::take_spinning() {
-        shell.data.overlays.spin = cx.new_next_frame();
-    }
 }
 
 fn draw_toast(shell: &mut PaseoShell, cx: &mut Cx2d, window: Rect) {

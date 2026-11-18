@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use makepad_widgets::*;
 use serde_json::{Value, json};
 
+use crate::common::UiContext;
 use crate::common::overlay::{self, MenuEntry, MenuItem};
 use crate::common::paint::HitMap;
-use crate::common::{UiContext, clock};
 use crate::theme::{self, Typography};
 
 use super::explorer::Entry;
@@ -691,14 +691,7 @@ impl ExplorerPanel {
         }
     }
 
-    pub fn draw(
-        &mut self,
-        cx: &mut Cx2d,
-        kit: &mut Kit,
-        area: Rect,
-        ui: &UiContext,
-        widget_area: Area,
-    ) {
+    pub fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, ui: &UiContext) {
         let p = theme::current_palette();
         let ty: Typography = theme::current_typography();
         let Some(target) = self.target.clone() else {
@@ -717,7 +710,7 @@ impl ExplorerPanel {
         };
         let drawn = store::with(|s| {
             if let Some(state) = s.explorer_mut(&owner) {
-                self.view.draw(cx, kit, area, state, &look, widget_area);
+                self.view.draw(cx, kit, area, state, &look);
                 true
             } else {
                 false
@@ -728,20 +721,8 @@ impl ExplorerPanel {
         }
         if busy {
             // The 2px accent progress line at the bottom.
-            let phase = clock::phase(1200);
             let y = area.pos.y + area.size.y - 2.0;
-            kit.fill(
-                cx,
-                rect(
-                    area.pos.x + area.size.x * phase * 0.7,
-                    y,
-                    area.size.x * 0.3,
-                    2.0,
-                ),
-                p.accent,
-                0.0,
-            );
-            clock::register(cx, widget_area);
+            kit.loading_bar(cx, rect(area.pos.x, y, area.size.x, 2.0), p.accent);
         }
         self.transfer_hits.clear();
         let transfers: Vec<(u64, String, u64, u64)> = store::with(|s| {

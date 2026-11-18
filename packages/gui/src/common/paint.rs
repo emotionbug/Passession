@@ -19,15 +19,36 @@ live_design! {
     use link::theme::*;
     use crate::theme::*;
 
+    pub DrawLoadingBar = {{DrawLoadingBar}} {
+        fn pixel(self) -> vec4 {
+            let left = self.phase * 0.7;
+            let d = min(self.pos.x - left, left + 0.3 - self.pos.x);
+            let alpha = clamp(0.5 + d * self.rect_size.x, 0.0, 1.0) * self.color.a;
+            return vec4(self.color.rgb * alpha, alpha);
+        }
+    }
+
     pub PaseoPainter = {{Painter}} {
         draw_box: {}
         capture: {}
         draw_ring: {}
+        loading_bar: <DrawLoadingBar> {}
         text_regular: { text_style: <PASEO_FONT_REGULAR> { line_spacing: 1.2 } }
         text_medium: { text_style: <PASEO_FONT_MEDIUM> { line_spacing: 1.2 } }
         text_mono: { text_style: <PASEO_FONT_MONO> { line_spacing: 1.35 } }
         text_icon: { text_style: <PASEO_FONT_ICON> {} }
     }
+}
+
+#[derive(Live, LiveHook, LiveRegister)]
+#[repr(C)]
+pub struct DrawLoadingBar {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    color: Vec4,
+    #[live]
+    phase: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +68,8 @@ pub struct Painter {
     pub capture: DrawBox,
     #[live]
     pub draw_ring: DrawRing,
+    #[live]
+    loading_bar: DrawLoadingBar,
     #[live]
     pub text_regular: DrawText,
     #[live]
@@ -400,6 +423,7 @@ impl Painter {
         for vars in [
             &mut self.draw_box.draw_vars,
             &mut self.draw_ring.draw_vars,
+            &mut self.loading_bar.draw_vars,
             &mut self.text_regular.draw_vars,
             &mut self.text_medium.draw_vars,
             &mut self.text_mono.draw_vars,
@@ -458,7 +482,7 @@ impl Painter {
         stroke: f64,
         progress: f64,
         rotation: f64,
-    ) {
+    ) -> Area {
         self.draw_ring.color = Vec4 {
             w: color.w * self.alpha,
             ..color
@@ -467,6 +491,59 @@ impl Painter {
         self.draw_ring.progress = progress as f32;
         self.draw_ring.rotation = rotation as f32;
         self.draw_ring.draw_abs(cx, rect);
+        self.draw_ring.area()
+    }
+
+    pub fn spinner(
+        &mut self,
+        cx: &mut Cx2d,
+        rect: Rect,
+        color: Vec4,
+        [stroke, sweep]: [f64; 2],
+        cycle_ms: f64,
+    ) {
+        use super::clock;
+        let area = self.ring(
+            cx,
+            rect,
+            color,
+            stroke,
+            sweep,
+            clock::rotation(cycle_ms, 0.0),
+        );
+        clock::spin(
+            cx,
+            area,
+            live_id!(rotation),
+            clock::MOTION_PERIOD,
+            cycle_ms,
+            0.0,
+        );
+    }
+
+    pub fn loading_bar(
+        &mut self,
+        cx: &mut Cx2d,
+        rect: Rect,
+        color: Vec4,
+        cycle_ms: f64,
+        cadence: std::time::Duration,
+    ) {
+        use super::clock;
+        self.loading_bar.color = Vec4 {
+            w: color.w * self.alpha,
+            ..color
+        };
+        self.loading_bar.phase = clock::rotation(cycle_ms, 0.0) as f32;
+        self.loading_bar.draw_abs(cx, rect);
+        clock::spin(
+            cx,
+            self.loading_bar.area(),
+            live_id!(phase),
+            cadence,
+            cycle_ms,
+            0.0,
+        );
     }
 }
 

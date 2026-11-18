@@ -574,10 +574,14 @@ impl Sheet for ConnectionsSheet {
         }
         y += 16.0;
         if self.busy {
-            let t = (cx.seconds_since_app_start() % 1.5) / 1.5;
             ui.fill(cx, rect(x, y, w, 2.0), p.surface2, 0.0);
-            ui.fill(cx, rect(x + w * t * 0.7, y, w * 0.3, 2.0), p.accent, 0.0);
-            crate::shell::sheets::SPINNING.with(|s| s.set(true));
+            ui.painter.loading_bar(
+                cx,
+                rect(x, y, w, 2.0),
+                p.accent,
+                1500.0,
+                crate::common::clock::MOTION_PERIOD,
+            );
             y += 2.0 + 16.0;
         }
         if host.is_some() {

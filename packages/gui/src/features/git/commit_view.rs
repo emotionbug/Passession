@@ -551,7 +551,6 @@ pub struct CommitView {
     message_generation: u64,
     editor_focused: bool,
     pub icons_pending: bool,
-    pub spinning: bool,
 }
 
 impl CommitView {
@@ -608,7 +607,6 @@ impl CommitView {
             message_generation: 0,
             editor_focused: false,
             icons_pending: false,
-            spinning: false,
         }
     }
 
@@ -747,10 +745,10 @@ impl CommitView {
             .begin(cx, area, key, &mut self.hits, paint)
     }
 
-    fn end_part(&mut self, cx: &mut Cx2d, paint: &GitPaint, part: Part) {
+    fn end_part(&mut self, cx: &mut Cx2d, part: Part) {
         let key = self.part_key(part);
         let section = self.sections.get_mut(&part).unwrap();
-        section.end(cx, &self.hits, paint);
+        section.end(cx, &self.hits);
         section.set_inputs(key);
     }
 
@@ -1380,7 +1378,6 @@ impl CommitView {
     ) {
         self.hits.clear();
         self.compact = compact;
-        self.spinning = false;
         let display = self.display(ui);
         self.presentation = display.clone();
         self.form_visible = display == Display::Files;
@@ -1393,7 +1390,7 @@ impl CommitView {
         let colors = palette();
         if self.begin_part(cx, paint, Part::Background, area) {
             paint.fill(cx, area, colors.surface0);
-            self.end_part(cx, paint, Part::Background);
+            self.end_part(cx, Part::Background);
         }
         let state = match &display {
             Display::Files | Display::Empty => None,
@@ -1469,7 +1466,7 @@ impl CommitView {
         if self.form_visible {
             if self.begin_part(cx, paint, Part::Tree, body) {
                 self.draw_tree(cx, paint, body, metrics, compact);
-                self.end_part(cx, paint, Part::Tree);
+                self.end_part(cx, Part::Tree);
             }
         } else {
             self.list = Rect::default();
@@ -1598,7 +1595,6 @@ impl CommitView {
             };
         let mut y = area.pos.y + ((area.size.y - total) * 0.4).max(16.0);
         let top = y;
-        self.spinning |= state.icon.is_none();
         if self.begin_part(cx, paint, Part::State, area) {
             match state.icon {
                 Some(icon) => paint.icon(
@@ -1613,14 +1609,7 @@ impl CommitView {
                     dvec2(center_x, y + 14.0),
                 ),
                 None => {
-                    paint.spinner(
-                        cx,
-                        dvec2(center_x, y + 14.0),
-                        24.0,
-                        colors.muted,
-                        cx.seconds_since_app_start(),
-                    );
-                    self.spinning = true;
+                    paint.spinner(cx, dvec2(center_x, y + 14.0), 24.0, colors.muted);
                 }
             }
             y += 28.0 + 14.0;
@@ -1663,7 +1652,7 @@ impl CommitView {
                     detail_w + 1.0,
                 );
             }
-            self.end_part(cx, paint, Part::State);
+            self.end_part(cx, Part::State);
         }
         y = top + total
             - if state.action.is_some() {
@@ -1696,7 +1685,7 @@ impl CommitView {
                 if enabled {
                     self.hits.push(frame, Action::Refresh);
                 }
-                self.end_part(cx, paint, Part::StateAction);
+                self.end_part(cx, Part::StateAction);
             }
         }
     }
@@ -1716,7 +1705,7 @@ impl CommitView {
         let colors = palette();
         if self.begin_part(cx, paint, Part::Toolbar, bar) {
             toolbar_band(cx, paint, bar, false);
-            self.end_part(cx, paint, Part::Toolbar);
+            self.end_part(cx, Part::Toolbar);
         }
         let center_y = bar.pos.y + bar.size.y / 2.0;
         let enabled = self.commit.is_none() && self.available(ui);
@@ -1740,7 +1729,6 @@ impl CommitView {
             let size = toolbar_button_size(compact);
             let bounds = rect(button_right - size, center_y - size / 2.0, size, size);
             let key = self.toolbar_key(&action);
-            self.spinning |= spinner;
             if self
                 .toolbar_actions
                 .entry(action.clone())
@@ -1759,14 +1747,7 @@ impl CommitView {
                     self.hovered.as_ref() == Some(&action),
                 );
                 if spinner {
-                    paint.spinner(
-                        cx,
-                        frame.center(),
-                        14.0,
-                        colors.muted,
-                        cx.seconds_since_app_start(),
-                    );
-                    self.spinning = true;
+                    paint.spinner(cx, frame.center(), 14.0, colors.muted);
                 }
                 if enabled {
                     self.hits.push(toolbar_hit(frame, compact), action.clone());
@@ -1774,7 +1755,7 @@ impl CommitView {
                 self.toolbar_actions
                     .get_mut(&action)
                     .unwrap()
-                    .end(cx, &self.hits, paint);
+                    .end(cx, &self.hits);
             }
             right -= pitch;
         }
@@ -1830,7 +1811,7 @@ impl CommitView {
                 limit - x,
             );
         }
-        self.end_part(cx, paint, Part::Summary);
+        self.end_part(cx, Part::Summary);
     }
 
     fn draw_tree(
@@ -2029,7 +2010,7 @@ impl CommitView {
                         check_action,
                     );
                 }
-                retained.row.end(cx, &self.hits, paint);
+                retained.row.end(cx, &self.hits);
             }
             if let NodeKind::File { index } = &node.kind {
                 let path = text(&self.selection.files[*index], "path");
@@ -2046,7 +2027,7 @@ impl CommitView {
                 ));
                 if visible && retained.icon.begin(cx, frame, key, &mut self.hits, paint) {
                     retained.pending = !paint.file_icon(cx, frame, file_name(path));
-                    retained.icon.end(cx, &self.hits, paint);
+                    retained.icon.end(cx, &self.hits);
                 }
                 retained.pending &= visible;
                 self.icons_pending |= retained.pending;
@@ -2066,7 +2047,7 @@ impl CommitView {
                     None,
                 );
             }
-            self.end_part(cx, paint, Part::Scrollbar);
+            self.end_part(cx, Part::Scrollbar);
         }
         paint.end_clip(cx);
     }
@@ -2099,7 +2080,7 @@ impl CommitView {
             if !compact {
                 self.hits.push(splitter, Action::Splitter);
             }
-            self.end_part(cx, paint, Part::Splitter);
+            self.end_part(cx, Part::Splitter);
         }
         let pad = 12.0;
         let left = form.pos.x + pad;
@@ -2162,7 +2143,7 @@ impl CommitView {
                         text_w - drawn - 8.0,
                     );
                 }
-                self.end_part(cx, paint, Part::Banner);
+                self.end_part(cx, Part::Banner);
             }
             if self.begin_part(cx, paint, Part::BannerAction, frame) {
                 button(
@@ -2183,7 +2164,7 @@ impl CommitView {
                     frame
                 };
                 self.hits.push(hit, Action::Refresh);
-                self.end_part(cx, paint, Part::BannerAction);
+                self.end_part(cx, Part::BannerAction);
             }
             y += banner_h;
         }
@@ -2231,7 +2212,7 @@ impl CommitView {
                     1.0,
                 );
             }
-            self.end_part(cx, paint, Part::Hint);
+            self.end_part(cx, Part::Hint);
         }
         y += label_h + 6.0;
         let button_h = Self::commit_button_height(compact);
@@ -2275,7 +2256,7 @@ impl CommitView {
                     (input_frame.size.y - 12.0).max(1.0),
                 )),
             );
-            self.end_part(cx, paint, Part::Editor);
+            self.end_part(cx, Part::Editor);
         }
         let count = self.selection.selected.len();
         let label = if self.commit.is_some() {
@@ -2308,7 +2289,7 @@ impl CommitView {
             if enabled {
                 self.hits.push(commit_button, Action::Commit);
             }
-            self.end_part(cx, paint, Part::Submit);
+            self.end_part(cx, Part::Submit);
         }
     }
 }

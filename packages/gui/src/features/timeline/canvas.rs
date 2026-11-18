@@ -625,14 +625,23 @@ impl ChatKit {
         );
     }
 
-    pub fn spinner(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4, phase: f64) {
+    pub fn spinner(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4) {
         if self.dry {
             return;
         }
         self.spinner.color = color;
-        self.spinner.phase = phase.fract() as f32;
+        use crate::common::clock;
+        self.spinner.phase = clock::phase(1_000) as f32;
         self.spinner.thickness = (r.size.x / 9.0).max(1.5) as f32;
         self.spinner.draw_abs(cx, r);
+        clock::spin(
+            cx,
+            self.spinner.area(),
+            live_id!(phase),
+            clock::MOTION_PERIOD,
+            1_000.0,
+            0.0,
+        );
     }
 
     pub fn texture(&mut self, cx: &mut Cx2d, r: Rect, texture: &Texture, radius: f64) {

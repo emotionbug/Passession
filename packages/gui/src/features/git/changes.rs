@@ -55,7 +55,6 @@ pub struct ChangesView {
     hits: Hits<Hit>,
     hovered: Option<Hit>,
     pressed: Option<Hit>,
-    pub spinning: bool,
     /// A material file icon was still decoding at the last draw.
     pub icons_pending: bool,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
@@ -64,7 +63,6 @@ pub struct ChangesView {
     toolbar: Retained<Hit>,
     banner: Retained<Hit>,
     body: Retained<Hit>,
-    body_spinning: bool,
     content_revision: u64,
     layout_revision: u64,
 }
@@ -102,7 +100,6 @@ impl ChangesView {
             hits: Hits::default(),
             hovered: None,
             pressed: None,
-            spinning: false,
             icons_pending: false,
             touch_scroll: Default::default(),
             horizontal_scroll: Default::default(),
@@ -110,7 +107,6 @@ impl ChangesView {
             toolbar: Retained::default(),
             banner: Retained::default(),
             body: Retained::default(),
-            body_spinning: false,
             content_revision: 0,
             layout_revision: 0,
         }
@@ -244,12 +240,6 @@ impl ChangesView {
     pub fn invalidate_media(&self, cx: &mut Cx) {
         if self.icons_pending {
             self.overlay.invalidate(cx);
-        }
-    }
-
-    pub fn animate(&self, cx: &mut Cx) {
-        if self.doc.animating_selection() {
-            self.body.invalidate(cx);
         }
     }
 }
@@ -932,9 +922,7 @@ impl ChangesView {
                 dvec2(body.pos.x + body.size.x / 2.0, y + 16.0),
                 32.0,
                 colors.muted,
-                cx.seconds_since_app_start(),
             );
-            self.spinning = true;
             y += 32.0 + 16.0;
         }
         if let Some(message) = message {
@@ -972,11 +960,10 @@ impl ChangesView {
         let split = Self::split(compact, &prefs);
         let wrap = pref_flag(&prefs, "wrapLines");
         self.hits.clear();
-        self.spinning = false;
         self.icons_pending = false;
         if self.background.begin(cx, area, 0, &mut self.hits, paint) {
             paint.fill(cx, area, colors.surface0);
-            self.background.end(cx, &self.hits, paint);
+            self.background.end(cx, &self.hits);
         }
         let toolbar_h = TOOLBAR_HEIGHT.max(ui_px(14.0) * 1.4 + 12.0);
         let toolbar = rect(area.pos.x, area.pos.y, area.size.x, toolbar_h);
@@ -986,7 +973,7 @@ impl ChangesView {
             .begin(cx, toolbar, toolbar_key, &mut self.hits, paint)
         {
             self.diff_only_toolbar(cx, ui, paint, toolbar, compact, &prefs);
-            self.toolbar.end(cx, &self.hits, paint);
+            self.toolbar.end(cx, &self.hits);
         }
         let mut y = area.pos.y + toolbar_h;
         let error = self
@@ -1017,7 +1004,7 @@ impl ChangesView {
                     area.size.x - 24.0,
                 );
             }
-            self.banner.end(cx, &self.hits, paint);
+            self.banner.end(cx, &self.hits);
         }
         y += banner_h;
         let body = rect(
@@ -1029,11 +1016,8 @@ impl ChangesView {
         let body_key = self.body_key(ui, compact);
         if self.body.begin(cx, body, body_key, &mut self.hits, paint) {
             self.draw_body(cx, ui, paint, body, split, wrap);
-            self.body_spinning = self.spinning;
-            self.body.end(cx, &self.hits, paint);
+            self.body.end(cx, &self.hits);
             self.body.set_inputs(self.body_key(ui, compact));
-        } else {
-            self.spinning = self.body_spinning;
         }
         if self
             .overlay
@@ -1130,7 +1114,6 @@ impl ChangesView {
             self.hits
                 .push_clipped(*rect_area, clip.unwrap_or(area), Hit::Doc(hit.clone()));
         }
-        self.spinning |= self.doc.spinning;
         // Placeholders near the viewport request their patch once.
         let wanted = std::mem::take(&mut self.doc.wanted);
         for path in wanted {

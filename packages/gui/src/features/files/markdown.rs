@@ -1256,7 +1256,7 @@ impl MarkdownPreview {
                     ImageState::Ready { texture, .. } => {
                         kit.texture(cx, r.translate(self.origin), &texture, 0.0, 1.0)
                     }
-                    ImageState::Loading => kit.spinner(cx, r.translate(self.origin), p.muted, 0.0),
+                    ImageState::Loading => kit.spinner(cx, r.translate(self.origin), p.muted),
                     ImageState::Failed(_) => {
                         let _ = alt;
                     }
