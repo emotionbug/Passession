@@ -432,7 +432,7 @@ impl SubagentStore {
 
     /// Called on a blocking worker. Parent event commits serialize these changes;
     /// only the touched projected row or descriptor is written, never its siblings.
-    /// A live provider event; `Value::Null` when it targets a deleted child.
+    /// A live provider event; `Value::Null` when deleted or unchanged.
     pub fn apply_persisted(
         &mut self,
         root: &Path,
@@ -445,7 +445,7 @@ impl SubagentStore {
 
     /// `live`: the provider reports this now (not replayed history). Only a
     /// live `running` upsert of a deleted child is a new run that lifts its
-    /// tombstone; every other event for it is dropped (`Value::Null`).
+    /// tombstone. Dropped or unchanged events return `Value::Null`.
     pub fn apply_persisted_event(
         &mut self,
         root: &Path,
@@ -473,12 +473,53 @@ impl SubagentStore {
         }
         let output = match event["type"].as_str() {
             Some("timeline") => self.append_child(root, parent, provider, id, event),
-            Some("upsert") => self.upsert_child(root, parent, provider, id, event),
+            Some("upsert") => self.upsert_child(root, parent, provider, id, event, live),
             Some("remove") => self.remove_child(root, parent, provider, id, event),
             _ => Err(anyhow!("Unknown provider subagent event")),
         };
         self.release_excess();
         output
+    }
+
+    /// A resumed OMP runtime's live roster disambiguates cached launch
+    /// receipts, including children whose launch never reached the transcript.
+    pub fn reconcile_roster(
+        &mut self,
+        root: Option<&Path>,
+        parent: &str,
+        provider: &str,
+        active_ids: &Value,
+    ) -> Result<Vec<Value>> {
+        let active: HashSet<&str> = active_ids
+            .as_array()
+            .and_then(|ids| ids.iter().map(Value::as_str).collect())
+            .context("Provider subagent roster missing IDs")?;
+        if let Some(root) = root
+            && !self.ensure_parent(root, parent, false)?
+        {
+            return Ok(Vec::new());
+        }
+        let missing: Vec<_> = self
+            .descriptors
+            .get(parent)
+            .into_iter()
+            .flatten()
+            .filter(|child| child["provider"] == provider && child["status"] == "running")
+            // OMP's roster contains only direct children, not their own tasks.
+            .filter(|child| active.is_empty() || child["parentSubagentId"].is_null())
+            .filter_map(|child| child["id"].as_str().filter(|id| !active.contains(id)))
+            .map(str::to_owned)
+            .collect();
+        missing
+            .into_iter()
+            .map(|id| {
+                let event = json!({"type":"upsert","id":id,"status":"canceled"});
+                match root {
+                    Some(root) => self.apply_persisted_event(root, parent, provider, &event, true),
+                    None => self.apply(parent, provider, &event),
+                }
+            })
+            .collect()
     }
 
     fn tombstoned(&self, parent: &str, id: &str) -> bool {
@@ -590,9 +631,12 @@ impl SubagentStore {
         provider: &str,
         id: &str,
         event: &Value,
+        live: bool,
     ) -> Result<Value> {
         let cataloged = self.cataloged(parent, id)?;
-        let descriptor = self.descriptor(parent, provider, id, event);
+        let Some(descriptor) = self.changed_descriptor(parent, provider, id, event, live) else {
+            return Ok(Value::Null);
+        };
         let encoded = serde_json::to_string(&descriptor)?;
         if cataloged {
             self.catalog(root, parent)?

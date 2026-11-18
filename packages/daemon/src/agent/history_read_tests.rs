@@ -1060,6 +1060,44 @@ async fn live_parent(app: &Arc<AppState>, root: &Path, staged: bool) -> Arc<Agen
     cell
 }
 
+#[tokio::test]
+async fn subagent_duplicate_upserts_are_not_published() {
+    let (root, app) = fixture().await;
+    let manager = &app.agents;
+    let cell = live_parent(&app, root.path(), false).await;
+    let mut updates = manager.events.subscribe();
+    let upsert = |status| {
+        json!({"type":"provider_subagent","provider":"omp",
+        "event":{"type":"upsert","id":"x","status":status,"title":"Scout"}})
+    };
+    cell.sink.emit(upsert("running")).await.unwrap();
+    manager.drain_events(&cell).await.unwrap();
+    assert_eq!(
+        updates.try_recv().unwrap()["event"]["subagent"]["status"],
+        "running"
+    );
+    for _ in 0..4 {
+        cell.sink.emit(upsert("running")).await.unwrap();
+    }
+    manager.drain_events(&cell).await.unwrap();
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    cell.sink.emit(upsert("completed")).await.unwrap();
+    manager.drain_events(&cell).await.unwrap();
+    assert_eq!(
+        updates.try_recv().unwrap()["event"]["subagent"]["status"],
+        "completed"
+    );
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    cell.cancel.cancel();
+    cell.task.lock().await.take().unwrap().await.unwrap();
+}
+
 fn live_child(item: Value) -> Value {
     json!({"type":"provider_subagent","provider":"omp","event":{"type":"timeline","id":"x","item":item}})
 }

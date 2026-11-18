@@ -146,6 +146,16 @@ pub fn public_subagent(mut descriptor: Value) -> Value {
     descriptor
 }
 
+const DESCRIPTOR_FIELDS: [&str; 7] = [
+    "title",
+    "description",
+    "toolCallId",
+    "cwd",
+    "subtitle",
+    "parentSubagentId",
+    "source",
+];
+
 /// Descriptors of loaded parents and hydrated child timelines. Persisted
 /// (cataloged) children hydrate lazily and are evicted under bounded residency;
 /// memory-only parents keep every timeline, as they have no other copy.
@@ -181,40 +191,73 @@ impl SubagentStore {
                 )
             }
             Some("upsert") => {
+                let Some(descriptor) =
+                    self.changed_descriptor(parent_id, provider, id, event, true)
+                else {
+                    return Ok(Value::Null);
+                };
                 self.timelines.entry(key).or_default();
-                let descriptor = self.descriptor(parent_id, provider, id, event);
                 self.store_descriptor(descriptor.clone());
                 Ok(json!({"type":"upsert","subagent":descriptor}))
             }
             _ => bail!("Unknown provider subagent event"),
         }
     }
-    /// Merge an upsert into the previous descriptor without touching storage.
-    fn descriptor(&self, parent_id: &str, provider: &str, id: &str, event: &Value) -> Value {
+    /// The wall-clock timestamp is assigned only for a real change. A provider
+    /// repeating the same patch (or only its timestamp) isn't new activity.
+    fn changed_descriptor(
+        &self,
+        parent_id: &str,
+        provider: &str,
+        id: &str,
+        event: &Value,
+        live: bool,
+    ) -> Option<Value> {
         let previous = self.get(parent_id, id);
+        let previous_status = previous
+            .and_then(|p| p.get("status"))
+            .filter(|status| !status.is_null());
+        let mut status = event.get("status").filter(|status| !status.is_null());
+        // History can end at the launch receipt even when live delivery already
+        // recorded the end of this same run.
+        if !live
+            && (status.is_some_and(|status| status == "running") || event["runUnobserved"] == true)
+            && previous_status.is_some_and(|status| {
+                matches!(status.as_str(), Some("completed" | "failed" | "canceled"))
+            })
+            && previous.is_some_and(|p| {
+                event
+                    .get("toolCallId")
+                    .is_none_or(|owner| owner == &p["toolCallId"])
+            })
+        {
+            status = None;
+        }
+        let status = status.or(previous_status);
+        if previous.is_some_and(|p| {
+            p["provider"] == provider
+                && status.is_none_or(|status| status == &p["status"])
+                && DESCRIPTOR_FIELDS
+                    .iter()
+                    .all(|&field| event.get(field).is_none_or(|value| value == &p[field]))
+        }) {
+            return None;
+        }
         let timestamp = event["timestamp"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(now);
         let mut descriptor = json!({"id":id,"parentAgentId":parent_id,"provider":provider,
-            "status":event.get("status").filter(|status|!status.is_null()).or_else(||previous.and_then(|p|p.get("status")).filter(|status|!status.is_null())).cloned().unwrap_or(json!("running")),
+            "status":status.cloned().unwrap_or(json!("running")),
             "createdAt":previous.and_then(|p|p.get("createdAt")).cloned().unwrap_or(json!(timestamp)),"updatedAt":timestamp});
-        for field in [
-            "title",
-            "description",
-            "toolCallId",
-            "cwd",
-            "subtitle",
-            "parentSubagentId",
-            "source",
-        ] {
+        for field in DESCRIPTOR_FIELDS {
             descriptor[field] = event
                 .get(field)
                 .or_else(|| previous.and_then(|p| p.get(field)))
                 .cloned()
                 .unwrap_or(Value::Null);
         }
-        descriptor
+        Some(descriptor)
     }
     fn store_descriptor(&mut self, descriptor: Value) {
         let parent = descriptor["parentAgentId"]

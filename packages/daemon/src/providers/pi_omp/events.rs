@@ -99,6 +99,8 @@ pub struct Mapper {
     tools: HashMap<String, (String, Value)>,
     permissions: permissions::Permissions,
     extensions: extensions::Extensions,
+    /// Effective descriptor patches last sent on this runtime's event stream.
+    subagent_descriptors: HashMap<String, serde_json::Map<String, Value>>,
     settled: Vec<Value>,
     terminal: Option<Value>,
     usage: Option<Value>,
@@ -135,6 +137,7 @@ impl Mapper {
             tools: HashMap::new(),
             permissions: permissions::Permissions::default(),
             extensions: extensions::Extensions::default(),
+            subagent_descriptors: HashMap::new(),
             settled: Vec::new(),
             terminal: None,
             usage: None,
@@ -369,9 +372,39 @@ impl Mapper {
             })
             .collect()
     }
-    fn subagents(&self, events: Vec<Value>) -> Vec<Value> {
+    fn subagents(&mut self, mut events: Vec<Value>) -> Vec<Value> {
+        self.extensions.attach_child_sources(&mut events);
         events
             .into_iter()
+            .filter(|event| {
+                let id = string(&event["id"]);
+                if event["type"] == "remove" {
+                    return self.subagent_descriptors.remove(id).is_some();
+                }
+                let fields = event
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(key, _)| !matches!(key.as_str(), "type" | "id"));
+                let Some(state) = self.subagent_descriptors.get_mut(id) else {
+                    self.subagent_descriptors.insert(
+                        id.into(),
+                        fields
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    );
+                    return true;
+                };
+                let mut changed = false;
+                for (key, value) in fields {
+                    if state.get(key) == Some(value) {
+                        continue;
+                    }
+                    state.insert(key.clone(), value.clone());
+                    changed = true;
+                }
+                changed
+            })
             .map(|event| json!({"type":"provider_subagent","provider":self.provider,"event":event}))
             .collect()
     }
@@ -575,10 +608,49 @@ impl Mapper {
         }
         out
     }
+    pub fn running_omp_children(&self) -> Vec<String> {
+        self.extensions.running_omp_children()
+    }
+    pub fn settle_missing_omp_children(
+        &mut self,
+        candidates: &[String],
+        active: &HashSet<&str>,
+    ) -> Vec<Value> {
+        let events = self
+            .extensions
+            .settle_missing_omp_children(candidates, active);
+        let out = self.subagents(events);
+        for event in &out {
+            if let Some(parent) = event["event"]["id"]
+                .as_str()
+                .and_then(|id| self.subagent_descriptors.get(id))
+                .and_then(|fields| fields.get("toolCallId"))
+                .and_then(Value::as_str)
+            {
+                self.extensions.finish_card(parent);
+            }
+        }
+        out
+    }
     pub fn close_work(&mut self) -> Vec<Value> {
         let mut out = self.cancel_work();
         if self.family == "omp" {
             let events = self.extensions.cancel();
+            out.extend(self.subagents(events));
+        } else {
+            let events = self.extensions.poll();
+            out.extend(self.subagents(events));
+            self.extensions.clear_async_runs();
+            let events = self
+                .subagent_descriptors
+                .iter()
+                .filter(|(_, fields)| {
+                    fields
+                        .get("status")
+                        .is_some_and(|status| status == "running")
+                })
+                .map(|(id, _)| json!({"type":"upsert","id":id,"status":"canceled"}))
+                .collect();
             out.extend(self.subagents(events));
         }
         out
@@ -939,6 +1011,99 @@ mod tests {
     }
 
     #[test]
+    fn subagent_polling_emits_only_real_pi_step_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("status.json");
+        let mut mapper = Mapper::new("pi", "pi");
+        mapper.map(
+            &json!({"type":"tool_execution_start","toolCallId":"spawn","toolName":"subagent",
+            "args":{"agent":"scout","task":"Inspect","async":true}}),
+        );
+        mapper.map(&json!({"type":"tool_execution_end","toolCallId":"spawn","toolName":"subagent",
+            "result":{"details":{"mode":"parallel","results":[],"asyncId":"bg","asyncDir":dir.path()}}}));
+        let mut snapshot = json!({"state":"running","steps":[
+            {"agent":"scout","status":"running","sessionFile":"/tmp/scout.jsonl"},
+            {"agent":"worker","status":"running"}
+        ]});
+        std::fs::write(&status, snapshot.to_string()).unwrap();
+        let first = mapper.poll();
+        assert_eq!(first.len(), 3); // remove the single launch placeholder, add two steps
+        assert_eq!(first[1]["event"]["source"]["file"], "/tmp/scout.jsonl");
+        assert_eq!(mapper.drain_child_sessions().len(), 1);
+
+        // Four successive 250 ms production ticks: no duplicate upserts.
+        let unchanged: usize = (0..4).map(|_| mapper.poll().len()).sum();
+        assert_eq!(unchanged, 0);
+        assert!(mapper.drain_child_sessions().is_empty());
+        snapshot["steps"][0]["logBytes"] = json!(128);
+        std::fs::write(&status, snapshot.to_string()).unwrap();
+        assert!(
+            mapper.poll().is_empty(),
+            "a changed file may project the same step"
+        );
+
+        snapshot["steps"][0]["status"] = json!("completed");
+        std::fs::write(&status, snapshot.to_string()).unwrap();
+        let changed = mapper.poll();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["event"]["id"], "spawn:0");
+        assert_eq!(changed[0]["event"]["status"], "completed");
+        assert!(mapper.poll().is_empty()); // The silent sibling stays running while its owner lives.
+        let exited = mapper.map(&json!({"type":"process_exit"}));
+        let children: Vec<_> = exited
+            .iter()
+            .filter(|e| e["type"] == "provider_subagent")
+            .collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["event"]["id"], "spawn:1");
+        assert_eq!(children[0]["event"]["status"], "canceled");
+        assert!(
+            mapper.poll().is_empty(),
+            "the abandoned file is no longer watched"
+        );
+    }
+
+    #[test]
+    fn subagent_omp_roster_preserves_quiet_children_and_settles_only_missing_ones() {
+        let mut mapper = Mapper::new("omp", "omp");
+        for id in ["stale", "quiet"] {
+            let started = json!({"type":"subagent_lifecycle",
+                "payload":{"id":id,"status":"started","agent":"scout"}});
+            assert_eq!(mapper.map(&started).len(), 1);
+            assert!(mapper.map(&started).is_empty());
+        }
+        let progress = json!({"type":"subagent_progress","payload":{
+            "progress":{"id":"stale","status":"running","recentOutput":["unchanged descriptor"]}
+        }});
+        assert_eq!(
+            (0..4).map(|_| mapper.map(&progress).len()).sum::<usize>(),
+            0
+        );
+        let candidates = mapper.running_omp_children();
+        let active = HashSet::from(["quiet"]);
+        let settled = mapper.settle_missing_omp_children(&candidates, &active);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0]["event"]["id"], "stale");
+        assert_eq!(settled[0]["event"]["status"], "canceled");
+        assert_eq!(mapper.running_omp_children(), ["quiet"]);
+        assert!(
+            mapper
+                .settle_missing_omp_children(&candidates, &active)
+                .is_empty()
+        );
+        assert!(
+            mapper.map(&progress).is_empty(),
+            "late progress cannot undo settlement"
+        );
+
+        let terminal = mapper.map(&json!({"type":"message_end","message":{
+            "role":"custom","customType":"async-result","display":false,
+            "details":{"jobs":[{"type":"task","agentId":"stale","status":"completed"}]}
+        }}));
+        assert_eq!(terminal[0]["event"]["status"], "completed");
+    }
+
+    #[test]
     fn omp_async_delivery_updates_only_known_children_without_overriding_native_terminal() {
         let mut mapper = Mapper::new("omp", "omp");
         mapper.map(&json!({"type":"tool_execution_start","toolCallId":"spawn","toolName":"task","args":{}}));
@@ -1267,7 +1432,8 @@ mod tests {
         let events=mapper.map(&json!({"type":"tool_execution_end","toolCallId":"spawn","toolName":"subagent","result":{"content":[{"type":"text","text":"Output file: /tmp/reviewer.jsonl"}],"details":{"agentId":"native-child","status":"running"}}}));
         assert!(events.iter().any(|e| e["type"] == "provider_subagent"
             && e["event"]["id"] == "spawn"
-            && e["event"]["status"] == "running"));
+            && e["event"]["status"] == "running"
+            && e["event"]["source"]["file"] == "/tmp/reviewer.jsonl"));
         assert_eq!(
             mapper.drain_child_sessions(),
             vec![json!({"id":"spawn","file":"/tmp/reviewer.jsonl"})]

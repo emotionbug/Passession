@@ -181,6 +181,13 @@ and native-history replay, repairing stale persisted status after a restart.
 Printed result text, nonterminal jobs, and background shell jobs are not child
 completion evidence.
 
+If the owning OMP process exits or is replaced, its remaining running children
+are canceled. While the process is alive, Paseo uses OMP's session-scoped
+`get_subagents` roster, not an age or inactivity threshold, to reconcile missing
+children. It also uses that roster on resume to repair cached launch receipts
+without overwriting previously recorded terminal outcomes. A child still on the
+roster can run quietly across parent turns without being canceled.
+
 ## Retained background records
 
 The persisted `workspace.background` field remains a discovery filter for existing directory-owner records. Their sessions and terminals retain ordinary history, parentage and restart recovery. Default agent discovery excludes those records; `filter.includeBackground` includes them, and exact-ID reads remain available. The session-only creation UI and MCP tools do not expose workspace visibility creation controls.

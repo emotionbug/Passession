@@ -842,6 +842,9 @@ pub(super) fn persist(timeline: &mut Timeline, path: &Path, agent_id: &str) -> R
 /// Certificate metadata updates never rewrite history. Row mutations clear the
 /// certificate in their own transaction.
 pub(super) fn certify(timeline: &mut Timeline, revision: Option<Value>) -> Result<()> {
+    if timeline.native_revision == revision {
+        return Ok(());
+    }
     let Some(store) = timeline.storage.as_mut() else {
         return Ok(());
     };

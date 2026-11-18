@@ -2,17 +2,53 @@ use super::tools::{content_text, text};
 use super::{array, first, put, string};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
 #[derive(Default)]
 pub struct Extensions {
     agents: HashMap<String, (String, bool)>,
     runs: HashMap<String, String>,
-    async_runs: HashMap<String, (String, bool)>,
+    async_runs: HashMap<String, AsyncRun>,
     seen_files: HashSet<String>,
     pending_files: HashMap<String, String>,
     children: Vec<Value>,
+    announced_children: usize,
     states: HashMap<String, Value>,
     cards: HashMap<String, BTreeMap<usize, Card>>,
 }
+
+struct AsyncRun {
+    owner: String,
+    status_path: PathBuf,
+    revision: Option<(SystemTime, u64)>,
+    finished: bool,
+    multi: bool,
+}
+
+impl AsyncRun {
+    fn new(dir: &str, owner: &str) -> Self {
+        Self {
+            owner: owner.into(),
+            status_path: Path::new(dir).join("status.json"),
+            revision: None,
+            finished: false,
+            multi: false,
+        }
+    }
+
+    fn changed_status(&mut self) -> Option<Value> {
+        let metadata = std::fs::metadata(&self.status_path).ok()?;
+        let revision = metadata.modified().ok().map(|time| (time, metadata.len()));
+        if revision.is_some() && self.revision == revision {
+            return None;
+        }
+        let bytes = std::fs::read(&self.status_path).ok()?;
+        self.revision = revision;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
 #[derive(Default)]
 struct Card {
     description: Option<String>,
@@ -21,14 +57,29 @@ struct Card {
 }
 impl Extensions {
     pub fn drain_children(&mut self) -> Vec<Value> {
+        self.announced_children = 0;
         std::mem::take(&mut self.children)
     }
-    fn child(&mut self, id: &str, file: Option<&str>) {
-        if let Some(file) = file.filter(|s| !s.trim().is_empty())
-            && self.seen_files.insert(file.into())
-        {
-            self.children.push(json!({"id":id,"file":file}));
+    /// Publish a discovered transcript locator with the descriptor rather than
+    /// emitting a second upsert for the same change when the watcher is attached.
+    pub fn attach_child_sources(&mut self, events: &mut Vec<Value>) {
+        for child in &self.children[self.announced_children..] {
+            let id = &child["id"];
+            let source = json!({"file":child["file"]});
+            if let Some(event) = events
+                .iter_mut()
+                .rev()
+                .find(|event| event["type"] == "upsert" && event["id"] == *id)
+            {
+                event["source"] = source;
+            } else {
+                events.push(json!({"type":"upsert","id":id,"source":source}));
+            }
         }
+        self.announced_children = self.children.len();
+    }
+    fn child(&mut self, id: &str, file: Option<&str>) {
+        register_child(&mut self.seen_files, &mut self.children, id, file);
     }
     pub fn tool(
         &mut self,
@@ -58,8 +109,8 @@ impl Extensions {
                 let file = output_file(result).or_else(|| self.pending_files.remove(agent));
                 self.child(id, file.as_deref());
                 out.push(json!({"type":"upsert","id":id,"title":title,"description":description,"toolCallId":id,"status":agent_status(state,tintin)}));
-            } else if status == "failed" {
-                out.push(json!({"type":"upsert","id":id,"status":"failed"}));
+            } else if matches!(status, "failed" | "canceled") {
+                out.push(json!({"type":"upsert","id":id,"status":status}));
             } else if !tintin {
                 out.push(json!({"type":"remove","id":id}));
             }
@@ -79,22 +130,20 @@ impl Extensions {
                 if array(&d["results"]).is_empty()
                     && (d["asyncId"].is_string() || args["async"] == true)
                 {
-                    if status != "failed"
-                        && let Some(dir) = first(&[&d["asyncDir"]])
-                    {
-                        self.async_runs.insert(dir.into(), (id.into(), true));
-                    }
                     let mut v = base;
                     v["status"] = json!(if status == "failed" {
                         "failed"
-                    } else {
+                    } else if let Some(dir) = first(&[&d["asyncDir"]]) {
+                        self.async_runs
+                            .entry(dir.into())
+                            .or_insert_with(|| AsyncRun::new(dir, id));
                         "running"
+                    } else {
+                        "canceled"
                     });
                     out.push(v);
-                } else if array(&d["results"]).is_empty() && status == "failed" {
-                    let mut v = base;
-                    v["status"] = json!("failed");
-                    out.push(v);
+                } else if array(&d["results"]).is_empty() {
+                    out.push(json!({"type":"upsert","id":id,"status":if status == "failed" {"failed"} else {"canceled"}}));
                 } else {
                     out.extend(self.rows(
                         id,
@@ -103,10 +152,10 @@ impl Extensions {
                         status == "failed",
                     ));
                 }
-            } else if status == "failed" {
-                let mut v = base;
-                v["status"] = json!("failed");
-                out.push(v);
+            } else if matches!(status, "failed" | "canceled") {
+                out.push(json!({"type":"upsert","id":id,"status":status}));
+            } else {
+                out.push(json!({"type":"upsert","id":id,"status":"canceled"}));
             }
         } else if matches!(name, "get_subagent_result" | "steer_subagent") && status != "running" {
             if let Some((owner, tintin)) = self.agents.get(string(&args["agent_id"])).cloned()
@@ -148,6 +197,9 @@ impl Extensions {
         failed: bool,
     ) -> Vec<Value> {
         let mut out = Vec::new();
+        if rows.len() > 1 {
+            out.push(json!({"type":"remove","id":owner}));
+        }
         for (index, row) in rows.iter().enumerate() {
             if first(&[&row["agent"]]).is_none() {
                 continue;
@@ -188,13 +240,22 @@ impl Extensions {
                 cached_regex!(r"^(?:Background task|Detached foreground task) (completed|failed|stopped): \*\*").captures(header).map(|c|if &c[1]=="stopped"{"canceled"}else if &c[1]=="failed"{"failed"}else{"completed"})
             };
             if let Some(status) = status {
+                // Prefer the per-step outcome and file, including the first
+                // poll of a very short run that notified before the timer.
+                out.extend(self.poll());
                 let mut owner = None;
                 for line in body.lines() {
                     if let Some(dir) = line.strip_prefix("Retention-managed async directory: ") {
-                        owner = self.async_runs.get(dir).map(|v| v.0.clone());
-                        if let Some(id) = &owner {
-                            out.push(json!({"type":"upsert","id":id,"status":status}));
-                        }
+                        owner = self.async_runs.get_mut(dir).and_then(|run| {
+                            if run.multi {
+                                return None;
+                            }
+                            if !run.finished {
+                                out.push(json!({"type":"upsert","id":run.owner,"status":status}));
+                                run.finished = true;
+                            }
+                            Some(run.owner.clone())
+                        });
                     } else if let Some(file) = line.strip_prefix("Session file: ")
                         && let Some(id) = owner.take()
                     {
@@ -223,17 +284,8 @@ impl Extensions {
     }
     pub fn poll(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
-        let runs: Vec<(String, String)> = self
-            .async_runs
-            .iter()
-            .filter(|(_, v)| v.1)
-            .map(|(d, v)| (d.clone(), v.0.clone()))
-            .collect();
-        for (dir, owner) in runs {
-            let Ok(bytes) = std::fs::read(std::path::Path::new(&dir).join("status.json")) else {
-                continue;
-            };
-            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+        for run in self.async_runs.values_mut().filter(|run| !run.finished) {
+            let Some(v) = run.changed_status() else {
                 continue;
             };
             if !v["state"].is_string() || !v["steps"].is_array() {
@@ -242,38 +294,51 @@ impl Extensions {
             let state = string(&v["state"]);
             let terminal = matches!(state, "complete" | "failed" | "stopped");
             let steps = array(&v["steps"]);
+            let owner = &run.owner;
+            if steps.len() > 1 && !run.multi {
+                run.multi = true;
+                out.push(json!({"type":"remove","id":owner}));
+            }
             for (i, step) in steps.iter().enumerate() {
                 if first(&[&step["agent"]]).is_none() {
                     continue;
                 }
-                let id = if steps.len() == 1 {
+                let id = if !run.multi {
                     owner.clone()
                 } else {
                     format!("{owner}:{i}")
                 };
-                let status = if !terminal {
-                    "running"
-                } else if state == "stopped" || step["status"] == "stopped" {
-                    "canceled"
-                } else if state == "failed" || matches!(string(&step["status"]), "failed" | "error")
-                {
-                    "failed"
-                } else {
-                    "completed"
+                let status = match string(&step["status"]) {
+                    "stopped" | "canceled" => "canceled",
+                    "failed" | "error" => "failed",
+                    "complete" | "completed" => "completed",
+                    _ if state == "stopped" => "canceled",
+                    _ if state == "failed" => "failed",
+                    _ if terminal => "completed",
+                    _ => "running",
                 };
-                out.push(json!({"type":"upsert","id":id,"title":step["agent"],"status":status}));
-                self.child(&id, step["sessionFile"].as_str());
+                out.push(json!({"type":"upsert","id":id,"title":step["agent"],"toolCallId":owner,"status":status}));
+                register_child(
+                    &mut self.seen_files,
+                    &mut self.children,
+                    &id,
+                    step["sessionFile"].as_str(),
+                );
             }
-            if terminal {
-                if steps.is_empty() {
-                    out.push(json!({"type":"upsert","id":owner,"status":if state=="complete"{"completed"}else{"failed"}}));
-                }
-                if let Some(r) = self.async_runs.get_mut(&dir) {
-                    r.1 = false;
-                }
+            if terminal && steps.is_empty() && !run.multi {
+                let status = match state {
+                    "complete" => "completed",
+                    "stopped" => "canceled",
+                    _ => "failed",
+                };
+                out.push(json!({"type":"upsert","id":owner,"status":status}));
             }
+            run.finished = terminal;
         }
         out
+    }
+    pub fn clear_async_runs(&mut self) {
+        self.async_runs.clear();
     }
     pub fn omp_task(&mut self, owner: &str, result: &Value) -> Vec<Value> {
         let mut out = Vec::new();
@@ -288,7 +353,9 @@ impl Extensions {
                 if let Some(state) = self.states.get(id) {
                     if state["toolCallId"].as_str().is_some_and(|id| id != owner) {
                         self.states.remove(id);
-                    } else if !terminal || state["status"] != "running" {
+                    } else if !terminal
+                        || !matches!(state["status"].as_str(), Some("running" | "unobserved"))
+                    {
                         continue;
                     }
                 }
@@ -316,11 +383,35 @@ impl Extensions {
             };
             // Native lifecycle is authoritative once terminal; a late delivery is
             // only needed when that lifecycle event was missed.
-            if state["status"] != "running" {
+            if !matches!(state["status"].as_str(), Some("running" | "unobserved")) {
                 continue;
             }
             state["status"] = json!(status);
             out.push(json!({"type":"upsert","id":id,"status":status}));
+        }
+        out
+    }
+    pub fn running_omp_children(&self) -> Vec<String> {
+        self.states
+            .iter()
+            .filter(|(_, state)| state["status"] == "running")
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    pub fn settle_missing_omp_children(
+        &mut self,
+        candidates: &[String],
+        active: &HashSet<&str>,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        for id in candidates.iter().filter(|id| !active.contains(id.as_str())) {
+            if let Some(state) = self.states.get_mut(id)
+                && state["status"] == "running"
+            {
+                // A late native result can still refine the unknown outcome.
+                state["status"] = json!("unobserved");
+                out.push(json!({"type":"upsert","id":id,"status":"canceled"}));
+            }
         }
         out
     }
@@ -332,6 +423,17 @@ impl Extensions {
             string(&payload["id"])
         };
         if id.is_empty() {
+            return None;
+        }
+        // Queued progress cannot reopen a finished run. A fresh lifecycle
+        // start can, including when OMP revives an existing subagent ID.
+        if progress
+            && super::omp_task_status(&payload["progress"], false) == "running"
+            && self
+                .states
+                .get(id)
+                .is_some_and(|state| state["status"] != "running")
+        {
             return None;
         }
         let state=self.states.entry(id.into()).or_insert_with(||json!({"type":"upsert","id":id,"title":"OMP subagent","description":null,"toolCallId":null,"status":"running"}));
@@ -494,6 +596,20 @@ impl Extensions {
         }
         self.cards.clear();
         out
+    }
+}
+
+fn register_child(
+    seen_files: &mut HashSet<String>,
+    children: &mut Vec<Value>,
+    id: &str,
+    file: Option<&str>,
+) {
+    if let Some(file) = file.filter(|s| !s.trim().is_empty())
+        && !seen_files.contains(file)
+    {
+        seen_files.insert(file.into());
+        children.push(json!({"id":id,"file":file}));
     }
 }
 fn append(card: &mut Card, key: String, text: String) {

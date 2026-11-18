@@ -667,3 +667,75 @@ fn deleted_children_are_not_resurrected_by_replay_or_late_events() {
         1
     );
 }
+
+#[test]
+fn subagent_duplicate_upserts_do_not_touch_sqlite() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let mut store = SubagentStore::default();
+    let running =
+        json!({"type":"upsert","id":"x","title":"Scout","status":"running","timestamp":TIMESTAMP});
+    let apply = |store: &mut SubagentStore, event: &Value| {
+        store.apply_persisted(root, "parent", "omp", event).unwrap()
+    };
+    assert_eq!(apply(&mut store, &running)["type"], "upsert");
+    let changes =
+        |store: &mut SubagentStore| store.catalog(root, "parent").unwrap().total_changes();
+    let before = changes(&mut store);
+    let mut repeated = running.clone();
+    repeated["timestamp"] = json!("2026-01-02T00:00:00.000Z");
+    for _ in 0..4 {
+        assert!(apply(&mut store, &repeated).is_null());
+    }
+    assert_eq!(changes(&mut store), before);
+    assert_eq!(store.get("parent", "x").unwrap()["updatedAt"], TIMESTAMP);
+    repeated["status"] = json!("completed");
+    let output = apply(&mut store, &repeated);
+    assert_eq!(output["subagent"]["status"], "completed");
+    assert_eq!(output["subagent"]["updatedAt"], repeated["timestamp"]);
+    assert_eq!(changes(&mut store) - before, 1);
+}
+
+#[test]
+fn subagent_restored_roster_ends_abandoned_children_without_regressing_history() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let mut store = SubagentStore::default();
+    for (id, status) in [
+        ("quiet", "running"),
+        ("stale", "running"),
+        ("done", "completed"),
+    ] {
+        store
+            .apply_persisted(
+                root,
+                "parent",
+                "custom-omp",
+                &json!({"type":"upsert","id":id,"status":status,"toolCallId":id}),
+            )
+            .unwrap();
+    }
+    let mut store = SubagentStore::default(); // read the persisted catalog after a restart
+    let roster = json!(["quiet"]);
+    let outputs = store
+        .reconcile_roster(Some(root), "parent", "custom-omp", &roster)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0]["subagent"]["id"], "stale");
+    assert_eq!(outputs[0]["subagent"]["status"], "canceled");
+    assert_eq!(store.get("parent", "quiet").unwrap()["status"], "running");
+    for (id, status, inferred) in [("stale", "running", false), ("done", "canceled", true)] {
+        let output = store.apply_persisted_event(
+            root, "parent", "custom-omp",
+            &json!({"type":"upsert","id":id,"status":status,"toolCallId":id,"runUnobserved":inferred}),
+            false,
+        ).unwrap();
+        assert!(output.is_null(), "{output}");
+    }
+    assert!(
+        store
+            .reconcile_roster(Some(root), "parent", "custom-omp", &roster)
+            .unwrap()
+            .is_empty()
+    );
+}

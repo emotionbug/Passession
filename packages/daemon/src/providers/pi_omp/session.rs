@@ -45,6 +45,7 @@ struct State {
     prompt_id: Option<String>,
     prompt_results: HashMap<String, Value>,
     prompt_epoch: u64,
+    omp_child_start_epoch: u64,
     turn_started: bool,
     turn_has_user: bool,
     live: bool,
@@ -71,6 +72,8 @@ struct Inner {
     child_files: crate::files::observer::Observers,
     closed: AtomicBool,
     generation: AtomicU64,
+    /// Apply roster observations in the same order as native child frames.
+    frame_gate: tokio::sync::Mutex<()>,
     operation: tokio::sync::Mutex<()>,
     manual_compaction: AtomicBool,
     compaction_started: AtomicBool,
@@ -306,7 +309,50 @@ impl Inner {
         };
         let _ = self.accept_events(events).await;
     }
+    /// Read OMP's session-scoped roster only while we have children to reconcile.
+    /// Elapsed time is not liveness: a quiet child on the roster stays running.
+    async fn reconcile_omp_children(&self) -> Result<()> {
+        let (generation, epoch, child_epoch, candidates) = {
+            let state = self.state.lock().unwrap();
+            if state.active.is_some() || state.settling || state.dead {
+                return Ok(());
+            }
+            (
+                self.generation.load(Ordering::Acquire),
+                state.prompt_epoch,
+                state.omp_child_start_epoch,
+                state.mapper.running_omp_children(),
+            )
+        };
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let runtime = self.runtime()?;
+        let Some(roster) = omp_subagent_roster(&runtime).await else {
+            return Ok(());
+        };
+        let active = roster.iter().map(String::as_str).collect();
+        let _frames = self.frame_gate.lock().await;
+        let events = {
+            let mut state = self.state.lock().unwrap();
+            if state.dead
+                || state.active.is_some()
+                || state.settling
+                || state.prompt_epoch != epoch
+                || state.omp_child_start_epoch != child_epoch
+                || self.closed.load(Ordering::Acquire)
+                || self.generation.load(Ordering::Acquire) != generation
+            {
+                return Ok(());
+            }
+            state
+                .mapper
+                .settle_missing_omp_children(&candidates, &active)
+        };
+        self.accept_events(events).await
+    }
     async fn frame(self: &Arc<Self>, mut frame: Value, generation: u64) -> Result<()> {
+        let _frames = self.frame_gate.lock().await;
         if self.generation.load(Ordering::Acquire) != generation
             || self.closed.load(Ordering::Acquire)
         {
@@ -497,8 +543,16 @@ impl Inner {
             self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"compaction","status":if started{"loading"}else{"completed"},"trigger":if frame["reason"]=="manual"{"manual"}else{"auto"}}})).await?;
             return Ok(());
         }
-        let (mut events, responses, children) = {
+        let (events, responses, children) = {
             let mut state = self.state.lock().unwrap();
+            if frame["type"] == "subagent_lifecycle"
+                && matches!(
+                    frame["payload"]["status"].as_str(),
+                    Some("started" | "running")
+                )
+            {
+                state.omp_child_start_epoch = state.omp_child_start_epoch.wrapping_add(1);
+            }
             let events = state.mapper.map(&frame);
             (
                 events,
@@ -510,7 +564,6 @@ impl Inner {
             self.runtime()?.send(&response).await?;
         }
         for child in children {
-            events.extend(history::pi_child_source(&self.spec.id, &child));
             self.follow_child(child, generation);
         }
         let completed = events
@@ -793,6 +846,7 @@ impl Inner {
                 return Err(error);
             }
         };
+        let frames = self.frame_gate.lock().await;
         if self.closed.load(Ordering::Acquire) {
             router.close().await;
             next.close().await.ok();
@@ -804,8 +858,9 @@ impl Inner {
         let previous = self.runtime.lock().unwrap().replace(next.clone());
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.child_status.send_modify(|statuses| statuses.clear());
-        {
+        let ended_children = {
             let mut data = self.state.lock().unwrap();
+            let ended_children = data.mapper.close_work();
             data.config = config;
             data.mode = Some(mode.into());
             data.features = catalog::features(&state).into();
@@ -817,16 +872,18 @@ impl Inner {
             data.live = false;
             data.bridged_tools = identities.clone();
             data.mapper.set_bridged_tools(&identities);
-            data.mapper.reset_streams();
-        }
-        self.attach(receiver, generation);
-        subscribe(&next).await;
+            ended_children
+        };
         if let Some(old_tools) = old_tools {
             old_tools.close().await;
         }
         if let Some(previous) = previous {
             previous.close().await.ok();
         }
+        self.accept_events(ended_children).await?;
+        drop(frames);
+        self.attach(receiver, generation);
+        subscribe(&next).await;
         if session_id != previous_id {
             self.emit(
                 json!({"type":"thread_started","provider":self.spec.id,"sessionId":session_id}),
@@ -919,6 +976,26 @@ async fn subscribe(runtime: &Transport) {
     {
         tracing::debug!(%error,"OMP subagent subscriptions unavailable");
     }
+}
+
+async fn omp_subagent_roster(runtime: &Transport) -> Option<Vec<String>> {
+    let (_, roster) = runtime
+        .request_with_timeout(
+            json!({"type":"get_subagents"}),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .ok()?;
+    roster["subagents"]
+        .as_array()?
+        .iter()
+        .map(|child| {
+            child["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
 }
 async fn initialized_state(
     runtime: &Transport,
@@ -1124,6 +1201,7 @@ impl Session {
                 prompt_id: None,
                 prompt_results: HashMap::new(),
                 prompt_epoch: 0,
+                omp_child_start_epoch: 0,
                 turn_started: false,
                 turn_has_user: false,
                 live: persistence.is_none(),
@@ -1144,6 +1222,7 @@ impl Session {
             child_files: crate::files::observer::Observers::new(),
             closed: AtomicBool::new(false),
             generation: AtomicU64::new(1),
+            frame_gate: tokio::sync::Mutex::new(()),
             operation: tokio::sync::Mutex::new(()),
             manual_compaction: AtomicBool::new(false),
             compaction_started: AtomicBool::new(false),
@@ -1184,6 +1263,27 @@ impl Session {
                     {let mut state=inner.state.lock().unwrap();state.bridged_tools=identities.clone();state.mapper.set_bridged_tools(&identities);}
                     *inner.host_tools.lock().unwrap()=Some(router);
                     subscribe(&runtime).await;
+                    if path.is_some()
+                        && let Some(active_ids) = omp_subagent_roster(&runtime).await
+                    {
+                        if let Some(history) = loaded.as_mut() {
+                            let active: HashSet<&str> = active_ids.iter().map(String::as_str).collect();
+                            for envelope in &mut history.events {
+                                if envelope["type"] == "provider_subagent" {
+                                    let event = &mut envelope["event"];
+                                    if event["type"] == "upsert"
+                                        && event["status"] == "running"
+                                        && event["id"].as_str().is_some_and(|id| !active.contains(id))
+                                    {
+                                        event["status"] = json!("canceled");
+                                        event["runUnobserved"] = json!(true);
+                                    }
+                                }
+                            }
+                        }
+                        inner.emit(json!({"type":"provider_subagent","provider":inner.spec.id,
+                            "event":{"type":"reconcile","activeIds":active_ids}})).await?;
+                    }
                 }
                 let session_id=inner.state.lock().unwrap().native["sessionId"].clone();
                 inner.emit(json!({"type":"thread_started","provider":inner.spec.id,"sessionId":session_id})).await?;
@@ -1202,6 +1302,7 @@ impl Session {
             let weak = Arc::downgrade(&inner);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(250));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut count = 0u32;
                 loop {
                     interval.tick().await;
@@ -1211,14 +1312,25 @@ impl Session {
                     if inner.closed.load(Ordering::Acquire) || inner.state.lock().unwrap().dead {
                         break;
                     }
-                    let events = inner.state.lock().unwrap().mapper.poll();
+                    let generation = inner.generation.load(Ordering::Acquire);
+                    let (events, children) = {
+                        let mut state = inner.state.lock().unwrap();
+                        (state.mapper.poll(), state.mapper.drain_child_sessions())
+                    };
+                    for child in children {
+                        inner.follow_child(child, generation);
+                    }
                     if inner.accept_events(events).await.is_err() {
                         break;
                     }
                     count = count.wrapping_add(1);
                     let active = inner.state.lock().unwrap().active.is_some();
-                    if count.is_multiple_of(12) && active {
-                        inner.poll_usage(None).await;
+                    if count.is_multiple_of(12) {
+                        if active {
+                            inner.poll_usage(None).await;
+                        } else if omp && inner.reconcile_omp_children().await.is_err() {
+                            break;
+                        }
                     }
                 }
             });
@@ -1753,11 +1865,6 @@ impl AgentSession for Session {
                 sink.emit(event).await?;
             }
         }
-        for child in mapper.drain_child_sessions() {
-            if let Some(event) = history::pi_child_source(self.provider(), &child) {
-                sink.emit(event).await?;
-            }
-        }
         Ok(HistoryCoverage::Unverified)
     }
     async fn runtime_info(&self) -> Result<Value> {
@@ -1880,12 +1987,11 @@ impl AgentSession for Session {
         };
         self.inner.assets.lock().unwrap().take();
         result?;
-        if self.inner.spec.family == "omp" {
-            // Closing suppresses transport frames, so process_exit cannot settle
-            // children here. A turn interrupt deliberately does not do this.
-            let events = self.inner.state.lock().unwrap().mapper.close_work();
-            self.inner.accept_events(events).await?;
-        }
+        // Closing suppresses transport frames, so process_exit cannot settle
+        // children here. A turn interrupt deliberately does not do this.
+        let _frames = self.inner.frame_gate.lock().await;
+        let events = self.inner.state.lock().unwrap().mapper.close_work();
+        self.inner.accept_events(events).await?;
         Ok(())
     }
     async fn list_commands(&self) -> Result<Vec<Value>> {

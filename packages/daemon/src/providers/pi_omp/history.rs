@@ -1074,23 +1074,8 @@ fn project(
                 json!({"type":"timeline","provider":provider,"item":todo}),
             );
         }
-    } else {
-        for child in mapper.drain_child_sessions() {
-            if let Some(event) = pi_child_source(provider, &child) {
-                push_event(&mut history, event);
-            }
-        }
     }
     history
-}
-
-/// Attaches the transcript file a Pi extension reported to the child's descriptor.
-pub(super) fn pi_child_source(provider: &str, child: &Value) -> Option<Value> {
-    let (Some(id), Some(file)) = (child["id"].as_str(), child["file"].as_str()) else {
-        return None;
-    };
-    Some(json!({"type":"provider_subagent","provider":provider,
-        "event":{"type":"upsert","id":id,"source":{"file":file}}}))
 }
 
 /// The opened child's rows, a title refreshed with its model, and descriptors for

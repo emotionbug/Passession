@@ -1329,6 +1329,18 @@ impl AgentManager {
                 .lock()
                 .map_err(|_| anyhow!("Subagent lock poisoned"))?;
             let provider = required(&event, "provider")?;
+            if live && event["event"]["type"] == "reconcile" {
+                return match store.reconcile_roster(
+                    root.as_deref(), &parent, provider, &event["event"]["activeIds"],
+                ) {
+                    Ok(outputs) => Ok(Value::Array(outputs)),
+                    Err(error) if error.downcast_ref::<timeline::SubagentStorageUnavailable>().is_some() => {
+                        tracing::warn!(agent_id = parent, %error, "Could not reconcile the provider subagent roster");
+                        Ok(Value::Null)
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             match root {
                 Some(root) => {
                     store.apply_persisted_event(&root, &parent, provider, &event["event"], live)
@@ -1337,8 +1349,16 @@ impl AgentManager {
             }
         })
         .await??;
-        self.publish_subagent_output(id, cell, &snapshot, output)
-            .await
+        if let Value::Array(outputs) = output {
+            for output in outputs {
+                self.publish_subagent_output(id, cell, &snapshot, output)
+                    .await?;
+            }
+            Ok(())
+        } else {
+            self.publish_subagent_output(id, cell, &snapshot, output)
+                .await
+        }
     }
     async fn publish_subagent_output(
         &self,
@@ -1362,7 +1382,7 @@ impl AgentManager {
         internal: bool,
         mut output: Value,
     ) -> Result<()> {
-        // A dropped event (it targeted a deleted child) publishes nothing.
+        // A dropped event (deleted child or no descriptor change) publishes nothing.
         if output.is_null() {
             return Ok(());
         }
