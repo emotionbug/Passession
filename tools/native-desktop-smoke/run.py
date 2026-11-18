@@ -117,7 +117,7 @@ try:
             home = environment['PASEO_HOME']
             with (case / 'foreground-daemon.log').open('w') as log:
                 daemon = subprocess.Popen(
-                    [str(daemon_cli), 'daemon', 'run', '--home', home],
+                    [str(daemon_cli), 'daemon', 'run', '--no-tray', '--home', home],
                     cwd=state, env=environment, stdin=subprocess.DEVNULL, stdout=log,
                     stderr=subprocess.STDOUT, start_new_session=True,
                 )

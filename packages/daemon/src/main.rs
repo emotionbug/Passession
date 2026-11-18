@@ -9,6 +9,14 @@ fn main() {
         // The ConPTY ownership gate must run before Tokio starts worker threads.
         finish(paseo_daemon::terminals::windows::run_child());
     }
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "__tray")
+    {
+        // AppKit and the Windows message loop must own the initial thread.
+        finish(paseo_daemon::tray::run_child(std::env::args_os().skip(2)));
+    }
     if std::env::args_os()
         .nth(1)
         .is_none_or(|arg| arg != "__worker")

@@ -410,7 +410,7 @@ async fn development(args: &[String], cancel: &CancellationToken) -> Result<()> 
         args
     };
     let command = if args.is_empty() {
-        vec!["daemon".into(), "run".into()]
+        vec!["daemon".into(), "run".into(), "--no-tray".into()]
     } else {
         args.to_vec()
     };

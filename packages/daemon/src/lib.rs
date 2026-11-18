@@ -37,4 +37,7 @@ pub mod providers;
 pub mod state;
 pub mod terminals;
 pub mod transport;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[doc(hidden)]
+pub mod tray;
 pub mod usage;

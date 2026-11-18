@@ -102,6 +102,18 @@ impl ConfigService {
             .clone()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    pub(crate) fn tray_enabled(&self) -> bool {
+        self.current
+            .read()
+            .expect("Configuration state poisoned")
+            .as_ref()
+            .expect("Configuration must initialize before use")
+            .resolved["tray"]
+            .as_bool()
+            .expect("Resolved tray setting must be a boolean")
+    }
+
     pub fn mutable_snapshot(&self) -> Value {
         self.current
             .read()

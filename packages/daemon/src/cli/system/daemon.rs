@@ -54,7 +54,11 @@ pub fn command() -> Command {
                 .about("Install or start the independent local daemon if needed")
                 .arg(option("runtime", "runtime").value_name("DIRECTORY")),
         )
-        .subcommand(launch_options(Command::new("run")))
+        .subcommand(launch_options(
+            Command::new("run").arg(
+                switch("no-tray", "no-tray").help("Do not show the daemon tray icon"),
+            ),
+        ))
         .subcommand(Command::new("status"))
         .subcommand(
             Command::new("stop")
@@ -142,8 +146,12 @@ pub async fn execute(path: &[&str], m: &ArgMatches, ctx: &Context) -> Result<Out
                     home: home.clone(),
                     foreground,
                     deployment: foreground,
+                    options: if foreground && flag(m, "no-tray") {
+                        json!({"tray":false})
+                    } else {
+                        json!({})
+                    },
                     timeout: duration(m, "timeout", 600.0)?,
-                    ..Default::default()
                 },
                 &ctx.cancel,
             )

@@ -77,7 +77,7 @@ impl Fixture {
             home.join("config.json"),
             serde_json::to_vec(&json!({"daemon":{
                 "listen":"127.0.0.1:0", "relay":{"enabled":false}, "mcp":{"enabled":false},
-                "serviceProxy":{"enabled":false}
+                "serviceProxy":{"enabled":false}, "tray":false
             }}))
             .unwrap(),
         )

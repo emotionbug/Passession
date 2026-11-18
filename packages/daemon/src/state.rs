@@ -316,6 +316,8 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
             }
         }
     });
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    let mut tray = None;
     let result: Result<()> = async {
         app.initialize(&options).await?;
         let listen = app
@@ -334,6 +336,10 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
         }
         tracing::info!(%listen,%server_id,version=crate::VERSION,"Paseo native daemon ready");
         app.automation.start_background_maintenance();
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        if app.config.tray_enabled() {
+            tray = Some(crate::tray::start(app.clone(), listen));
+        }
         app.cancel.cancelled().await;
         Ok(())
     }
@@ -344,7 +350,15 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
     if let Err(error) = crate::daemon_control::publish_worker_stopping(exit) {
         tracing::error!(%error, "Failed to announce worker shutdown");
     }
-    let shutdown = app.shutdown().await;
+    let shutdown = app.shutdown();
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    let (shutdown, _) = tokio::join!(shutdown, async {
+        if let Some(tray) = tray {
+            let _ = tray.await;
+        }
+    });
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let shutdown = shutdown.await;
     if let Some(error) = app.failure.lock().unwrap().take() {
         return Err(error);
     }

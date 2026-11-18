@@ -252,6 +252,7 @@ pub fn resolve_with_options(
     let mut retained_cli = Map::new();
     for (key, path) in [
         ("listen", "daemon.listen"),
+        ("tray", "daemon.tray"),
         ("relayEnabled", "daemon.relay.enabled"),
         ("relayUseTls", "daemon.relay.useTls"),
         ("mcpEnabled", "daemon.mcp.enabled"),
@@ -267,6 +268,7 @@ pub fn resolve_with_options(
     }
     let mut resolved = json!({
         "listen": present(cli, "/listen").cloned().unwrap_or_else(|| pick(env, "PASEO_LISTEN", persisted, "/daemon/listen", json!(format!("127.0.0.1:{}", ev(env,"PORT").unwrap_or("6767"))))),
+        "tray": cli["tray"].as_bool().or_else(|| persisted.pointer("/daemon/tray").and_then(Value::as_bool)).unwrap_or(true),
         "paseoHome": home,
         "corsAllowedOrigins": cors(persisted, env),
         "hostnames": hostnames(persisted, env, cli),

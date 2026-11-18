@@ -353,6 +353,17 @@ ExecStart-only drop-in; its original unit file is not replaced. Linux without a
 working user manager, macOS, and Windows start a detached daemon without login
 autostart. On every platform the daemon keeps running when Passession exits.
 
+The daemon shows a tray icon with its version and listen address in a supported
+graphical session. The icon remains after you close Passession and disappears
+when the daemon stops. Its menu can reopen Passession or stop the daemon. Stopping
+requires a second click to confirm because it can interrupt running agents.
+On Linux the icon needs a session D-Bus StatusNotifierWatcher (provided by many
+desktop shells or a shell extension); it appears when the watcher becomes
+available. Headless, SSH-only, and container sessions do not show an icon.
+
+The tray is enabled by default. Run `paseo daemon config set daemon.tray false`
+and restart the daemon to turn it off for that home.
+
 A daemon started by an older Passession is replaced only after its running work
 has drained and new work is paused. During active work `ensure` returns
 `owner: "desktop-legacy"` and `migration: "pending"` and leaves that daemon running.
@@ -456,6 +467,9 @@ PASEO_LISTEN=127.0.0.1:6799 PASEO_RELAY_ENABLED=false paseo daemon run --home ~/
 ```
 
 It stays attached until the supervisor exits or you cancel, without a readiness timeout. Worker restart retains these launch inputs. Stop and relaunch the deployment to change them. If the home already has a live supervisor, `run` returns `already_running` without owning or launching a foreground process.
+
+Add `--no-tray` to `daemon run` to disable the icon for that launch without
+changing the persisted `daemon.tray` setting.
 
 Managed `start` ignores inherited daemon-setting overrides, including `PORT`, `PASEO_LISTEN`, and relay settings. It preserves provider credentials and executable/runtime controls. `start --foreground` is removed; use `daemon run`. Former start/restart configuration flags such as `--port` and `--no-relay` fail before side effects; use the corresponding persisted setting. `--web-ui` is obsolete and has no native replacement. See [configuration edits](/docs/configuration#apply-changes).
 

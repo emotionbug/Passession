@@ -192,6 +192,32 @@ fn launch_overrides_survive_reload_without_erasing_hostname_sources() {
 }
 
 #[test]
+fn tray_setting_resolves_persisted_and_foreground_opt_out() {
+    let home = tempfile::tempdir().unwrap();
+    let resolve = |persisted, cli| {
+        super::resolve::resolve_with_options(
+            home.path(),
+            home.path(),
+            &persisted,
+            &Default::default(),
+            None,
+            &cli,
+        )
+        .unwrap()
+    };
+    assert_eq!(resolve(json!({}), json!({}))["tray"], true);
+    let persisted = super::schema::normalize_persisted(json!({"daemon":{"tray":false}})).unwrap();
+    assert_eq!(resolve(persisted, json!({}))["tray"], false);
+    let overridden = resolve(json!({"daemon":{"tray":true}}), json!({"tray":false}));
+    assert_eq!(overridden["tray"], false);
+    assert_eq!(
+        overridden["configReload"]["overrideControlledPaths"],
+        json!(["daemon.tray"])
+    );
+    assert!(super::schema::normalize_persisted(json!({"daemon":{"tray":"false"}})).is_err());
+}
+
+#[test]
 fn json_failure_is_not_accepted_as_a_different_document_format() {
     assert!(storage::parse_document(std::path::Path::new("config.json"), "version: 1").is_err());
     assert_eq!(

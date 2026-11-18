@@ -149,6 +149,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
             Strip,
             &[
                 ("listen", Text, false),
+                ("tray", Boolean, false),
                 ("hostnames", Hosts, false),
                 ("trustedProxies", Hosts, false),
                 ("mcp", Mcp, false),

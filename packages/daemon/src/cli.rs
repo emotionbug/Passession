@@ -510,15 +510,61 @@ pub(super) async fn open_agent_desktop(server: &str, agent: &str) -> Result<()> 
 }
 
 pub async fn open_desktop(args: &[String]) -> Result<()> {
+    launch_desktop(args, None).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub(crate) async fn open_daemon_desktop(home: &Path) -> Result<()> {
+    launch_desktop(&[], Some(home)).await
+}
+
+async fn launch_desktop(args: &[String], tray_home: Option<&Path>) -> Result<()> {
     let path = desktop_application()?;
+    #[cfg(target_os = "linux")]
+    if let Some(home) = tray_home
+        && std::env::var_os("INVOCATION_ID").is_some()
+    {
+        // Leaving the process group is not enough to leave a systemd unit's
+        // cgroup. The user manager starts the app in a separate unit with the
+        // current desktop environment (which may postdate daemon startup).
+        let mut home_env = std::ffi::OsString::from("--setenv=PASEO_HOME=");
+        home_env.push(home);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("systemd-run")
+                .args(["--user", "--collect", "--quiet"])
+                .arg(home_env)
+                .arg("--")
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await??;
+        anyhow::ensure!(
+            status.success(),
+            "systemd-run could not start Passession: {status}"
+        );
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = tokio::process::Command::new("open");
         command.arg("-a").arg(path);
+        if let Some(home) = tray_home {
+            let mut home_env = std::ffi::OsString::from("PASEO_HOME=");
+            home_env.push(home);
+            command.arg("--env").arg(home_env);
+        }
         command
     };
     #[cfg(not(target_os = "macos"))]
     let mut command = tokio::process::Command::new(path);
+    #[cfg(not(target_os = "macos"))]
+    if let Some(home) = tray_home {
+        command.env("PASEO_HOME", home);
+    }
     command
         .args(args)
         .stdin(Stdio::null())
@@ -534,7 +580,17 @@ pub async fn open_desktop(args: &[String]) -> Result<()> {
         });
     }
     #[cfg(windows)]
-    command.creation_flags(0x00000008 | 0x00000200);
+    {
+        use windows_sys::Win32::System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+        };
+        let flags = if tray_home.is_some() {
+            CREATE_BREAKAWAY_FROM_JOB
+        } else {
+            0
+        };
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | flags);
+    }
     let mut child = command.spawn()?;
     tokio::spawn(async move {
         let _ = child.wait().await;

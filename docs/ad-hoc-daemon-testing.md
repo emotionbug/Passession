@@ -9,10 +9,15 @@ Build the executable and required runtime assets with `cargo xtask build-daemon`
 ```sh
 PASEO_HOME=/absolute/path/to/disposable-home \
 PASEO_LISTEN=127.0.0.1:17678 \
-./.dev/build/native/dev-fast/paseo daemon run
+./.dev/build/native/dev-fast/paseo daemon run --no-tray
 ```
 
 Choose an unused endpoint and a genuinely disposable directory. Native runtime staging stays source-local even with `CARGO_TARGET_DIR`; use `paseo.exe` on Windows. `daemon run` is the foreground mode; managed supervisor tests must deliberately use the managed start path instead.
+
+Disable the tray so the test cannot register an icon on your desktop. For
+`daemon start`, `daemon ensure`, or tests that let the GUI launch the daemon,
+set `"tray": false` in the disposable home's `config.json` under `"daemon"`
+before starting it.
 
 Connect using the native CLI, the Rust GUI, or the `paseo-client` SDK from `packages/client` (see `packages/client/examples/inspect.rs`). For example, in another terminal:
 
