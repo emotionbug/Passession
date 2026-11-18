@@ -6,7 +6,9 @@
 //! here parses at its index with the parser Makepad itself uses, has outlines
 //! and maps the role's probe character, so defining it can never panic.
 
-use makepad_widgets::makepad_draw::text::font_face::FontFace as ParsedFace;
+use makepad_widgets::makepad_draw::text::{
+    font_face::FontFace as ParsedFace, glyph_outline::Builder,
+};
 use std::{collections::HashMap, sync::Arc};
 
 /// What to resolve. Families are unquoted, in CSS order.
@@ -266,9 +268,6 @@ pub(crate) fn finish_face(
     if tables.glyf.is_none() && tables.cff.is_none() && tables.cff2.is_none() {
         return None;
     }
-    if face.glyph_index(probe).is_none_or(|glyph| glyph.0 == 0) {
-        return None;
-    }
     let mut variations = Vec::new();
     for axis in face.variation_axes() {
         let tag = axis.tag.0.to_be_bytes();
@@ -287,6 +286,14 @@ pub(crate) fn finish_face(
             axis.max_value.max(axis.min_value),
         );
         variations.push((tag, value.clamp(low, high)));
+    }
+    // Some CoreText system faces expose a cmap and outline tables whose glyphs
+    // our rasterizer cannot decode. They must not hide the bundled fallback.
+    let parsed = ParsedFace::from_data_index_and_variations(data.clone(), index, &variations)?;
+    let face = parsed.as_ttf_parser_face();
+    let glyph = face.glyph_index(probe).filter(|glyph| glyph.0 != 0)?;
+    if !probe.is_whitespace() && face.outline_glyph(glyph, &mut Builder::new()).is_none() {
+        return None;
     }
     Some(FontFace {
         data,
@@ -626,6 +633,42 @@ mod tests {
                 (tag, data[offset..offset + length].to_vec())
             })
             .collect()
+    }
+
+    #[test]
+    fn validation_rejects_mapped_glyphs_without_drawable_outlines() {
+        let bytes = include_bytes!("../vendor/makepad-widgets/resources/IBMPlexSans-Text.ttf");
+        let mut tables = split_sfnt(bytes);
+        let (_, outlines) = tables.iter_mut().find(|(tag, _)| tag == b"glyf").unwrap();
+        outlines.fill(0);
+        let data = Arc::new(build_sfnt(&tables));
+        let parsed = ParsedFace::from_data_and_index(data.clone(), 0).unwrap();
+        assert!(parsed.as_ttf_parser_face().glyph_index('A').is_some());
+        assert!(parsed.as_ttf_parser_face().tables().glyf.is_some());
+        assert!(finish_face(data, 0, &[], Role::Regular, 'A', "unusable".into()).is_none());
+    }
+
+    #[test]
+    fn validation_accepts_bundled_latin_hangul_and_whitespace() {
+        let latin = include_bytes!("../vendor/makepad-widgets/resources/IBMPlexSans-Text.ttf");
+        let hangul = include_bytes!("../../gui/resources/fonts/NotoSansKR-Regular.otf");
+        for (bytes, probe) in [
+            (latin.as_slice(), 'A'),
+            (hangul.as_slice(), '한'),
+            (latin, ' '),
+        ] {
+            assert!(
+                finish_face(
+                    Arc::new(bytes.to_vec()),
+                    0,
+                    &[],
+                    Role::Regular,
+                    probe,
+                    "bundled".into()
+                )
+                .is_some()
+            );
+        }
     }
 
     #[test]

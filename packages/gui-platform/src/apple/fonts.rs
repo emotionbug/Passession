@@ -413,6 +413,39 @@ pub(crate) fn fallback_fonts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use makepad_widgets::makepad_draw::text::font_face::FontFace as ParsedFace;
+
+    #[test]
+    fn core_text_ui_faces_are_renderable_or_rejected() {
+        autoreleasepool(|_| {
+            let mut backend = CoreText {
+                language: "ko-KR".into(),
+                sfnts: HashMap::new(),
+                installed: None,
+            };
+            for role in [
+                Role::Regular,
+                Role::Semibold,
+                Role::Italic,
+                Role::BoldItalic,
+            ] {
+                let font = system_ui_font(role).unwrap();
+                if let Some(face) = backend.load(&font, role, 'A') {
+                    let parsed = ParsedFace::from_data_index_and_variations(
+                        face.data,
+                        face.index,
+                        &face.variations,
+                    )
+                    .unwrap();
+                    let face = parsed.as_ttf_parser_face();
+                    let glyph = face.glyph_index('A').unwrap();
+                    let mut builder =
+                        makepad_widgets::makepad_draw::text::glyph_outline::Builder::new();
+                    assert!(face.outline_glyph(glyph, &mut builder).is_some());
+                }
+            }
+        });
+    }
 
     #[test]
     fn null_core_foundation_results_are_not_released() {
