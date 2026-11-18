@@ -775,7 +775,7 @@ lists, time-varying or external pixels, and unclassified repaint requests fall
 back to rendering the full window. An unchanged draw with unknown bounds is
 replayed inside the repair scissor.
 
-X11 keeps a bounded EGLSurface-owned damage history. The acquired
+X11 and Android keep a bounded EGLSurface-owned damage history. The acquired
 buffer's age selects the repair region, which limits the color/depth clear
 and draw submission. `EGL_KHR_partial_update`, when available, receives the
 repair region; `eglSwapBuffersWithDamageKHR/EXT` instead receives the delta
@@ -788,11 +788,9 @@ owner starts with no draw items, viewport, transform, or attachment. A stale
 viewport affects both painting and touch bounds; partial and full rendering
 of the same incorrect list can therefore agree pixel-for-pixel.
 
-Android uses the same EGL damage code but repaints in full by default.
-`adb shell setprop debug.paseo.partial_redraw 1` enables partial repair;
-`debug.paseo.verify_damage 1` adds the same-frame pixel comparison
-(`paseo_damage` in logcat). Restart the app after setting either. Verify on
-Adreno and Mali before enabling partial repair by default.
+On Android, `adb shell setprop debug.paseo.verify_damage 1` and an app restart
+enable the same-frame pixel comparison (`paseo_damage` in logcat). The oracle
+bypasses driver damage hints; disable it to exercise actual EGL presentation.
 
 Windows uses flip-sequential `Present1` dirty rectangles with D3D11.1
 `ClearView` and a scissor. DXGI reconciles old backbuffer contents outside

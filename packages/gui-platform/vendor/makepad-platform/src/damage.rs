@@ -19,37 +19,12 @@ pub(crate) fn log_oracle(args: std::fmt::Arguments<'_>) {
 }
 
 /// Whether every window frame must repaint in full.
-///
-/// Android defaults to full redraws: on an Adreno phone (OnePlus 15) partial
-/// presentation left stale and missing regions on screen, a path no desktop
-/// driver exercised (`eglSetDamageRegionKHR`). `adb shell setprop
-/// debug.paseo.partial_redraw 1` re-enables it for device verification.
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android", target_os = "macos", target_os = "ios"))]
 pub(crate) fn force_full_redraw() -> bool {
     static FULL_REDRAW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("PASEO_FULL_REDRAW").is_some_and(|value| value == "1")
-            || (cfg!(target_os = "android") && !debug_flag("debug.paseo.partial_redraw"))
     });
     *FULL_REDRAW
-}
-
-/// An Android system property set to `1`, readable without a debuggable build
-/// (`adb shell setprop debug.paseo.<name> 1`, then restart the app).
-#[cfg(target_os = "android")]
-pub(crate) fn debug_flag(name: &str) -> bool {
-    use std::ffi::{c_char, c_int, CString};
-    unsafe extern "C" {
-        fn __system_property_get(name: *const c_char, value: *mut c_char) -> c_int;
-    }
-    let Ok(name) = CString::new(name) else { return false };
-    let mut value = [0 as c_char; 92]; // PROP_VALUE_MAX
-    let len = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr()) };
-    len == 1 && value[0] == b'1' as c_char
-}
-
-#[cfg(not(target_os = "android"))]
-pub(crate) fn debug_flag(_name: &str) -> bool {
-    false
 }
 
 thread_local! {

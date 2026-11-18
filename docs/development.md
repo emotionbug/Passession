@@ -194,11 +194,11 @@ several `render_passes` during a transition.
 `render_ms / render_frames` includes time spent in presentation and should
 not be interpreted as GPU execution time.
 
-Android repaints in full by default. To exercise actual EGL partial
-presentation, run `adb shell setprop debug.paseo.partial_redraw 1`, then
-force-stop and reopen. To compare logical damage instead, also set
-`debug.paseo.verify_damage` to `1` and read `paseo_damage` lines in logcat.
-The oracle bypasses EGL damage hints. Reset both properties afterwards.
+Android uses EGL partial presentation when the buffer age and damage history
+permit it. No system property is needed. To compare logical damage with a
+full render, set `adb shell setprop debug.paseo.verify_damage 1`, restart the
+app and read `paseo_damage` in logcat. The oracle bypasses EGL damage hints;
+set the property to `0` and restart to test actual presentation again.
 
 On Linux, build a debug client and daemon. The pixel oracle requires Python
 with Pillow, X11, and a private `dbus-run-session`:

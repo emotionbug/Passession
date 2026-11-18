@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Android redraws only changed regions when the graphics driver provides usable buffer history. New, resized or invalidated surfaces still get a full repaint.
+
 ## 0.13.43 - 2026-11-19
 
 ### Fixed

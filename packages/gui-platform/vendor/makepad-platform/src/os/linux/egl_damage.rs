@@ -1,5 +1,5 @@
 use super::{egl_sys::{EGLBoolean, EGLDisplay, EGLSurface, LibEgl}, gl_sys::{self, LibGl}};
-use crate::{cx::Cx, damage::{debug_flag, force_full_redraw, log_oracle, DamageFrame, DamageHistory, DamageRect, FullDamageReason}, makepad_math::Vec4, pass::PassId};
+use crate::{cx::Cx, damage::{force_full_redraw, log_oracle, DamageFrame, DamageHistory, DamageRect, FullDamageReason}, makepad_math::Vec4, pass::PassId};
 use std::{ffi::CStr, sync::LazyLock};
 
 const EGL_EXTENSIONS: i32 = 0x3055;
@@ -110,8 +110,17 @@ impl OracleResult {
 }
 
 static VERIFY_DAMAGE: LazyLock<bool> = LazyLock::new(|| {
+    #[cfg(target_os = "android")]
+    {
+        use std::ffi::{c_char, c_int};
+        unsafe extern "C" {
+            fn __system_property_get(name: *const c_char, value: *mut c_char) -> c_int;
+        }
+        let mut value = [0 as c_char; 92]; // PROP_VALUE_MAX
+        let len = unsafe { __system_property_get(c"debug.paseo.verify_damage".as_ptr(), value.as_mut_ptr()) };
+        if len == 1 && value[0] == b'1' as c_char { return true; }
+    }
     std::env::var_os("PASEO_VERIFY_DAMAGE").is_some_and(|value| value == "1")
-        || debug_flag("debug.paseo.verify_damage")
 });
 
 impl EglWindowDamage {
