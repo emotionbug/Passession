@@ -67,9 +67,15 @@ pub fn define_macos_timer_delegate() -> *const Class {
 
 
 pub fn define_app_delegate() -> *const Class {
+    extern "C" fn surface_workspace_did_wake(_: &Object, _: Sel, _: ObjcId) {
+        super::macos_app::post_surface_wake();
+    }
     
     let superclass = class!(NSObject);
-    let decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
+    let mut decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
+    unsafe {
+        decl.add_method(sel!(surfaceWorkspaceDidWake:), surface_workspace_did_wake as extern "C" fn(&Object, Sel, ObjcId));
+    }
 
     return decl.register();
 }
@@ -191,13 +197,13 @@ pub fn define_macos_window_delegate() -> *const Class {
     
     extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: ObjcId) {
         let cw = get_cocoa_window(this);
-        cw.send_change_event();
+        cw.backing_changed();
     }
     
     // This will always be called before `window_did_change_screen`.
     extern "C" fn window_did_change_backing_properties(this: &Object, _: Sel, _: ObjcId) {
         let cw = get_cocoa_window(this);
-        cw.send_change_event();
+        cw.backing_changed();
     }
     
     extern "C" fn window_did_become_key(this: &Object, _: Sel, _: ObjcId) {
@@ -287,8 +293,8 @@ pub fn define_macos_window_delegate() -> *const Class {
         decl.add_method(sel!(windowDidEndLiveResize:), window_did_end_live_resize as extern "C" fn(&Object, Sel, ObjcId));
         
         decl.add_method(sel!(windowDidMove:), window_did_move as extern "C" fn(&Object, Sel, ObjcId));
-        decl.add_method(sel!(windowChangedScreen:), window_did_change_screen as extern "C" fn(&Object, Sel, ObjcId));
-        decl.add_method(sel!(windowChangedBackingProperties:), window_did_change_backing_properties as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(windowDidChangeScreen:), window_did_change_screen as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(windowDidChangeBackingProperties:), window_did_change_backing_properties as extern "C" fn(&Object, Sel, ObjcId));
         decl.add_method(sel!(windowDidBecomeKey:), window_did_become_key as extern "C" fn(&Object, Sel, ObjcId));
         decl.add_method(sel!(windowDidResignKey:), window_did_resign_key as extern "C" fn(&Object, Sel, ObjcId));
         

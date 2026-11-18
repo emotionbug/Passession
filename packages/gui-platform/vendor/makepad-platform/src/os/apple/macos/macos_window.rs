@@ -44,6 +44,7 @@ pub struct MacosWindow {
     pub(crate) is_fullscreen: bool,
     pub(crate) is_fullscreen_transitioning: bool,
     pub(crate) last_mouse_pos: DVec2,
+    pub(super) backing_generation: u64,
     window_delegate: ObjcId,
     live_resize_timer: ObjcId,
     last_window_geom: Option<WindowGeom>,
@@ -69,6 +70,7 @@ impl MacosWindow {
                 window: window,
                 window_id: window_id,
                 view: view,
+                backing_generation: 0,
                 last_window_geom: None,
                 ime_spot: DVec2::default(),
                 last_mouse_pos: DVec2::default(),
@@ -328,6 +330,11 @@ impl MacosWindow {
         scale
     }
     
+    pub(super) fn backing_changed(&mut self) {
+        self.backing_generation = self.backing_generation.wrapping_add(1);
+        self.send_change_event();
+    }
+
     pub fn send_change_event(&mut self) {
         //return;
         let new_geom = self.get_window_geom();

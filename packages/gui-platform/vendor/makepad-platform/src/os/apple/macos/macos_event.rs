@@ -30,6 +30,8 @@ pub enum MacosEvent {
     WindowClosed(WindowClosedEvent),
     Paint,
     DisplayFrame,
+    SurfaceReady,
+    SurfaceWake,
     
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),

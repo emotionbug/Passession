@@ -550,7 +550,7 @@ impl NSMutableAttributedString for ObjcId {
 
 
 #[repr(u64)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum MTLLoadAction {
     DontCare = 0,
     Load = 1,

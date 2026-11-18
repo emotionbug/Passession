@@ -163,16 +163,57 @@ hardware adapters first, then the WARP software driver, and reports a startup
 error if neither succeeds.
 
 On macOS, a CoreVideo display link targets the key window's screen (otherwise
-the first window's screen). It coalesces ticks onto the AppKit event queue only
-while `NextFrame` work is pending. Input and resize paints do not advance
-animations themselves. If CoreVideo cannot start, the existing timer supplies
-animation ticks capped at 60 Hz.
+the first window's screen). It coalesces ticks onto the AppKit event queue
+while `NextFrame` work or an IOSurface reuse wait is pending. Input and resize
+paints do not advance animations themselves. If CoreVideo cannot start, the
+existing timer supplies animation ticks capped at 60 Hz.
 
 `gpu_info.rs` stores and logs the actual native API/renderer once during
 initialization. EGL also reports GL vendor/version, shading-language version and
 EGL vendor. Windows reports DXGI adapter description, D3D feature level and WARP
 selection; Metal reports the selected device name. The same info reaches the
 existing client diagnostics report and flags known CPU renderers.
+
+## Opt-in macOS IOSurface presentation
+
+`PASEO_METAL_SURFACE_PRESENT=1` enables an experimental, unified-memory macOS
+window presenter. `os/apple/macos/metal_surface.rs` wraps three row-aligned
+BGRA IOSurfaces as shared `BGRA8Unorm` Metal render targets. No drawable copy is
+used for display. `CAMetalLayer` continues to be the default and handles live
+resize, incompatible viewports, and unsupported or failed presenters. iOS
+continues to use its own `MTKView` path.
+
+The existing drawable layer leaves `colorspace` nil (no color matching).
+The plain CALayer's IOSurfaces instead carry `kIOSurfaceColorSpace` set to
+`CGColorSpaceCopyPropertyList` of the window's RGB backing color space (its
+screen's if no window profile is provided). This labels the same premultiplied
+SDR channel values in their destination space without forcing an sRGB/P3
+conversion or changing shaders. Color parity still needs Mac display testing,
+particularly for windows spanning displays. `contentsScale` is the native
+backing scale; the unflipped hosted view uses top-left gravity and unflipped
+texture contents. Size, scale, display/profile changes, fullscreen and wake
+discard the ring; a new Metal device also gets new textures and clear state.
+
+One window frame can be in flight. The Metal completion handler releases GPU
+reads and posts a coalesced main-thread wake; scheduling alone does not guarantee
+that Core Animation can read the pixels. The main thread assigns distinct
+surface contents in a disabled-actions `CATransaction`. The newest submitted
+front is reserved; older fronts are quarantined until a successor reports use
+and a fresh `IOSurfaceIsInUse` check on the old surface is clear. If no buffer
+is free, repaint work coalesces and reuse is retried at display cadence, not
+in a spin loop. If a visible window cannot reclaim a buffer for 250 ms, the
+presenter abandons its ring without reusing any uncertain buffer.
+
+The backend-neutral `damage.rs` history is shared with EGL. Only a successfully
+published frame advances the logical scene and history. A partial repair loads
+and stores color and depth, scissor-clears both, and replays intersecting draw
+items without changing their order or depth bias. The pass-owned depth buffer
+must still represent the previous scene outside the repair; a changed depth
+resource forces full repair. The optional Metal pixel oracle uses independent
+scratch attachments, the same encoder inputs, and fenced readback; it rejects
+the candidate and switches to the full drawable path on mismatch. See
+[development](../../../../docs/development.md#macos-iosurface-verification)
+for switches, Mac runtime scenarios, and timing/trace fields.
 
 ## Android Surface lifetime
 

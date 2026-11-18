@@ -1,5 +1,5 @@
 //! Conservative paint damage from the *render* tree, independent of pending GPU uploads.
-#![cfg_attr(not(any(target_os = "linux", target_os = "android", target_os = "windows")), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "android", target_os = "windows", target_os = "macos")), allow(dead_code))]
 use crate::{
     cx::Cx,
     draw_list::{CxDrawListUniforms, DrawListId},
@@ -10,7 +10,7 @@ use crate::{
 };
 use std::cell::Cell;
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android", target_os = "macos"))]
 pub(crate) fn force_full_redraw() -> bool {
     static FULL_REDRAW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("PASEO_FULL_REDRAW").is_some_and(|value| value == "1")
@@ -68,6 +68,84 @@ impl DamageRect {
 
     pub fn egl(self) -> [i32; 4] {
         [self.x0, self.y0, self.x1 - self.x0, self.y1 - self.y0]
+    }
+}
+
+/// The changes between successfully presented frames, not the repairs used to
+/// bring individual buffers up to date. Age one means the immediately previous
+/// presentation. Zero/negative age or missing history requires a full repair.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
+#[derive(Clone, Default)]
+pub(crate) struct DamageHistory {
+    frames: [DamageRect; 4],
+    next: usize,
+    len: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
+impl DamageHistory {
+    pub fn repair(&self, age: i32, current: DamageRect) -> Option<DamageRect> {
+        let count = usize::try_from(age.checked_sub(1)?).ok()?;
+        if count > self.len {
+            return None;
+        }
+        let len = self.frames.len();
+        Some((1..=count).fold(current, |rect, index| {
+            rect.union(self.frames[(self.next + len - index) % len])
+        }))
+    }
+
+    pub fn push(&mut self, rect: DamageRect) {
+        self.frames[self.next] = rect;
+        self.next = (self.next + 1) % self.frames.len();
+        self.len = (self.len + 1).min(self.frames.len());
+    }
+
+    pub fn invalidate(&mut self) {
+        self.len = 0;
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn rect(x: i32) -> DamageRect {
+        DamageRect { x0: x, y0: 0, x1: x + 1, y1: 1 }
+    }
+
+    #[test]
+    fn repairs_include_only_intervening_presentations() {
+        let mut history = DamageHistory::default();
+        assert_eq!(history.repair(0, rect(9)), None);
+        assert_eq!(history.repair(1, rect(9)), Some(rect(9)));
+        assert_eq!(history.repair(2, rect(9)), None);
+        history.push(rect(1));
+        // This computed repair was dropped, not presented.
+        assert_eq!(history.repair(2, rect(0)), Some(rect(0).union(rect(1))));
+        // Coalesced input can go straight from the last presented scene to the
+        // latest one. The dropped repair never expands the history.
+        history.push(rect(3).union(rect(4)));
+        assert_eq!(history.repair(1, rect(9)), Some(rect(9)));
+        assert_eq!(history.repair(2, rect(9)), Some(rect(3).union(rect(9))));
+        assert_eq!(history.repair(3, rect(9)), Some(rect(1).union(rect(9))));
+    }
+
+    #[test]
+    fn lost_history_and_resize_require_full_repair() {
+        let mut history = DamageHistory::default();
+        for i in 0..8 {
+            history.push(rect(i));
+        }
+        assert_eq!(history.repair(3, rect(9)), Some(rect(6).union(rect(9))));
+        assert_eq!(history.repair(5, rect(9)), Some(rect(4).union(rect(9))));
+        assert_eq!(history.repair(6, rect(9)), None);
+        history.invalidate();
+        assert_eq!(history.repair(2, rect(9)), None);
+        // Resize also resets buffer identities: the first acquired buffer has age 0.
+        assert_eq!(history.repair(0, rect(9)), None);
+        history.push(rect(10));
+        assert_eq!(history.repair(2, rect(11)), Some(rect(10).union(rect(11))));
     }
 }
 

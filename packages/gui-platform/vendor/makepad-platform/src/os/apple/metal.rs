@@ -45,6 +45,25 @@ use crate::{
     metal_xpc::store_xpc_service_texture
 };
 
+#[cfg(target_os = "macos")]
+use crate::{
+    damage::{force_full_redraw, DamageFrame, DamageRect},
+    os::apple::macos::metal_surface::{SurfaceCompletion, SurfacePresenter},
+};
+
+#[cfg(target_os = "macos")]
+type DamageCursor<'a> = Option<(&'a DamageFrame, DamageRect, usize)>;
+
+struct MetalDraw<'a> {
+    encoder: ObjcId,
+    metal_cx: &'a MetalCx,
+    zbias: f32,
+    zbias_step: f32,
+    gpu_read_guards: &'a mut Vec<MetalRwLockGpuReadGuard>,
+    #[cfg(target_os = "macos")]
+    damage: DamageCursor<'a>,
+}
+
 
 impl Cx {
     
@@ -53,12 +72,7 @@ impl Cx {
         &mut self,
         pass_id: PassId,
         draw_list_id: DrawListId,
-        zbias: &mut f32,
-        zbias_step: f32,
-        encoder: ObjcId,
-        command_buffer: ObjcId,
-        gpu_read_guards: &mut Vec<MetalRwLockGpuReadGuard>,
-        metal_cx: &MetalCx,
+        draw: &mut MetalDraw<'_>,
     ) {
         // tad ugly otherwise the borrow checker locks 'self' and we can't recur
         let draw_items_len = self.draw_lists[draw_list_id].draw_items.len();
@@ -67,16 +81,7 @@ impl Cx {
         
         for draw_item_id in 0..draw_items_len {
             if let Some(sub_list_id) = self.draw_lists[draw_list_id].draw_items[draw_item_id].kind.sub_list() {
-                self.render_view(
-                    pass_id,
-                    sub_list_id,
-                    zbias,
-                    zbias_step,
-                    encoder,
-                    command_buffer,
-                    gpu_read_guards,
-                    metal_cx,
-                );
+                self.render_view(pass_id, sub_list_id, draw);
             }
             else {
                 let draw_list = &mut self.draw_lists[draw_list_id];
@@ -86,6 +91,14 @@ impl Cx {
                 }else {
                     continue;
                 };
+
+                // Match DamageFrame's paint ordinal, including uncompiled shaders.
+                #[cfg(target_os = "macos")]
+                let culled = if let Some((frame, repair, ordinal)) = &mut draw.damage {
+                    let culled = frame.should_cull(*ordinal, *repair);
+                    *ordinal += 1;
+                    culled
+                } else { false };
                 
                 let sh = &self.draw_shaders[draw_call.draw_shader.draw_shader_id];
                 if sh.os_shader_id.is_none() { // shader didnt compile somehow
@@ -96,6 +109,13 @@ impl Cx {
                 if sh.mapping.uses_time{
                     self.demo_time_repaint = true;
                 }
+                // A skipped draw must still consume its original depth bias.
+                draw_call.draw_call_uniforms.set_zbias(draw.zbias);
+                draw.zbias += draw.zbias_step;
+                #[cfg(target_os = "macos")]
+                if culled { continue; }
+                let MetalDraw { encoder, metal_cx, gpu_read_guards, .. } = draw;
+                let encoder = *encoder;
                 
                 
                 if draw_call.instance_dirty {
@@ -105,10 +125,6 @@ impl Cx {
                     draw_item.os.instance_buffer.next();
                     draw_item.os.instance_buffer.get_mut().cpu_write().update(metal_cx, &draw_item.instances.as_ref().unwrap());
                 }
-                
-                // update the zbias uniform if we have it.
-                draw_call.draw_call_uniforms.set_zbias(*zbias);
-                *zbias += zbias_step;
                 
                 if draw_call.uniforms_dirty {
                     draw_call.uniforms_dirty = false;
@@ -341,6 +357,8 @@ impl Cx {
                 let cxtexture = &mut self.textures[color_texture.texture.texture_id()];
                 let size = dpi_factor * pass_rect.size; 
                 cxtexture.update_render_target(metal_cx, size.x as usize, size.y as usize);
+                #[cfg(target_os = "macos")]
+                cxtexture.mark_content_changed();
                 
                 let is_initial = cxtexture.take_initial();
                 
@@ -391,6 +409,8 @@ impl Cx {
             let cxtexture = &mut self.textures[depth_texture.texture_id()];
             let size = dpi_factor * pass_rect.size;
             cxtexture.update_depth_stencil(metal_cx, size.x as usize, size.y as usize);
+            #[cfg(target_os = "macos")]
+            cxtexture.mark_content_changed();
             let is_initial = cxtexture.take_initial();
             
             let depth_attachment: ObjcId = unsafe {msg_send![render_pass_descriptor, depthAttachment]};
@@ -419,14 +439,7 @@ impl Cx {
                 }
             }
             // create depth state
-            if self.passes[pass_id].os.mtl_depth_state.is_none() {
-                
-                let desc: ObjcId = unsafe {msg_send![class!(MTLDepthStencilDescriptor), new]};
-                let () = unsafe {msg_send![desc, setDepthCompareFunction: MTLCompareFunction::LessEqual]};
-                let () = unsafe {msg_send![desc, setDepthWriteEnabled: true]};
-                let depth_stencil_state: ObjcId = unsafe {msg_send![metal_cx.device, newDepthStencilStateWithDescriptor: desc]};
-                self.passes[pass_id].os.mtl_depth_state = Some(depth_stencil_state);
-            }
+            self.metal_depth_state(pass_id, metal_cx);
         }
         
         let command_buffer: ObjcId = unsafe {msg_send![metal_cx.command_queue, commandBuffer]};
@@ -439,29 +452,16 @@ impl Cx {
         let pass_width = dpi_factor * pass_rect.size.x;
         let pass_height = dpi_factor * pass_rect.size.y;
         
-        let () = unsafe {msg_send![encoder, setViewport: MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
-            width: pass_width,
-            height: pass_height,
-            znear: 0.0,
-            zfar: 1.0,
-        }]};
+        set_metal_viewport(encoder, pass_width, pass_height);
         
-        let mut zbias = 0.0;
-        let zbias_step = self.passes[pass_id].zbias_step;
         let mut gpu_read_guards = Vec::new();
-        
-        self.render_view(
-            pass_id,
-            draw_list_id,
-            &mut zbias,
-            zbias_step,
-            encoder,
-            command_buffer,
-            &mut gpu_read_guards,
-            &metal_cx,
-        );
+        let mut draw = MetalDraw {
+            encoder, metal_cx, zbias: 0.0, zbias_step: self.passes[pass_id].zbias_step,
+            gpu_read_guards: &mut gpu_read_guards,
+            #[cfg(target_os = "macos")]
+            damage: None,
+        };
+        self.render_view(pass_id, draw_list_id, &mut draw);
         
         let () = unsafe {msg_send![encoder, endEncoding]};
         
@@ -503,6 +503,139 @@ impl Cx {
             }
         }
         let () = unsafe {msg_send![pool, release]};
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn surface_viewport(&self, pass_id: PassId, size: [i32; 2]) -> Option<crate::makepad_math::Rect> {
+        let rect = self.get_pass_rect(pass_id, 1.0)?;
+        let dpi = self.passes[pass_id].dpi_factor?;
+        ((rect.size.x * dpi - f64::from(size[0])).abs() <= 1e-6
+            && (rect.size.y * dpi - f64::from(size[1])).abs() <= 1e-6).then_some(rect)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn draw_surface_pass(
+        &mut self, pass_id: PassId, metal_cx: &MetalCx, presenter: &mut SurfacePresenter,
+        slot: usize, size: [i32; 2], pass_rect: crate::makepad_math::Rect,
+    ) -> Result<(), &'static str> {
+        let pass = &mut self.passes[pass_id];
+        let Some(root) = pass.main_draw_list_id else { return Err("missing Metal window draw list"); };
+        let Some(dpi) = pass.dpi_factor else { return Err("missing Metal window scale"); };
+        let (Some(depth_texture), &PassClearDepth::ClearWith(depth)) = (&pass.depth_texture, &pass.clear_depth) else {
+            return Err("window depth must be cleared each frame");
+        };
+        if !(0.0..=1.0).contains(&depth) { return Err("window depth clear value out of range"); }
+        let depth_id = depth_texture.texture_id();
+        let depth_texture = &mut self.textures[depth_id];
+        if !depth_texture.update_depth_stencil(metal_cx, size[0] as usize, size[1] as usize)
+            || !depth_texture.alloc.as_ref().is_some_and(|alloc| {
+                matches!(alloc.pixel, TexturePixel::D32) && [alloc.width, alloc.height] == size.map(|v| v as usize)
+            })
+        {
+            return Err("window Depth32Float attachment unavailable");
+        }
+        let initial_depth = depth_texture.take_initial();
+        let depth_target = depth_texture.os.texture.as_ref().unwrap().as_id();
+        let depth_valid = !initial_depth
+            && presenter.depth_baseline() == Some((depth_id, depth_texture.visual_revision));
+        depth_texture.mark_content_changed();
+        let depth_baseline = (depth_id, depth_texture.visual_revision);
+        let color = pass.clear_color;
+        pass.set_ortho_matrix(pass_rect.pos, pass_rect.size);
+        pass.set_dpi_factor(dpi);
+        let full = force_full_redraw();
+        let logical = if full {
+            DamageRect::full(size)
+        } else {
+            presenter.scene_mut().collect(self, pass_id, root, size, [
+                color.x.to_bits(), color.y.to_bits(), color.z.to_bits(), color.w.to_bits(), depth.to_bits(),
+            ])
+        };
+        let screenshot_requested = self.screenshot_requests.iter().any(|request| request.kind_id == 0);
+        let Some(mut paint) = presenter.prepare(
+            slot, logical, depth_baseline, full || !depth_valid || screenshot_requested, self.frame_trace.is_some(),
+        ) else {
+            return Err("Metal scissored clear or oracle allocation failed");
+        };
+        let command: ObjcId = unsafe { msg_send![metal_cx.command_queue, commandBuffer] };
+        if command == nil { return Err("Metal command buffer unavailable"); }
+        let desc: ObjcId = unsafe { msg_send![class!(MTLRenderPassDescriptor), renderPassDescriptor] };
+        let colors: ObjcId = unsafe { msg_send![desc, colorAttachments] };
+        let color_attachment: ObjcId = unsafe { msg_send![colors, objectAtIndexedSubscript: 0usize] };
+        let depth_attachment: ObjcId = unsafe { msg_send![desc, depthAttachment] };
+        let load = if paint.repair.is_some() { MTLLoadAction::Load } else { MTLLoadAction::Clear };
+        let depth_state = self.metal_depth_state(pass_id, metal_cx);
+        if depth_state == nil { return Err("Metal depth state unavailable"); }
+        unsafe {
+            let () = msg_send![color_attachment, setTexture: paint.texture];
+            let () = msg_send![color_attachment, setLoadAction: load];
+            let () = msg_send![color_attachment, setStoreAction: MTLStoreAction::Store];
+            let () = msg_send![color_attachment, setClearColor: MTLClearColor {
+                red: color.x as f64, green: color.y as f64, blue: color.z as f64, alpha: color.w as f64
+            }];
+            let () = msg_send![depth_attachment, setTexture: depth_target];
+            let () = msg_send![depth_attachment, setLoadAction: load];
+            let () = msg_send![depth_attachment, setStoreAction: MTLStoreAction::Store];
+            let () = msg_send![depth_attachment, setClearDepth: depth as f64];
+        }
+        let encoder: ObjcId = unsafe { msg_send![command, renderCommandEncoderWithDescriptor: desc] };
+        if encoder == nil { return Err("Metal render encoder unavailable"); }
+        set_metal_viewport(encoder, f64::from(size[0]), f64::from(size[1]));
+        // Color is retained per surface. Depth belongs to the window pass and is
+        // current outside repair; inside it replay must start from clear depth,
+        // not from this pass's previous writes (which could reject moved/removed geometry).
+        if let Some((_, rect, clear)) = paint.repair {
+            clear.encode(encoder, rect, size[1], color, depth);
+        }
+        let () = unsafe { msg_send![encoder, setDepthStencilState: depth_state] };
+        self.os.draw_calls_done = 0;
+        let mut draw = MetalDraw {
+            encoder, metal_cx, zbias: 0.0, zbias_step: self.passes[pass_id].zbias_step,
+            gpu_read_guards: &mut paint.guards,
+            damage: paint.repair.map(|(frame, rect, _)| (frame, rect, 0)),
+        };
+        self.render_view(pass_id, root, &mut draw);
+        let () = unsafe { msg_send![encoder, endEncoding] };
+        if let Some(oracle) = paint.oracle {
+            // Replay exactly this scene, with the same uniforms and offscreen results,
+            // into separate full-clear attachments on the very same command buffer.
+            unsafe {
+                let () = msg_send![color_attachment, setTexture: oracle.color.as_id()];
+                let () = msg_send![color_attachment, setLoadAction: MTLLoadAction::Clear];
+                let () = msg_send![depth_attachment, setTexture: oracle.depth.as_id()];
+                let () = msg_send![depth_attachment, setLoadAction: MTLLoadAction::Clear];
+                let () = msg_send![depth_attachment, setStoreAction: MTLStoreAction::DontCare];
+            }
+            let encoder: ObjcId = unsafe { msg_send![command, renderCommandEncoderWithDescriptor: desc] };
+            if encoder == nil { return Err("Metal oracle encoder unavailable"); }
+            set_metal_viewport(encoder, f64::from(size[0]), f64::from(size[1]));
+            let () = unsafe { msg_send![encoder, setDepthStencilState: depth_state] };
+            draw.encoder = encoder;
+            draw.damage = None;
+            draw.zbias = 0.0;
+            self.render_view(pass_id, root, &mut draw);
+            let () = unsafe { msg_send![encoder, endEncoding] };
+            if !oracle.encode_readback(command, paint.texture, size) { return Err("Metal oracle blit unavailable"); }
+        }
+        let screenshot = if screenshot_requested {
+            self.build_screenshot_struct(metal_cx, command, 0, size[0] as usize, size[1] as usize, paint.texture, None)
+        } else {
+            None
+        };
+        self.passes[pass_id].paint_dirty = false;
+        self.commit_metal_command(screenshot, None, command, paint.guards, Some(paint.completion));
+        Ok(())
+    }
+
+    fn metal_depth_state(&mut self, pass_id: PassId, metal_cx: &MetalCx) -> ObjcId {
+        *self.passes[pass_id].os.mtl_depth_state.get_or_insert_with(|| unsafe {
+            let desc: ObjcId = msg_send![class!(MTLDepthStencilDescriptor), new];
+            let () = msg_send![desc, setDepthCompareFunction: MTLCompareFunction::LessEqual];
+            let () = msg_send![desc, setDepthWriteEnabled: YES];
+            let state = msg_send![metal_cx.device, newDepthStencilStateWithDescriptor: desc];
+            let () = msg_send![desc, release];
+            state
+        })
     }
     
     fn build_screenshot_struct(&mut self, metal_cx:&MetalCx, command_buffer:ObjcId, kind_id: usize, width: usize, height: usize, in_texture:ObjcId, alloc:Option<TextureAlloc>)->Option<ScreenshotInfo>{
@@ -550,6 +683,20 @@ impl Cx {
     }
         
     fn commit_command_buffer(&self, screenshot_info: Option<ScreenshotInfo>, stdin_frame: Option<PresentableDraw>, command_buffer: ObjcId, gpu_read_guards: Vec<MetalRwLockGpuReadGuard>) {
+        self.commit_metal_command(screenshot_info, stdin_frame, command_buffer, gpu_read_guards,
+            #[cfg(target_os = "macos")]
+            None,
+        );
+    }
+
+    fn commit_metal_command(
+        &self,
+        screenshot_info: Option<ScreenshotInfo>,
+        stdin_frame: Option<PresentableDraw>,
+        command_buffer: ObjcId,
+        gpu_read_guards: Vec<MetalRwLockGpuReadGuard>,
+        #[cfg(target_os = "macos")] surface_completion: Option<Arc<SurfaceCompletion>>,
+    ) {
         let gpu_read_guards = Mutex::new(Some(gpu_read_guards));
         let screenshot_info =  Mutex::new(screenshot_info);
         //let present_index = Arc::clone(&self.os.present_index);
@@ -558,27 +705,33 @@ impl Cx {
         let () = unsafe {msg_send![
             command_buffer,
             addCompletedHandler: &objc_block!(move | command_buffer: ObjcId | {
+                #[cfg(target_os = "macos")]
+                let completed = surface_completion.as_ref().is_none_or(|_| {
+                    // MTLCommandBufferStatusCompleted (4) is the only successful terminal state.
+                    let status: usize = unsafe { msg_send![command_buffer, status] };
+                    status == 4
+                });
+                #[cfg(not(target_os = "macos"))]
+                let completed = true;
                 // alright lets grab a texture if need be
                 if let Some(sf) = &*screenshot_info.lock().unwrap(){
-                    let mut buf = Vec::new();
-                    buf.resize(sf.width * sf.height * 4, 0u8);
-                    let region = MTLRegion {
-                        origin: MTLOrigin {x: 0, y: 0, z: 0},
-                        size: MTLSize {width: sf.width as u64, height: sf.height as u64, depth: 1}
-                    };
-                    let _:() = unsafe{msg_send![
-                        sf.texture, 
-                        getBytes: buf.as_ptr()
-                        bytesPerRow: sf.width *4
-                        bytesPerImage: sf.width * sf.height * 4
-                        fromRegion: region
-                        mipmapLevel: 0
-                        slice: 0
-                    ]};
+                    let image = completed.then(|| {
+                        let mut buf = vec![0u8; sf.width * sf.height * 4];
+                        let region = MTLRegion {
+                            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                            size: MTLSize { width: sf.width as u64, height: sf.height as u64, depth: 1 },
+                        };
+                        let () = unsafe { msg_send![
+                            sf.texture, getBytes: buf.as_mut_ptr()
+                            bytesPerRow: sf.width * 4 bytesPerImage: sf.width * sf.height * 4
+                            fromRegion: region mipmapLevel: 0 slice: 0
+                        ] };
+                        buf
+                    });
                     let () = msg_send![sf.texture, release];
                     Self::send_studio_message(AppToStudio::Screenshot(StudioScreenshotResponse{
                         request_ids: sf.request_ids.clone(),
-                        image: Some(buf),
+                        image,
                         width: sf.width as _, 
                         height: sf.height as _,
                     }))
@@ -598,7 +751,13 @@ impl Cx {
                     start, end
                 }));
                 
-                drop(gpu_read_guards.lock().unwrap().take().unwrap());
+                let guards = gpu_read_guards.lock().unwrap().take().unwrap();
+                #[cfg(target_os = "macos")]
+                if let Some(completion) = &surface_completion {
+                    completion.complete(completed, guards);
+                    return;
+                }
+                drop(guards);
             })
         ]};
         let () = unsafe {msg_send![command_buffer, commit]};
@@ -661,6 +820,12 @@ impl Cx {
             _dummy_for_unsupported: None,
         }
     }
+}
+
+fn set_metal_viewport(encoder: ObjcId, width: f64, height: f64) {
+    let () = unsafe { msg_send![encoder, setViewport: MTLViewport {
+        originX: 0.0, originY: 0.0, width, height, znear: 0.0, zfar: 1.0,
+    }] };
 }
 
 #[derive(Clone)]
@@ -1104,7 +1269,7 @@ impl CxTexture {
         metal_cx: &MetalCx,
         width: usize,
         height: usize
-    ) {
+    ) -> bool {
         if self.alloc_depth(width, height){
        
             let alloc = self.alloc.as_ref().unwrap();
@@ -1122,11 +1287,10 @@ impl CxTexture {
                 descriptor.as_id(),
                 setPixelFormat: texture_pixel_to_mtl_pixel(&alloc.pixel)
             ]};
-            let texture = RcObjcId::from_owned(NonNull::new(unsafe {
-                msg_send![metal_cx.device, newTextureWithDescriptor: descriptor]
-            }).unwrap());
-            self.os.texture = Some(texture);
+            self.os.texture = NonNull::new(unsafe { msg_send![metal_cx.device, newTextureWithDescriptor: descriptor] })
+                .map(RcObjcId::from_owned);
         }
+        self.os.texture.is_some()
     }    
 }
 
@@ -1164,7 +1328,7 @@ struct MetalRwLockInner {
     condvar: Condvar,
 }
 
-struct MetalRwLockGpuReadGuard {
+pub(crate) struct MetalRwLockGpuReadGuard {
     inner: Arc<MetalRwLockInner>
 }
 

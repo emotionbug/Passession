@@ -6,6 +6,7 @@
 
 - Animate moving between screens on phones and narrow windows. Opening a session from the menu slides it in, and going back to the menu slides it out; detail views (files, diffs, subagents, logs) and the file explorer do the same. A transition that is interrupted turns around from where it is, and a window resize ends it at its destination.
 - Show the graphics card and driver the app renders with in Settings → Diagnostics, and log them at startup. The app warns when it falls back to a software renderer such as llvmpipe or Microsoft Basic Render.
+- Add an experimental macOS renderer that repaints only the changed parts of a window, turned on with `PASEO_METAL_SURFACE_PRESENT=1`. The app draws into three of its own screen buffers instead of the system's, so it knows what each one already shows and doesn't have to redraw or copy the whole window. It is off by default until it has been checked on Macs; `PASEO_DAMAGE_ORACLE=1` compares every partial frame with a full one and switches back to full redraws on any difference. See "macOS IOSurface verification" in `docs/development.md`.
 
 ### Changed
 

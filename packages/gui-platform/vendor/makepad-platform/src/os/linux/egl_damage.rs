@@ -1,12 +1,11 @@
 use super::{egl_sys::{EGLBoolean, EGLDisplay, EGLSurface, LibEgl}, gl_sys::{self, LibGl}};
-use crate::{cx::Cx, damage::{force_full_redraw, DamageFrame, DamageRect}, makepad_math::Vec4, pass::PassId};
+use crate::{cx::Cx, damage::{force_full_redraw, DamageFrame, DamageHistory, DamageRect}, makepad_math::Vec4, pass::PassId};
 use std::{ffi::CStr, sync::LazyLock};
 
 const EGL_EXTENSIONS: i32 = 0x3055;
 const EGL_WIDTH: i32 = 0x3057;
 const EGL_HEIGHT: i32 = 0x3056;
 const EGL_BUFFER_AGE: i32 = 0x313D; // EXT and KHR assign the same enum.
-const HISTORY: usize = 4;
 
 type SwapDamage = unsafe extern "C" fn(EGLDisplay, EGLSurface, *const i32, i32) -> EGLBoolean;
 type SetDamage = unsafe extern "C" fn(EGLDisplay, EGLSurface, *mut i32, i32) -> EGLBoolean;
@@ -66,27 +65,6 @@ impl Surface<'_> {
     }
 }
 
-#[derive(Clone, Default)]
-struct DamageHistory {
-    frames: [DamageRect; HISTORY],
-    next: usize,
-    len: usize,
-}
-
-impl DamageHistory {
-    fn repair(&self, age: i32, current: DamageRect) -> Option<DamageRect> {
-        let count = usize::try_from(age.checked_sub(1)?).ok()?;
-        if count > self.len { return None; }
-        Some((1..=count).fold(current, |rect, index| rect.union(self.frames[(self.next + HISTORY - index) % HISTORY])))
-    }
-
-    fn push(&mut self, rect: DamageRect) {
-        self.frames[self.next] = rect;
-        self.next = (self.next + 1) % HISTORY;
-        self.len = (self.len + 1).min(HISTORY);
-    }
-}
-
 /// Histories are owned by EGL *surfaces*, not GL contexts or passes.
 #[derive(Clone, Default)]
 pub(crate) struct EglWindowDamage {
@@ -115,7 +93,7 @@ static VERIFY_DAMAGE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("PASEO_
 impl EglWindowDamage {
     pub fn invalidate(&mut self) {
         self.scene.invalidate();
-        self.history.len = 0;
+        self.history.invalidate();
         self.size = None;
     }
 
@@ -226,24 +204,5 @@ fn read_pixels(gl: &LibGl, [width, height]: [i32; 2], bytes: &mut Vec<u8>) -> bo
         }
         (gl.glReadPixels)(0, 0, width, height, gl_sys::RGBA, gl_sys::UNSIGNED_BYTE, bytes.as_mut_ptr().cast());
         (gl.glGetError)() == 0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rect(x: i32) -> DamageRect { DamageRect { x0: x, y0: 0, x1: x + 1, y1: 1 } }
-
-    #[test]
-    fn repair_uses_only_intervening_successful_presentations() {
-        let mut history = DamageHistory::default();
-        assert_eq!(history.repair(0, rect(9)), None);
-        assert_eq!(history.repair(1, rect(9)), Some(rect(9)));
-        assert_eq!(history.repair(2, rect(9)), None);
-        for i in 0..8 { history.push(rect(i)); }
-        assert_eq!(history.repair(3, rect(9)), Some(rect(6).union(rect(9))));
-        assert_eq!(history.repair(5, rect(9)), Some(rect(4).union(rect(9))));
-        assert_eq!(history.repair(6, rect(9)), None);
     }
 }

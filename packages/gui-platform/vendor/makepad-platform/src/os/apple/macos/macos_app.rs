@@ -1,6 +1,6 @@
 use crate::file_dialogs::FileDialog;
 use crate::os::window_state::{PendingWindowState, WindowStateChange};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 // CVDisplayLink supports the macOS 13 deployment target. Its callback runs on
 // a CoreVideo thread and only posts an event; all UI work stays on AppKit.
@@ -20,32 +20,57 @@ extern "C" {
 
 const DISPLAY_FRAME_SUBTYPE: i16 = 0x5046;
 static DISPLAY_FRAME_QUEUED: AtomicBool = AtomicBool::new(false);
+const SURFACE_READY_SUBTYPE: i16 = 0x5053;
+static SURFACE_READY_QUEUED: AtomicBool = AtomicBool::new(false);
+static SURFACE_READY_EVENT: AtomicPtr<Object> = AtomicPtr::new(std::ptr::null_mut());
+const SURFACE_WAKE_SUBTYPE: i16 = 0x5057;
+static SURFACE_WAKE_QUEUED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn display_link_tick(
     _: DisplayLinkRef, _: *const c_void, _: *const c_void, _: u64, _: *mut u64, _: *mut c_void,
 ) -> CVReturn {
-    if DISPLAY_FRAME_QUEUED.swap(true, Ordering::AcqRel) {
-        return 0;
-    }
+    post_frame_event(DISPLAY_FRAME_SUBTYPE, &DISPLAY_FRAME_QUEUED);
+    0
+}
+
+pub(super) fn post_surface_ready() {
+    // An immutable, application-defined event needs no new payload for each frame.
+    let event = SURFACE_READY_EVENT.load(Ordering::Acquire);
+    if event.is_null() || SURFACE_READY_QUEUED.swap(true, Ordering::AcqRel) { return; }
+    unsafe { post_frame_wake(event); }
+}
+
+pub(super) fn post_surface_wake() {
+    post_frame_event(SURFACE_WAKE_SUBTYPE, &SURFACE_WAKE_QUEUED);
+}
+
+fn post_frame_event(subtype: i16, queued: &AtomicBool) {
+    if queued.swap(true, Ordering::AcqRel) { return; }
     unsafe {
         let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
-        let event: ObjcId = msg_send![
-            class!(NSEvent),
-            otherEventWithType: NSEventType::NSApplicationDefined
-            location: NSPoint { x: 0., y: 0. }
-            modifierFlags: 0u64
-            timestamp: 0f64
-            windowNumber: 0u64
-            context: nil
-            subtype: DISPLAY_FRAME_SUBTYPE
-            data1: 0u64
-            data2: 0u64
-        ];
-        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-        let () = msg_send![ns_app, postEvent: event atStart: NO];
+        post_frame_wake(new_frame_event(subtype));
         let () = msg_send![pool, release];
     }
-    0
+}
+
+unsafe fn new_frame_event(subtype: i16) -> ObjcId {
+    msg_send![
+        class!(NSEvent),
+        otherEventWithType: NSEventType::NSApplicationDefined
+        location: NSPoint { x: 0., y: 0. }
+        modifierFlags: 0u64
+        timestamp: 0f64
+        windowNumber: 0u64
+        context: nil
+        subtype: subtype
+        data1: 0u64
+        data2: 0u64
+    ]
+}
+
+unsafe fn post_frame_wake(event: ObjcId) {
+    let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+    let () = msg_send![ns_app, postEvent: event atStart: NO];
 }
 
 use {
@@ -207,6 +232,17 @@ impl MacosApp {
             
             let () = msg_send![ns_app, setDelegate: app_delegate_instance];
             let () = msg_send![ns_app, setActivationPolicy: NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular as i64];
+            if super::metal_surface::enabled() {
+                // Posted by completion handlers even as windows are closed; retain
+                // the shared wake event for the lifetime of the AppKit process.
+                let ready: ObjcId = msg_send![new_frame_event(SURFACE_READY_SUBTYPE), retain];
+                SURFACE_READY_EVENT.store(ready, Ordering::Release);
+                let workspace: ObjcId = msg_send![class!(NSWorkspace), sharedWorkspace];
+                let center: ObjcId = msg_send![workspace, notificationCenter];
+                let () = msg_send![center, addObserver: app_delegate_instance
+                    selector: sel!(surfaceWorkspaceDidWake:)
+                    name: str_to_nsstring("NSWorkspaceDidWakeNotification") object: nil];
+            }
             
             
             // Construct the bits that are shared between windows
@@ -503,6 +539,16 @@ impl MacosApp {
                 if with_macos_app(|app| !app.display_link.is_null()) {
                     Self::do_callback(MacosEvent::DisplayFrame);
                 }
+                return;
+            }
+            if subtype == SURFACE_READY_SUBTYPE {
+                SURFACE_READY_QUEUED.store(false, Ordering::Release);
+                Self::do_callback(MacosEvent::SurfaceReady);
+                return;
+            }
+            if subtype == SURFACE_WAKE_SUBTYPE {
+                SURFACE_WAKE_QUEUED.store(false, Ordering::Release);
+                Self::do_callback(MacosEvent::SurfaceWake);
                 return;
             }
         }
