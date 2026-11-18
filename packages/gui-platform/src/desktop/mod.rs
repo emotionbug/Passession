@@ -2,6 +2,7 @@
 //! One process owns the app's logical Makepad windows.
 
 pub(crate) mod app_update;
+mod app_update_owner;
 pub mod component_store;
 pub(crate) mod daemon_service;
 pub(crate) mod editors;
@@ -46,7 +47,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{OnceCell, oneshot};
+use tokio::sync::{Notify, OnceCell, oneshot};
 
 /// A later launch's request, forwarded by the single-instance channel.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -101,8 +102,23 @@ struct QuitState {
     /// Quitting intent (OS session ending or accepted quit).
     quitting: bool,
     prepared: bool,
+    remote_update_handoff: bool,
     next_token: u64,
     pending: Option<PendingQuit>,
+}
+
+impl QuitState {
+    fn is_quitting(&self) -> bool {
+        self.quitting || self.remote_update_handoff
+    }
+
+    fn reserve_remote_update(&mut self) -> bool {
+        if self.is_quitting() || self.prepared || self.pending.is_some() {
+            return false;
+        }
+        self.remote_update_handoff = true;
+        true
+    }
 }
 
 struct PendingQuit {
@@ -125,6 +141,7 @@ pub(crate) struct DesktopShared {
     daemon_status: Mutex<Value>,
     updater: updater::Updater,
     app_updates: app_update::Operations,
+    app_update_bridge_stop: Notify,
     daemon_start_unblocked: AtomicBool,
     pub geometry: geometry::GeometryStore,
     quit: Mutex<QuitState>,
@@ -152,6 +169,7 @@ impl DesktopShared {
             daemon_status: Mutex::new(Value::Null),
             updater: updater::Updater::new(config.app_version.clone()),
             app_updates: Default::default(),
+            app_update_bridge_stop: Notify::new(),
             daemon_start_unblocked: AtomicBool::new(
                 std::env::var_os("PASEO_UPDATE_OPERATION_DIRECTORY").is_none(),
             ),
@@ -181,7 +199,7 @@ impl DesktopShared {
     }
 
     pub fn quitting(&self) -> bool {
-        self.quit.lock().unwrap().quitting
+        self.quit.lock().unwrap().is_quitting()
     }
 
     pub fn set_dormant(&self, dormant: bool) {
@@ -333,6 +351,7 @@ pub(crate) fn start(shared: &Arc<Shared>, config: &PlatformConfig) {
                     .desktop
                     .daemon_start_unblocked
                     .store(true, Ordering::SeqCst);
+                app_update_owner::start(&task_shared);
                 let _ = task_shared.desktop.start_daemon(false).await;
             }
             Ok(false) => {}
@@ -452,7 +471,7 @@ pub(crate) fn request_quit(shared: &Arc<Shared>, reason: QuitReason, force: bool
     let desktop = &shared.desktop;
     let token = {
         let mut quit = desktop.quit.lock().unwrap();
-        if quit.prepared || (quit.pending.is_some() && !force) {
+        if quit.prepared || (!force && (quit.remote_update_handoff || quit.pending.is_some())) {
             return;
         }
         quit.next_token += 1;
@@ -518,7 +537,7 @@ async fn guarded_consent(shared: &Arc<Shared>, reason: QuitReason) -> bool {
     let (tx, rx) = oneshot::channel();
     let token = {
         let mut quit = shared.desktop.quit.lock().unwrap();
-        if quit.pending.is_some() || quit.quitting {
+        if quit.pending.is_some() || quit.is_quitting() {
             return false;
         }
         quit.next_token += 1;
@@ -553,8 +572,10 @@ async fn finish_quit(shared: &Arc<Shared>) {
             return;
         }
         quit.quitting = true;
+        quit.remote_update_handoff = false;
         quit.prepared = true;
     }
+    shared.desktop.app_update_bridge_stop.notify_one();
     // Let in-flight notification deliveries settle before teardown.
     drop(shared.desktop.notifications.lock().await);
     let geometry_shared = shared.clone();
@@ -623,7 +644,9 @@ async fn invoke_inner(
         }
         "desktop_update_diagnostics" => Ok(desktop.updater.diagnostics().await),
         "check_app_update" => app_update::check_local(shared, args).await,
-        "install_app_update" => app_update::install_local(shared, args).await,
+        "install_app_update" => {
+            app_update::install_local(shared, args, app_update::Origin::Local).await
+        }
         "app_update_status" => app_update::status_local(shared, args).await,
         "start_desktop_daemon" => desktop.start_daemon(true).await,
         "desktop_daemon_status" => {
@@ -792,6 +815,23 @@ pub(crate) fn notification_clicked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_update_handoff_respects_existing_close_decisions() {
+        let mut quit = QuitState::default();
+        assert!(quit.reserve_remote_update());
+        assert!(quit.is_quitting());
+        assert!(!quit.reserve_remote_update());
+        quit.remote_update_handoff = false;
+        quit.pending = Some(PendingQuit {
+            token: 1,
+            waiter: None,
+        });
+        assert!(!quit.reserve_remote_update());
+        quit.pending = None;
+        quit.quitting = true;
+        assert!(!quit.reserve_remote_update());
+    }
 
     #[test]
     fn last_window_requests_guarded_quit_but_other_windows_can_close() {

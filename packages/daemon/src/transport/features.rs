@@ -29,6 +29,7 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
         "daemonConfigReload",
         "durableDaemonUpdates",
         "daemonUpdateCheck",
+        "remoteDesktopAppUpdates",
         "daemonSelfUpdate",
         "pushTokenRevocation",
         "plugins",

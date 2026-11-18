@@ -38,6 +38,7 @@ dirs = "6"
 # The portal backend stays; `wayland` only resolves `set_parent` Wayland handles,
 # and no dialog sets a parent window.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+paseo-client = { path = "../client" }
 paseo-protocol = { path = "../protocol" }
 flate2 = "1"
 tar = "0.4"
@@ -63,14 +64,12 @@ block2 = "0.6"
 objc2 = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-paseo-client = { path = "../client" }
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["protected"] }
 
 [target.'cfg(windows)'.dependencies]
-paseo-client = { path = "../client" }
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
 windows-collections = "0.2"
 # COM implementation macros expand absolute windows_core paths.

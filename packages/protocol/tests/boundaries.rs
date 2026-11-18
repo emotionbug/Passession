@@ -294,6 +294,196 @@ fn desktop_component_operation_roundtrips_restart_groups_and_observed_selection_
     }
 }
 
+const DESKTOP_UPDATE_ID: &str = "0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11";
+
+fn desktop_update_pin() -> Value {
+    json!({"version":"2.0.0-rc.1","manifestSha512":format!("{}==", "A".repeat(86))})
+}
+
+fn assert_update_roundtrip(message: &Value, direction: Direction, request_id: Option<&str>) {
+    let parsed = SessionMessage::parse(message.clone(), direction).unwrap();
+    assert_eq!(parsed.request_id(), request_id);
+    let bytes = encode_envelope(&parsed.into_envelope(), direction).unwrap();
+    let Envelope::Session { message: decoded } = parse_envelope(&bytes, direction).unwrap() else {
+        panic!("not a session envelope");
+    };
+    assert_eq!(&decoded.into_value(), message);
+}
+
+fn assert_update_rejected(message: &Value, direction: Direction) {
+    assert!(validate_session(message, direction).is_err(), "{message}");
+    let bytes = serde_json::to_vec(&json!({"type":"session","message":message})).unwrap();
+    assert!(parse_envelope(&bytes, direction).is_err(), "{message}");
+}
+
+#[test]
+fn remote_desktop_app_update_accepts_only_explicit_pinned_app_component_requests() {
+    let check = json!({"type":"desktop.app.update.check.request","requestId":"check"});
+    let status = json!({"type":"desktop.app.update.status.request","requestId":"status",
+        "operationId":DESKTOP_UPDATE_ID});
+    let submit = json!({"type":"desktop.app.update.submit.request","requestId":"submit",
+        "operationId":DESKTOP_UPDATE_ID,"expectedRelease":desktop_update_pin(),
+        "selectedComponents":["app","tailnet","update-helper"]});
+    for (request, id) in [(&check, "check"), (&status, "status"), (&submit, "submit")] {
+        assert_update_roundtrip(request, Direction::Inbound, Some(id));
+        let mut invalid = request.clone();
+        invalid["path"] = json!("/private/install");
+        assert_update_rejected(&invalid, Direction::Inbound);
+        invalid.as_object_mut().unwrap().remove("path");
+        invalid.as_object_mut().unwrap().remove("requestId");
+        assert_update_rejected(&invalid, Direction::Inbound);
+    }
+    for key in ["operationId", "expectedRelease", "selectedComponents"] {
+        let mut invalid = submit.clone();
+        invalid.as_object_mut().unwrap().remove(key);
+        assert_update_rejected(&invalid, Direction::Inbound);
+    }
+    for key in ["source", "targetKind", "channel", "url", "forceRunning"] {
+        let mut invalid = submit.clone();
+        invalid[key] = json!("unauthorized");
+        assert_update_rejected(&invalid, Direction::Inbound);
+    }
+    for selection in [
+        Value::Null,
+        json!([]),
+        json!(["daemon"]),
+        json!(["app", "daemon"]),
+        json!(["tailnet", "tailnet"]),
+        json!(["unknown"]),
+        json!([{"id":"app","path":"/private/install"}]),
+    ] {
+        let mut invalid = submit.clone();
+        invalid["selectedComponents"] = selection;
+        assert_update_rejected(&invalid, Direction::Inbound);
+    }
+    for id in [
+        "../operation",
+        "00000000-0000-0000-0000-000000000000",
+        "0F8B6C5E-2A71-4C5B-9A43-7F2A1D0C9E11",
+    ] {
+        for request in [&status, &submit] {
+            let mut invalid = request.clone();
+            invalid["operationId"] = json!(id);
+            assert_update_rejected(&invalid, Direction::Inbound);
+        }
+    }
+    for pin in [
+        Value::Null,
+        json!({"version":"2.0.0","manifestSha512":"short"}),
+        json!({"version":"2.0.0","manifestSha512":"A".repeat(88)}),
+        json!({"version":"2.0.0","manifestSha512":format!("{}B==", "A".repeat(85))}),
+        json!({"version":"../../release","manifestSha512":desktop_update_pin()["manifestSha512"]}),
+        json!({"version":"2.0.0","manifestSha512":desktop_update_pin()["manifestSha512"],"url":"https://example.invalid"}),
+    ] {
+        let mut invalid = submit.clone();
+        invalid["expectedRelease"] = pin;
+        assert_update_rejected(&invalid, Direction::Inbound);
+    }
+}
+
+#[test]
+fn remote_desktop_app_check_reports_component_inventory_and_rate_limit() {
+    let latest = desktop_update_pin();
+    let check = json!({"type":"desktop.app.update.check.response","payload":{"requestId":"check","check":{
+        "targetKind":"app","current":{"version":"1.0.0","sourceSha":""},"latest":latest,
+        "supported":true,"updateAvailable":true,"owner":{"kind":"desktopApp"},
+        "supportError":null,"checkError":null,"components":{"app":component_identity(0)},
+        "componentRequirements":{"app":{"tailnet":1}},
+        "availableComponents":[{"id":"app","current":component_identity(0),
+            "target":component_identity(1),"downloadSize":1024,"artifactSha256":"a".repeat(64),
+            "requires":{"tailnet":1},"activationOnly":false}],
+        "restartGroup":"gui","atomicGroups":[["app","tailnet"]]
+    }}});
+    assert_update_roundtrip(&check, Direction::Outbound, Some("check"));
+    for parent in [
+        "/payload",
+        "/payload/check",
+        "/payload/check/owner",
+        "/payload/check/latest",
+        "/payload/check/availableComponents/0",
+        "/payload/check/availableComponents/0/target",
+    ] {
+        let mut invalid = check.clone();
+        invalid.pointer_mut(parent).unwrap()["path"] = json!("/private/install");
+        assert_update_rejected(&invalid, Direction::Outbound);
+    }
+    let mut invalid = check;
+    invalid["payload"]["check"]["latest"] = Value::Null;
+    assert_update_rejected(&invalid, Direction::Outbound);
+    let rate_limit = json!({"type":"desktop.app.update.check.response","payload":{"requestId":"check","check":{
+        "targetKind":"app","updateAvailable":false,"latest":null,
+        "checkError":"GitHub rate limit","errorCode":"github_rate_limited","retryAt":"2026-11-18T16:37:00Z"
+    }}});
+    assert_update_roundtrip(&rate_limit, Direction::Outbound, Some("check"));
+    let mut invalid = rate_limit;
+    invalid["payload"]["check"]["retryAt"] = json!("tomorrow");
+    assert_update_rejected(&invalid, Direction::Outbound);
+}
+
+#[test]
+fn remote_desktop_app_update_reports_journal_progress_without_private_fields() {
+    let admitted = json!({"type":"desktop.app.update.submit.response","payload":{"requestId":"submit",
+        "operation":{"operationId":DESKTOP_UPDATE_ID,"targetKind":"app","phase":"preparation",
+            "terminal":false,"accepted":true,"outcome":null,"candidate":null,"message":null,
+            "error":null,"recoveryRequired":false,"actionRequired":null,"expectedRelease":desktop_update_pin(),
+            "selectedComponents":["app"],"targetComponents":{},"observedComponents":null,"restartGroup":"none"}
+    }});
+    assert_update_roundtrip(&admitted, Direction::Outbound, Some("submit"));
+    let mut invalid = admitted.clone();
+    invalid["payload"]["operation"]["selectedComponents"] = Value::Null;
+    assert_update_rejected(&invalid, Direction::Outbound);
+    let mut status = admitted;
+    status["type"] = json!("desktop.app.update.status.response");
+    status["payload"]["requestId"] = json!("status");
+    status["payload"]["operation"]["candidate"] =
+        json!({"version":"2.0.0","sourceSha":"a".repeat(40)});
+    status["payload"]["operation"]["targetComponents"] = json!({"app":component_identity(1)});
+    status["payload"]["operation"]["restartGroup"] = json!("gui");
+    for phase in [
+        "waitingForAuthorization",
+        "activating",
+        "rollingBack",
+        "committed",
+    ] {
+        let op = &mut status["payload"]["operation"];
+        op["phase"] = json!(phase);
+        op["actionRequired"] =
+            json!((phase == "waitingForAuthorization").then_some("osAuthorization"));
+        if phase == "committed" {
+            op["terminal"] = json!(true);
+            op["outcome"] = json!("committed");
+            op["observedComponents"] = op["targetComponents"].clone();
+        }
+        assert_update_roundtrip(&status, Direction::Outbound, Some("status"));
+    }
+    for (parent, field) in [
+        ("/payload/operation", "ownerSession"),
+        ("/payload/operation/candidate", "path"),
+        ("/payload/operation/targetComponents/app", "downloadUrl"),
+    ] {
+        let mut invalid = status.clone();
+        invalid.pointer_mut(parent).unwrap()[field] = json!("private");
+        assert_update_rejected(&invalid, Direction::Outbound);
+    }
+    status["payload"]["operation"]["terminal"] = json!(false);
+    assert_update_rejected(&status, Direction::Outbound);
+}
+
+#[test]
+fn remote_desktop_app_update_leaves_feature_negotiation_and_legacy_requests_compatible() {
+    for features in [json!({}), json!({"remoteDesktopAppUpdates":true})] {
+        let info = json!({"type":"status","payload":{"status":"server_info","features":features}});
+        assert_update_roundtrip(&info, Direction::Outbound, None);
+    }
+    let legacy_submit = json!({"type":"daemon.update.submit.request","requestId":"legacy",
+        "operationId":"legacy","expectedRelease":null});
+    assert_update_roundtrip(&legacy_submit, Direction::Inbound, Some("legacy"));
+    let unavailable = json!({"type":"rpc_error","payload":{"requestId":"check",
+        "requestType":"desktop.app.update.check.request","code":"desktop_app_unavailable",
+        "error":"The desktop app is unavailable on the target host."}});
+    assert_update_roundtrip(&unavailable, Direction::Outbound, Some("check"));
+}
+
 #[test]
 fn terminal_wire_bytes_and_borrowed_demultiplexing() {
     let bytes = encode_terminal_frame(TerminalOpcode::Input, 255, b"\x1b[A");

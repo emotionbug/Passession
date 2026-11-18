@@ -1,0 +1,7 @@
+Added
+- Update a PC's desktop app from Settings -> host -> Version while the app is running there. With a daemon update too, one approval updates the daemon first, then the app. Save open files on the PC first.
+
+Changed
+- Android redraws only the changed parts of the screen again when the graphics driver supports it.
+
+Full notes: https://github.com/emotionbug/Passession/releases

@@ -7,6 +7,13 @@ use std::{path::Path, process::Stdio};
 use tokio::io::AsyncWriteExt;
 
 const LIMIT: u64 = 64 * 1024;
+pub(super) const OPERATION_NOT_FOUND: &str = "APP_UPDATE_OPERATION_NOT_FOUND";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Origin {
+    Local,
+    Remote,
+}
 
 fn error(message: impl Into<String>) -> PlatformError {
     PlatformError::new("APP_UPDATE_FAILED", message)
@@ -28,11 +35,16 @@ struct Submit {
 }
 
 impl Submit {
-    fn parse(args: &Value) -> Result<Self, PlatformError> {
+    fn parse(args: &Value, origin: Origin) -> Result<Self, PlatformError> {
         use base64::Engine as _;
         let request: Self =
             serde_json::from_value(args.clone()).map_err(|e| error(e.to_string()))?;
         validate_id(&request.operation_id)?;
+        if origin == Origin::Remote && request.selected_components.is_none() {
+            return Err(error(
+                "Select desktop app components for the remote update.",
+            ));
+        }
         if let Some(selected) = &request.selected_components
             && (selected.is_empty()
                 || selected.contains(&ComponentId::Daemon)
@@ -119,8 +131,12 @@ pub async fn check_local(shared: &Arc<Shared>, args: &Value) -> Result<Value, Pl
     Ok(result)
 }
 
-pub async fn install_local(shared: &Arc<Shared>, args: &Value) -> Result<Value, PlatformError> {
-    let request = Submit::parse(args)?;
+pub(super) async fn install_local(
+    shared: &Arc<Shared>,
+    args: &Value,
+    origin: Origin,
+) -> Result<Value, PlatformError> {
+    let request = Submit::parse(args, origin)?;
     let channel = channel(shared, &Value::Null).await;
     let root = operations_root()?;
     let updates = &shared.desktop.app_updates;
@@ -169,7 +185,7 @@ pub async fn install_local(shared: &Arc<Shared>, args: &Value) -> Result<Value, 
     atomic_json(&directory.join("operation.json"), &operation).await?;
     let task_shared = shared.clone();
     shared.spawn(async move {
-        if let Err(e) = execute(&task_shared, &channel, &directory, &request).await {
+        if let Err(e) = execute(&task_shared, &channel, &directory, &request, origin).await {
             let _ = fail_operation(&directory, &e.message).await;
         }
     });
@@ -191,7 +207,15 @@ impl Operations {
     async fn status(&self, root: &Path, id: &str) -> Result<Value, PlatformError> {
         validate_id(id)?;
         let directory = root.join(id);
-        let mut operation = read_json(&directory.join("operation.json")).await?;
+        let path = directory.join("operation.json");
+        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                PlatformError::new(OPERATION_NOT_FOUND, "APP update operation not found.")
+            } else {
+                err.into()
+            }
+        })?;
+        let mut operation = read_json_file(&path, metadata).await?;
         if operation["operationId"] != id {
             return Err(error("APP operation ID mismatch."));
         }
@@ -383,6 +407,7 @@ async fn execute(
     channel: &str,
     directory: &Path,
     request: &Submit,
+    origin: Origin,
 ) -> Result<(), PlatformError> {
     let expected =
         serde_json::to_value(&request.expected_release).map_err(|e| error(e.to_string()))?;
@@ -502,12 +527,20 @@ async fn execute(
             "No-restart helper unexpectedly requested runtime handoff",
         ));
     }
-    if !guarded_consent(shared, QuitReason::AppUpdate).await {
-        // A ready helper cannot activate without the handoff. Reap it so a
-        // declined operation does not have to wait for the handoff timeout.
+    let can_quit = match origin {
+        Origin::Local => guarded_consent(shared, QuitReason::AppUpdate).await,
+        Origin::Remote => shared.desktop.quit.lock().unwrap().reserve_remote_update(),
+    };
+    if !can_quit {
+        // A ready helper cannot activate until the desktop writes its handoff.
         child.kill().await?;
         retire_pre_handoff_helper(directory, &helper_identity).await?;
-        return Err(error("Unsaved local documents block application restart."));
+        return Err(error(match origin {
+            Origin::Local => "Unsaved local documents block application restart.",
+            Origin::Remote => {
+                "The desktop app is already closing; application restart was not handed off."
+            }
+        }));
     }
     let handoff =
         json!({"schemaVersion":2,"operationId":request.operation_id,"nonce":ready["nonce"]});
@@ -519,10 +552,15 @@ async fn execute(
             != Some(&handoff)
     {
         let mut quit = shared.desktop.quit.lock().unwrap();
-        if !quit.prepared {
-            quit.quitting = false;
+        match origin {
+            Origin::Local => {
+                if !quit.prepared {
+                    quit.quitting = false;
+                }
+                post_event(PlatformEvent::QuitCancelled);
+            }
+            Origin::Remote => quit.remote_update_handoff = false,
         }
-        post_event(PlatformEvent::QuitCancelled);
         return Err(write_error);
     }
     finish_quit(shared).await;
@@ -578,6 +616,10 @@ pub(super) async fn private_dir(path: &Path) -> Result<(), PlatformError> {
 }
 pub(super) async fn read_json(path: &Path) -> Result<Value, PlatformError> {
     let meta = tokio::fs::symlink_metadata(path).await?;
+    read_json_file(path, meta).await
+}
+
+async fn read_json_file(path: &Path, meta: std::fs::Metadata) -> Result<Value, PlatformError> {
     if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > LIMIT {
         return Err(error("Invalid APP update journal file."));
     }
@@ -827,26 +869,34 @@ mod tests {
     fn request_is_pinned_and_has_no_remote_paths() {
         use base64::Engine as _;
         let mut args = json!({"operationId":"0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11","expectedRelease":{"version":"2.0.0","manifestSha512":base64::engine::general_purpose::STANDARD.encode([0u8;64])}});
-        assert!(Submit::parse(&args).is_ok());
+        assert!(Submit::parse(&args, Origin::Local).is_ok());
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
+        args["selectedComponents"] = Value::Null;
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
+        args["selectedComponents"] = json!(["app"]);
+        assert!(Submit::parse(&args, Origin::Remote).is_ok());
+        args["force"] = json!(true);
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
+        args.as_object_mut().unwrap().remove("force");
         args["path"] = json!("/tmp/installer");
-        assert!(Submit::parse(&args).is_err());
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
         args.as_object_mut().unwrap().remove("path");
         args["expectedRelease"]["manifestSha512"] = json!("invalid");
-        assert!(Submit::parse(&args).is_err());
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
     }
     #[test]
     fn selected_components_are_part_of_idempotent_request() {
         use base64::Engine as _;
         let mut args = json!({"operationId":"0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11","expectedRelease":{"version":"2.0.0","manifestSha512":base64::engine::general_purpose::STANDARD.encode([0u8;64])},"selectedComponents":["app"]});
-        let app = Submit::parse(&args).unwrap();
+        let app = Submit::parse(&args, Origin::Local).unwrap();
         args["selectedComponents"] = json!(["update-helper"]);
-        assert_ne!(app, Submit::parse(&args).unwrap());
+        assert_ne!(app, Submit::parse(&args, Origin::Local).unwrap());
         args["selectedComponents"] = json!(["daemon"]);
-        assert!(Submit::parse(&args).is_err());
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
         args["selectedComponents"] = json!(["app", "app"]);
-        assert!(Submit::parse(&args).is_err());
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
         args["selectedComponents"] = json!([]);
-        assert!(Submit::parse(&args).is_err());
+        assert!(Submit::parse(&args, Origin::Remote).is_err());
     }
     #[test]
     fn helper_commit_requires_same_operation_and_observed_components() {
@@ -911,12 +961,11 @@ mod tests {
         assert!(first.get("ownerSession").is_none());
         assert!(first.get("request").is_none());
         assert_eq!(updates.status(&installation, id).await.unwrap(), first);
-        assert!(
-            updates
-                .status(&base.join("other-installation"), id)
-                .await
-                .is_err()
-        );
+        let missing = updates
+            .status(&base.join("other-installation"), id)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, OPERATION_NOT_FOUND);
         assert!(!directory.join("request.json").exists());
     }
 

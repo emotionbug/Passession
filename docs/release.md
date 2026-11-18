@@ -121,7 +121,9 @@ An already-installed updater still uses its old verification code. If that versi
 
 macOS app/Tailnet delivery preserves an intact signed app bundle. A new signed container records a package identity without relabeling unchanged compiled components. Android and iOS still install complete OS packages; unchanged raw images can be reused during packaging, but mobile apps do not self-replace native libraries outside the OS installer.
 
-Settings → local host → Version checks the local app and the standalone daemon separately. The daemon uses its durable updater and may wait for running agent work. The app uses its local updater helper; unsaved documents can block its restart. Remote clients can update a supported daemon but cannot update a desktop app from another device.
+Settings → host → Version checks the standalone daemon and desktop app separately. From Android or another client, leave the updated desktop app running on the target PC under the same user and daemon home. A headless host or closed app can still update its daemon. Older versions without this feature need a one-time update on the PC.
+
+When both have updates, the client pins both releases in one confirmation and starts the app update only after the daemon commits. The daemon may wait for running agent work. A remote app approval authorizes a desktop restart without another prompt on the PC: save open files first. Updates started on the PC retain the local unsaved-document check.
 
 Stable update checks start with GitHub's direct release inventory download. The daemon and desktop app keep separate private verification caches in the daemon home and the app data directory. Once a release is verified, unchanged inventory bytes for that target require no GitHub REST calls on the stable download path. Beta checks and stable releases without the needed component still use the paginated releases API for discovery. If GitHub limits requests from the network, the Version page shows the local time to retry.
 

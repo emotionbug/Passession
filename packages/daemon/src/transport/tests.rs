@@ -52,6 +52,138 @@ fn permission_arrays_are_alternatives_and_unknown_operations_fail_closed() {
     ));
 }
 
+#[test]
+fn remote_desktop_app_update_permissions_mirror_daemon_update_permissions() {
+    for (operation, required) in [
+        ("check", "daemon.read"),
+        ("status", "daemon.read"),
+        ("submit", "daemon.manage"),
+    ] {
+        let request = format!("desktop.app.update.{operation}.request");
+        let response = format!("desktop.app.update.{operation}.response");
+        assert_eq!(permissions::inbound(&request), Some(&[required][..]));
+        assert_eq!(permissions::outbound(&response), Some(&[required][..]));
+        assert_eq!(
+            permissions::inbound(&request),
+            permissions::inbound(&format!("daemon.update.{operation}.request"))
+        );
+        assert_eq!(
+            permissions::outbound(&response),
+            permissions::outbound(&format!("daemon.update.{operation}.response"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_desktop_app_update_cannot_bypass_direct_or_routed_grants() {
+    let root = tempfile::tempdir().unwrap();
+    let app = AppState::new(
+        root.path().join("home"),
+        root.path().into(),
+        std::env::current_exe().unwrap(),
+    );
+    app.config.initialize().await.unwrap();
+    let all = ["check", "status", "submit"];
+    let submit_only = ["submit"];
+    // Granted link permissions, forwarded session ceiling, denied operations.
+    type Case<'a> = (&'a [&'a str], Option<&'a [&'a str]>, &'a [&'a str]);
+    let cases: [Case<'_>; 4] = [
+        (&["workspace.read"], None, &all),
+        (
+            &["workspace.read", "daemon.manage"],
+            Some(&["workspace.read", "daemon.read"]),
+            &all,
+        ),
+        (
+            &["daemon.read", "daemon.manage"],
+            Some(&["daemon.read"]),
+            &submit_only,
+        ),
+        (
+            &["daemon.read"],
+            Some(&["daemon.read", "daemon.manage"]),
+            &submit_only,
+        ),
+    ];
+    for (index, (link_grants, forwarded, denied)) in cases.into_iter().enumerate() {
+        let (input, inbound) = mpsc::channel(4);
+        let (outbound, mut output) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let mut hello = json!({
+            "type":"hello", "clientId":format!("app-update-permission-{index}"), "clientType":"cli",
+            "protocolVersion":1, "capabilities":{"owned_subscriptions":true}
+        });
+        if let Some(forwarded) = forwarded {
+            hello["routed"] = json!(true);
+            hello["producer"] = json!({"serverId":"origin","sourceId":"caller"});
+            hello["sessionPermissions"] = json!(forwarded);
+        }
+        input
+            .send(OutboundFrame::Text(hello.to_string()))
+            .await
+            .unwrap();
+        for &operation in denied {
+            let mut request = json!({
+                "type":format!("desktop.app.update.{operation}.request"), "requestId":operation
+            });
+            if operation != "check" {
+                request["operationId"] = json!("0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11");
+            }
+            if operation == "submit" {
+                request["selectedComponents"] = json!(["app"]);
+                request["expectedRelease"] =
+                    json!({"version":"2.0.0","manifestSha512":format!("{}==", "A".repeat(86))});
+            }
+            input
+                .send(OutboundFrame::Text(
+                    json!({"type":"session","message":request}).to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+        let admission = Admission {
+            permissions: link_grants
+                .iter()
+                .map(|grant| (*grant).to_owned())
+                .collect(),
+            ..Admission::owner()
+        };
+        let server_app = app.clone();
+        let server_cancel = cancel.clone();
+        let server = tokio::spawn(async move {
+            server_app
+                .transport
+                .run_channel(inbound, outbound, server_cancel, Some(admission))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let Some(OutboundFrame::Text(text)) = output.recv().await else {
+                panic!("no server handshake");
+            };
+            let info: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(info["message"]["payload"]["status"], "server_info");
+            for &operation in denied {
+                let Some(OutboundFrame::Text(text)) = output.recv().await else {
+                    panic!("no permission error for {operation}");
+                };
+                let reply: Value = serde_json::from_str(&text).unwrap();
+                let message = &reply["message"];
+                assert_eq!(message["type"], "rpc_error");
+                assert_eq!(message["payload"]["requestId"], operation);
+                assert_eq!(
+                    message["payload"]["requestType"],
+                    format!("desktop.app.update.{operation}.request")
+                );
+                assert_eq!(message["payload"]["code"], "access_denied");
+            }
+        })
+        .await
+        .expect("permission responses timed out");
+        cancel.cancel();
+        server.await.unwrap().unwrap();
+    }
+}
+
 fn schema_message_types(schema: &str) -> Vec<String> {
     let schema: Value = serde_json::from_str(schema).unwrap();
     schema["oneOf"]

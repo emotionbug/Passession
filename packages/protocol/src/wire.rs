@@ -275,10 +275,45 @@ pub fn encode_envelope(
 
 // Cross-field semantics not expressible by the original structural schema.
 fn validate_semantics(value: &Value) -> Result<(), ProtocolError> {
-    if value["type"]
-        .as_str()
-        .is_some_and(|kind| kind.starts_with("hub."))
-    {
+    let kind = value["type"].as_str();
+    let pin = match kind {
+        Some("desktop.app.update.submit.request") => Some(&value["expectedRelease"]),
+        Some("desktop.app.update.check.response") => {
+            let check = &value["payload"]["check"];
+            if check["updateAvailable"] == true
+                && (check["supported"] != true || !check["latest"].is_object())
+            {
+                return Err(ProtocolError::Invalid("desktop app release availability"));
+            }
+            Some(&check["latest"])
+        }
+        Some("desktop.app.update.submit.response" | "desktop.app.update.status.response") => {
+            let operation = &value["payload"]["operation"];
+            let outcome = match operation["phase"].as_str() {
+                Some("committed") => Some("committed"),
+                Some("failed") => Some("failed"),
+                Some("rolledBack") => Some("rolled_back"),
+                _ => None,
+            };
+            if operation["terminal"].as_bool() != Some(outcome.is_some())
+                || operation["outcome"].as_str() != outcome
+            {
+                return Err(ProtocolError::Invalid("desktop app operation outcome"));
+            }
+            if kind == Some("desktop.app.update.submit.response")
+                && !operation["selectedComponents"].is_array()
+            {
+                return Err(ProtocolError::Invalid("desktop app selected components"));
+            }
+            Some(&operation["expectedRelease"])
+        }
+        _ => None,
+    };
+    if let Some(version) = pin.and_then(|pin| pin["version"].as_str()) {
+        crate::components::validate_version(version)
+            .map_err(|_| ProtocolError::Invalid("desktop app release version"))?;
+    }
+    if kind.is_some_and(|kind| kind.starts_with("hub.")) {
         let payload = &value["payload"];
         if let (Some(agent_id), Some(nested_id)) =
             (payload["agentId"].as_str(), payload["agent"]["id"].as_str())
@@ -287,7 +322,7 @@ fn validate_semantics(value: &Value) -> Result<(), ProtocolError> {
             return Err(ProtocolError::Invalid("hub agent correlation"));
         }
     }
-    if value["type"] == "browser.automation.execute.request" {
+    if kind == Some("browser.automation.execute.request") {
         let command = value.get("command").unwrap_or(value);
         let args = command.get("args").or_else(|| value.get("args"));
         if let Some(args) = args {

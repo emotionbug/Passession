@@ -2,6 +2,8 @@
 //! Operation methods accept wire-shaped JSON fields so optional provider/plugin extensions
 //! remain lossless. Use owned subscriptions for streaming and explicit cursor pagination.
 pub use paseo_protocol::crypto;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod desktop_app_bridge;
 mod discovery;
 mod files;
 mod operations;

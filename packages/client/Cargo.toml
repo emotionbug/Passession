@@ -37,6 +37,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+sha2 = "0.10"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
@@ -51,5 +52,6 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_JobObjects",
   "Win32_System_Pipes",
   "Win32_System_SystemInformation",
+  "Win32_System_SystemServices",
   "Win32_System_Threading",
 ] }

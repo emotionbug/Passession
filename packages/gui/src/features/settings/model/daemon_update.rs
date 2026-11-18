@@ -7,6 +7,7 @@ use crate::features::settings::json::{get, str_of};
 
 pub const DURABLE_FEATURE: &str = "durableDaemonUpdates";
 pub const COMPONENT_IDS: [&str; 4] = ["app", "daemon", "tailnet", "update-helper"];
+pub const APP_COMPONENT_IDS: [&str; 3] = ["app", "tailnet", "update-helper"];
 
 pub fn supports_durable(server_info: &Value) -> bool {
     if server_info["desktopManaged"] == true {
@@ -52,13 +53,15 @@ pub fn can_update_host(server_info: &Value, check: &Value) -> bool {
 pub fn can_update_checked(check: &Value) -> bool {
     check["supported"] == true
         && check["updateAvailable"] == true
-        && check["latest"]["version"]
-            .as_str()
-            .is_some_and(|v| !v.is_empty())
-        && check["latest"]["manifestSha512"]
-            .as_str()
-            .is_some_and(|v| !v.is_empty())
+        && can_pin_release(&check["latest"])
         && check["checkError"].is_null()
+}
+
+pub fn can_pin_release(release: &Value) -> bool {
+    release["version"].as_str().is_some_and(|v| !v.is_empty())
+        && release["manifestSha512"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
 }
 
 /// The selected set is always explicit in the persisted approval.
@@ -197,6 +200,22 @@ fn valid_identity(identity: &Value) -> bool {
         && identity["abiVersion"]
             .as_u64()
             .is_some_and(|abi| abi > 0 && abi <= u32::MAX as u64)
+}
+
+/// The independent app helper verifies the complete app-side selection before
+/// projecting a committed journal. No daemon component belongs to that result.
+pub fn remote_app_commit_verified(operation: &Value) -> bool {
+    operation["outcome"] == "committed"
+        && operation["candidate"]["version"] == operation["expectedRelease"]["version"]
+        && operation["observedComponents"] == operation["targetComponents"]
+        && operation["targetComponents"]
+            .as_object()
+            .is_some_and(|components| {
+                components.len() == APP_COMPONENT_IDS.len()
+                    && APP_COMPONENT_IDS
+                        .iter()
+                        .all(|id| components.get(*id).is_some_and(valid_identity))
+            })
 }
 
 /// The standalone executor records the authenticated replacement worker and

@@ -199,10 +199,45 @@ fn stored_update_record(state: &CoreState, server_id: &str) -> Option<Value> {
     record.is_object().then_some(record)
 }
 
+pub const REMOTE_APP_STAGE: &str = "remoteDesktopApp";
+pub const REMOTE_APP_APPROVAL: &str = "remoteDesktopAppUpdate";
+
+/// A desktop continuation is client-local metadata, bound to the same host
+/// even after the daemon's journal has been replaced with the app operation.
+pub fn remote_app_approval<'a>(record: &'a Value, server_id: &str) -> Option<&'a Value> {
+    let approval = &record[REMOTE_APP_APPROVAL];
+    let request = approval["request"].as_object()?;
+    let id = request.get("operationId")?.as_str()?;
+    let release = request.get("expectedRelease")?.as_object()?;
+    let selected = request.get("selectedComponents")?.as_array()?;
+    (approval["serverId"] == server_id
+        && request.len() == 3
+        && uuid::Uuid::parse_str(id).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == id)
+        && release.len() == 2
+        && release
+            .get("version")?
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
+        && release
+            .get("manifestSha512")?
+            .as_str()
+            .is_some_and(|pin| pin.len() == 88)
+        && !selected.is_empty()
+        && selected.iter().enumerate().all(|(index, value)| {
+            matches!(value.as_str(), Some("app" | "tailnet" | "update-helper"))
+                && !selected[..index].contains(value)
+        })
+        && (record["targetKind"] != REMOTE_APP_STAGE || record["operationId"] == id))
+        .then(|| &approval["request"])
+}
+
 /// The saved operation ID, or `None` when it is missing or not a UUID the
 /// daemon can observe (such a record can only fail; drop it).
 pub fn stored_update_operation(state: &CoreState, server_id: &str) -> Option<String> {
     let record = stored_update_record(state, server_id)?;
+    if record["targetKind"] == REMOTE_APP_STAGE {
+        remote_app_approval(&record, server_id)?;
+    }
     record["operationId"]
         .as_str()
         .filter(|id| uuid::Uuid::parse_str(id.trim()).is_ok_and(|id| !id.is_nil()))
@@ -219,11 +254,15 @@ pub fn has_unusable_update_record(state: &CoreState, server_id: &str) -> bool {
 }
 
 pub fn stored_update_request(state: &CoreState, server_id: &str) -> Option<Value> {
-    stored_update_operation(state, server_id)?;
     let record = stored_update_record(state, server_id)?;
-    if !record.is_object()
-        || record["operationId"].as_str().is_none_or(str::is_empty)
-        || record["source"] != "release"
+    if record["targetKind"] == REMOTE_APP_STAGE {
+        remote_app_approval(&record, server_id)?;
+        return Some(record);
+    }
+    if record["source"] != "release"
+        || record["operationId"]
+            .as_str()
+            .is_none_or(|id| !uuid::Uuid::parse_str(id.trim()).is_ok_and(|id| !id.is_nil()))
     {
         return None;
     }
@@ -250,7 +289,7 @@ pub fn stored_update_request(state: &CoreState, server_id: &str) -> Option<Value
             return None;
         }
     }
-    Some(record.clone())
+    Some(record)
 }
 
 /// Flutter `DaemonUpdateOperationStore.clear`.
@@ -592,6 +631,39 @@ mod update_restore_tests {
         assert_eq!(stored_update_operation(&state, "host-d"), None);
         assert!(has_unusable_update_record(&state, "host-d"));
         assert!(!has_unusable_update_record(&state, "host-a"));
+    }
+
+    #[test]
+    fn restores_remote_app_stage_only_with_its_original_host_and_exact_approval() {
+        let request = json!({
+            "operationId": OP_A,
+            "expectedRelease": {"version":"3.0.0", "manifestSha512":"A".repeat(86) + "=="},
+            "selectedComponents": ["app", "update-helper"],
+        });
+        let stage = json!({
+            "targetKind": REMOTE_APP_STAGE, "operationId": OP_A,
+            (REMOTE_APP_APPROVAL): {"serverId": "pc", "request": request},
+        });
+        let mut state = CoreState::default();
+        let prefs = std::sync::Arc::make_mut(&mut state.prefs);
+        prefs.insert(update_operation_key("pc"), saved(&stage));
+        prefs.insert(update_operation_key("other-pc"), saved(&stage));
+        let mut wrong_operation = stage.clone();
+        wrong_operation[REMOTE_APP_APPROVAL]["serverId"] = json!("wrong-op");
+        wrong_operation["operationId"] = json!(OP_B);
+        prefs.insert(update_operation_key("wrong-op"), saved(&wrong_operation));
+        assert_eq!(stored_update_operation(&state, "pc").as_deref(), Some(OP_A));
+        assert_eq!(stored_update_request(&state, "pc"), Some(stage.clone()));
+        assert!(stored_update_request(&state, "other-pc").is_none());
+        assert!(stored_update_operation(&state, "other-pc").is_none());
+        assert!(stored_update_request(&state, "wrong-op").is_none());
+        assert!(stored_update_operation(&state, "wrong-op").is_none());
+        let mut invalid = stage.clone();
+        invalid[REMOTE_APP_APPROVAL]["request"]["selectedComponents"] = json!(["daemon"]);
+        assert!(remote_app_approval(&invalid, "pc").is_none());
+        invalid = stage;
+        invalid[REMOTE_APP_APPROVAL]["request"]["source"] = json!("release");
+        assert!(remote_app_approval(&invalid, "pc").is_none());
     }
 
     #[test]

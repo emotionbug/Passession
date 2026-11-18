@@ -1,3 +1,4 @@
+mod desktop_update;
 mod diagnostics;
 #[cfg(test)]
 mod tests;
@@ -33,18 +34,21 @@ impl DaemonAdminService {
     }
     pub async fn handle(&self, context: &RequestContext, message: &Value) -> Result<bool> {
         let kind = message["type"].as_str().unwrap_or("");
-        if !matches!(
-            kind,
-            "diagnostics.request"
-                | "daemon.update.request"
-                | "daemon.update.check.request"
-                | "daemon.update.submit.request"
-                | "daemon.update.status.request"
-                | "daemon.update.drain.request"
-                | "daemon.update.drain.release.request"
-                | "restart_server_request"
-                | "shutdown_server_request"
-        ) {
+        let desktop_method = desktop_update::method(kind);
+        if desktop_method.is_none()
+            && !matches!(
+                kind,
+                "diagnostics.request"
+                    | "daemon.update.request"
+                    | "daemon.update.check.request"
+                    | "daemon.update.submit.request"
+                    | "daemon.update.status.request"
+                    | "daemon.update.drain.request"
+                    | "daemon.update.drain.release.request"
+                    | "restart_server_request"
+                    | "shutdown_server_request"
+            )
+        {
             return Ok(false);
         }
         let app = self
@@ -52,6 +56,10 @@ impl DaemonAdminService {
             .upgrade()
             .ok_or_else(|| anyhow!("Daemon is shutting down"))?;
         let request = crate::transport::request_id(message).context("Missing requestId")?;
+        if let Some(method) = desktop_method {
+            desktop_update::respond(&app.home, context, request, kind, method, message).await?;
+            return Ok(true);
+        }
         match kind{
             "diagnostics.request"=>{
                 match diagnostics::collect(&app,self.started).await{
@@ -147,7 +155,7 @@ fn remote_submit_request(message: &Value) -> Result<SubmitRequest> {
             .get("targetKind")
             .is_none_or(|kind| kind == "daemon")
             && message.get("selectedComponents").is_none_or(Value::is_null),
-        "This daemon endpoint updates only the daemon. Update the app from its local Settings."
+        "This endpoint updates only the daemon. Use the desktop app update operation for app components."
     );
     let operation_id = match message["operationId"].as_str() {
         Some(raw) => update_operation_id(raw)?,

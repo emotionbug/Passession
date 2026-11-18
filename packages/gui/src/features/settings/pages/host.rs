@@ -772,6 +772,177 @@ pub struct UpdateCard {
     pub force_running: bool,
     pub app_update: bool,
     pub action_required: bool,
+    remote_app_committed: bool,
+    remote_app: RemoteAppCheck,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RemoteAppCheck {
+    checking: bool,
+    checked: bool,
+    update: Value,
+    error: Option<RemoteAppCheckError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteAppCheckError {
+    Unavailable,
+    Failed(String),
+}
+
+const REMOTE_APP_UNAVAILABLE: &str = "DESKTOP_APP_UNAVAILABLE";
+const REMOTE_APP_NOT_FOUND: &str = "DESKTOP_APP_OPERATION_NOT_FOUND";
+const REMOTE_APP_UNSUPPORTED: &str = "DESKTOP_APP_UNSUPPORTED";
+const REMOTE_APP_OUTCOME_UNKNOWN: &str = "DESKTOP_APP_OUTCOME_UNKNOWN";
+
+enum RemoteAppRpc {
+    Check,
+    Submit,
+    Status,
+}
+
+fn remote_app_supported(host: &HostView) -> bool {
+    !has_local_app(host)
+        && host.server_info["desktopManaged"] != true
+        && host.feature("remoteDesktopAppUpdates")
+}
+
+impl UpdateCard {
+    fn remote_app_stage(&self) -> bool {
+        self.submit_request
+            .as_ref()
+            .is_some_and(|record| record["targetKind"] == host::REMOTE_APP_STAGE)
+    }
+
+    fn has_remote_app_approval(&self) -> bool {
+        self.submit_request
+            .as_ref()
+            .is_some_and(|record| record.get(host::REMOTE_APP_APPROVAL).is_some())
+    }
+}
+
+fn check_remote_app(s: &mut Settings, env: &mut Env, server_id: String) {
+    let c = card(s, &server_id);
+    if c.remote_app.checking {
+        return;
+    }
+    c.remote_app = RemoteAppCheck {
+        checked: true,
+        checking: true,
+        ..Default::default()
+    };
+    let generation = c.check_generation;
+    let id = server_id.clone();
+    remote_app_rpc(
+        s,
+        env,
+        &server_id,
+        RemoteAppRpc::Check,
+        json!({}),
+        move |s, _, result| {
+            let c = card(s, &id);
+            if c.check_generation != generation {
+                return;
+            }
+            c.remote_app.checking = false;
+            match result {
+                Ok(mut value) if value["check"]["targetKind"] == "app" => {
+                    c.remote_app.update = value["check"].take();
+                }
+                Ok(_) => {
+                    c.remote_app.error = Some(RemoteAppCheckError::Failed(t(
+                        "settingsNative.identityChanged",
+                    )));
+                }
+                Err(error) if error.code == REMOTE_APP_UNAVAILABLE => {
+                    c.remote_app.error = Some(RemoteAppCheckError::Unavailable);
+                }
+                Err(error) => {
+                    let text = update_error_text(&error.code, &error.message);
+                    // Unmapped failures carry the daemon's fixed English
+                    // summary; state it in the UI language instead.
+                    let text = if text == error.message.trim() {
+                        ut("appRemote.checkFailed")
+                    } else {
+                        text
+                    };
+                    c.remote_app.error = Some(RemoteAppCheckError::Failed(text));
+                }
+            }
+        },
+    );
+}
+
+fn remote_app_rpc(
+    s: &mut Settings,
+    env: &mut Env,
+    server_id: &str,
+    method: RemoteAppRpc,
+    fields: Value,
+    then: impl FnOnce(&mut Settings, &mut Env, Result<Value, ReqError>) + 'static,
+) {
+    if let Err(error) = remote_app_host(env, server_id) {
+        then(s, env, Err(error));
+        return;
+    }
+    let (request, response) = match method {
+        RemoteAppRpc::Check => (
+            "desktop.app.update.check.request",
+            "desktop.app.update.check.response",
+        ),
+        RemoteAppRpc::Submit => (
+            "desktop.app.update.submit.request",
+            "desktop.app.update.submit.response",
+        ),
+        RemoteAppRpc::Status => (
+            "desktop.app.update.status.request",
+            "desktop.app.update.status.response",
+        ),
+    };
+    let id = server_id.to_owned();
+    s.request_timeout(
+        env,
+        server_id,
+        request,
+        fields,
+        response,
+        Some(Duration::from_secs(60)),
+        move |s, env, result| {
+            let result = result.and_then(|value| {
+                match remote_app_host(env, &id) {
+                    Ok(()) => Ok(value),
+                    Err(mut error) => {
+                        // A reply arrived from the former connection. Refusing
+                        // it cannot establish that the operation did not start.
+                        error.outcome_unknown = true;
+                        Err(error)
+                    }
+                }
+            });
+            then(s, env, result);
+        },
+    );
+}
+
+fn remote_app_host(env: &Env, server_id: &str) -> Result<(), ReqError> {
+    let Some(host) = env.host(server_id).filter(HostView::connected) else {
+        return Err(ReqError {
+            code: "DAEMON_NOT_CONNECTED".into(),
+            message: ut("offlineMessage"),
+            outcome_unknown: false,
+        });
+    };
+    if str_of(&host.server_info, "serverId") != server_id {
+        return Err(ReqError::msg(t("settingsNative.identityChanged")));
+    }
+    if !remote_app_supported(&host) {
+        return Err(ReqError {
+            code: REMOTE_APP_UNSUPPORTED.into(),
+            message: ut("appRemote.unsupported"),
+            outcome_unknown: false,
+        });
+    }
+    Ok(())
 }
 
 fn ut(key: &str) -> String {
@@ -875,8 +1046,8 @@ fn fail(s: &mut Settings, server_id: &str, title: String, message: String) {
     c.legacy_request = None;
 }
 
-/// Resumes observing an operation this app submitted before a reconnect,
-/// rebuilt view or restart. It never submits a new update.
+/// Recovers a saved approval when this host's Version page first connects.
+/// Remote app operations resume by status, never by replaying a mutation.
 pub fn ensure_update_card(s: &mut Settings, env: &mut Env, host: &HostView) {
     if host.server_id.is_empty() {
         return;
@@ -886,35 +1057,39 @@ pub fn ensure_update_card(s: &mut Settings, env: &mut Env, host: &HostView) {
         return;
     }
     if c.operation_id.is_none() {
-        if host::has_unusable_update_record(&env.ctx.state, &host.server_id) {
-            host::clear_update_operation(&env.ctx.core, &host.server_id);
-        }
-        c.operation_id = host::stored_update_operation(&env.ctx.state, &host.server_id);
-        c.submit_request = host::stored_update_request(&env.ctx.state, &host.server_id);
-        c.app_update = c
-            .submit_request
-            .as_ref()
-            .is_some_and(|v| v["targetKind"] == "app");
-        c.selected_components = c
-            .submit_request
-            .as_ref()
-            .and_then(|request| request["selectedComponents"].as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|id| id.as_str().map(String::from))
-            .collect();
-        c.force_running = c
-            .submit_request
-            .as_ref()
-            .is_some_and(|request| request["forceRunning"] == true);
+        restore_update(c, env, &host.server_id);
     }
     if !host.connected() {
         return;
     }
     c.resumed = true;
     if let Some(operation) = c.operation_id.clone() {
-        durable_update(s, env, host.server_id.clone(), operation, true);
+        resume_update(s, env, host.server_id.clone(), operation);
     }
+}
+
+fn restore_update(c: &mut UpdateCard, env: &Env, server_id: &str) {
+    if host::has_unusable_update_record(&env.ctx.state, server_id) {
+        host::clear_update_operation(&env.ctx.core, server_id);
+    }
+    c.operation_id = host::stored_update_operation(&env.ctx.state, server_id);
+    c.submit_request = host::stored_update_request(&env.ctx.state, server_id);
+    c.app_update = c
+        .submit_request
+        .as_ref()
+        .is_some_and(|v| v["targetKind"] == "app");
+    c.selected_components = c
+        .submit_request
+        .as_ref()
+        .and_then(|request| request["selectedComponents"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().map(String::from))
+        .collect();
+    c.force_running = c
+        .submit_request
+        .as_ref()
+        .is_some_and(|request| request["forceRunning"] == true);
 }
 
 pub fn reset_version_check(s: &mut Settings, server_id: &str) {
@@ -923,6 +1098,7 @@ pub fn reset_version_check(s: &mut Settings, server_id: &str) {
         c.checking = false;
         c.checked = false;
         c.check = None;
+        c.remote_app = RemoteAppCheck::default();
     }
 }
 
@@ -931,9 +1107,15 @@ pub fn ensure_version_page(s: &mut Settings, env: &mut Env, host: &HostView) {
     if has_local_app(host) {
         about::ensure_update(s, env);
     }
-    let c = card(s, &host.server_id);
-    if host.connected() && !c.checked && !c.checking {
-        check_version(s, env, host.server_id.clone());
+    if host.connected() {
+        let c = card(s, &host.server_id);
+        if !c.checked && !c.checking {
+            check_version(s, env, host.server_id.clone());
+        }
+        let c = card(s, &host.server_id);
+        if remote_app_supported(host) && c.state != UpdatePhase::Updating && !c.remote_app.checked {
+            check_remote_app(s, env, host.server_id.clone());
+        }
     }
 }
 
@@ -1023,6 +1205,277 @@ fn update_request(
     );
 }
 
+const OBSERVATION_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+fn resume_update(s: &mut Settings, env: &mut Env, server_id: String, operation_id: String) {
+    if card(s, &server_id).remote_app_stage() {
+        begin_update(s, &server_id, operation_id.clone());
+        observe_remote_app(
+            s,
+            env,
+            server_id,
+            operation_id,
+            Instant::now() + OBSERVATION_LIMIT,
+        );
+    } else {
+        durable_update(s, env, server_id, operation_id, true);
+    }
+}
+
+fn begin_update(s: &mut Settings, server_id: &str, operation_id: String) {
+    let c = card(s, server_id);
+    c.state = UpdatePhase::Updating;
+    c.durable = true;
+    c.operation_id = Some(operation_id);
+    c.phase = ut("phaseStarting");
+    c.action_required = false;
+}
+
+fn clear_update(s: &mut Settings, env: &Env, server_id: &str) {
+    host::clear_update_operation(&env.ctx.core, server_id);
+    let c = card(s, server_id);
+    c.operation_id = None;
+    c.submit_request = None;
+}
+
+fn start_remote_app(s: &mut Settings, env: &mut Env, server_id: String, approval: Value) {
+    let operation_id = str_of(&approval["request"], "operationId").to_owned();
+    let record = json!({
+        "targetKind": host::REMOTE_APP_STAGE,
+        "operationId": operation_id,
+        (host::REMOTE_APP_APPROVAL): approval,
+    });
+    if host::remote_app_approval(&record, &server_id).is_none() {
+        fail(
+            s,
+            &server_id,
+            ut("requestFailedTitle"),
+            ut("approvalMissing"),
+        );
+        return;
+    }
+    begin_update(s, &server_id, operation_id.clone());
+    card(s, &server_id).submit_request = Some(record.clone());
+    let key = format!("prefs:{}", host::update_operation_key(&server_id));
+    // On combined upgrades this atomically replaces the saved daemon stage.
+    // No submit can run until the desktop operation ID is durable.
+    s.save_flushed(env, &key, record, move |s, env, saved| {
+        if let Err(error) = saved {
+            clear_update(s, env, &server_id);
+            settle_error(s, env, &server_id, error);
+            return;
+        }
+        submit_remote_app(
+            s,
+            env,
+            server_id,
+            operation_id,
+            Instant::now() + OBSERVATION_LIMIT,
+        );
+    });
+}
+
+fn submit_remote_app(
+    s: &mut Settings,
+    env: &mut Env,
+    server_id: String,
+    operation_id: String,
+    deadline: Instant,
+) {
+    if Instant::now() >= deadline {
+        fail(
+            s,
+            &server_id,
+            ut("appRemote.observationPaused"),
+            ut("appRemote.resumeHint"),
+        );
+        return;
+    }
+    if env
+        .host(&server_id)
+        .is_some_and(|host| !host.connected() || host.maintenance_operation.is_some())
+    {
+        card(s, &server_id).phase = ut("appLocal.waitingForDaemon");
+        s.after(env, 1.0, move |s, env| {
+            submit_remote_app(s, env, server_id, operation_id, deadline)
+        });
+        return;
+    }
+    let approved = card(s, &server_id)
+        .submit_request
+        .as_ref()
+        .and_then(|record| host::remote_app_approval(record, &server_id))
+        .filter(|request| request["operationId"] == operation_id)
+        .cloned();
+    let Some(request) = approved else {
+        fail(
+            s,
+            &server_id,
+            ut("requestFailedTitle"),
+            ut("approvalMissing"),
+        );
+        return;
+    };
+    let sid = server_id.clone();
+    remote_app_rpc(
+        s,
+        env,
+        &server_id,
+        RemoteAppRpc::Submit,
+        request,
+        move |s, env, result| {
+            accept_remote_app(s, env, sid, operation_id, deadline, true, result);
+        },
+    );
+}
+
+fn observe_remote_app(
+    s: &mut Settings,
+    env: &mut Env,
+    server_id: String,
+    operation_id: String,
+    deadline: Instant,
+) {
+    if Instant::now() >= deadline {
+        fail(
+            s,
+            &server_id,
+            ut("appRemote.observationPaused"),
+            ut("appRemote.resumeHint"),
+        );
+        return;
+    }
+    let sid = server_id.clone();
+    remote_app_rpc(
+        s,
+        env,
+        &server_id,
+        RemoteAppRpc::Status,
+        json!({"operationId": operation_id}),
+        move |s, env, result| accept_remote_app(s, env, sid, operation_id, deadline, false, result),
+    );
+}
+
+fn accept_remote_app(
+    s: &mut Settings,
+    env: &mut Env,
+    server_id: String,
+    operation_id: String,
+    deadline: Instant,
+    submitting: bool,
+    result: Result<Value, ReqError>,
+) {
+    if card(s, &server_id).operation_id.as_deref() != Some(operation_id.as_str()) {
+        return;
+    }
+    match result {
+        Ok(mut response) => {
+            let operation = response["operation"].take();
+            let c = card(s, &server_id);
+            let approved = c
+                .submit_request
+                .as_ref()
+                .and_then(|record| host::remote_app_approval(record, &server_id));
+            if !approved.is_some_and(|request| remote_app_operation_matches(&operation, request)) {
+                fail(
+                    s,
+                    &server_id,
+                    ut("appRemote.observationPaused"),
+                    t("settingsNative.otherOperation"),
+                );
+                return;
+            }
+            c.phase = ut(du::phase_key(str_of(&operation, "phase")));
+            c.action_required = operation["actionRequired"] == "osAuthorization"
+                || operation["phase"] == "waitingForAuthorization";
+            if operation["terminal"] == true {
+                if du::outcome(&operation) == Outcome::Committed
+                    && !du::remote_app_commit_verified(&operation)
+                {
+                    fail(
+                        s,
+                        &server_id,
+                        ut("appRemote.observationPaused"),
+                        ut("versionUnconfirmed"),
+                    );
+                    return;
+                }
+                c.app_update = true;
+                complete_operation(s, env, &server_id, &operation_id, operation);
+                if card(s, &server_id).state != UpdatePhase::Complete {
+                    reset_version_check(s, &server_id);
+                }
+                return;
+            }
+        }
+        Err(error)
+            if submitting
+                && !error.outcome_unknown
+                && error.message.starts_with("daemon_update_in_progress:") =>
+        {
+            // Admission was refused before reaching the bridge. Ambiguous
+            // replies take the status-only path instead.
+            card(s, &server_id).phase = ut("appLocal.waitingForDaemon");
+            s.after(env, 1.0, move |s, env| {
+                submit_remote_app(s, env, server_id, operation_id, deadline)
+            });
+            return;
+        }
+        Err(error) if error.code == REMOTE_APP_NOT_FOUND => {
+            // A different/reinstalled owner might not have the old journal.
+            // Never turn a missing receipt into a fresh installation request.
+            clear_update(s, env, &server_id);
+            reset_version_check(s, &server_id);
+            fail(
+                s,
+                &server_id,
+                ut("appRemote.observationPaused"),
+                ut("appRemote.operationMissing"),
+            );
+            return;
+        }
+        Err(error) if error.code == REMOTE_APP_UNAVAILABLE && !error.outcome_unknown => {
+            if submitting {
+                clear_update(s, env, &server_id);
+                reset_version_check(s, &server_id);
+                fail(
+                    s,
+                    &server_id,
+                    ut("appRemote.unavailable"),
+                    ut("appRemote.openApp"),
+                );
+                return;
+            }
+            card(s, &server_id).phase = ut("appRemote.waitingForApp");
+        }
+        Err(error) if error.is_reconnect() || error.code == REMOTE_APP_OUTCOME_UNKNOWN => {
+            card(s, &server_id).phase = ut("appRemote.waitingForApp");
+        }
+        Err(error) => {
+            if submitting {
+                clear_update(s, env, &server_id);
+                reset_version_check(s, &server_id);
+                settle_error(s, env, &server_id, error);
+            } else {
+                let detail = with_detail(&ut("appRemote.resumeHint"), &error.message);
+                fail(s, &server_id, ut("appRemote.observationPaused"), detail);
+            }
+            return;
+        }
+    }
+    s.after(env, 1.0, move |s, env| {
+        observe_remote_app(s, env, server_id, operation_id, deadline)
+    });
+}
+
+fn remote_app_operation_matches(operation: &Value, request: &Value) -> bool {
+    operation["targetKind"] == "app"
+        && operation["operationId"] == request["operationId"]
+        && operation["expectedRelease"] == request["expectedRelease"]
+        && operation["selectedComponents"] == request["selectedComponents"]
+        && operation["terminal"].is_boolean()
+}
+
 fn durable_update(
     s: &mut Settings,
     env: &mut Env,
@@ -1030,16 +1483,10 @@ fn durable_update(
     operation_id: String,
     resumed: bool,
 ) {
-    {
-        let c = card(s, &server_id);
-        c.state = UpdatePhase::Updating;
-        c.durable = true;
-        c.operation_id = Some(operation_id.clone());
-        c.phase = ut("phaseStarting");
-        c.action_required = false;
-    }
+    begin_update(s, &server_id, operation_id.clone());
     if resumed {
-        if card(s, &server_id).submit_request.is_some() {
+        let c = card(s, &server_id);
+        if c.submit_request.is_some() && !c.has_remote_app_approval() {
             // This exact request was flushed before its first submission.
             // Idempotent resubmission also recovers a crash before that send.
             submit(
@@ -1056,7 +1503,7 @@ fn durable_update(
             env,
             server_id,
             operation_id,
-            Instant::now() + Duration::from_secs(30 * 60),
+            Instant::now() + OBSERVATION_LIMIT,
             None,
         );
         return;
@@ -1113,11 +1560,10 @@ fn submit(
         );
         return;
     };
-    // This is an app-local continuation, never part of the daemon wire request.
-    fields
-        .as_object_mut()
-        .unwrap()
-        .remove("afterDaemonAppUpdate");
+    // Client-local continuation fields are never part of the daemon request.
+    let fields_map = fields.as_object_mut().unwrap();
+    let combined = fields_map.remove(host::REMOTE_APP_APPROVAL).is_some();
+    fields_map.remove("afterDaemonAppUpdate");
     let sid = server_id.clone();
     let oid = operation_id.clone();
     update_request(
@@ -1127,22 +1573,27 @@ fn submit(
         "daemon.update.submit.request",
         fields,
         "daemon.update.submit.response",
-        move |s, env, result| match result
-            .and_then(|r| du::operation_of(&r, &oid, &sid).map_err(ReqError::msg))
-        {
+        move |s, env, result| match result.and_then(|r| {
+            du::operation_of(&r, &oid, &sid).map_err(|message| ReqError {
+                code: String::new(),
+                message,
+                outcome_unknown: combined,
+            })
+        }) {
             Ok(operation) if terminal_update_ready(&operation) => {
                 // Resuming a saved approval can return an already settled
                 // journal from the submit acknowledgement itself.
                 finish(s, env, &sid, &oid, operation);
             }
-            Ok(_) => observe(
-                s,
-                env,
-                sid,
-                oid,
-                Instant::now() + Duration::from_secs(30 * 60),
-                None,
-            ),
+            Ok(_) => observe(s, env, sid, oid, Instant::now() + OBSERVATION_LIMIT, None),
+            Err(error) if combined && (error.is_reconnect() || error.code.is_empty()) => {
+                observe(s, env, sid, oid, Instant::now() + OBSERVATION_LIMIT, None)
+            }
+            Err(error) if combined => {
+                clear_update(s, env, &sid);
+                reset_version_check(s, &sid);
+                settle_error(s, env, &sid, error);
+            }
             Err(error) if error.is_reconnect() && Instant::now() < deadline => {
                 s.after(env, 1.0, move |s, env| submit(s, env, sid, oid, deadline));
             }
@@ -1227,6 +1678,19 @@ fn observe(
             }
             Err(error)
                 if error.code == "UPDATE_OPERATION_NOT_FOUND"
+                    && card(s, &sid).has_remote_app_approval() =>
+            {
+                clear_update(s, env, &sid);
+                reset_version_check(s, &sid);
+                fail(
+                    s,
+                    &sid,
+                    ut("appRemote.observationPaused"),
+                    ut("appRemote.daemonOperationMissing"),
+                );
+            }
+            Err(error)
+                if error.code == "UPDATE_OPERATION_NOT_FOUND"
                     && card(s, &sid).submit_request.is_some() =>
             {
                 submit(s, env, sid, oid, Instant::now() + Duration::from_secs(120));
@@ -1265,6 +1729,30 @@ fn finish(s: &mut Settings, env: &mut Env, server_id: &str, operation_id: &str, 
                 ut("requestFailedTitle"),
                 ut("versionUnconfirmed"),
             );
+        }
+        Outcome::Committed if card(s, server_id).has_remote_app_approval() => {
+            let approved = card(s, server_id)
+                .submit_request
+                .as_ref()
+                .filter(|record| {
+                    record["targetKind"] == "daemon"
+                        && record["operationId"] == operation_id
+                        && operation["operationId"] == operation_id
+                        && du::can_pin_release(&record["expectedRelease"])
+                        && host::remote_app_approval(record, server_id).is_some()
+                })
+                .map(|record| record[host::REMOTE_APP_APPROVAL].clone());
+            if let Some(approved) = approved {
+                start_remote_app(s, env, server_id.to_owned(), approved);
+            } else {
+                clear_update(s, env, server_id);
+                fail(
+                    s,
+                    server_id,
+                    ut("requestFailedTitle"),
+                    ut("approvalMissing"),
+                );
+            }
         }
         _ => complete_operation(s, env, server_id, operation_id, operation),
     }
@@ -1332,11 +1820,11 @@ fn complete_operation(
         None
     };
     let has_deferred_app = app.is_some();
+    let c = card(s, server_id);
+    let independent_app = operation["targetKind"] == "app" && c.remote_app_stage();
+    let remote_app = operation["targetKind"] != "app" && c.has_remote_app_approval();
     if !du::retain_operation(&operation) {
-        host::clear_update_operation(&env.ctx.core, server_id);
-        let c = card(s, server_id);
-        c.operation_id = None;
-        c.submit_request = None;
+        clear_update(s, env, server_id);
     }
     let error = str_of(&operation, "error").to_string();
     match du::outcome(&operation) {
@@ -1347,7 +1835,9 @@ fn complete_operation(
                 .map(Value::is_object)
                 .unwrap_or(false);
             let note = match (requested, resume) {
-                (false, _) => ut(if operation["targetKind"] == "app" {
+                (false, _) => ut(if independent_app {
+                    "appRemote.committedMessage"
+                } else if operation["targetKind"] == "app" {
                     "appCommittedMessage"
                 } else {
                     "committedMessage"
@@ -1361,6 +1851,7 @@ fn complete_operation(
             let c = card(s, server_id);
             c.state = UpdatePhase::Complete;
             c.worker_version = str_of(get(&operation, "candidate"), "version").to_string();
+            c.remote_app_committed = independent_app;
             c.complete_note = note;
             reset_version_check(s, server_id);
             if let Some(approved) = app {
@@ -1393,17 +1884,27 @@ fn complete_operation(
     if card(s, server_id).state == UpdatePhase::Failed && has_deferred_app {
         s.about.install_error = Some(ut("appLocal.notStarted"));
     }
+    if remote_app && card(s, server_id).state == UpdatePhase::Failed {
+        let c = card(s, server_id);
+        c.failure_message.push('\n');
+        c.failure_message.push_str(&ut("appRemote.notStarted"));
+    }
 }
 
 fn has_local_app(host: &HostView) -> bool {
     DESKTOP && host.local
 }
 
+enum AppContinuation {
+    Local(Value),
+    Remote(Value),
+}
+
 fn start_update(
     s: &mut Settings,
     env: &mut Env,
     server_id: String,
-    after_daemon_app_update: Option<Value>,
+    after_daemon_app_update: Option<AppContinuation>,
 ) {
     let Some(host) = env.host(&server_id) else {
         return;
@@ -1416,7 +1917,7 @@ fn start_update(
         return;
     }
     if let Some(operation) = card(s, &server_id).operation_id.clone() {
-        durable_update(s, env, server_id, operation, true);
+        resume_update(s, env, server_id, operation);
         return;
     }
     if has_local_app(&host) && du::target_kind(&host.server_info) != "daemon" {
@@ -1452,8 +1953,12 @@ fn start_update(
         if c.app_update {
             request["selectedComponents"] = json!(c.selected_components);
         }
-        if let Some(approved) = after_daemon_app_update {
-            request["afterDaemonAppUpdate"] = approved;
+        match after_daemon_app_update {
+            Some(AppContinuation::Local(approval)) => request["afterDaemonAppUpdate"] = approval,
+            Some(AppContinuation::Remote(approval)) => {
+                request[host::REMOTE_APP_APPROVAL] = approval
+            }
+            None => {}
         }
         c.submit_request = Some(request);
         durable_update(s, env, server_id, operation, false);
@@ -1476,6 +1981,7 @@ fn legacy_update(s: &mut Settings, env: &mut Env, server_id: String) {
     {
         let c = card(s, &server_id);
         c.state = UpdatePhase::Updating;
+        c.remote_app_committed = false;
         c.durable = false;
         c.phase = ut("phaseStarting");
         c.legacy_request = Some(request_id.clone());
@@ -1755,25 +2261,39 @@ fn draw_component_plan(ui: &mut Ui, host: &HostView, c: &UpdateCard, check: &Val
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct LocalUpdatePlan {
+struct VersionUpdatePlan {
     daemon: Option<Value>,
     app: Option<Value>,
     force: bool,
+    remote_generation: Option<u64>,
 }
 
-fn local_update_plan(
+fn independent_update_plan(
     host: &HostView,
     daemon: &UpdateCard,
-    app: &about::AboutState,
-) -> Option<LocalUpdatePlan> {
-    if !host.local
-        || daemon.checking
+    local: Option<&about::AboutState>,
+) -> Option<VersionUpdatePlan> {
+    let (app_check, remote_generation) = if let Some(app) = local {
+        if !has_local_app(host) || app.checking || app.installing || !app.checked {
+            return None;
+        }
+        (&app.update, None)
+    } else {
+        let app = &daemon.remote_app;
+        if !remote_app_supported(host)
+            || !host.connected()
+            || str_of(&host.server_info, "serverId") != host.server_id
+            || app.checking
+            || !app.checked
+        {
+            return None;
+        }
+        (&app.update, Some(daemon.check_generation))
+    };
+    if daemon.checking
         || daemon.state == UpdatePhase::Updating
         || daemon.operation_id.is_some()
         || host.maintenance_operation.is_some()
-        || app.checking
-        || app.installing
-        || !app.checked
     {
         return None;
     }
@@ -1787,31 +2307,34 @@ fn local_update_plan(
                 && du::can_update_host(&host.server_info, check)
         })
         .map(|check| check["latest"].clone());
-    let app = about::app_approval(&app.update);
-    (target.is_some() || app.is_some()).then_some(LocalUpdatePlan {
+    let app = about::app_approval(app_check);
+    (target.is_some() || app.is_some()).then_some(VersionUpdatePlan {
         force: target.is_some() && daemon.force_running,
         daemon: target,
         app,
+        remote_generation,
     })
 }
 
-fn local_version_update(
+fn independent_version_update(
     host: &HostView,
     c: &UpdateCard,
-    app: &about::AboutState,
+    local: Option<&about::AboutState>,
 ) -> Option<crate::features::settings::rpc::Handler> {
     let id = host.server_id.clone();
     if c.operation_id.is_some() {
         return (host.connected()
             && c.state != UpdatePhase::Updating
-            && !app.installing
-            && host
-                .maintenance_operation
-                .as_ref()
-                .is_none_or(|operation| c.operation_id.as_ref() == Some(operation)))
+            && !local.is_some_and(|app| app.installing)
+            && (c.remote_app_stage()
+                || host
+                    .maintenance_operation
+                    .as_ref()
+                    .is_none_or(|operation| c.operation_id.as_ref() == Some(operation))))
         .then(|| handler(move |s, env| start_update(s, env, id.clone(), None)));
     }
-    let plan = local_update_plan(host, c, app)?;
+    let plan = independent_update_plan(host, c, local)?;
+    let remote = plan.remote_generation.is_some();
     let label = host.label.clone();
     Some(handler(move |s, _| {
         let mut message = Vec::new();
@@ -1836,13 +2359,29 @@ fn local_version_update(
                 .collect::<Vec<_>>()
                 .join(", ");
             let version = str_of(&app["expectedRelease"], "version");
-            message.push(uta("appLocal.approvedVersion", &[("version", version)]));
+            message.push(uta(
+                if remote {
+                    "appRemote.approvedVersion"
+                } else {
+                    "appLocal.approvedVersion"
+                },
+                &[("version", version)],
+            ));
             message.push(uta("selectedComponents", &[("components", &components)]));
-            message.push(ut(if plan.daemon.is_some() {
-                "appLocal.confirmAfterDaemon"
+            if remote {
+                if plan.daemon.is_some() {
+                    message.push(ut("appRemote.confirmAfterDaemon"));
+                }
+                if remote_app_restarts_gui(app) {
+                    message.push(ut("appRemote.restartWarning"));
+                }
             } else {
-                "appLocal.confirm"
-            }));
+                message.push(ut(if plan.daemon.is_some() {
+                    "appLocal.confirmAfterDaemon"
+                } else {
+                    "appLocal.confirm"
+                }));
+            }
         }
         let id = id.clone();
         let approved = plan.clone();
@@ -1858,49 +2397,108 @@ fn local_version_update(
                 let Some(c) = s.update_cards.get(&id) else {
                     return;
                 };
-                if local_update_plan(&current, c, &s.about).as_ref() != Some(&approved) {
+                let local = (!remote).then_some(&s.about);
+                if independent_update_plan(&current, c, local).as_ref() != Some(&approved) {
                     return;
                 }
-                if approved.daemon.is_some() {
-                    let app = approved.app.clone().map(|mut request| {
+                let app = approved.app.clone().map(|mut request| {
+                    if remote || approved.daemon.is_some() {
                         request["operationId"] = json!(du::new_operation_id());
-                        request
-                    });
-                    if app.is_some() {
+                    }
+                    if remote {
+                        AppContinuation::Remote(json!({"serverId": id, "request": request}))
+                    } else {
+                        AppContinuation::Local(request)
+                    }
+                });
+                if approved.daemon.is_some() {
+                    if matches!(&app, Some(AppContinuation::Local(_))) {
                         s.about.operation = Value::Null;
                         s.about.install_error = None;
                     }
                     start_update(s, env, id.clone(), app);
-                } else if let Some(app) = &approved.app {
-                    about::install_approved(s, env, app.clone());
+                } else {
+                    match app {
+                        Some(AppContinuation::Remote(approval)) => {
+                            start_remote_app(s, env, id.clone(), approval);
+                        }
+                        Some(AppContinuation::Local(request)) => {
+                            about::install_approved(s, env, request);
+                        }
+                        None => {}
+                    }
                 }
             }),
         );
     }))
 }
 
-fn draw_local_app_versions(ui: &mut Ui, app: &about::AboutState, daemon: &UpdateCard) {
+fn remote_app_restarts_gui(request: &Value) -> bool {
+    request["selectedComponents"].as_array().is_some_and(|ids| {
+        ids.iter()
+            .any(|id| matches!(id.as_str(), Some("app" | "tailnet")))
+    })
+}
+
+struct AppVersionRows<'a> {
+    local: bool,
+    update: &'a Value,
+    checking: bool,
+    check_error: Option<&'a str>,
+    install_error: Option<&'a str>,
+    journal_error: Option<&'a str>,
+    unavailable: Option<&'a str>,
+    progress: Option<String>,
+}
+
+fn draw_app_versions(ui: &mut Ui, app: AppVersionRows<'_>) {
     ui.card_row_separator();
     let current = app.update["current"]["version"]
         .as_str()
         .map(String::from)
-        .or_else(platform::app_version)
+        .or_else(|| app.local.then(platform::app_version).flatten())
         .unwrap_or_else(|| t("settingsNative.unknownVersion"));
-    ui.row(row(ut("appLocal.current")).hint(current));
+    ui.row(
+        row(ut(if app.local {
+            "appLocal.current"
+        } else {
+            "appRemote.current"
+        }))
+        .hint(current),
+    );
     ui.card_row_separator();
-    let release_error = release_check_error_text(&app.update);
+    // A remote host forwards only fixed English summaries (`daemon_admin`
+    // redacts local detail); say what they mean in the UI language.
+    let release_error = if app.local || app.update["errorCode"] == "github_rate_limited" {
+        release_check_error_text(app.update)
+    } else {
+        app.update["checkError"]
+            .as_str()
+            .filter(|error| !error.trim().is_empty())
+            .map(|_| ut("appRemote.checkFailed"))
+    };
     let check_error = app
         .check_error
-        .as_deref()
         .or(release_error.as_deref())
         .filter(|error| !error.is_empty());
-    let support_error = app.update["supportError"].as_str();
+    let support_error = app.update["supportError"]
+        .as_str()
+        .filter(|error| !error.is_empty())
+        .map(|error| {
+            if app.local {
+                error.to_owned()
+            } else {
+                ut("appRemote.cannotSelfUpdate")
+            }
+        });
     let latest = app.update["latest"]["version"]
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| {
             if app.checking {
                 ut("checking")
+            } else if app.unavailable.is_some() {
+                ut("appRemote.unavailable")
             } else if check_error.is_some_and(not_published) {
                 ut("notPublished")
             } else if check_error.is_some() {
@@ -1911,44 +2509,54 @@ fn draw_local_app_versions(ui: &mut Ui, app: &about::AboutState, daemon: &Update
                 ut("notChecked")
             }
         });
-    let waiting_for_daemon = daemon.state == UpdatePhase::Updating
-        && daemon
-            .submit_request
-            .as_ref()
-            .is_some_and(|request| request["afterDaemonAppUpdate"].is_object());
-    let status = app.update_progress().or_else(|| {
-        if waiting_for_daemon {
-            Some(ut("appLocal.waitingForDaemon"))
-        } else if app.update["supported"] == true
+    let status = app.progress.or_else(|| {
+        if app.unavailable.is_none()
+            && app.update["supported"] == true
             && app.update["updateAvailable"] == false
             && check_error.is_none()
         {
-            Some(ut("appLocal.upToDate"))
+            Some(ut(if app.local {
+                "appLocal.upToDate"
+            } else {
+                "appRemote.upToDate"
+            }))
         } else {
             None
         }
     });
     let mut detail = latest;
+    if let Some(unavailable) = app.unavailable {
+        detail.push('\n');
+        detail.push_str(&ut(unavailable));
+    }
     if let Some(status) = status {
         detail.push('\n');
         detail.push_str(&status);
     }
     let error = app
         .install_error
-        .as_deref()
         .or_else(|| check_error.filter(|error| !not_published(error)))
-        .or_else(|| app.operation["error"].as_str())
-        .or(support_error)
+        .or(app.journal_error)
+        .or(support_error.as_deref())
         .filter(|error| !error.is_empty())
         .map(String::from);
-    ui.row(row(ut("appLocal.latest")).hint(detail).error(error));
+    ui.row(
+        row(ut(if app.local {
+            "appLocal.latest"
+        } else {
+            "appRemote.latest"
+        }))
+        .hint(detail)
+        .error(error),
+    );
 }
 
-/// The local host also shows the app release checked by this desktop.
+/// Independent desktop owners have their own release alongside the daemon.
 pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     let empty = UpdateCard::default();
     let c = s.update_cards.get(&host.server_id).unwrap_or(&empty);
     let local_app = has_local_app(host);
+    let remote_app = remote_app_supported(host);
     let checked = c
         .check
         .as_ref()
@@ -1958,7 +2566,7 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     let durable = du::supports_durable(&host.server_info);
     let check_supported = du::supports_check(&host.server_info);
     let desktop_managed = host.server_info["desktopManaged"] == true;
-    let app_update = !local_app && (desktop_managed || c.app_update);
+    let app_update = !local_app && desktop_managed;
     let component_update = !local_app && desktop_managed && du::supports_app(&host.server_info);
     let restart = du::restart_group(&c.selected_components);
     let selection_ready = !component_update
@@ -1972,7 +2580,8 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
         !desktop_managed && (durable || host.feature("daemonSelfUpdate"))
     };
     let id = host.server_id.clone();
-    let checking = c.checking || (local_app && s.about.checking);
+    let checking =
+        c.checking || (local_app && s.about.checking) || (remote_app && c.remote_app.checking);
     let installing = local_app && s.about.installing;
     let refresh =
         ((host.connected() || local_app) && !checking && !updating && !installing).then(|| {
@@ -1981,6 +2590,9 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
                     about::check(s, env, true);
                 }
                 check_version(s, env, id.clone());
+                if env.host(&id).as_ref().is_some_and(remote_app_supported) {
+                    check_remote_app(s, env, id.clone());
+                }
             })
         });
     ui.section_title(&t("settings.hostSections.version"), None, None);
@@ -2103,7 +2715,49 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
         })));
     }
     if local_app {
-        draw_local_app_versions(ui, &s.about, c);
+        let app = &s.about;
+        let waiting_for_daemon = updating
+            && c.submit_request
+                .as_ref()
+                .is_some_and(|request| request["afterDaemonAppUpdate"].is_object());
+        draw_app_versions(
+            ui,
+            AppVersionRows {
+                local: true,
+                update: &app.update,
+                checking: app.checking,
+                check_error: app.check_error.as_deref(),
+                install_error: app.install_error.as_deref(),
+                journal_error: app.operation["error"].as_str(),
+                unavailable: None,
+                progress: app
+                    .update_progress()
+                    .or_else(|| waiting_for_daemon.then(|| ut("appLocal.waitingForDaemon"))),
+            },
+        );
+    } else if remote_app {
+        let app = &c.remote_app;
+        let waiting_for_daemon = updating && c.has_remote_app_approval() && !c.remote_app_stage();
+        draw_app_versions(
+            ui,
+            AppVersionRows {
+                local: false,
+                update: &app.update,
+                checking: app.checking,
+                check_error: match &app.error {
+                    Some(RemoteAppCheckError::Failed(error)) => Some(error),
+                    _ => None,
+                },
+                install_error: None,
+                journal_error: None,
+                unavailable: (app.error == Some(RemoteAppCheckError::Unavailable))
+                    .then_some("appRemote.openApp"),
+                progress: waiting_for_daemon.then(|| ut("appLocal.waitingForDaemon")),
+            },
+        );
+    } else if host.connected() && !desktop_managed {
+        ui.card_row_separator();
+        ui.row(row(ut("appRemote.unavailable")).hint(ut("appRemote.unsupported")));
     }
     ui.card_end();
     ui.gap(24.0);
@@ -2156,7 +2810,8 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     );
     ui.card_row_separator();
     let force = c.force_running;
-    let remote_act = (!local_app
+    let independent = local_app || remote_app;
+    let remote_act = (!independent
         && host.connected()
         && !updating
         && !busy_elsewhere
@@ -2244,8 +2899,8 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
                 );
             })
         });
-    let act = if local_app {
-        local_version_update(host, c, &s.about)
+    let act = if independent {
+        independent_version_update(host, c, local_app.then_some(&s.about))
     } else {
         remote_act
     };
@@ -2261,6 +2916,8 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     } else {
         ut(if local_app {
             "appLocal.hint"
+        } else if remote_app {
+            "appRemote.hint"
         } else if app_update {
             "appHint"
         } else {
@@ -2270,6 +2927,8 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     ui.row(
         row(ut(if local_app {
             "appLocal.title"
+        } else if remote_app {
+            "appRemote.title"
         } else if app_update {
             "appTitle"
         } else {
@@ -2307,7 +2966,9 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
                 ui,
                 true,
                 &uta(
-                    if c.app_update {
+                    if c.remote_app_committed {
+                        "appRemote.committedTitle"
+                    } else if c.app_update {
                         "appCommittedTitle"
                     } else {
                         "committedTitle"
@@ -2378,6 +3039,239 @@ pub fn picker_hint(host: &HostView) -> String {
 mod tests {
     use super::*;
 
+    fn remote_host(server_id: &str, supports_app: bool) -> Value {
+        json!({
+            "serverId": server_id, "status": "connected",
+            "config": {"id": server_id, "endpoint": "192.0.2.25:6767"},
+            "serverInfo": {"serverId": server_id, "features": {
+                "durableDaemonUpdates": true, "daemonUpdateCheck": true,
+                "remoteDesktopAppUpdates": supports_app,
+            }},
+        })
+    }
+
+    fn remote_check(pin: &Value, target: &str) -> Value {
+        json!({
+            "targetKind": target, "current": {"version": "1.0.0"},
+            "latest": pin, "supported": true, "updateAvailable": true,
+            "availableComponents": [{"id": "app"}, {"id": "update-helper"}],
+        })
+    }
+
+    #[test]
+    fn remote_version_approval_is_host_bound_and_observes_app_only_after_daemon_commit() {
+        use makepad_widgets::Cx;
+        use paseo_gui_core::{CoreConfig, CoreState, GuiCore};
+        use std::{fs, sync::Arc};
+
+        let dir =
+            std::env::temp_dir().join(format!("paseo-remote-version-{}", du::new_operation_id()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.clone(),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut ctx = crate::common::UiContext::new(core.handle());
+        ctx.state = Arc::new(CoreState::new(json!({"hosts": [
+            remote_host("first", true), remote_host("second", true), remote_host("headless", false)
+        ]})));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fields = Default::default();
+        let mut bridge = platform::Bridge::record_desktop();
+        let mut env = Env {
+            cx: &mut cx,
+            ctx: &mut ctx,
+            fields: &mut fields,
+            bridge: &mut bridge,
+        };
+        let mut s = Settings::default();
+        let first = env.host("first").unwrap();
+        let second = env.host("second").unwrap();
+        let headless = env.host("headless").unwrap();
+        let daemon_pin = json!({"version":"2.0.0","manifestSha512":"A".repeat(86) + "=="});
+        let app_pin =
+            json!({"version":"3.0.0","manifestSha512":"B".to_owned() + &"A".repeat(85) + "=="});
+        let initial = |generation| UpdateCard {
+            check_generation: generation,
+            check: Some(remote_check(&daemon_pin, "daemon")),
+            remote_app: RemoteAppCheck {
+                checked: true,
+                update: remote_check(&app_pin, "app"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        s.update_cards.insert("first".into(), initial(1));
+        s.update_cards.insert("headless".into(), initial(1));
+        let second_card = card(&mut s, "second");
+        second_card.check = Some(remote_check(&daemon_pin, "daemon"));
+        second_card.remote_app.checked = true;
+        second_card.remote_app.error = Some(RemoteAppCheckError::Unavailable);
+        let daemon_only = independent_update_plan(&second, second_card, None).unwrap();
+        assert_eq!(daemon_only.daemon, Some(daemon_pin.clone()));
+        assert!(
+            daemon_only.app.is_none(),
+            "a closed remote app is not an update target"
+        );
+        assert!(independent_update_plan(&headless, &s.update_cards["headless"], None).is_none());
+        let mut app_only_card = initial(1);
+        app_only_card.check = None;
+        let app_only = independent_update_plan(&first, &app_only_card, None).unwrap();
+        assert!(app_only.daemon.is_none());
+        assert_eq!(app_only.app.unwrap()["expectedRelease"], app_pin);
+
+        independent_version_update(&first, &s.update_cards["first"], None).unwrap()(
+            &mut s, &mut env,
+        );
+        let SheetKind::Confirm(stale) = s.sheets.pop().unwrap().kind else {
+            panic!("expected combined approval");
+        };
+        assert!(stale.message.contains(&ut("appRemote.confirmAfterDaemon")));
+        assert!(stale.message.contains(&ut("appRemote.restartWarning")));
+        assert!(stale.message.contains("2.0.0") && stale.message.contains("3.0.0"));
+        // Even identical release pins do not authorize a pre-reconnect sheet.
+        reset_version_check(&mut s, "first");
+        s.update_cards.insert("first".into(), initial(2));
+        (stale.on_confirm)(&mut s, &mut env);
+        assert!(s.update_cards["first"].operation_id.is_none());
+        independent_version_update(&first, &s.update_cards["first"], None).unwrap()(
+            &mut s, &mut env,
+        );
+        let SheetKind::Confirm(approval) = s.sheets.pop().unwrap().kind else {
+            panic!("expected fresh combined approval");
+        };
+        // UI navigation does not redirect an already approved plan.
+        s.host = Some("second".into());
+        (approval.on_confirm)(&mut s, &mut env);
+        let daemon = s.update_cards["first"].submit_request.clone().unwrap();
+        let daemon_id = daemon["operationId"].as_str().unwrap();
+        let app = host::remote_app_approval(&daemon, "first").unwrap();
+        let app_id = app["operationId"].as_str().unwrap();
+        assert_eq!(daemon["expectedRelease"], daemon_pin);
+        assert_eq!(app["expectedRelease"], app_pin);
+        assert_eq!(app["selectedComponents"], json!(["app", "update-helper"]));
+        assert_ne!(daemon_id, app_id);
+        assert!(host::remote_app_approval(&daemon, "second").is_none());
+        assert!(daemon.get("selectedComponents").is_none());
+        assert!(s.update_cards["second"].operation_id.is_none());
+
+        let mut journal = json!({
+            "operationId": daemon_id, "serverId": "second", "targetKind": "daemon",
+            "phase": "committed", "terminal": true,
+            "candidate": {"version": "2.0.0", "executableSha256": "a".repeat(64)},
+            "worker": {"serverId": "first", "version": "2.0.0", "executableSha256": "a".repeat(64)},
+        });
+        finish(&mut s, &mut env, "first", daemon_id, journal.clone());
+        assert_eq!(
+            s.update_cards["first"].operation_id.as_deref(),
+            Some(daemon_id)
+        );
+        assert!(!s.update_cards["first"].remote_app_stage());
+        journal["serverId"] = json!("first");
+        finish(&mut s, &mut env, "first", daemon_id, journal);
+        assert_eq!(
+            s.update_cards["first"].operation_id.as_deref(),
+            Some(app_id)
+        );
+        assert!(s.update_cards["first"].remote_app_stage());
+        accept_remote_app(
+            &mut s,
+            &mut env,
+            "first".into(),
+            app_id.into(),
+            Instant::now() + OBSERVATION_LIMIT,
+            true,
+            Err(ReqError {
+                code: REMOTE_APP_OUTCOME_UNKNOWN.into(),
+                message: String::new(),
+                outcome_unknown: false,
+            }),
+        );
+        assert_eq!(s.update_cards["first"].state, UpdatePhase::Updating);
+        assert_eq!(s.update_cards["first"].phase, ut("appRemote.waitingForApp"));
+        let status_error = ReqError::msg("status temporarily denied");
+        accept_remote_app(
+            &mut s,
+            &mut env,
+            "first".into(),
+            app_id.into(),
+            Instant::now(),
+            false,
+            Err(status_error),
+        );
+        assert_eq!(
+            s.update_cards["first"].failure_title,
+            ut("appRemote.observationPaused")
+        );
+        assert_eq!(
+            s.update_cards["first"].operation_id.as_deref(),
+            Some(app_id)
+        );
+        assert!(env.bridge.desktop_requests.as_ref().unwrap().is_empty());
+        assert!(s.about.operation.is_null() && !s.about.installing);
+
+        drop(core);
+        let prefs: Value =
+            serde_json::from_slice(&fs::read(dir.join("shared_preferences.json")).unwrap())
+                .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        let key = format!("flutter.{}", host::update_operation_key("first"));
+        let saved: Value = serde_json::from_str(prefs[&key].as_str().unwrap()).unwrap();
+        assert_eq!(host::remote_app_approval(&saved, "first"), Some(app));
+        assert!(
+            prefs
+                .get(format!("flutter.{}", host::update_operation_key("second")))
+                .is_none()
+        );
+        assert!(
+            prefs
+                .get("flutter.paseo.desktopAppUpdate.operation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_restart_warning_matches_selected_app_components() {
+        for (id, warns) in [("app", true), ("tailnet", true), ("update-helper", false)] {
+            assert_eq!(
+                remote_app_restarts_gui(&json!({"selectedComponents": [id]})),
+                warns
+            );
+        }
+    }
+
+    #[test]
+    fn remote_terminal_journal_must_match_the_pin_and_verified_app_components() {
+        let approval = json!({
+            "operationId": du::new_operation_id(),
+            "expectedRelease": {"version":"3.0.0","manifestSha512":"A".repeat(86) + "=="},
+            "selectedComponents": ["app"],
+        });
+        let identity = json!({
+            "version": "3.0.0", "sourceSha": "a".repeat(40),
+            "inputHash": "b".repeat(64), "abiVersion": 1,
+        });
+        let components = json!({"app": identity, "tailnet": identity, "update-helper": identity});
+        let mut journal = approval.clone();
+        journal["targetKind"] = json!("app");
+        journal["terminal"] = json!(true);
+        journal["phase"] = json!("committed");
+        journal["outcome"] = json!("committed");
+        journal["candidate"] = json!({"version":"3.0.0"});
+        journal["targetComponents"] = components.clone();
+        assert!(remote_app_operation_matches(&journal, &approval));
+        assert!(!du::remote_app_commit_verified(&journal));
+        journal["observedComponents"] = components;
+        assert!(du::remote_app_commit_verified(&journal));
+        journal["selectedComponents"] = json!(["tailnet"]);
+        assert!(!remote_app_operation_matches(&journal, &approval));
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn local_version_update_and_removal_use_separate_authorities() {
@@ -2432,7 +3326,9 @@ mod tests {
             "supported": true, "updateAvailable": true, "latest": app_release,
             "availableComponents": [{"id": "app"}, {"id": "tailnet"}, {"id": "update-helper"}],
         });
-        local_version_update(&host, &s.update_cards["local"], &s.about).unwrap()(&mut s, &mut env);
+        independent_version_update(&host, &s.update_cards["local"], Some(&s.about)).unwrap()(
+            &mut s, &mut env,
+        );
         let SheetKind::Confirm(approval) = s.sheets.pop().unwrap().kind else {
             panic!("update must request confirmation");
         };
