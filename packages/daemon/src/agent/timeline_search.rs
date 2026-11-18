@@ -46,7 +46,7 @@ fn searchable_blocks(text: &str) -> Vec<String> {
     blocks
 }
 impl Timeline {
-    /// Streams every user and assistant row; stored rows are decoded one at a time.
+    /// Streams user and assistant rows after the cursor in projection order.
     pub fn search(&self, options: &Value) -> Result<Value> {
         let query = options["query"].as_str().unwrap_or("").trim();
         let mut locations: Vec<Value> = Vec::new();
@@ -64,11 +64,8 @@ impl Timeline {
         .build()?;
         let cursor = options["cursor"].as_i64().unwrap_or(0);
         let mut next = Value::Null;
-        self.scan(&["user_message", "assistant_message"], |row| {
+        self.search_rows(cursor, |row| {
             let seq = row["seqEnd"].as_i64().unwrap_or(0);
-            if seq <= cursor {
-                return Ok(true);
-            }
             let role = match row["item"]["type"].as_str() {
                 Some("user_message") => "user",
                 Some("assistant_message") => "assistant",
@@ -87,6 +84,8 @@ impl Timeline {
             if count == 0 {
                 return Ok(true);
             }
+            // One matching lookahead distinguishes a full final page from one
+            // with a continuation without reading any further message bodies.
             if locations.len() == 200 {
                 next = locations.last().map_or(Value::Null, |v| v["seq"].clone());
                 return Ok(false);

@@ -1,10 +1,14 @@
 //! Native implementation of the directory-suggestions discovery/retrieval policy.
+//! The limit caps retained matches, not discovery: a later candidate can still
+//! win on rank, while equal-ranked, locale-equivalent paths keep discovery order.
 use crate::json::locale_compare;
 use anyhow::{Result, bail};
 use futures_util::{FutureExt, future::BoxFuture};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    borrow::Cow,
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     fs::Metadata,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
@@ -379,20 +383,21 @@ fn inside(root: &Path, candidate: &Path) -> bool {
         candidate.starts_with(root)
     }
 }
-fn relative(root: &Path, path: &Path) -> String {
-    let suffix = if cfg!(windows) && inside(root, path) {
-        path.components()
-            .skip(root.components().count())
-            .collect::<PathBuf>()
+fn relative_path<'a>(root: &Path, path: &'a Path) -> Cow<'a, Path> {
+    if cfg!(windows) && inside(root, path) {
+        Cow::Owned(path.components().skip(root.components().count()).collect())
     } else {
-        path.strip_prefix(root).unwrap_or(path).to_owned()
-    };
+        Cow::Borrowed(path.strip_prefix(root).unwrap_or(path))
+    }
+}
+fn relative(root: &Path, path: &Path) -> String {
+    let suffix = relative_path(root, path);
     if suffix.as_os_str().is_empty() {
         ".".into()
+    } else if cfg!(windows) {
+        suffix.to_string_lossy().replace('\\', "/")
     } else {
-        suffix
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/")
+        suffix.to_string_lossy().into_owned()
     }
 }
 struct Plan {
@@ -500,65 +505,70 @@ impl Input {
             .as_ref()
             .is_some_and(|root| inside(root, path))
     }
-    fn discover(&self, entry: &Entry, allow_excluded: bool) -> bool {
-        if entry.symlink {
-            if !inside(&self.root, &entry.resolved) || self.git_ignored(&entry.resolved) {
+    fn discover(&self, raw: &RawEntry, resolved: &Path, kind: Kind, allow_excluded: bool) -> bool {
+        if raw.kind == Kind::Symlink {
+            if !inside(&self.root, resolved) || self.git_ignored(resolved) {
                 return false;
             }
-            if !allow_excluded && self.excluded(&entry.resolved) {
+            if !allow_excluded && self.excluded(resolved) {
                 return false;
             }
-        } else if self.ignored.contains(&entry.resolved)
-            || (!allow_excluded && self.excluded.as_ref() == Some(&entry.resolved))
+        } else if self.ignored.contains(resolved)
+            || (!allow_excluded && self.excluded.as_deref() == Some(resolved))
         {
             return false;
         }
-        if entry.kind == Kind::File {
-            return self.include_files && !entry.name.starts_with('.');
+        if kind == Kind::File {
+            return self.include_files && !raw.name.starts_with('.');
         }
-        !IGNORED.contains(&entry.name.as_str())
-            && (!entry.name.starts_with('.')
-                || (self.workspace && HIDDEN.contains(&entry.name.as_str())))
+        !IGNORED.contains(&raw.name.as_str())
+            && (!raw.name.starts_with('.')
+                || (self.workspace && HIDDEN.contains(&raw.name.as_str())))
     }
-    fn format(&self, entry: &Entry) -> Value {
-        json!({"path": if self.workspace { relative(&self.root, &entry.visible) } else { entry.visible.to_string_lossy().into_owned() }, "kind": entry.kind.wire()})
+    fn format(&self, visible: &Path, kind: Kind) -> Value {
+        json!({"path": if self.workspace { relative(&self.root, visible) } else { visible.to_string_lossy().into_owned() }, "kind": kind.wire()})
     }
 }
-struct Entry {
-    name: String,
+#[derive(Default)]
+struct ChildPaths {
     visible: PathBuf,
     resolved: PathBuf,
-    kind: Kind,
-    symlink: bool,
-    depth: usize,
+    hidden: bool,
 }
-async fn resolve_child(
-    parent: &Path,
-    visible_parent: &Path,
-    raw: &RawEntry,
-    depth: usize,
-    cancel: &CancellationToken,
-) -> Result<Option<Entry>> {
-    let target = parent.join(&raw.name);
-    let (resolved, kind) = if raw.kind == Kind::Symlink {
-        let Some(resolved) = canonical(&target, cancel).await? else {
-            return Ok(None);
+impl ChildPaths {
+    async fn resolve(
+        &mut self,
+        input: &Input,
+        parent: &Path,
+        visible_parent: &Path,
+        raw: &RawEntry,
+        allow_excluded: bool,
+    ) -> Result<Option<Kind>> {
+        self.resolved.clear();
+        self.resolved.push(parent);
+        self.resolved.push(&raw.name);
+        let kind = if raw.kind == Kind::Symlink {
+            let Some(resolved) = canonical(&self.resolved, &input.cancel).await? else {
+                return Ok(None);
+            };
+            let Some(kind) = kind(&resolved, &input.cancel).await? else {
+                return Ok(None);
+            };
+            self.resolved.clear();
+            self.resolved.push(resolved);
+            kind
+        } else {
+            raw.kind
         };
-        let Some(kind) = kind(&resolved, cancel).await? else {
+        if !input.discover(raw, &self.resolved, kind, allow_excluded) {
             return Ok(None);
-        };
-        (resolved, kind)
-    } else {
-        (target, raw.kind)
-    };
-    Ok(Some(Entry {
-        name: raw.name.clone(),
-        visible: visible_parent.join(&raw.name),
-        resolved,
-        kind,
-        symlink: raw.kind == Kind::Symlink,
-        depth,
-    }))
+        }
+        self.visible.clear();
+        self.visible.push(visible_parent);
+        self.visible.push(&raw.name);
+        self.hidden = raw.name.starts_with('.');
+        Ok(Some(kind))
+    }
 }
 
 // Nested round-robin, not BFS or DFS: every sibling subtree gets one result
@@ -573,8 +583,7 @@ struct RoundRobin {
     active: VecDeque<Branch>,
 }
 struct Branch {
-    entry: Entry,
-    descendants: Option<RoundRobin>,
+    walk: RoundRobin,
     started: bool,
 }
 impl RoundRobin {
@@ -589,82 +598,57 @@ impl RoundRobin {
             active: VecDeque::new(),
         }
     }
-    fn next<'a>(
-        &'a mut self,
-        input: &'a Input,
-        visited: &'a mut HashSet<PathBuf>,
-    ) -> BoxFuture<'a, Result<Option<Entry>>> {
-        async move {
-            if input.cancel.is_cancelled() {
-                bail!("Directory search cancelled")
-            }
-            if self.first_round {
-                if self.raw.is_none() {
-                    self.raw = Some(children(&self.parent, &input.cancel).await?);
-                }
-                let raw = self.raw.as_ref().unwrap();
-                while self.index < raw.len() {
-                    let child = &raw[self.index];
-                    self.index += 1;
-                    let Some(entry) = resolve_child(
-                        &self.parent,
-                        &self.visible,
-                        child,
-                        self.depth,
-                        &input.cancel,
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
-                    if !input.discover(&entry, false) {
-                        continue;
-                    }
-                    if entry.kind == Kind::Directory && entry.depth < MAX_DEPTH {
-                        self.active.push_back(Branch {
-                            entry: Entry {
-                                name: String::new(),
-                                visible: entry.visible.clone(),
-                                resolved: entry.resolved.clone(),
-                                kind: entry.kind,
-                                symlink: entry.symlink,
-                                depth: entry.depth,
-                            },
-                            descendants: None,
-                            started: false,
-                        });
-                    }
-                    return Ok(Some(entry));
-                }
-                self.raw = None;
-                self.first_round = false;
-            }
-            while let Some(mut branch) = self.active.pop_front() {
-                if !branch.started {
-                    branch.started = true;
-                    if !visited.insert(branch.entry.resolved.clone()) {
-                        continue;
-                    }
-                    branch.descendants = Some(Self::new(
-                        branch.entry.resolved.clone(),
-                        branch.entry.visible.clone(),
-                        branch.entry.depth + 1,
-                    ));
-                }
-                if let Some(entry) = branch
-                    .descendants
-                    .as_mut()
-                    .unwrap()
-                    .next(input, visited)
-                    .await?
-                {
-                    self.active.push_back(branch);
-                    return Ok(Some(entry));
-                }
-            }
-            Ok(None)
+    async fn next(
+        &mut self,
+        input: &Input,
+        visited: &mut HashSet<PathBuf>,
+        paths: &mut ChildPaths,
+    ) -> Result<Option<Kind>> {
+        if input.cancel.is_cancelled() {
+            bail!("Directory search cancelled")
         }
-        .boxed()
+        if self.first_round {
+            if self.raw.is_none() {
+                self.raw = Some(children(&self.parent, &input.cancel).await?);
+            }
+            let raw = self.raw.as_ref().unwrap();
+            while self.index < raw.len() {
+                let child = &raw[self.index];
+                self.index += 1;
+                let Some(kind) = paths
+                    .resolve(input, &self.parent, &self.visible, child, false)
+                    .await?
+                else {
+                    continue;
+                };
+                if kind == Kind::Directory && self.depth < MAX_DEPTH {
+                    self.active.push_back(Branch {
+                        walk: Self::new(
+                            paths.resolved.clone(),
+                            paths.visible.clone(),
+                            self.depth + 1,
+                        ),
+                        started: false,
+                    });
+                }
+                return Ok(Some(kind));
+            }
+            self.raw = None;
+            self.first_round = false;
+        }
+        while let Some(mut branch) = self.active.pop_front() {
+            if !branch.started {
+                branch.started = true;
+                if !visited.insert(branch.walk.parent.clone()) {
+                    continue;
+                }
+            }
+            if let Some(kind) = Box::pin(branch.walk.next(input, visited, paths)).await? {
+                self.active.push_back(branch);
+                return Ok(Some(kind));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -676,6 +660,152 @@ struct Rank {
     fuzzy: usize,
     depth: usize,
     kind: Kind,
+}
+
+struct RankedPath {
+    rank: Rank,
+    visible: Arc<Path>,
+    order: usize,
+}
+impl RankedPath {
+    fn compare(&self, rank: Rank, visible: &Path, order: usize) -> Ordering {
+        self.rank
+            .cmp(&rank)
+            .then_with(|| {
+                locale_compare(&self.visible.to_string_lossy(), &visible.to_string_lossy())
+            })
+            // The old stable sort kept discovery order for collation ties.
+            .then_with(|| self.order.cmp(&order))
+    }
+}
+impl Ord for RankedPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.compare(other.rank, &other.visible, other.order)
+    }
+}
+impl PartialOrd for RankedPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for RankedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for RankedPath {}
+
+struct TopMatches {
+    heap: BinaryHeap<RankedPath>,
+    seen: HashSet<(Arc<Path>, Kind)>,
+    limit: usize,
+    next_order: usize,
+}
+impl TopMatches {
+    fn new(limit: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(limit),
+            seen: HashSet::with_capacity(limit),
+            limit,
+            next_order: 0,
+        }
+    }
+    fn add(&mut self, rank: Rank, visible: &Path) {
+        let order = self.next_order;
+        self.next_order += 1;
+        let full = self.heap.len() == self.limit;
+        if full
+            && !self
+                .heap
+                .peek()
+                .unwrap()
+                .compare(rank, visible, order)
+                .is_gt()
+        {
+            return;
+        }
+        // Repeated visible paths of a given kind always score alike. Once
+        // evicted, a later duplicate cannot outrank the new cutoff.
+        let visible = Arc::<Path>::from(visible);
+        if !self.seen.insert((visible.clone(), rank.kind)) {
+            return;
+        }
+        let candidate = RankedPath {
+            rank,
+            visible,
+            order,
+        };
+        if full {
+            let mut worst = self.heap.peek_mut().unwrap();
+            self.seen.remove(&(worst.visible.clone(), worst.rank.kind));
+            *worst = candidate;
+        } else {
+            self.heap.push(candidate);
+        }
+    }
+}
+
+const SLASH: u16 = b'/' as u16;
+
+struct Scorer {
+    path: Vec<u16>,
+    compact: CompactScore,
+}
+impl Scorer {
+    fn new(query: &[u16]) -> Self {
+        Self {
+            path: Vec::new(),
+            compact: CompactScore {
+                query: query.iter().copied().filter(|&c| ascii_word(c)).collect(),
+                path: Vec::new(),
+                offsets: Vec::new(),
+            },
+        }
+    }
+
+    fn suggestible_rank(&mut self, input: &Input, paths: &ChildPaths, kind: Kind) -> Option<Rank> {
+        if paths.hidden || (kind == Kind::Directory && !input.include_directories) {
+            return None;
+        }
+        let relative = relative_path(&input.root, &paths.visible);
+        let relative = relative.to_string_lossy();
+        let relative = if relative.is_empty() { "." } else { &relative };
+        self.path.clear();
+        if relative.is_ascii() {
+            self.path.extend(relative.bytes().map(|c| {
+                if cfg!(windows) && c == b'\\' {
+                    SLASH
+                } else {
+                    c.to_ascii_lowercase().into()
+                }
+            }));
+        } else if cfg!(windows) {
+            self.path
+                .extend(relative.replace('\\', "/").to_lowercase().encode_utf16());
+        } else {
+            self.path.extend(relative.to_lowercase().encode_utf16());
+        }
+        let q = &input.query;
+        if input.suffix && !input.plan.normalized.is_empty() {
+            let mut path = self.path.rsplit(|&c| c == SLASH).filter(|p| !p.is_empty());
+            if q.iter().all(|&c| c == SLASH)
+                || !q
+                    .rsplit(|&c| c == SLASH)
+                    .filter(|p| !p.is_empty())
+                    .all(|p| path.next() == Some(p))
+            {
+                return None;
+            }
+        }
+        let rank = rank(&self.path, &mut self.compact, input, kind);
+        (input.plan.normalized.is_empty() || input.suffix || rank.tier != 5).then_some(rank)
+    }
+}
+
+struct CompactScore {
+    query: Vec<u16>,
+    path: Vec<u16>,
+    offsets: Vec<usize>,
 }
 #[derive(Clone, Copy)]
 struct Score {
@@ -750,31 +880,26 @@ fn score_match(q: &[u16], text: &[u16]) -> Option<Score> {
     }
     None
 }
-fn score_path(q: &[u16], text: &[u16]) -> Option<Score> {
-    if let Some(score) = score_match(q, text) {
-        return Some(score);
-    }
-    let compact_query: Vec<_> = q.iter().copied().filter(|&c| ascii_word(c)).collect();
-    if compact_query.is_empty() {
-        return None;
-    }
-    let mut offsets = Vec::new();
-    let compact_path: Vec<_> = text
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(i, c)| {
+impl CompactScore {
+    fn score_path(&mut self, q: &[u16], text: &[u16]) -> Option<Score> {
+        if let Some(score) = score_match(q, text) {
+            return Some(score);
+        }
+        if self.query.is_empty() {
+            return None;
+        }
+        self.path.clear();
+        self.offsets.clear();
+        for (i, &c) in text.iter().enumerate() {
             if ascii_word(c) {
-                offsets.push(i);
-                Some(c)
-            } else {
-                None
+                self.path.push(c);
+                self.offsets.push(i);
             }
-        })
-        .collect();
-    let mut score = score_match(&compact_query, &compact_path)?;
-    score.offset = offsets[score.offset];
-    Some(score)
+        }
+        let mut score = score_match(&self.query, &self.path)?;
+        score.offset = self.offsets[score.offset];
+        Some(score)
+    }
 }
 fn fuzzy_subsequence(q: &[u16], text: &[u16]) -> Option<usize> {
     if q.is_empty() {
@@ -791,26 +916,25 @@ fn fuzzy_subsequence(q: &[u16], text: &[u16]) -> Option<usize> {
     }
     None
 }
-fn rank(entry: &Entry, input: &Input) -> Rank {
-    let relative = relative(&input.root, &entry.visible).to_lowercase();
-    let path: Vec<_> = relative.encode_utf16().collect();
-    let segments: Vec<_> = path.split(|&c| c == b'/' as u16).collect();
+fn rank(path: &[u16], compact: &mut CompactScore, input: &Input, kind: Kind) -> Rank {
+    let segments = path.split(|&c| c == SLASH);
     let q = &input.query;
-    let score = if q.is_empty() {
-        None
-    } else {
-        score_path(q, &path)
-    };
     let mut rank = Rank {
         tier: 5,
         segment: NONE,
         offset: NONE,
         fuzzy: NONE,
-        depth: if relative == "." { 0 } else { segments.len() },
-        kind: entry.kind,
+        depth: if path == [b'.' as u16] {
+            0
+        } else {
+            segments.clone().count()
+        },
+        kind,
     };
     if input.plan.path_query {
-        if let Some(s) = score {
+        if !q.is_empty()
+            && let Some(s) = compact.score_path(q, path)
+        {
             rank.tier = s.tier.min(4);
             rank.offset = s.offset;
             rank.fuzzy = s.spread;
@@ -822,10 +946,10 @@ fn rank(entry: &Entry, input: &Input) -> Rank {
         return rank;
     }
     let offset = path.windows(q.len()).position(|w| w == q).unwrap_or(NONE);
-    let fuzzy = fuzzy_subsequence(q, segments.last().copied().unwrap_or(&[])).unwrap_or(NONE);
+    let fuzzy = fuzzy_subsequence(q, segments.clone().next_back().unwrap_or(&[])).unwrap_or(NONE);
     for tier in 0..3 {
-        if let Some(index) = segments.iter().position(|s| match tier {
-            0 => *s == q,
+        if let Some(index) = segments.clone().position(|s| match tier {
+            0 => s == q,
             1 => s.starts_with(q),
             _ => s.windows(q.len()).any(|w| w == q),
         }) {
@@ -848,33 +972,14 @@ fn rank(entry: &Entry, input: &Input) -> Rank {
         rank.tier = 4;
         rank.offset = offset;
         rank.fuzzy = fuzzy;
-    } else if let Some(s) = score {
+    } else if let Some(s) = compact.score_path(q, path) {
         rank.tier = s.tier.min(4);
         rank.offset = s.offset;
         rank.fuzzy = s.spread;
     }
     rank
 }
-fn suggestible(entry: &Entry, input: &Input, rank: Rank) -> bool {
-    if entry.name.starts_with('.')
-        || (entry.kind == Kind::Directory && !input.include_directories)
-        || (entry.kind == Kind::File && !input.include_files)
-    {
-        return false;
-    }
-    if input.plan.normalized.is_empty() {
-        return true;
-    }
-    if !input.suffix {
-        return rank.tier != 5;
-    }
-    let query = input.plan.normalized.to_lowercase();
-    let path = relative(&input.root, &entry.visible).to_lowercase();
-    let query: Vec<_> = query.split('/').filter(|p| !p.is_empty()).collect();
-    let path: Vec<_> = path.split('/').filter(|p| !p.is_empty()).collect();
-    !query.is_empty() && path.ends_with(&query)
-}
-async fn exact_entry(input: &Input) -> Result<Option<Entry>> {
+async fn exact_entry(input: &Input) -> Result<Option<(PathBuf, Kind)>> {
     if input.plan.normalized.is_empty() {
         return Ok(None);
     }
@@ -893,27 +998,14 @@ async fn exact_entry(input: &Input) -> Result<Option<Entry>> {
     {
         return Ok(None);
     }
-    Ok(Some(Entry {
-        name: String::new(),
-        visible,
-        resolved,
-        kind,
-        symlink: false,
-        depth: 0,
-    }))
+    Ok(Some((visible, kind)))
 }
-async fn search(input: &Input) -> Result<Vec<Value>> {
+fn wants_exact(input: &Input) -> bool {
+    input.plan.browse_exact || (input.plan.path_query && (input.suffix || !input.workspace))
+}
+
+async fn scan_matches(input: &Input, mut add: impl FnMut(Rank, &Path)) -> Result<()> {
     let typed = !input.workspace && input.plan.path_query;
-    let exact = if input.plan.browse_exact || (input.plan.path_query && (input.suffix || typed)) {
-        exact_entry(input).await?
-    } else {
-        None
-    };
-    if input.limit == 1
-        && let Some(entry) = exact.as_ref()
-    {
-        return Ok(vec![input.format(entry)]);
-    }
     let mut start = (input.root.clone(), input.root.clone());
     let mut browse =
         (input.plan.path_query && input.plan.normalized.is_empty()) || input.plan.browse_exact;
@@ -927,7 +1019,8 @@ async fn search(input: &Input) -> Result<Vec<Value>> {
             start = (resolved, visible);
         }
     }
-    let mut ranked = Vec::new();
+    let mut scorer = Scorer::new(&input.query);
+    let mut paths = ChildPaths::default();
     if browse {
         let visible = normalize(&input.root.join(&input.plan.parent));
         if let Some(parent) = canonical(&visible, &input.cancel).await?
@@ -936,16 +1029,14 @@ async fn search(input: &Input) -> Result<Vec<Value>> {
         {
             let allow_excluded = input.excluded(&parent);
             for raw in children(&parent, &input.cancel).await?.iter() {
-                let Some(entry) = resolve_child(&parent, &visible, raw, 1, &input.cancel).await?
+                let Some(kind) = paths
+                    .resolve(input, &parent, &visible, raw, allow_excluded)
+                    .await?
                 else {
                     continue;
                 };
-                if !input.discover(&entry, allow_excluded) {
-                    continue;
-                }
-                let rank = rank(&entry, input);
-                if suggestible(&entry, input, rank) {
-                    ranked.push((rank, entry));
+                if let Some(rank) = scorer.suggestible_rank(input, &paths, kind) {
+                    add(rank, &paths.visible);
                 }
             }
         }
@@ -959,38 +1050,51 @@ async fn search(input: &Input) -> Result<Vec<Value>> {
         } else {
             input.plan.normalized.encode_utf16().count()
         };
-        while let Some(entry) = walk.next(input, &mut visited).await? {
+        while let Some(kind) = walk.next(input, &mut visited, &mut paths).await? {
             scanned += 1;
-            let rank = rank(&entry, input);
-            if suggestible(&entry, input, rank) {
+            if let Some(rank) = scorer.suggestible_rank(input, &paths, kind) {
                 confident |=
                     rank.tier < 4 || (rank.tier == 4 && rank.fuzzy <= confident_query_length * 2);
-                ranked.push((rank, entry));
+                add(rank, &paths.visible);
             }
             if scanned >= SCAN_LIMIT || (!input.workspace && scanned >= 5_000 && confident) {
                 break;
             }
         }
     }
-    ranked.sort_by(|(a, ae), (b, be)| {
-        a.cmp(b).then_with(|| {
-            locale_compare(&ae.visible.to_string_lossy(), &be.visible.to_string_lossy())
-        })
-    });
+    Ok(())
+}
+
+async fn search(input: &Input) -> Result<Vec<Value>> {
+    let exact = if wants_exact(input) {
+        exact_entry(input).await?
+    } else {
+        None
+    };
     let mut entries = Vec::with_capacity(input.limit);
-    let mut seen = HashSet::new();
-    if let Some(entry) = exact {
-        entries.push(input.format(&entry));
-        seen.insert((entry.visible, entry.kind));
-    }
-    for (_, entry) in ranked {
-        if entries.len() >= input.limit {
-            break;
-        }
-        if seen.insert((entry.visible.clone(), entry.kind)) {
-            entries.push(input.format(&entry));
+    if let Some((visible, kind)) = exact.as_ref() {
+        entries.push(input.format(visible, *kind));
+        if input.limit == 1 {
+            return Ok(entries);
         }
     }
+    let mut ranked = TopMatches::new(input.limit - entries.len());
+    scan_matches(input, |rank, visible| {
+        if !exact
+            .as_ref()
+            .is_some_and(|(path, kind)| path == visible && *kind == rank.kind)
+        {
+            ranked.add(rank, visible);
+        }
+    })
+    .await?;
+    entries.extend(
+        ranked
+            .heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|entry| input.format(&entry.visible, entry.rank.kind)),
+    );
     Ok(entries)
 }
 
@@ -1116,12 +1220,23 @@ mod tests {
             .collect()
     }
     fn input(root: &Path, query: &str) -> Input {
+        search_input(root, query, false)
+    }
+
+    fn search_input(root: &Path, query: &str, workspace: bool) -> Input {
         let root = std::fs::canonicalize(root).unwrap();
-        let plan = parse_query(query, &root, &root, false).unwrap();
+        let plan = parse_query(query, &root, &root, workspace).unwrap();
         Input {
-            query: query.to_lowercase().encode_utf16().collect(),
+            query: if plan.path_query {
+                &plan.normalized
+            } else {
+                &plan.term
+            }
+            .to_lowercase()
+            .encode_utf16()
+            .collect(),
             root,
-            workspace: false,
+            workspace,
             plan,
             include_files: false,
             include_directories: true,
@@ -1131,6 +1246,164 @@ mod tests {
             excluded: None,
             cancel: CancellationToken::new(),
         }
+    }
+
+    fn old_sort_matches(
+        mut ranked: Vec<(Rank, PathBuf)>,
+        exact: Option<(PathBuf, Kind)>,
+    ) -> Vec<(PathBuf, Kind)> {
+        ranked.sort_by(|(a, ap), (b, bp)| {
+            a.cmp(b)
+                .then_with(|| locale_compare(&ap.to_string_lossy(), &bp.to_string_lossy()))
+        });
+        let mut seen = HashSet::new();
+        exact
+            .into_iter()
+            .chain(ranked.into_iter().map(|(rank, path)| (path, rank.kind)))
+            .filter(|entry| seen.insert(entry.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn top_matches_equal_full_sort_across_fixture_queries_and_limits() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        let temp = fixture();
+        let mut rng = StdRng::seed_from_u64(1);
+        for index in 0..144 {
+            let folder =
+                ["src", "src/inner", "other/src", "notes", "misc", ""][rng.random_range(0..6)];
+            let name = ["file", "profile", "f-ile", "notes", "file-notes"][rng.random_range(0..5)];
+            let path = format!("{folder}/{name}-{index:03}.ts");
+            file(temp.path(), path.trim_start_matches('/'));
+        }
+        for path in [
+            "file",
+            "src/file-notes.ts",
+            "notes/src/file-notes.ts",
+            "notes/file 5 notes.ts",
+            "misc/ΟΣ.txt",
+            "generated/file-notes.ts",
+            ".file-notes.ts",
+            "node_modules/file-notes.ts",
+        ] {
+            file(temp.path(), path);
+        }
+        directory(temp.path(), "notes/file");
+        for (query, suffix, workspace) in [
+            ("file", false, true),
+            ("file-not", false, true),
+            ("flnt", false, true),
+            ("file 5 notes", false, true),
+            ("οσ", false, true),
+            ("ος", false, true),
+            ("", false, true),
+            ("not-found", false, true),
+            ("src/file-notes.ts", true, true),
+            ("~/src/file-not", false, false),
+        ] {
+            let mut input = search_input(temp.path(), query, workspace);
+            input.include_files = true;
+            input.suffix = suffix;
+            input.ignored = Arc::new(HashSet::from([input.root.join("generated")]));
+            let mut ranked = Vec::new();
+            scan_matches(&input, |rank, path| ranked.push((rank, path.to_owned())))
+                .await
+                .unwrap();
+            let exact = if wants_exact(&input) {
+                exact_entry(&input).await.unwrap()
+            } else {
+                None
+            };
+            let expected = old_sort_matches(ranked, exact);
+            for limit in [1, 2, 7, 30, 50, 100] {
+                input.limit = limit;
+                assert_eq!(
+                    search(&input).await.unwrap(),
+                    expected
+                        .iter()
+                        .take(limit)
+                        .map(|(path, kind)| input.format(path, *kind))
+                        .collect::<Vec<_>>(),
+                    "query={query:?} suffix={suffix} workspace={workspace} limit={limit}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn top_matches_keep_stable_locale_ties_and_deduplicate_by_path_and_kind() {
+        // Canonically equivalent spellings collate equally but are distinct
+        // paths (tested outside the filesystem to avoid host normalization).
+        let composed = Path::new("file-é");
+        let decomposed = Path::new("file-e\u{301}");
+        assert_ne!(composed, decomposed);
+        assert!(locale_compare(composed.to_str().unwrap(), decomposed.to_str().unwrap()).is_eq());
+        let file_rank = Rank {
+            tier: 1,
+            segment: 0,
+            offset: 0,
+            fuzzy: 0,
+            depth: 1,
+            kind: Kind::File,
+        };
+        let dir_rank = Rank {
+            kind: Kind::Directory,
+            ..file_rank
+        };
+        let stream = [
+            (file_rank, Path::new("zzz")),
+            (file_rank, composed),
+            (file_rank, decomposed),
+            (file_rank, composed),
+            (dir_rank, composed),
+            (file_rank, Path::new("aaa")),
+            (file_rank, Path::new("zzz")),
+            (file_rank, Path::new("bbb")),
+        ];
+        let expected = old_sort_matches(
+            stream
+                .iter()
+                .map(|(rank, path)| (*rank, path.to_path_buf()))
+                .collect(),
+            None,
+        );
+        for limit in 1..=stream.len() {
+            let mut top = TopMatches::new(limit);
+            for (rank, path) in stream {
+                top.add(rank, path);
+                assert!(top.heap.len() <= limit);
+                assert_eq!(top.seen.len(), top.heap.len());
+            }
+            let sorted = top.heap.into_sorted_vec();
+            assert!(
+                sorted
+                    .iter()
+                    .map(|entry| (&*entry.visible, entry.rank.kind))
+                    .eq(expected
+                        .iter()
+                        .take(limit)
+                        .map(|(path, kind)| (path.as_path(), *kind))),
+                "limit={limit}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn name_search_stops_when_cancelled_after_a_match() {
+        let temp = fixture();
+        directory(temp.path(), "first-match");
+        directory(temp.path(), "second-match");
+        let input = input(temp.path(), "match");
+        let mut matches = 0;
+        let error = scan_matches(&input, |_, _| {
+            matches += 1;
+            input.cancel.cancel();
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(matches, 1);
+        assert_eq!(error.to_string(), "Directory search cancelled");
     }
 
     #[tokio::test]
@@ -1262,9 +1535,13 @@ mod tests {
         let mut walk = RoundRobin::new(input.root.clone(), input.root.clone(), 1);
         let mut visited = HashSet::from([input.root.clone()]);
         let mut scanned = Vec::new();
+        let mut paths = ChildPaths::default();
         for _ in 0..8 {
-            let entry = walk.next(&input, &mut visited).await.unwrap().unwrap();
-            scanned.push(relative(&input.root, &entry.visible));
+            walk.next(&input, &mut visited, &mut paths)
+                .await
+                .unwrap()
+                .unwrap();
+            scanned.push(relative(&input.root, &paths.visible));
         }
         assert!(
             scanned

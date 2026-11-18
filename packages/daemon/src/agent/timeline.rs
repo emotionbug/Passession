@@ -134,6 +134,10 @@ fn merge_identity(existing: &mut Value, incoming: &Value) -> bool {
     true
 }
 fn merge_text(previous: &mut Value, next: &Value) -> bool {
+    merge_text_with(previous, next, |_| {})
+}
+
+fn merge_text_with(previous: &mut Value, next: &Value, before_merge: impl FnOnce(&Value)) -> bool {
     let ty = kind(&previous["item"]);
     if !matches!(ty, "assistant_message" | "reasoning")
         || ty != kind(&next["item"])
@@ -155,6 +159,7 @@ fn merge_text(previous: &mut Value, next: &Value) -> bool {
     } else {
         "assistant_merge"
     };
+    before_merge(previous);
     let text = next["item"]["text"].as_str().unwrap_or("");
     if let Some(Value::String(previous_text)) = previous["item"].get_mut("text") {
         previous_text.push_str(text);
@@ -353,6 +358,14 @@ impl Timeline {
     /// Projects `row` into the resident tail and returns the affected
     /// position. A stored identity outside the tail is merged by `storage`.
     fn append_row(&mut self, row: Value) -> usize {
+        self.append_row_with(row, |_, _| {})
+    }
+
+    fn append_row_with(
+        &mut self,
+        row: Value,
+        before_text_merge: impl FnOnce(usize, &Value),
+    ) -> usize {
         let entry = canonical(row);
         if self.min_seq == 0 {
             self.min_seq = num(&entry, "seqStart");
@@ -365,12 +378,12 @@ impl Timeline {
             }
             self.identities.insert(id, self.len());
         }
-        if self
-            .rows
-            .last_mut()
-            .is_some_and(|previous| merge_text(previous, &entry))
+        if let Some(index) = self.rows.len().checked_sub(1)
+            && merge_text_with(&mut self.rows[index], &entry, |previous| {
+                before_text_merge(index, previous);
+            })
         {
-            return self.len() - 1;
+            return self.base + index;
         }
         if kind(&entry["item"]) == "user_message"
             && let Some(id) = entry["item"]["clientMessageId"]
@@ -457,8 +470,20 @@ impl Timeline {
         let min = self.min_seq;
         let (rows, start, end, older, newer) =
             self.select_page(request.mode, request.cursor, request.limit, min, max);
+        self.page_response(&request, rows, start, end, older, newer)
+    }
+
+    fn page_response(
+        &self,
+        request: &PageRequest<'_>,
+        rows: Vec<&Value>,
+        start: Option<i64>,
+        end: Option<i64>,
+        older: bool,
+        newer: bool,
+    ) -> Value {
         json!({"epoch":self.epoch,"direction":request.direction,"reset":request.stale||request.gap,"staleCursor":request.stale,"gap":request.gap,
-            "window":{"minSeq":min,"maxSeq":max,"nextSeq":self.next_seq},"hasOlder":older,"hasNewer":newer,"startSeq":start,"endSeq":end,"rows":rows})
+            "window":{"minSeq":self.min_seq,"maxSeq":self.next_seq-1,"nextSeq":self.next_seq},"hasOlder":older,"hasNewer":newer,"startSeq":start,"endSeq":end,"rows":rows})
     }
     /// The page answered by resident rows alone, when no stored row can be
     /// selected or change its bounds; otherwise `None`.
@@ -657,6 +682,11 @@ impl Timeline {
     pub(super) fn checkpoint_exists(path: &Path, agent_id: &str) -> Result<bool> {
         storage::checkpoint_exists(path, agent_id)
     }
+    /// Reads only the validated checkpoint header, without opening a page.
+    pub(super) fn saved_epoch(path: &Path, agent_id: &str) -> Result<Option<String>> {
+        storage::saved_epoch(path, agent_id)
+    }
+
     /// An existing checkpoint as one read-only snapshot with no resident rows.
     /// Saved readers page, scan and search it without hydrating history.
     pub fn open_saved(path: &Path, agent_id: &str) -> Result<Self> {

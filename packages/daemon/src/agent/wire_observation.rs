@@ -57,7 +57,7 @@ pub(super) async fn handle(
                                     break;
                                 };
                                 for id in &ids {
-                                    // Recovery reports the current epoch; it never starts a provider.
+                                    // Recovery reads the epoch, not history, and never starts a provider.
                                     match app.agents.timeline_epoch(id).await {
                                         Ok(Some(epoch)) => pending.push_back(std::sync::Arc::new(json!({"type":"timeline_replacement","agentId":id,"epoch":epoch}))),
                                         Ok(None) => {}

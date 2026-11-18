@@ -303,17 +303,15 @@ impl AgentManager {
     /// The current projection epoch without starting a provider; `None` when
     /// the agent has neither a runtime nor a checkpoint.
     pub async fn timeline_epoch(&self, id: &str) -> Result<Option<String>> {
-        let page = match self
-            .projection_page(id, &json!({"direction":"tail","limit":1}))
-            .await?
-        {
-            Some(page) => Some(page),
-            None => {
-                self.read_checkpoint(id, json!({"direction":"tail","limit":1}))
-                    .await?
-            }
-        };
-        Ok(page.and_then(|page| page["epoch"].as_str().map(str::to_owned)))
+        let cell = { self.agents.read().await.get(id).cloned() };
+        if let Some(cell) = cell {
+            return cell
+                .read_timeline(|timeline| Ok(Some(timeline.epoch().to_owned())))
+                .await;
+        }
+        let path = self.timeline_path(id)?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || Timeline::saved_epoch(&path, &id)).await?
     }
     /// Runs `read` on the runtime projection, else on a read-only snapshot of
     /// the saved checkpoint, without starting a provider. Neither hydrates the

@@ -369,6 +369,60 @@ fn search_paging_retains_every_location() {
 }
 
 #[test]
+fn saved_search_decodes_only_after_cursor_and_stops_at_lookahead() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut timeline = Timeline::new();
+    for index in 0..402 {
+        let item = if index % 2 == 0 {
+            json!({"type":"assistant_message","text":"**target** target"})
+        } else {
+            json!({"type":"user_message","text":"target"})
+        };
+        timeline.append(item, &options());
+    }
+    timeline.persist(&path, "agent").unwrap();
+    let saved = Timeline::open_saved(&path, "agent").unwrap();
+    for (cursor, decodes) in [(0, 201), (200, 201), (400, 2), (402, 0)] {
+        let query = json!({"query":"target","cursor":cursor});
+        storage::take_read_counts();
+        assert_eq!(
+            saved.search(&query).unwrap(),
+            timeline.search(&query).unwrap()
+        );
+        assert_eq!(storage::take_read_counts(), (decodes, 0));
+    }
+}
+
+#[test]
+fn saved_search_keeps_projection_order_for_nonmonotonic_message_ends() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut timeline = Timeline::seed(&json!({"epoch":"seed","rows":[
+        {"seq":7,"timestamp":"time","item":{"type":"assistant_message","text":"target"}},
+        {"seq":4,"timestamp":"time","item":{"type":"user_message","text":"target target"}},
+        {"seq":3,"timestamp":"time","item":{"type":"user_message","text":"target"}},
+        {"seq":7,"timestamp":"time","item":{"type":"user_message","text":"target"}}
+    ]}))
+    .unwrap();
+    timeline.persist(&path, "agent").unwrap();
+    let saved = Timeline::open_saved(&path, "agent").unwrap();
+    let query = json!({"query":"target","cursor":3});
+    storage::take_read_counts();
+    let result = saved.search(&query).unwrap();
+    assert_eq!(result, timeline.search(&query).unwrap());
+    assert_eq!(
+        result["locations"],
+        json!([
+            {"seq":7,"role":"assistant","count":1},
+            {"seq":4,"role":"user","count":2},
+            {"seq":7,"role":"user","count":1}
+        ])
+    );
+    assert_eq!(storage::take_read_counts(), (3, 0));
+}
+
+#[test]
 fn provider_message_identity_is_durable_without_new_sequence() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("timeline.sqlite3");
@@ -750,6 +804,113 @@ fn saved_page_index_preserves_overlapping_ranges_retention_and_empty_boundaries(
     let mut empty = Timeline::new();
     empty.persist(&path, "agent").unwrap();
     assert_saved_pages(&path, &empty);
+}
+
+#[test]
+fn saved_tail_visits_only_the_window_and_overlap_anchors() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut timeline = Timeline::new();
+    for _ in 0..600 {
+        timeline.append(json!({"type":"user_message","text":"history"}), &options());
+    }
+    timeline.persist(&path, "agent").unwrap();
+    for limit in [1, 40] {
+        let page = json!({"limit":limit});
+        storage::take_read_counts();
+        assert_eq!(
+            Timeline::fetch_saved(&path, "agent", &page).unwrap(),
+            timeline.fetch(&page)
+        );
+        assert_eq!(storage::take_read_counts(), (limit, limit + 1));
+    }
+
+    timeline
+        .append_persisted(&path, "agent", tool("running"), &options())
+        .unwrap();
+    for _ in 0..5 {
+        timeline
+            .append_persisted(
+                &path,
+                "agent",
+                json!({"type":"user_message","text":"gap"}),
+                &options(),
+            )
+            .unwrap();
+    }
+    timeline
+        .append_persisted(&path, "agent", tool("completed"), &options())
+        .unwrap();
+    let page = json!({"limit":1});
+    storage::take_read_counts();
+    assert_eq!(
+        Timeline::fetch_saved(&path, "agent", &page).unwrap(),
+        timeline.fetch(&page)
+    );
+    assert_eq!(storage::take_read_counts(), (6, 8));
+}
+
+#[test]
+fn legacy_checkpoint_page_upgrade_preserves_snapshot_and_checks_skipped_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut timeline = Timeline::new();
+    for _ in 0..12 {
+        timeline.append(json!({"type":"user_message","text":"history"}), &options());
+    }
+    timeline.persist(&path, "agent").unwrap();
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute_batch(
+            "DROP TRIGGER timeline_page_insert;
+         DROP TRIGGER timeline_page_update;
+         DROP TRIGGER timeline_page_delete;
+         DROP INDEX timeline_rows_end;
+         DROP INDEX timeline_rows_search;
+         DROP TABLE timeline_page_state;
+         DROP TABLE timeline_invalid_page_rows;
+         BEGIN IMMEDIATE;",
+        )
+        .unwrap();
+    let page = json!({"limit":1});
+    let expected = timeline.fetch(&page);
+    storage::take_read_counts();
+    assert_eq!(
+        Timeline::saved_epoch(&path, "agent").unwrap().as_deref(),
+        Some(timeline.epoch())
+    );
+    assert_eq!(storage::take_read_counts(), (0, 0));
+    // A held write lock prevents the additive upgrade, not the read.
+    assert_eq!(
+        Timeline::fetch_saved(&path, "agent", &page).unwrap(),
+        expected
+    );
+    assert_eq!(storage::take_read_counts(), (1, 12));
+    database.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(
+        Timeline::fetch_saved(&path, "agent", &page).unwrap(),
+        expected
+    );
+    assert_eq!(storage::take_read_counts(), (1, 2));
+    assert_eq!(
+        Timeline::open_saved(&path, "agent")
+            .unwrap()
+            .all_rows()
+            .unwrap(),
+        timeline.rows
+    );
+    database.execute(
+        "UPDATE timeline_rows SET row_json = json_set(row_json, '$.sourceSeqRanges', json('[{}]')) WHERE position = 0",
+        [],
+    ).unwrap();
+    storage::take_read_counts();
+    assert_eq!(
+        Timeline::saved_epoch(&path, "agent").unwrap().as_deref(),
+        Some(timeline.epoch())
+    );
+    assert_eq!(storage::take_read_counts(), (0, 0));
+    assert!(Timeline::fetch_saved(&path, "agent", &page).is_err());
 }
 
 #[test]
