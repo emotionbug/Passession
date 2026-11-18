@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Fix blank areas, leftover pieces of earlier screens, flicker, and animations that looked stuck until you scrolled on Android. On a OnePlus 15 (Adreno 840), redrawing only the changed parts of the screen left stale and missing regions, so Android draws the whole screen for every new frame again, as in 0.13.41. `adb shell setprop debug.paseo.partial_redraw 1` turns partial redraws back on for testing a device.
+
 ## 0.13.42 - 2026-11-18
 
 ### Added

@@ -194,6 +194,12 @@ several `render_passes` during a transition.
 `render_ms / render_frames` includes time spent in presentation and should
 not be interpreted as GPU execution time.
 
+Android repaints in full by default. To test partial repair on a device,
+run `adb shell setprop debug.paseo.partial_redraw 1` (and
+`adb shell setprop debug.paseo.verify_damage 1` for the pixel oracle, whose
+`paseo_damage` lines go to logcat), then force-stop and reopen the app. Set
+the properties back to `0` afterwards.
+
 On Linux, build a debug client and daemon. The pixel oracle requires Python
 with Pillow, X11, and a private `dbus-run-session`:
 

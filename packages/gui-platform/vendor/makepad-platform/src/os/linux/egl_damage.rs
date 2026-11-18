@@ -1,5 +1,5 @@
 use super::{egl_sys::{EGLBoolean, EGLDisplay, EGLSurface, LibEgl}, gl_sys::{self, LibGl}};
-use crate::{cx::Cx, damage::{force_full_redraw, DamageFrame, DamageHistory, DamageRect}, makepad_math::Vec4, pass::PassId};
+use crate::{cx::Cx, damage::{debug_flag, force_full_redraw, DamageFrame, DamageHistory, DamageRect}, makepad_math::Vec4, pass::PassId};
 use std::{ffi::CStr, sync::LazyLock};
 
 const EGL_EXTENSIONS: i32 = 0x3055;
@@ -88,7 +88,10 @@ pub(crate) struct Frame {
     checked: bool,
 }
 
-static VERIFY_DAMAGE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("PASEO_VERIFY_DAMAGE").is_some_and(|value| value == "1"));
+static VERIFY_DAMAGE: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("PASEO_VERIFY_DAMAGE").is_some_and(|value| value == "1")
+        || debug_flag("debug.paseo.verify_damage")
+});
 
 impl EglWindowDamage {
     pub fn invalidate(&mut self) {

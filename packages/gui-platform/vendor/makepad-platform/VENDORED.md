@@ -775,13 +775,21 @@ lists, time-varying or external pixels, and unclassified repaint requests fall
 back to rendering the full window. An unchanged draw with unknown bounds is
 replayed inside the repair scissor.
 
-X11 and Android keep a bounded EGLSurface-owned damage history. The acquired
+X11 keeps a bounded EGLSurface-owned damage history. The acquired
 buffer's age selects the repair region, which limits the color/depth clear
 and draw submission. `EGL_KHR_partial_update`, when available, receives the
 repair region; `eglSwapBuffersWithDamageKHR/EXT` instead receives the delta
 from the immediately preceding presentation. Age zero, an insufficient
 history, resize, expose/recreation, failed binding or presentation never
 use assumed backbuffer contents. Culling preserves depth-bias order.
+
+Android uses the same code but repaints in full by default. On a OnePlus 15
+(Adreno) partial presentation left stale fragments and blank regions on
+screen; the device exposes `EGL_KHR_partial_update`, which no desktop Mesa
+driver used here exercises. `adb shell setprop debug.paseo.partial_redraw 1`
+re-enables partial repair and `debug.paseo.verify_damage 1` adds the
+same-frame pixel oracle (`paseo_damage` lines in logcat); restart the app
+after setting either. Verify on Adreno and Mali before making it the default.
 
 Windows uses flip-sequential `Present1` dirty rectangles with D3D11.1
 `ClearView` and a scissor. DXGI reconciles old backbuffer contents outside
