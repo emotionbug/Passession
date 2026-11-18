@@ -1,0 +1,4 @@
+Changed
+- Desktop: the daemon now runs on its own and keeps running when the app closes. No changes on Android.
+
+Full notes: https://github.com/emotionbug/Passession/releases

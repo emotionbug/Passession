@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.40 - 2026-11-18
+
 ### Changed
 
 - Run the local daemon on its own instead of inside Passession. Passession used to start the daemon from its own bundle, stop it when you quit unless "keep running after quit" was on, and stop and restart it during app updates. Now the daemon is installed once in its own folder and keeps running when Passession closes: on Linux as a systemd user service (`paseo.service`, or a home-specific name if that is taken) that also starts at login, and on macOS, Windows or Linux without a user service manager as a background process that does not start at login. The new setting "Start the local daemon if it is not running", on by default, installs and starts it when Passession opens; Settings also has a "Start now" button. Removing the local host's connection no longer stops the daemon. A daemon started by an older Passession is handed over once its running work finishes, keeping its sessions, server identity and pairing. `paseo daemon ensure` does the same from the command line.

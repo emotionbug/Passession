@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-client"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3546,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-daemon"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3621,7 +3621,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-gui"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3654,7 +3654,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-gui-core"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3676,7 +3676,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-gui-platform"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -3726,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-highlight"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "arborium",
  "tree-sitter-astro-next",
@@ -3735,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-plugin"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-protocol"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -3776,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-relay"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "axum",
  "clap",
@@ -3793,7 +3793,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-relay-cloudflare"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "js-sys",
  "url",
@@ -3804,7 +3804,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-tailnet"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "libc",
@@ -3820,14 +3820,14 @@ dependencies = [
 
 [[package]]
 name = "paseo-terminal"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "libghostty-vt",
 ]
 
 [[package]]
 name = "paseo-workspace-inspector"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "paseo-plugin",
  "serde_json",
@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-xtask"
-version = "0.13.39"
+version = "0.13.40"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -1,6 +1,6 @@
 # Release
 
-The checkout version is **0.13.39**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
+The checkout version is **0.13.40**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
 
 ## Distribution requirements
 
