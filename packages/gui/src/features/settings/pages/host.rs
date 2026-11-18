@@ -1108,6 +1108,11 @@ fn submit(
         move |s, env, result| match result
             .and_then(|r| du::operation_of(&r, &oid, &sid).map_err(ReqError::msg))
         {
+            Ok(operation) if terminal_update_ready(&operation) => {
+                // Resuming a saved approval can return an already settled
+                // journal from the submit acknowledgement itself.
+                finish(s, env, &sid, &oid, operation);
+            }
             Ok(_) => observe(
                 s,
                 env,
@@ -1142,6 +1147,10 @@ fn settle_error(s: &mut Settings, _env: &mut Env, server_id: &str, error: ReqErr
             uta("requestFailedMessage", &[("error", &error.text())]),
         );
     }
+}
+
+fn terminal_update_ready(operation: &Value) -> bool {
+    operation["terminal"] == true && operation["continuation"]["state"] != "pending"
 }
 
 /// Original `observeDaemonUpdate`: poll status every second until terminal
@@ -1186,9 +1195,7 @@ fn observe(
                 c.app_update = operation["targetKind"] == "app";
                 c.action_required = operation["actionRequired"] == "osAuthorization"
                     || operation["phase"] == "waitingForAuthorization";
-                if operation.get("terminal").and_then(Value::as_bool) == Some(true)
-                    && du::unconfirmed_continuation(&operation).as_deref() != Some("pending")
-                {
+                if terminal_update_ready(&operation) {
                     finish(s, env, &sid, &oid, operation);
                 } else {
                     s.after(env, 1.0, move |s, env| {
@@ -1211,24 +1218,37 @@ fn observe(
 }
 
 fn finish(s: &mut Settings, env: &mut Env, server_id: &str, operation_id: &str, operation: Value) {
-    if du::outcome(&operation) == Outcome::Committed {
-        let sid = server_id.to_string();
-        let oid = operation_id.to_string();
-        card(s, server_id).phase = ut("phaseVerifying");
-        confirm_committed(
-            s,
-            env,
-            sid,
-            oid,
-            operation,
-            Instant::now() + Duration::from_secs(120),
-        );
-        return;
+    match du::outcome(&operation) {
+        Outcome::Committed if operation["targetKind"] == "app" => {
+            card(s, server_id).phase = ut("phaseVerifying");
+            confirm_committed_app(
+                s,
+                env,
+                server_id.to_string(),
+                operation_id.to_string(),
+                operation,
+                Instant::now() + Duration::from_secs(120),
+            );
+        }
+        Outcome::Committed
+            if !du::committed_daemon_matches(&operation, server_id)
+                || !du::committed_release_matches(
+                    &operation,
+                    card(s, server_id).submit_request.as_ref(),
+                ) =>
+        {
+            fail(
+                s,
+                server_id,
+                ut("requestFailedTitle"),
+                ut("versionUnconfirmed"),
+            );
+        }
+        _ => complete_operation(s, env, server_id, operation_id, operation),
     }
-    complete_operation(s, env, server_id, operation_id, operation);
 }
 
-fn confirm_committed(
+fn confirm_committed_app(
     s: &mut Settings,
     env: &mut Env,
     server_id: String,
@@ -1237,21 +1257,20 @@ fn confirm_committed(
     deadline: Instant,
 ) {
     let sid = server_id.clone();
-    let desktop = operation["targetKind"] == "app";
     let then = move |s: &mut Settings, env: &mut Env, worker: Result<Value, ReqError>| {
         let approved =
             du::committed_release_matches(&operation, card(s, &sid).submit_request.as_ref());
         let confirmed = approved
             && worker
                 .as_ref()
-                .is_ok_and(|worker| du::committed_worker_matches(&operation, worker, &sid));
+                .is_ok_and(|worker| du::committed_app_components_match(&operation, worker, &sid));
         if confirmed {
             complete_operation(s, env, &sid, &operation_id, operation);
         } else if Instant::now() < deadline
             && worker.as_ref().err().is_none_or(ReqError::is_reconnect)
         {
             s.after(env, 1.0, move |s, env| {
-                confirm_committed(s, env, sid, operation_id, operation, deadline)
+                confirm_committed_app(s, env, sid, operation_id, operation, deadline)
             });
         } else {
             fail(
@@ -1262,19 +1281,15 @@ fn confirm_committed(
             );
         }
     };
-    if desktop {
-        update_request(
-            s,
-            env,
-            &server_id,
-            "daemon.update.check.request",
-            json!({}),
-            "daemon.update.check.response",
-            then,
-        );
-    } else {
-        read_worker(s, env, &server_id, then);
-    }
+    update_request(
+        s,
+        env,
+        &server_id,
+        "daemon.update.check.request",
+        json!({}),
+        "daemon.update.check.response",
+        then,
+    );
 }
 
 fn complete_operation(
@@ -2077,6 +2092,92 @@ pub fn picker_hint(host: &HostView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_standalone_terminal_status_settles_card_and_clears_saved_approval() {
+        use makepad_widgets::Cx;
+        use paseo_gui_core::{CoreConfig, GuiCore};
+        use std::{fs, sync::Arc};
+
+        let dir =
+            std::env::temp_dir().join(format!("paseo-update-result-{}", du::new_operation_id()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.clone(),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut ctx = crate::common::UiContext::new(core.handle());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fields = Default::default();
+        let mut bridge = Default::default();
+        let mut env = Env {
+            cx: &mut cx,
+            ctx: &mut ctx,
+            fields: &mut fields,
+            bridge: &mut bridge,
+        };
+        let mut settings = Settings::default();
+        let cases = [
+            ("committed", UpdatePhase::Complete, "committedMessage"),
+            ("rolled_back", UpdatePhase::Failed, "rolledBackTitle"),
+            ("failed", UpdatePhase::Failed, "requestFailedTitle"),
+        ];
+        for (phase, expected, message) in cases.iter().cloned() {
+            let id = du::new_operation_id();
+            let key = host::update_operation_key(phase);
+            let approval = json!({"operationId":id,"source":"release","targetKind":"daemon",
+                "expectedRelease":{"version":"0.13.36","manifestSha512":"A".repeat(88)}});
+            env.ctx
+                .core
+                .save_state(&format!("prefs:{key}"), approval.clone());
+            Arc::make_mut(&mut Arc::make_mut(&mut env.ctx.state).prefs)
+                .insert(key, json!(approval.to_string()));
+            let c = card(&mut settings, phase);
+            c.operation_id = host::stored_update_operation(&env.ctx.state, phase);
+            c.submit_request = host::stored_update_request(&env.ctx.state, phase);
+            assert_eq!(c.operation_id.as_deref(), Some(id.as_str()));
+            assert_eq!(c.submit_request, Some(approval));
+            c.durable = true;
+            c.state = UpdatePhase::Updating;
+
+            // No live worker reply is needed: the cutover evidence remains
+            // true even if the operation is read after another update.
+            let response = json!({"operation":{"operationId":id,"serverId":phase,"terminal":true,
+                "phase":phase,"candidate":{"version":"0.13.36","executableSha256":"a".repeat(64)},
+                "worker":{"serverId":phase,"version":"0.13.36","executableSha256":"a".repeat(64)},
+                "continuation":null}});
+            finish(
+                &mut settings,
+                &mut env,
+                phase,
+                &id,
+                du::operation_of(&response, &id, phase).unwrap(),
+            );
+            let c = card(&mut settings, phase);
+            assert_eq!(c.state, expected, "{phase}");
+            assert!(c.operation_id.is_none());
+            assert!(c.submit_request.is_none());
+            if phase == "committed" {
+                assert_eq!(c.worker_version, "0.13.36");
+                assert_eq!(c.complete_note, ut(message));
+            } else {
+                assert_eq!(c.failure_title, ut(message));
+            }
+        }
+        drop(core); // Flushes preferences after the queued clear commands.
+        let persisted = fs::read(dir.join("shared_preferences.json"));
+        fs::remove_dir_all(dir).unwrap();
+        let persisted: Value = serde_json::from_slice(&persisted.unwrap()).unwrap();
+        for (phase, _, _) in cases {
+            let key = format!("flutter.{}", host::update_operation_key(phase));
+            assert!(persisted.get(&key).is_none(), "{key}");
+        }
+    }
 
     #[test]
     fn update_failures_are_localized_with_raw_text_as_detail() {

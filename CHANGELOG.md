@@ -26,6 +26,7 @@
 ### Fixed
 
 - Show the same name for a host everywhere. The sidebar replaced a saved label that only repeated the endpoint or server ID with the daemon's hostname, but Settings (including the host's overview), the chat subtitle, workspace creation and other views showed the stored label or server ID, so one host appeared under two names. All of them now use one rule: a custom label wins, otherwise the daemon's hostname; rename fields still edit the stored label.
+- Finish a daemon update in Settings instead of staying on "Verifying the host's actual components…" with a spinning Update button. After the daemon reported the update as committed, the card asked the restarted daemon again and waited for a match that could stay out of reach. It now trusts the replacement worker and image the daemon already verified and recorded, shows the result, and clears the saved update. Reopening the Version page after an update shows its result too.
 
 ## 0.13.36 - 2026-11-17
 

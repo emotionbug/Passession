@@ -75,19 +75,29 @@ pub fn changed_components(check: &Value) -> Vec<String> {
 
 /// Signed cohorts can expose multiple primary images in one archive.
 pub fn download_bytes(check: &Value, selected: &[String]) -> u64 {
-    let Some(available) = check["availableComponents"].as_array() else { return 0 };
+    let Some(available) = check["availableComponents"].as_array() else {
+        return 0;
+    };
     let selected_entry = |entry: &Value| selected.iter().any(|id| entry["id"] == id.as_str());
-    available.iter().enumerate()
-        .filter(|(index, entry)| selected_entry(entry)
-            && !available[..*index].iter().any(|previous| {
-                selected_entry(previous) && previous["artifactSha256"] == entry["artifactSha256"]
-            }))
+    available
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            selected_entry(entry)
+                && !available[..*index].iter().any(|previous| {
+                    selected_entry(previous)
+                        && previous["artifactSha256"] == entry["artifactSha256"]
+                })
+        })
         .filter_map(|(_, entry)| entry["downloadSize"].as_u64())
         .fold(0_u64, u64::saturating_add)
 }
 
 pub fn restart_group(selected: &[String]) -> &'static str {
-    if selected.iter().any(|id| matches!(id.as_str(), "app" | "tailnet")) {
+    if selected
+        .iter()
+        .any(|id| matches!(id.as_str(), "app" | "tailnet"))
+    {
         "gui"
     } else if selected.iter().any(|id| id == "daemon") {
         "daemon"
@@ -99,24 +109,43 @@ pub fn restart_group(selected: &[String]) -> &'static str {
 /// Validate the retained and selected ABI graph together. The owner repeats
 /// this check against its verified inventory before admitting the request.
 pub fn selection_valid(check: &Value, selected: &[String]) -> bool {
-    let Some(current) = check["components"].as_object() else { return false };
-    let Some(available) = check["availableComponents"].as_array() else { return false };
-    let Some(requirements) = check["componentRequirements"].as_object() else { return false };
-    let Some(groups) = check["atomicGroups"].as_array() else { return false };
+    let Some(current) = check["components"].as_object() else {
+        return false;
+    };
+    let Some(available) = check["availableComponents"].as_array() else {
+        return false;
+    };
+    let Some(requirements) = check["componentRequirements"].as_object() else {
+        return false;
+    };
+    let Some(groups) = check["atomicGroups"].as_array() else {
+        return false;
+    };
     if current.len() != COMPONENT_IDS.len()
         || requirements.len() != COMPONENT_IDS.len()
-        || !COMPONENT_IDS.iter().all(|id| current.get(*id).is_some_and(valid_identity))
+        || !COMPONENT_IDS
+            .iter()
+            .all(|id| current.get(*id).is_some_and(valid_identity))
         || selected.iter().enumerate().any(|(index, id)| {
             !COMPONENT_IDS.contains(&id.as_str())
                 || selected[..index].contains(id)
-                || available.iter().filter(|entry| entry["id"] == id.as_str()).count() != 1
+                || available
+                    .iter()
+                    .filter(|entry| entry["id"] == id.as_str())
+                    .count()
+                    != 1
         })
     {
         return false;
     }
     for group in groups {
-        let Some(group) = group.as_array() else { return false };
-        if group.iter().any(|id| selected.iter().any(|selected| id == selected.as_str())) {
+        let Some(group) = group.as_array() else {
+            return false;
+        };
+        if group
+            .iter()
+            .any(|id| selected.iter().any(|selected| id == selected.as_str()))
+        {
             for id in group {
                 if available.iter().any(|entry| entry["id"] == *id)
                     && !selected.iter().any(|selected| id == selected.as_str())
@@ -127,14 +156,18 @@ pub fn selection_valid(check: &Value, selected: &[String]) -> bool {
         }
     }
     let chosen = |id: &str| {
-        selected.iter().any(|selected| selected == id)
+        selected
+            .iter()
+            .any(|selected| selected == id)
             .then(|| available.iter().find(|entry| entry["id"] == id))
             .flatten()
     };
     COMPONENT_IDS.iter().all(|id| {
         let entry = chosen(id);
         let identity = entry.map(|entry| &entry["target"]).unwrap_or(&current[*id]);
-        let requires = entry.map(|entry| &entry["requires"]).or_else(|| requirements.get(*id));
+        let requires = entry
+            .map(|entry| &entry["requires"])
+            .or_else(|| requirements.get(*id));
         valid_identity(identity)
             && requires.and_then(Value::as_object).is_some_and(|requires| {
                 requires.iter().all(|(dependency, abi)| {
@@ -156,37 +189,51 @@ fn valid_identity(identity: &Value) -> bool {
             value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
     };
-    identity["version"].as_str().is_some_and(|version| !version.is_empty())
+    identity["version"]
+        .as_str()
+        .is_some_and(|version| !version.is_empty())
         && hex("sourceSha", 40)
         && hex("inputHash", 64)
-        && identity["abiVersion"].as_u64().is_some_and(|abi| abi > 0 && abi <= u32::MAX as u64)
+        && identity["abiVersion"]
+            .as_u64()
+            .is_some_and(|abi| abi > 0 && abi <= u32::MAX as u64)
 }
 
-/// A committed journal alone is not proof of the running component selection.
-/// Desktop callers pass a fresh owner check, standalone callers worker status.
-pub fn committed_worker_matches(operation: &Value, actual: &Value, server_id: &str) -> bool {
-    if outcome(operation) != Outcome::Committed
-        || str_of(operation, "serverId") != server_id
-        || str_of(actual, "serverId") != server_id
-    {
-        return false;
-    }
-    if operation["targetKind"] == "app" {
-        let Some(expected) = operation["targetComponents"].as_object() else { return false };
-        return operation["outcome"] == "committed"
-            && expected.len() == COMPONENT_IDS.len()
-            && COMPONENT_IDS.iter().all(|id| expected.get(*id).is_some_and(valid_identity))
-            && actual["targetKind"] == "app"
-            && actual["owner"]["kind"] == "desktopApp"
-            && operation["observedComponents"] == operation["targetComponents"]
-            && actual["components"] == operation["targetComponents"];
-    }
+/// The standalone executor records the authenticated replacement worker and
+/// its running image digest before it commits. That evidence also applies to
+/// an operation restored after the host has moved on to a newer runtime.
+pub fn committed_daemon_matches(operation: &Value, server_id: &str) -> bool {
     let candidate = get(operation, "candidate");
+    let worker = get(operation, "worker");
     let version = str_of(candidate, "version");
-    !version.is_empty()
-        && str_of(actual, "version") == version
-        && (str_of(candidate, "sourceSha").is_empty()
-            || str_of(actual, "sourceSha") == str_of(candidate, "sourceSha"))
+    let digest = str_of(candidate, "executableSha256");
+    outcome(operation) == Outcome::Committed
+        && str_of(operation, "serverId") == server_id
+        && str_of(worker, "serverId") == server_id
+        && !version.is_empty()
+        && str_of(worker, "version") == version
+        && !digest.is_empty()
+        && str_of(worker, "executableSha256") == digest
+}
+
+/// For desktop updates compare the complete selection with the live owner.
+pub fn committed_app_components_match(operation: &Value, actual: &Value, server_id: &str) -> bool {
+    let Some(expected) = operation["targetComponents"].as_object() else {
+        return false;
+    };
+    outcome(operation) == Outcome::Committed
+        && operation["targetKind"] == "app"
+        && operation["outcome"] == "committed"
+        && str_of(operation, "serverId") == server_id
+        && str_of(actual, "serverId") == server_id
+        && expected.len() == COMPONENT_IDS.len()
+        && COMPONENT_IDS
+            .iter()
+            .all(|id| expected.get(*id).is_some_and(valid_identity))
+        && actual["targetKind"] == "app"
+        && actual["owner"]["kind"] == "desktopApp"
+        && operation["observedComponents"] == operation["targetComponents"]
+        && actual["components"] == operation["targetComponents"]
 }
 
 /// Confirmation stays bound to the exact pin and component selection flushed
@@ -323,23 +370,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn committed_requires_reconnected_host_version_and_source() {
-        let operation = json!({"terminal":true,"phase":"committed","serverId":"one",
-            "candidate":{"version":"2.0.0","sourceSha":"abc"}});
-        let worker = json!({"serverId":"one","version":"2.0.0","sourceSha":"abc"});
-        assert!(committed_worker_matches(&operation, &worker, "one"));
-        for (key, value) in [("serverId", "two"), ("version", "1.0.0"), ("sourceSha", "")] {
-            let mut changed = worker.clone();
-            changed[key] = json!(value);
-            assert!(
-                !committed_worker_matches(&operation, &changed, "one"),
-                "{key}"
-            );
+    fn committed_daemon_requires_the_recorded_worker_image_version_and_host() {
+        let mut operation = json!({"terminal":true,"phase":"committed","serverId":"one",
+            "candidate":{"version":"2.0.0","executableSha256":"a".repeat(64)},
+            "worker":{"serverId":"one","version":"2.0.0","executableSha256":"a".repeat(64)}});
+        assert!(committed_daemon_matches(&operation, "one"));
+        assert!(!committed_daemon_matches(&operation, "two"));
+        for (key, value) in [
+            ("serverId", "two"),
+            ("version", "1.0.0"),
+            ("executableSha256", ""),
+        ] {
+            let mut changed = operation.clone();
+            changed["worker"][key] = json!(value);
+            assert!(!committed_daemon_matches(&changed, "one"), "{key}");
         }
-        let mut rolled_back = operation.clone();
-        rolled_back["phase"] = json!("rolled_back");
-        assert!(!committed_worker_matches(&rolled_back, &worker, "one"));
-        assert!(!committed_worker_matches(&operation, &worker, "two"));
+        operation["phase"] = json!("rolled_back");
+        assert!(!committed_daemon_matches(&operation, "one"));
     }
 
     #[test]
@@ -402,7 +449,10 @@ mod tests {
                 target["abiVersion"] = check["components"][*id]["abiVersion"].clone();
                 let change = json!({"id":id,"current":check["components"][*id],
                     "target":target,"downloadSize":1024,"requires":{}});
-                check["availableComponents"].as_array_mut().unwrap().push(change);
+                check["availableComponents"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(change);
             }
         }
         check
@@ -427,7 +477,9 @@ mod tests {
             }
         }
         for (key, value) in [
-            ("owner", Value::Null), ("targetKind", json!("daemon")), ("supported", json!(false)),
+            ("owner", Value::Null),
+            ("targetKind", json!("daemon")),
+            ("supported", json!(false)),
         ] {
             let mut changed = checked.clone();
             changed[key] = value;
@@ -438,9 +490,12 @@ mod tests {
     #[test]
     fn component_plan_selects_only_changes_and_classifies_restarts() {
         for (changes, group) in [
-            (vec!["update-helper"], "none"), (vec!["daemon"], "daemon"),
-            (vec!["app"], "gui"), (vec!["tailnet"], "gui"),
-            (vec!["daemon", "update-helper"], "daemon"), (vec![], "none"),
+            (vec!["update-helper"], "none"),
+            (vec!["daemon"], "daemon"),
+            (vec!["app"], "gui"),
+            (vec!["tailnet"], "gui"),
+            (vec!["daemon", "update-helper"], "daemon"),
+            (vec![], "none"),
         ] {
             let checked = desktop_check(&changes);
             let selected = changed_components(&checked);
@@ -464,7 +519,7 @@ mod tests {
         assert!(!selection_valid(&checked, &["daemon".into()]));
         assert!(!selection_valid(&checked, &["app".into(), "app".into()]));
         checked = desktop_check(&["app", "tailnet"]);
-        checked["atomicGroups"] = json!([["app","tailnet"]]);
+        checked["atomicGroups"] = json!([["app", "tailnet"]]);
         assert!(!selection_valid(&checked, &["app".into()]));
         assert!(selection_valid(&checked, &selected));
         checked["availableComponents"][1]["target"] = checked["components"]["tailnet"].clone();
@@ -482,35 +537,57 @@ mod tests {
 
     #[test]
     fn committed_components_require_actual_complete_identities_not_equal_versions() {
-        for (changed, group) in [("update-helper", "none"), ("daemon", "daemon"), ("app", "gui"), ("tailnet", "gui")] {
+        for (changed, group) in [
+            ("update-helper", "none"),
+            ("daemon", "daemon"),
+            ("app", "gui"),
+            ("tailnet", "gui"),
+        ] {
             let mut actual = desktop_check(&[changed]);
             actual["components"][changed] = actual["availableComponents"][0]["target"].clone();
             let operation = json!({"operationId":"op","serverId":"one","targetKind":"app",
                 "terminal":true,"phase":"committed","outcome":"committed","restartGroup":group,
                 "targetComponents":actual["components"],"observedComponents":actual["components"]});
-            assert!(committed_worker_matches(&operation, &actual, "one"));
-            assert_ne!(actual["components"]["app"]["version"], actual["components"]["daemon"]["version"]);
+            assert!(committed_app_components_match(&operation, &actual, "one"));
+            assert_ne!(
+                actual["components"]["app"]["version"],
+                actual["components"]["daemon"]["version"]
+            );
             for id in COMPONENT_IDS {
                 for field in ["version", "sourceSha", "inputHash", "abiVersion"] {
                     let mut stale = actual.clone();
                     stale["components"][id][field] = Value::Null;
-                    assert!(!committed_worker_matches(&operation, &stale, "one"), "{changed}/{id}/{field}");
+                    assert!(
+                        !committed_app_components_match(&operation, &stale, "one"),
+                        "{changed}/{id}/{field}"
+                    );
                 }
             }
-            assert!(!committed_worker_matches(&operation, &actual, "other"));
-            for phase in ["waitingForParent","waitingForAuthorization","installing","starting","checking"] {
+            assert!(!committed_app_components_match(
+                &operation, &actual, "other"
+            ));
+            for phase in [
+                "waitingForParent",
+                "waitingForAuthorization",
+                "installing",
+                "starting",
+                "checking",
+            ] {
                 let mut pending = operation.clone();
                 pending["phase"] = json!(phase);
-                assert!(!committed_worker_matches(&pending, &actual, "one"));
+                assert!(!committed_app_components_match(&pending, &actual, "one"));
             }
             let mut unobserved = operation.clone();
             unobserved["observedComponents"] = Value::Null;
-            assert!(!committed_worker_matches(&unobserved, &actual, "one"));
+            assert!(!committed_app_components_match(&unobserved, &actual, "one"));
             unobserved["phase"] = json!("rolledBack");
             unobserved["recoveryRequired"] = json!(true);
             assert!(retain_operation(&unobserved));
         }
-        assert_eq!(phase_key("waitingForAuthorization"), "phaseWaitingForAuthorization");
+        assert_eq!(
+            phase_key("waitingForAuthorization"),
+            "phaseWaitingForAuthorization"
+        );
     }
 
     #[test]
@@ -524,12 +601,16 @@ mod tests {
         for (pointer, value) in [
             ("/expectedRelease/version", json!("3.0.0")),
             ("/expectedRelease/manifestSha512", json!("B".repeat(88))),
-            ("/selectedComponents", json!(["app"])), ("/operationId", json!("other")),
+            ("/selectedComponents", json!(["app"])),
+            ("/operationId", json!("other")),
             ("/targetKind", json!("daemon")),
         ] {
             let mut changed = operation.clone();
             *changed.pointer_mut(pointer).unwrap() = value;
-            assert!(!committed_release_matches(&changed, Some(&request)), "{pointer}");
+            assert!(
+                !committed_release_matches(&changed, Some(&request)),
+                "{pointer}"
+            );
         }
         let response = json!({"operation":operation});
         assert!(operation_of(&response, "op", "one").is_ok());
