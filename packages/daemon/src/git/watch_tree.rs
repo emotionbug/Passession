@@ -1,112 +1,240 @@
-use super::command;
+use super::{command, scheduler};
 use anyhow::{Result, bail};
+use paseo_client::process::{CommandSpec, ManagedProcess};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
+    time::Duration,
 };
+use tokio::{io::AsyncReadExt, runtime::Handle};
 use tokio_util::sync::CancellationToken;
 
-/// Ask Git about each directory frontier before descending. Unlike a recursive
-/// filesystem watch, ignored build/dependency trees are never traversed.
-pub(super) async fn directories(
+pub(super) fn subtree<'a>(
+    paths: &'a BTreeSet<PathBuf>,
+    base: &'a Path,
+) -> impl Iterator<Item = &'a PathBuf> {
+    paths
+        .range(base.to_owned()..)
+        .take_while(move |p| p.starts_with(base))
+}
+
+pub(super) fn is_dir(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Walk just `base`. Register each parent before reading it so a child created
+/// concurrently is either discovered in the walk or delivered as an event.
+/// Ignored directory trees are never descended into, even for tracked files.
+pub(super) fn visible_directories(
     root: &Path,
+    base: &Path,
     env: &BTreeMap<String, String>,
-    cancel: CancellationToken,
-) -> Result<HashSet<PathBuf>> {
-    let mut directories = HashSet::from([root.to_owned()]);
-    let mut frontier = vec![root.to_owned()];
+    cancel: &CancellationToken,
+    runtime: &Handle,
+    mut register: impl FnMut(&Path) -> Result<bool>,
+) -> Result<BTreeSet<PathBuf>> {
+    let mut directories = BTreeSet::new();
+    let mut frontier = BTreeSet::from([base.to_owned()]);
     while !frontier.is_empty() {
-        let mut children = Vec::new();
+        if cancel.is_cancelled() {
+            bail!("Git watch inventory cancelled");
+        }
+        let ignored = runtime.block_on(ignored_paths(
+            root,
+            frontier.iter().filter(|p| *p != root).map(PathBuf::as_path),
+            true,
+            env,
+            cancel,
+        ))?;
+        let mut children = BTreeSet::new();
         for directory in frontier {
-            if cancel.is_cancelled() {
-                bail!("Git watch inventory cancelled");
+            let relative = directory.strip_prefix(root)?;
+            if ignored.contains(relative) || !register(&directory)? {
+                continue;
             }
-            let mut entries = match tokio::fs::read_dir(&directory).await {
+            let entries = match fs::read_dir(&directory) {
                 Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
-            while let Some(entry) = entries.next_entry().await? {
-                if entry.file_name() != ".git" && entry.file_type().await?.is_dir() {
-                    children.push(entry.path());
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_name() != ".git" && entry.file_type()?.is_dir() {
+                    children.insert(entry.path());
                 }
             }
+            directories.insert(directory);
         }
-        let mut ignored = HashSet::new();
-        for chunk in children.chunks(128) {
-            // `-z` needs `--stdin`, which the runner does not feed. Unquoted
-            // newline output covers every name except ones Git must C-quote
-            // (quotes, backslashes, control characters); such a directory is
-            // not matched and stays watched, which only costs a watch.
-            let mut args = vec![
-                "-c".into(),
-                "core.quotePath=false".into(),
-                "check-ignore".into(),
-                "--no-index".into(),
-                "--".into(),
-            ];
-            args.extend(chunk.iter().map(|path| path.to_string_lossy().into_owned()));
-            let result = command::run(
-                root,
-                &args,
-                env,
-                cancel.child_token(),
-                command::READ_LIMIT,
-                command::READ_TIMEOUT,
-            )
-            .await?;
-            if result.status != 0 && result.status != 1 {
-                bail!("{}", result.stderr);
-            }
-            ignored.extend(
-                result
-                    .stdout
-                    .split(|byte| *byte == b'\n')
-                    .filter(|path| !path.is_empty())
-                    .map(|path| PathBuf::from(String::from_utf8_lossy(path).as_ref())),
-            );
-        }
-        frontier = children
-            .into_iter()
-            .filter(|path| !ignored.contains(path))
-            .collect();
-        directories.extend(frontier.iter().cloned());
+        frontier = children;
     }
-    // Git still observes tracked files underneath an ignored directory.
-    let tracked = command::checked(
+    Ok(directories)
+}
+
+/// List only tracked paths Git considers ignored, not every tracked path.
+/// Store their ancestor directories even when absent, so a later create can
+/// add the required watches without another index query.
+pub(super) async fn tracked_ignored_dirs(
+    root: &Path,
+    base: &Path,
+    env: &BTreeMap<String, String>,
+    cancel: &CancellationToken,
+) -> Result<BTreeSet<PathBuf>> {
+    let mut args = [
+        "--literal-pathspecs",
+        "ls-files",
+        "-z",
+        "--cached",
+        "--ignored",
+        "--exclude-standard",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let relative = base.strip_prefix(root)?;
+    if let Some(path) = relative.to_str().filter(|path| !path.is_empty()) {
+        args.push("--".into());
+        #[cfg(windows)]
+        args.push(path.replace('\\', "/"));
+        #[cfg(not(windows))]
+        args.push(path.into());
+    }
+    let bytes = command::checked(
         root,
-        &["ls-files".into(), "--cached".into(), "-z".into()],
+        &args,
         env,
-        cancel,
+        cancel.child_token(),
         command::READ_LIMIT,
         command::READ_TIMEOUT,
     )
     .await?;
-    let mut tracked_directories = HashSet::new();
-    for file in tracked
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        let file = root.join(String::from_utf8_lossy(file).as_ref());
-        for directory in file.parent().into_iter().flat_map(Path::ancestors) {
-            if !directory.starts_with(root) {
-                break;
-            }
-            if directories.contains(directory) || !tracked_directories.insert(directory.to_owned())
-            {
+    let mut dirs = BTreeSet::new();
+    for path in git_paths(&bytes) {
+        let file = root.join(path?);
+        if !file.starts_with(base) {
+            continue;
+        }
+        for dir in file.ancestors().skip(1).take_while(|p| p.starts_with(base)) {
+            if !dirs.insert(dir.to_owned()) {
                 break;
             }
         }
     }
-    for directory in tracked_directories {
-        if tokio::fs::metadata(&directory)
-            .await
-            .is_ok_and(|metadata| metadata.is_dir())
+    Ok(dirs)
+}
+
+/// Git's default check retains tracked files even when they match an ignore
+/// rule. Directory traversal uses --no-index and adds tracked exceptions
+/// independently; ordinary file event batches use the default index check.
+pub(super) async fn ignored_paths<'a>(
+    root: &Path,
+    paths: impl Iterator<Item = &'a Path>,
+    no_index: bool,
+    env: &BTreeMap<String, String>,
+    cancel: &CancellationToken,
+) -> Result<BTreeSet<PathBuf>> {
+    let mut input = Vec::new();
+    for path in paths {
+        let path = path.strip_prefix(root)?;
+        #[cfg(unix)]
         {
-            directories.insert(directory);
+            use std::os::unix::ffi::OsStrExt;
+            input.extend_from_slice(path.as_os_str().as_bytes());
         }
+        #[cfg(windows)]
+        input.extend_from_slice(
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("Git path is not Unicode"))?
+                .replace('\\', "/")
+                .as_bytes(),
+        );
+        input.push(0);
     }
-    Ok(directories)
+    if input.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let _permit = scheduler::acquire(cancel).await?;
+    let mut environment = env.clone();
+    environment.extend([
+        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+        ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
+        ("LC_ALL".into(), "C".into()),
+    ]);
+    let mut args = ["check-ignore", "-z", "--stdin"]
+        .map(str::to_owned)
+        .to_vec();
+    if no_index {
+        args.push("--no-index".into());
+    }
+    let (process, stdout) = ManagedProcess::spawn(CommandSpec {
+        program: "git".into(),
+        args,
+        cwd: Some(root.into()),
+        env: environment,
+        clear_env: false,
+    })
+    .await?;
+    let read = async {
+        let mut output = Vec::new();
+        stdout
+            .take((command::READ_LIMIT + 1) as u64)
+            .read_to_end(&mut output)
+            .await?;
+        if output.len() > command::READ_LIMIT {
+            bail!("Git ignore output exceeded limit");
+        }
+        Ok(output)
+    };
+    let write = async {
+        process.write_bytes(&input).await?;
+        process.close_stdin().await
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("Git ignore check cancelled")),
+        _ = tokio::time::sleep(command::READ_TIMEOUT) => Err(anyhow::anyhow!("Git ignore check timed out")),
+        result = async { tokio::try_join!(read, write, process.wait()) } => result,
+    };
+    let (output, (), status) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(cleanup) = process.terminate(Duration::ZERO).await {
+                return Err(error.context(format!("Git ignore check cleanup failed: {cleanup:#}")));
+            }
+            return Err(error);
+        }
+    };
+    if status != 0 && status != 1 {
+        bail!("{}", process.stderr_tail());
+    }
+    git_paths(&output).collect()
+}
+
+fn git_paths(output: &[u8]) -> impl Iterator<Item = Result<PathBuf>> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|p| !p.is_empty())
+        .map(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+            }
+            #[cfg(windows)]
+            {
+                Ok(PathBuf::from(std::str::from_utf8(path)?))
+            }
+        })
 }
 
 #[cfg(test)]
@@ -142,17 +270,18 @@ mod tests {
             command::READ_TIMEOUT,
         )
         .await?;
-        let watched = directories(root, &env, cancel.clone()).await?;
-        assert!(!watched.contains(&root.join("target")));
-        assert!(!watched.contains(&root.join(".git")));
-        assert!(watched.contains(&root.join("empty/nested")));
-        assert!(watched.contains(&root.join("ignored/tracked")));
-        tokio::fs::remove_dir_all(root.join("empty")).await?;
-        assert!(
-            !directories(root, &env, cancel)
-                .await?
-                .contains(&root.join("empty/nested"))
-        );
+        let tracked = tracked_ignored_dirs(root, root, &env, &cancel).await?;
+        let root = root.to_owned();
+        let runtime = Handle::current();
+        let scanned = tokio::task::spawn_blocking(move || {
+            visible_directories(&root, &root, &env, &cancel, &runtime, |_| Ok(true))
+        })
+        .await??;
+        assert!(!scanned.contains(&temp.path().join("target")));
+        assert!(!scanned.contains(&temp.path().join(".git")));
+        assert!(scanned.contains(&temp.path().join("empty/nested")));
+        assert!(!scanned.contains(&temp.path().join("ignored")));
+        assert!(tracked.contains(&temp.path().join("ignored/tracked")));
         Ok(())
     }
 }

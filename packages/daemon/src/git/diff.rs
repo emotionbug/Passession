@@ -621,36 +621,33 @@ pub async fn commit_file(
     Ok(Some(value))
 }
 
-/// The checkout snapshot's `diffStat` for its already resolved worktree root,
-/// current branch and operation base. It uses the comparison branch, not an
-/// all-diff inventory: an untracked-only checkout with no comparison ref has
-/// no shortstat.
-pub(crate) async fn shortstat(
+/// Resolve the baseline for checkout aggregate line totals. It is independent
+/// of index/worktree edits, so the observer caches it separately from the totals.
+pub(super) async fn shortstat_base(
     cwd: &Path,
     branch: &str,
-    base: Option<String>,
+    base: Option<&str>,
     env: &BTreeMap<String, String>,
-    cancel: CancellationToken,
-) -> Result<Option<Value>> {
-    let env = readonly(env);
-    let comparison = if let Some(base) = base.filter(|base| base != branch) {
+    cancel: &CancellationToken,
+) -> Result<Option<String>> {
+    let comparison = if let Some(base) = base.filter(|base| *base != branch) {
         if base.starts_with("refs/heads/") || base.starts_with("refs/remotes/") {
-            if !command::exists(cwd, &base, &env, cancel.clone()).await? {
+            if !command::exists(cwd, base, env, cancel.clone()).await? {
                 return Ok(None);
             }
-            base
+            base.to_owned()
         } else {
-            let name = command::branch_name(&base);
+            let name = command::branch_name(base);
             if command::exists(
                 cwd,
                 &format!("refs/remotes/origin/{name}"),
-                &env,
+                env,
                 cancel.clone(),
             )
             .await?
             {
                 format!("origin/{name}")
-            } else if command::exists(cwd, &format!("refs/heads/{name}"), &env, cancel.clone())
+            } else if command::exists(cwd, &format!("refs/heads/{name}"), env, cancel.clone())
                 .await?
             {
                 name.to_owned()
@@ -662,7 +659,7 @@ pub(crate) async fn shortstat(
         if !command::exists(
             cwd,
             &format!("refs/remotes/origin/{branch}"),
-            &env,
+            env,
             cancel.clone(),
         )
         .await?
@@ -674,7 +671,7 @@ pub(crate) async fn shortstat(
     let merge = command::run(
         cwd,
         &args(&["merge-base", "HEAD", &comparison]),
-        &env,
+        env,
         cancel.clone(),
         1024,
         TIMEOUT,
@@ -685,9 +682,15 @@ pub(crate) async fn shortstat(
     }
     let merge = String::from_utf8(merge.stdout)?;
     let merge = merge.trim();
-    if merge.is_empty() {
-        return Ok(None);
-    }
+    Ok((!merge.is_empty()).then(|| merge.to_owned()))
+}
+
+pub(super) async fn shortstat(
+    cwd: &Path,
+    merge: &str,
+    env: &BTreeMap<String, String>,
+    cancel: &CancellationToken,
+) -> Result<Option<Value>> {
     let tracked = git(
         cwd,
         &args(&[
@@ -697,8 +700,8 @@ pub(crate) async fn shortstat(
             "--shortstat",
             merge,
         ]),
-        &env,
-        &cancel,
+        env,
+        cancel,
         FILE_LIMIT,
     )
     .await?;
@@ -718,8 +721,8 @@ pub(crate) async fn shortstat(
     let paths = git(
         cwd,
         &args(&["ls-files", "-z", "--others", "--exclude-standard"]),
-        &env,
-        &cancel,
+        env,
+        cancel,
         INVENTORY_LIMIT,
     )
     .await?;
@@ -740,7 +743,7 @@ pub(crate) async fn shortstat(
             true,
             &mut total,
             &parse::PatchFormat::default(),
-            &cancel,
+            cancel,
         )
         .await?
         {

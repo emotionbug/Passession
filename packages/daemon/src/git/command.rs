@@ -12,6 +12,11 @@ pub const READ_LIMIT: usize = 20 * 1024 * 1024;
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MUTATION_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static COMMAND_LOG: std::cell::RefCell<Vec<Vec<String>>>;
+}
+
 /// The source's `NotGitRepoError`: the only error classified as `NOT_GIT_REPO`.
 #[derive(Debug, thiserror::Error)]
 #[error("Not a git repository: {0}")]
@@ -71,6 +76,8 @@ pub async fn run(
     timeout: Duration,
 ) -> Result<CommandOutput> {
     let _permit = super::scheduler::acquire(&cancel).await?;
+    #[cfg(test)]
+    let _ = COMMAND_LOG.try_with(|log| log.borrow_mut().push(args.to_vec()));
     let mut environment = env.clone();
     environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
     environment.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
@@ -211,7 +218,10 @@ pub async fn metadata(
     env: &BTreeMap<String, String>,
     cancel: CancellationToken,
 ) -> Result<Option<Value>> {
-    let path = git_dir(cwd, env, cancel).await?.join("paseo/worktree.json");
+    metadata_in_git_dir(&git_dir(cwd, env, cancel).await?).await
+}
+pub(super) async fn metadata_in_git_dir(dir: &Path) -> Result<Option<Value>> {
+    let path = dir.join("paseo/worktree.json");
     match tokio::fs::read(path).await {
         Ok(bytes) => Ok(Some(crate::projects::runtime::parse_metadata(
             &serde_json::from_slice::<Value>(&bytes)?,
@@ -284,7 +294,17 @@ pub async fn operation_base(
     if let Some(value) = requested {
         safe_ref(value)?;
     }
-    let meta = metadata(cwd, env, cancel.clone()).await?;
+    let dir = git_dir(cwd, env, cancel.clone()).await?;
+    operation_base_in_git_dir(cwd, &dir, requested, env, cancel).await
+}
+pub(super) async fn operation_base_in_git_dir(
+    cwd: &Path,
+    dir: &Path,
+    requested: Option<&str>,
+    env: &BTreeMap<String, String>,
+    cancel: CancellationToken,
+) -> Result<Option<String>> {
+    let meta = metadata_in_git_dir(dir).await?;
     let stored = meta.as_ref().and_then(|m| {
         m.get("baseRef")
             .and_then(Value::as_str)

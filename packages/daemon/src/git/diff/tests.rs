@@ -264,15 +264,17 @@ async fn aggregate_budget_keeps_later_small_files_and_cancellation_propagates() 
 
 /// The checkout snapshot's `diffStat`, produced from its resolved root, branch and base.
 async fn snapshot_diff_stat(repo: &Repo) -> Result<Value> {
-    let snapshot = crate::git::facts::snapshot(
+    let cancel = CancellationToken::new();
+    let mut snapshot = crate::git::facts::ObservedRepo::read(
         repo.path(),
         repo.path(),
         &json!({}),
         &repo.env,
-        CancellationToken::new(),
+        &cancel,
     )
-    .await?;
-    Ok(snapshot["diffStat"].clone())
+    .await?
+    .unwrap();
+    Ok(snapshot.diff_stat(&repo.env, cancel).await)
 }
 
 #[tokio::test]

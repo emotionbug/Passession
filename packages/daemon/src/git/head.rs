@@ -170,7 +170,8 @@ impl GitService {
                 "featuresEnabled":false,"pullRequest":null,"authState":"no_remote","error":null
             }});
         }
-        let mut snapshot = self.cached_snapshot(cwd).await.unwrap_or_else(|| json!({
+        let root = head["repoRoot"].as_str().map(Path::new).unwrap_or(cwd);
+        let mut snapshot = self.cached_snapshot_with_stat(root).await.unwrap_or_else(|| json!({
             "git":super::facts::non_git(cwd),
             "forge":{"featuresEnabled":false,"pullRequest":null,"authState":"no_remote","error":null}
         }));

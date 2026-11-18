@@ -95,8 +95,26 @@ impl GitService {
                 return Err(error);
             }
             let app = self.app.clone();
+            let alias = PathBuf::from(raw_cwd);
             tokio::spawn(async move {
-                owner.cancellation().cancelled().await;
+                let cancel = owner.cancellation();
+                // Equality suppression is shared by the checkout, not by
+                // subscribers. Even a fully warm cache must prime this owner.
+                if let Some(app) = app.upgrade() {
+                    let initial = async {
+                        let snapshot = app.git.snapshot(&cwd, false, cancel.clone()).await?;
+                        owner
+                            .emit(super::checkout_status_update(&alias, &snapshot))
+                            .await
+                    }
+                    .await;
+                    if let Err(error) = initial
+                        && !cancel.is_cancelled()
+                    {
+                        tracing::debug!(%error, cwd=%cwd.display(), "Initial checkout status unavailable");
+                    }
+                }
+                cancel.cancelled().await;
                 if let Some(app) = app.upgrade() {
                     let _ = app.git.release_observation(&cwd).await;
                 }
@@ -286,7 +304,7 @@ impl GitService {
             }
             "checkout.refresh.request" => {
                 self.invalidate(cwd).await?;
-                self.snapshot(cwd, true, cancel.clone()).await?;
+                self.snapshot(cwd, false, cancel.clone()).await?;
                 self.refresh_forge(cwd, cancel).await?;
                 return Ok(json!({"success":true,"error":null}));
             }
@@ -346,7 +364,7 @@ impl GitService {
                 };
                 let result = mutations::commit_selected(&cwd, &paths, &text, &env, cancel).await;
                 if let Some(app) = app.upgrade()
-                    && let Err(error) = app.git.notify_mutation(&cwd).await
+                    && let Err(error) = app.git.notify_mutation(&cwd, true).await
                 {
                     tracing::warn!(%error, "Selected commit settled; refresh failed");
                 }
@@ -426,7 +444,8 @@ impl GitService {
                 )
                 .await?;
                 if target != cwd {
-                    self.notify_mutation(&target).await?;
+                    self.notify_mutation(&target, message["strategy"] != "squash")
+                        .await?;
                 }
             }
             "checkout_merge_from_base_request" => {
@@ -478,7 +497,11 @@ impl GitService {
             }
             _ => bail!("Unknown Git mutation {kind}"),
         }
-        if let Err(error) = self.notify_mutation(cwd).await {
+        let refs = !(matches!(
+            kind,
+            "checkout.discard_changes.request" | "stash_save_request" | "stash_pop_request"
+        ) || (kind == "checkout_merge_request" && message["strategy"] == "squash"));
+        if let Err(error) = self.notify_mutation(cwd, refs).await {
             tracing::warn!(%error,"Mutation completed; refresh failed");
         }
         Ok(result)
@@ -500,13 +523,23 @@ impl GitService {
                 return Err(error);
             }
         };
-        let mut changes = entry.changes.subscribe();
         let compare = message["compare"].clone();
+        let diff = match Self::diff_entry(&entry, &compare).await {
+            Ok(diff) => diff,
+            Err(error) => {
+                owner.release().await?;
+                return Err(error);
+            }
+        };
+        let mut changes = diff.changes.subscribe();
         if let Err(error) = self.retain_observation(&response_cwd).await {
             owner.release().await?;
             return Err(error);
         }
-        let initial = match self.read_diff(&cwd, &compare, owner.cancellation()).await {
+        let initial = match self
+            .read_cached_diff(&cwd, &diff, &compare, owner.cancellation())
+            .await
+        {
             Ok(value) => value,
             Err(error) => {
                 let _ = self.release_observation(&response_cwd).await;
@@ -544,7 +577,10 @@ impl GitService {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
                 }
                 let Some(state) = app.upgrade() else { break };
-                let next = state.git.read_diff(&cwd, &compare, cancel.clone()).await;
+                let next = state
+                    .git
+                    .read_cached_diff(&cwd, &diff, &compare, cancel.clone())
+                    .await;
                 drop(state);
                 let mut value = match next {
                     Ok(value) => value,
@@ -634,7 +670,7 @@ impl GitService {
                     | "checkout.github.set_auto_merge.request"
             )
         ) {
-            let _ = self.notify_mutation(cwd).await;
+            let _ = self.notify_mutation(cwd, true).await;
         }
         Ok(response)
     }
@@ -666,6 +702,13 @@ fn require_git(git: &Value, cwd: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{ChangedPaths, CheckoutChange};
+    use crate::transport::{OutboundFrame, SourceConfig};
+    use std::{
+        collections::HashSet,
+        sync::{Arc, RwLock, atomic::Ordering},
+        time::Duration,
+    };
 
     #[test]
     fn merge_snapshot_outside_a_repository_is_typed_not_git_repo() {
@@ -705,6 +748,188 @@ mod tests {
             .operation("checkout_status_request", &json!({}), &folder, None, cancel)
             .await?;
         assert_eq!(status["isGit"], false, "{status}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observation_targets_diff_subscriptions_and_forge_generation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let folder = root.path().join("checkout");
+        tokio::fs::create_dir(&folder).await?;
+        let app = crate::state::AppState::new(
+            root.path().join("home"),
+            root.path().into(),
+            std::env::current_exe()?,
+        );
+        app.config.initialize().await?;
+        let cancel = CancellationToken::new();
+        let env = app.git.environment()?;
+        let git =
+            |args: &'static [&'static str]| command::text(&folder, args, &env, cancel.clone());
+        git(&["init", "-b", "main"]).await?;
+        git(&["config", "user.name", "Observation test"]).await?;
+        git(&["config", "user.email", "test@example.invalid"]).await?;
+        git(&["config", "commit.gpgsign", "false"]).await?;
+        git(&["config", "status.showUntrackedFiles", "all"]).await?;
+        tokio::fs::write(folder.join("tracked"), "clean\n").await?;
+        git(&["add", "tracked"]).await?;
+        git(&["commit", "-m", "base"]).await?;
+        tokio::fs::write(folder.join(".git/info/exclude"), "ignored\n").await?;
+
+        app.git.snapshot(&folder, false, cancel.clone()).await?;
+        let (_, checkout) = app.git.checkout_entry(&folder).await?;
+        let base = GitService::diff_entry(&checkout, &json!({"mode":"base"})).await?;
+        let all = GitService::diff_entry(&checkout, &json!({"mode":"all"})).await?;
+        let uncommitted = GitService::diff_entry(&checkout, &json!({"mode":"uncommitted"})).await?;
+        let base_change = base.changes.subscribe();
+        let mut all_change = all.changes.subscribe();
+        let mut uncommitted_change = uncommitted.changes.subscribe();
+        let forge_generation = checkout.forge_generation.load(Ordering::Acquire);
+        let paths = |path| CheckoutChange {
+            paths: ChangedPaths::Paths([PathBuf::from(path)].into()),
+            ..CheckoutChange::default()
+        };
+
+        tokio::fs::write(folder.join("ignored"), "ignored\n").await?;
+        assert!(
+            app.git
+                .refresh_observed(&folder, paths("ignored"), cancel.clone())
+                .await?
+                .is_none()
+        );
+        assert!(!base_change.has_changed()?);
+        assert!(!all_change.has_changed()?);
+        assert!(!uncommitted_change.has_changed()?);
+
+        tokio::fs::write(folder.join("tracked"), "dirty\n").await?;
+        let changed = app
+            .git
+            .refresh_observed(&folder, paths("tracked"), cancel.clone())
+            .await?
+            .expect("dirty state should publish");
+        assert_eq!(changed["git"]["isDirty"], true);
+        assert!(!base_change.has_changed()?);
+        assert!(all_change.has_changed()?);
+        assert!(uncommitted_change.has_changed()?);
+        all_change.borrow_and_update();
+        uncommitted_change.borrow_and_update();
+        assert_eq!(
+            checkout.forge_generation.load(Ordering::Acquire),
+            forge_generation
+        );
+
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]).await?;
+        app.git
+            .refresh_observed(
+                &folder,
+                CheckoutChange {
+                    refs: true,
+                    ..CheckoutChange::default()
+                },
+                cancel.clone(),
+            )
+            .await?;
+        assert!(base_change.has_changed()?);
+        assert!(all_change.has_changed()?);
+        assert!(!uncommitted_change.has_changed()?);
+        assert_eq!(
+            checkout.forge_generation.load(Ordering::Acquire),
+            forge_generation + 1
+        );
+        assert_eq!(
+            app.git.cached_snapshot(&folder).await.unwrap()["git"]["diffStat"],
+            Value::Null
+        );
+        assert_eq!(
+            app.git.directory_snapshot(&folder).await["git"]["diffStat"],
+            json!({"additions":1,"deletions":1}),
+        );
+
+        app.git.retain_legacy_shortstat(&folder).await;
+        tokio::fs::write(folder.join("tracked"), "dirty\nanother line\n").await?;
+        let changed = app
+            .git
+            .refresh_observed(&folder, paths("tracked"), cancel)
+            .await?
+            .expect("legacy observers also publish line-total-only changes");
+        assert_eq!(
+            changed["git"]["diffStat"],
+            json!({"additions":2,"deletions":1})
+        );
+        app.git.release_legacy_shortstat(&folder).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkout_observe_primes_owner_from_prewarmed_cache() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let checkout = root.path().join("checkout");
+        tokio::fs::create_dir(&checkout).await?;
+        let app = crate::state::AppState::new(
+            root.path().join("home"),
+            checkout.clone(),
+            std::env::current_exe()?,
+        );
+        app.config.initialize().await?;
+        let cancel = CancellationToken::new();
+        command::text(
+            &checkout,
+            &["init", "-b", "main"],
+            &app.git.environment()?,
+            cancel.clone(),
+        )
+        .await?;
+        let cached = app.git.snapshot(&checkout, false, cancel.clone()).await?;
+        assert_eq!(cached["git"]["currentBranch"], "main");
+
+        let (source, mut frames) = RequestContext::attach(SourceConfig {
+            id: "git-observer".into(),
+            session_id: "git-session".into(),
+            client_id: "git-client".into(),
+            capabilities: json!({"owned_subscriptions":true,"checkout_observation":true}),
+            principal: json!({"kind":"owner"}),
+            permissions: Arc::new(RwLock::new(HashSet::from(["workspace.read".to_owned()]))),
+            routed: false,
+            app_version: None,
+            cancel: cancel.clone(),
+        });
+        // Resolve the alias for Git reads, but echo exactly what the GUI keyed
+        // this subscription on in both the response and initial update.
+        let message = json!({"type":"checkout.observe.request","requestId":"observe","cwd":"~"});
+        let request = source.for_request(message.clone());
+        assert!(app.git.handle_message(&request, &message).await?);
+
+        let (response, update) = tokio::time::timeout(Duration::from_secs(5), async {
+            let response = frames.recv().await.unwrap();
+            let update = frames.recv().await.unwrap();
+            (response, update)
+        })
+        .await?;
+        let parse = |frame: &OutboundFrame| -> Result<Value> {
+            let OutboundFrame::Text(text) = frame else {
+                bail!("Expected text frame");
+            };
+            Ok(serde_json::from_str::<Value>(text)?["message"].clone())
+        };
+        let response = parse(&response.frame)?;
+        let update = parse(&update.frame)?;
+        assert_eq!(response["type"], "checkout.observe.response");
+        assert_eq!(response["payload"]["requestId"], "observe");
+        assert!(response["payload"]["subscriptionId"].is_string());
+        assert_eq!(update["type"], "checkout_status_update");
+        assert_eq!(
+            update["payload"]["subscriptionId"],
+            response["payload"]["subscriptionId"]
+        );
+        assert_eq!(update["payload"]["cwd"], "~");
+        assert_eq!(
+            update["payload"]["currentBranch"],
+            cached["git"]["currentBranch"]
+        );
+        assert_eq!(update["payload"]["prStatus"]["cwd"], "~");
+        assert!(frames.try_recv().is_err());
+        cancel.cancel();
+        app.git.shutdown().await?;
         Ok(())
     }
 }
