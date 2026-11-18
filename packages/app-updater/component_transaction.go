@@ -15,6 +15,22 @@ import (
 	"time"
 )
 
+// This file is part of the candidate's verified App object and is hashed in
+// component-build-app.json. The old GUI cannot opt into app-only health.
+const independentDaemonMarker = "app-lifecycle-v1"
+const independentDaemonMarkerContents = "independent-daemon\n"
+
+func (o *componentOperation) hasIndependentDaemonMarker() bool {
+	r := o.request
+	app := r.TargetComponents["app"]
+	if r.RestartGroup != "gui" || reflect.DeepEqual(app, r.Current["app"]) {
+		return false
+	}
+	path := filepath.Join(componentRoot(r, app), independentDaemonMarker)
+	marker, err := componentFileHash(path)
+	return err == nil && marker == "e1c70375f01b0f78b8e37512ad45ec4e4c83c223ec4cbfb80d619d005e74fcf8"
+}
+
 func runComponentRequest(path string) error {
 	var r componentRequest
 	raw, err := readJSON(path, &r)
@@ -184,6 +200,7 @@ func (o *componentOperation) prepare() error {
 	if err := queryComponentHelper(r, r.TargetComponents["update-helper"]); err != nil {
 		return fmt.Errorf("selected helper identity query: %w", err)
 	}
+	o.journal.AppOnlyCandidate = o.hasIndependentDaemonMarker()
 	return o.persist()
 }
 func (o *componentOperation) authorized(name string) bool {
@@ -271,7 +288,11 @@ func (o *componentOperation) activateAndCheck() error {
 	}
 	o.journal.Step = "trial"
 	if o.request.RestartGroup == "gui" {
-		if err := o.phase("starting", "Starting selected GUI with the original daemon home.", true); err != nil {
+		message := "Starting selected GUI with the original daemon home."
+		if o.journal.AppOnlyCandidate {
+			message = "Starting selected GUI without a daemon handoff."
+		}
+		if err := o.phase("starting", message, true); err != nil {
 			return err
 		}
 		if err := o.launch(o.request.TargetComponents); err != nil {
@@ -393,6 +414,9 @@ func (o *componentOperation) checkHealth(name string, set componentSet) error {
 	if err := privatePath(p, false); err != nil {
 		return err
 	}
+	if name == "health.json" && o.journal.AppOnlyCandidate {
+		return o.checkAppOnlyHealth(p, set)
+	}
 	var h componentHealth
 	if _, err := readJSON(p, &h); err != nil {
 		return err
@@ -435,6 +459,34 @@ func (o *componentOperation) checkHealth(name string, set componentSet) error {
 	if !daemonFound {
 		return errors.New("health daemon is not in owned runtime set")
 	}
+	return o.recordHealth(set, h)
+}
+
+func (o *componentOperation) checkAppOnlyHealth(path string, set componentSet) error {
+	var h struct {
+		SchemaVersion int                          `json:"schemaVersion"`
+		OperationID   string                       `json:"operationId"`
+		Nonce         string                       `json:"nonce"`
+		Components    map[string]componentIdentity `json:"components"`
+		GUIProcess    processIdentity              `json:"guiProcess"`
+	}
+	if _, err := readJSON(path, &h); err != nil {
+		return err
+	}
+	expected := componentIdentities(set)
+	delete(expected, "daemon")
+	if h.SchemaVersion != 2 || h.OperationID != o.request.OperationID || h.Nonce != o.journal.Status.Nonce || h.GUIProcess != o.journal.Launched || !reflect.DeepEqual(h.Components, expected) {
+		return errors.New("app-only health identity mismatch")
+	}
+	if err := boundLive(runtimeBinding{h.GUIProcess, componentImage(o.request, set["app"])}); err != nil {
+		return err
+	}
+	// The legacy status format contains the entire immutable selection; that
+	// daemon entry is the verified bundled image, not a live process identity.
+	return o.recordHealth(set, componentHealth{SchemaVersion: 2, OperationID: h.OperationID, Nonce: h.Nonce, Components: componentIdentities(set), GUIProcess: h.GUIProcess})
+}
+
+func (o *componentOperation) recordHealth(set componentSet, h componentHealth) error {
 	for _, c := range set {
 		if err := verifyObject(o.request, c); err != nil {
 			return err
@@ -466,6 +518,9 @@ func (o *componentOperation) stopTrial() bool {
 		}
 		if _, err := readJSON(p, &ack); err != nil || ack.SchemaVersion != 2 || ack.OperationID != o.request.OperationID || ack.Nonce != o.journal.Status.Nonce || len(ack.RuntimeProcesses) > 16 {
 			return false
+		}
+		if o.journal.AppOnlyCandidate {
+			return len(ack.RuntimeProcesses) == 0 && o.journal.Launched.PID != 0 && exited(o.journal.Launched)
 		}
 		seen := make(map[processIdentity]bool)
 		for _, binding := range ack.RuntimeProcesses {

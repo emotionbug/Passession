@@ -85,6 +85,28 @@ func init() {
 				set = r.Current
 				name = "rollback-health.json"
 			}
+			actual := make(map[string]componentIdentity)
+			for id, c := range set {
+				var v componentIdentity
+				if _, err = readJSON(filepath.Join(componentRoot(r, c), "identity.json"), &v); err != nil {
+					os.Exit(87)
+				}
+				actual[id] = v
+			}
+			if _, err = os.Stat(filepath.Join(componentRoot(r, set["app"]), independentDaemonMarker)); err == nil && status.Phase == "checking" {
+				delete(actual, "daemon")
+				if os.Getenv("PASEO_COMPONENT_HEALTH") == "wrong" {
+					delete(actual, "app")
+				}
+				if err = atomicJSON(filepath.Join(directory, name), map[string]any{
+					"schemaVersion": 2, "operationId": r.OperationID, "nonce": status.Nonce,
+					"components": actual, "guiProcess": me.identity,
+				}); err != nil {
+					os.Exit(88)
+				}
+				lastPhase = status.Phase
+				continue
+			}
 			image := componentImage(r, set["daemon"])
 			daemon = exec.Command(image)
 			daemon.Env = append(os.Environ(), "PASEO_UPDATER_FIXTURE_ROLE=component-daemon")
@@ -96,14 +118,6 @@ func init() {
 				os.Exit(86)
 			}
 			binding = runtimeBinding{dp.identity, image}
-			actual := make(map[string]componentIdentity)
-			for id, c := range set {
-				var v componentIdentity
-				if _, e = readJSON(filepath.Join(componentRoot(r, c), "identity.json"), &v); e != nil {
-					os.Exit(87)
-				}
-				actual[id] = v
-			}
 			server := r.ServerID
 			if (os.Getenv("PASEO_COMPONENT_HEALTH") == "wrong" || os.Getenv("PASEO_COMPONENT_HEALTH") == "refuse") && status.Phase == "checking" {
 				server = "wrong-server"
@@ -255,6 +269,9 @@ func componentFixture(t *testing.T, changed ...string) *componentOperation {
 			c.Identity = componentFixtureIdentity(id, "2.0.0")
 			if err = atomicJSON(filepath.Join(candidate, "identity.json"), c.Identity); err != nil {
 				t.Fatal(err)
+			}
+			if id == "app" && os.Getenv("PASEO_COMPONENT_MARK_APP") == "1" {
+				mustWrite(t, filepath.Join(candidate, independentDaemonMarker), []byte(independentDaemonMarkerContents), 0600)
 			}
 			writeComponentFixtureDescriptor(t, candidate, c)
 			archive := filepath.Join(opdir, id+".zip")
@@ -431,6 +448,28 @@ func TestComponentGUIRestartLaunchesSelectedImageAndCommits(t *testing.T) {
 		t.Fatal("GUI health did not bind independent selected process/components")
 	}
 }
+
+func TestComponentLegacyHandoffCanActivateIndependentDaemonApp(t *testing.T) {
+	for _, health := range []string{"ready", "wrong"} {
+		t.Run(health, func(t *testing.T) {
+			t.Setenv("PASEO_COMPONENT_MARK_APP", "1")
+			t.Setenv("PASEO_COMPONENT_HEALTH", health)
+			o := componentFixture(t, "app", "daemon")
+			prepareComponentFixture(t, o)
+			handoffComponentFixture(t, o)
+			err := o.activateAndCheck()
+			if health == "ready" {
+				if err != nil || o.journal.Status.Phase != "committed" || o.journal.Health == nil ||
+					o.journal.Health.GUIProcess != o.journal.Launched || o.journal.Health.DaemonProcess.PID != 0 ||
+					len(o.journal.Health.RuntimeProcesses) != 0 {
+					t.Fatalf("marked app did not commit without an owned daemon: phase=%s health=%+v error=%v", o.journal.Status.Phase, o.journal.Health, err)
+				}
+			} else if o.journal.Status.Phase != "rolledBack" || o.journal.Health == nil || o.journal.Health.DaemonProcess.PID == 0 {
+				t.Fatalf("invalid app-only health did not restore legacy GUI and runtime: phase=%s health=%+v error=%v", o.journal.Status.Phase, o.journal.Health, err)
+			}
+		})
+	}
+}
 func TestComponentFailedHealthRestoresCoherentSelection(t *testing.T) {
 	for _, id := range []string{"app", "daemon"} {
 		t.Run(id, func(t *testing.T) {
@@ -582,6 +621,11 @@ func writeComponentFixtureDescriptor(t *testing.T, root string, c componentRef) 
 		t.Fatal(err)
 	}
 	d := componentBuildDescriptor{SchemaVersion: 1, ID: c.ID, Target: c.Target, Identity: c.Identity, Executable: c.Executable, ExecutableSHA256: c.ExecutableSHA256, Requires: c.Requires, Licenses: []string{}, Dependencies: map[string]string{"identity.json": hash}}
+	if os.Getenv("PASEO_COMPONENT_MARK_APP") == "1" && c.ID == "app" {
+		if hash, err := componentFileHash(filepath.Join(root, independentDaemonMarker)); err == nil {
+			d.Dependencies[independentDaemonMarker] = hash
+		}
+	}
 	if err = atomicJSON(filepath.Join(root, "component-build-"+c.ID+".json"), d); err != nil {
 		t.Fatal(err)
 	}

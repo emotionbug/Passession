@@ -163,14 +163,15 @@ type componentLeaseOwner struct {
 	Generation         uint64          `json:"generation"`
 }
 type componentJournal struct {
-	SchemaVersion int                `json:"schemaVersion"`
-	RequestDigest string             `json:"requestDigest"`
-	Status        componentStatus    `json:"status"`
-	Step          string             `json:"step"`
-	Original      componentSelection `json:"original"`
-	Launched      processIdentity    `json:"launched"`
-	LaunchPending bool               `json:"launchPending"`
-	Health        *componentHealth   `json:"health,omitempty"`
+	SchemaVersion    int                `json:"schemaVersion"`
+	RequestDigest    string             `json:"requestDigest"`
+	Status           componentStatus    `json:"status"`
+	Step             string             `json:"step"`
+	Original         componentSelection `json:"original"`
+	Launched         processIdentity    `json:"launched"`
+	LaunchPending    bool               `json:"launchPending"`
+	Health           *componentHealth   `json:"health,omitempty"`
+	AppOnlyCandidate bool               `json:"appOnlyCandidate,omitempty"`
 }
 type componentOperation struct {
 	request                                             componentRequest
