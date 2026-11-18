@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.39 - 2026-11-18
+
+### Changed
+
+- Prepare in-app updates for the next version. In the next version Passession stops running the daemon itself, and an update is installed by the update helper that is already on your computer. This version's helper can install an app that does not hand a daemon back to it; older helpers would roll that update back. Update to this version before the next one, or install the next one with its installer.
+
 ## 0.13.38 - 2026-11-18
 
 ### Changed

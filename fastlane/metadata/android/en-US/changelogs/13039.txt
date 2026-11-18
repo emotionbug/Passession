@@ -1,0 +1,4 @@
+Changed
+- Desktop update helper prepared for the next version. No changes on Android.
+
+Full notes: https://github.com/emotionbug/Passession/releases
