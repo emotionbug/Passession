@@ -50,8 +50,8 @@ use windows_sys::Win32::{
         TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE, WinLocalSystemSid,
         WinTrust::{
             WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_CATALOG_INFO, WINTRUST_DATA,
-            WINTRUST_FILE_INFO, WTD_CHOICE_CATALOG, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
-            WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+            WINTRUST_FILE_INFO, WTD_CHOICE_CATALOG, WTD_CHOICE_FILE,
+            WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
             WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
             WTHelperProvDataFromStateData, WinVerifyTrust,
         },
@@ -90,8 +90,7 @@ pub fn verify_update_signature(
     candidate: &Path,
     policy: UnsignedPolicy,
 ) -> Result<()> {
-    let installed =
-        authenticode(installed).context("Installed Authenticode signature is invalid")?;
+    let installed = authenticode(installed).context("Installed Authenticode signature is invalid")?;
     let candidate = authenticode(candidate).context("Invalid update Authenticode signature")?;
     update_continuity(&installed, &candidate, policy)
 }
@@ -151,14 +150,9 @@ fn verify_private_descriptor(
     // SAFETY: Windows returned a self-relative descriptor.
     let length = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
     let start = descriptor.0 as usize;
-    let end = start
-        .checked_add(length)
-        .context("Malformed security descriptor")?;
+    let end = start.checked_add(length).context("Malformed security descriptor")?;
     let within = |pointer: usize| pointer >= start && pointer < end;
-    ensure!(
-        !owner.is_null() && within(owner as usize),
-        "Directory owner is unavailable"
-    );
+    ensure!(!owner.is_null() && within(owner as usize), "Directory owner is unavailable");
     // SAFETY: `owner` lies inside the descriptor; `sid_length` bounds the read.
     unsafe { sid_length(owner as *const u8, end - owner as usize) }?;
     ensure!(
@@ -296,9 +290,7 @@ pub(crate) fn verify_private_named_pipe(
 #[derive(Debug, Eq, PartialEq)]
 enum Authenticode {
     /// DER of the leaf signer certificate's Subject name.
-    Signed {
-        subject: Vec<u8>,
-    },
+    Signed { subject: Vec<u8> },
     Unsigned,
 }
 
@@ -439,14 +431,8 @@ fn certificate_table_entry(mut image: impl Read + Seek) -> Result<Option<Certifi
     };
     ensure!(optional_size >= directories, MALFORMED);
     let optional = pe + 24;
-    ensure!(
-        optional + optional_size <= image.seek(SeekFrom::End(0))?,
-        MALFORMED
-    );
-    let count = u64::from(u32::from_le_bytes(read::<4>(
-        &mut image,
-        optional + count_offset,
-    )?));
+    ensure!(optional + optional_size <= image.seek(SeekFrom::End(0))?, MALFORMED);
+    let count = u64::from(u32::from_le_bytes(read::<4>(&mut image, optional + count_offset)?));
     if count <= SECURITY_DIRECTORY {
         return Ok(None);
     }
@@ -473,10 +459,7 @@ enum CatalogSignature {
 /// before legacy SHA1 ones and taking the first catalog Windows returns.
 /// Lookup and API failures are errors rather than [`CatalogSignature::Failed`].
 fn catalog_signature(mut file: &File, path_wide: &[u16], path: &Path) -> Result<CatalogSignature> {
-    for algorithm in [
-        windows_sys::core::w!("SHA256"),
-        windows_sys::core::w!("SHA1"),
-    ] {
+    for algorithm in [windows_sys::core::w!("SHA256"), windows_sys::core::w!("SHA1")] {
         let mut admin = 0isize;
         // SAFETY: out-pointer only; null selects the default catalog subsystem.
         ensure!(
@@ -626,11 +609,7 @@ impl TrustState {
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         // SAFETY: fully initialised data; the caller keeps subject pointers alive.
         state_ref.status = unsafe {
-            WinVerifyTrust(
-                null_mut(),
-                &mut action,
-                (&mut state_ref.data as *mut WINTRUST_DATA).cast(),
-            )
+            WinVerifyTrust(null_mut(), &mut action, (&mut state_ref.data as *mut WINTRUST_DATA).cast())
         };
         // SAFETY: read immediately after WinVerifyTrust, as its contract requires.
         state_ref.last_error = unsafe { GetLastError() };
@@ -643,11 +622,7 @@ impl Drop for TrustState {
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         // SAFETY: closes the state opened by the VERIFY call on this same data.
         unsafe {
-            WinVerifyTrust(
-                null_mut(),
-                &mut action,
-                (&mut self.data as *mut WINTRUST_DATA).cast(),
-            );
+            WinVerifyTrust(null_mut(), &mut action, (&mut self.data as *mut WINTRUST_DATA).cast());
         }
     }
 }
@@ -664,10 +639,7 @@ fn signer_subject(trust: &TrustState) -> Result<Vec<u8>> {
         let certificate = WTHelperGetProvCertFromChain(signer, 0);
         ensure!(!certificate.is_null(), "No Authenticode signer certificate");
         let context = (*certificate).pCert;
-        ensure!(
-            !context.is_null(),
-            "No Authenticode signer certificate context"
-        );
+        ensure!(!context.is_null(), "No Authenticode signer certificate context");
         let info = (*context).pCertInfo;
         ensure!(!info.is_null(), "No Authenticode signer certificate info");
         let subject = (*info).Subject;
@@ -735,9 +707,7 @@ fn trust_failure(status: i32) -> &'static str {
         CERT_E_UNTRUSTEDROOT | CERT_E_UNTRUSTEDTESTROOT | CERT_E_CHAINING => {
             "signer certificate is not trusted"
         }
-        TRUST_E_EXPLICIT_DISTRUST | TRUST_E_SUBJECT_NOT_TRUSTED => {
-            "signer is explicitly distrusted"
-        }
+        TRUST_E_EXPLICIT_DISTRUST | TRUST_E_SUBJECT_NOT_TRUSTED => "signer is explicitly distrusted",
         CERT_E_REVOKED | CRYPT_E_REVOKED => "signer certificate is revoked",
         CERT_E_EXPIRED | TRUST_E_TIME_STAMP => "signer certificate expired or timestamp is invalid",
         CRYPT_E_SECURITY_SETTINGS => "signature rejected by local security policy",
@@ -794,8 +764,7 @@ unsafe fn sid_length(sid: *const u8, available: usize) -> Result<usize> {
     ensure!(length <= available, "Truncated SID");
     // SAFETY: the whole SID lies within the checked bytes.
     ensure!(
-        unsafe { IsValidSid(sid as PSID) } != 0
-            && unsafe { GetLengthSid(sid as PSID) } as usize == length,
+        unsafe { IsValidSid(sid as PSID) } != 0 && unsafe { GetLengthSid(sid as PSID) } as usize == length,
         "Malformed SID"
     );
     Ok(length)
@@ -808,19 +777,13 @@ unsafe fn check_dacl(dacl: *const ACL, available: usize, allowed: &[Sid]) -> Res
     // SAFETY: the ACL header lies within the checked bytes.
     let header = unsafe { ptr::read_unaligned(dacl) };
     let size = header.AclSize as usize;
-    ensure!(
-        size >= size_of::<ACL>() && size <= available,
-        "Malformed DACL"
-    );
+    ensure!(size >= size_of::<ACL>() && size <= available, "Malformed DACL");
     let start = dacl as usize;
     let end = start + size;
     for index in 0..u32::from(header.AceCount) {
         let mut ace: *mut c_void = null_mut();
         // SAFETY: `dacl` is a bounded ACL and `index` is below its ACE count.
-        ensure!(
-            unsafe { GetAce(dacl, index, &mut ace) } != 0,
-            "Malformed DACL entry"
-        );
+        ensure!(unsafe { GetAce(dacl, index, &mut ace) } != 0, "Malformed DACL entry");
         let ace_start = ace as usize;
         ensure!(
             ace_start >= start + size_of::<ACL>() && ace_start + size_of::<ACE_HEADER>() <= end,
@@ -868,13 +831,7 @@ fn current_user_sid() -> Result<Sid> {
     let mut length = 0u32;
     // SAFETY: size query with a null buffer.
     let queried = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle() as HANDLE,
-            TokenUser,
-            null_mut(),
-            0,
-            &mut length,
-        )
+        GetTokenInformation(token.as_raw_handle() as HANDLE, TokenUser, null_mut(), 0, &mut length)
     };
     ensure!(
         // SAFETY: read immediately after the size query.
@@ -920,8 +877,7 @@ fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Sid> {
     let mut length = SECURITY_MAX_SID_SIZE;
     // SAFETY: `storage` holds SECURITY_MAX_SID_SIZE writable bytes.
     ensure!(
-        unsafe { CreateWellKnownSid(kind, null_mut(), storage.as_mut_ptr().cast(), &mut length) }
-            != 0,
+        unsafe { CreateWellKnownSid(kind, null_mut(), storage.as_mut_ptr().cast(), &mut length) } != 0,
         "CreateWellKnownSid failed: {}",
         std::io::Error::last_os_error()
     );
@@ -1003,10 +959,7 @@ mod tests {
         let mut storage = vec![0u32; bytes.div_ceil(4)];
         let acl = storage.as_mut_ptr().cast::<ACL>();
         unsafe {
-            assert_ne!(
-                InitializeAcl(acl, (storage.len() * 4) as u32, ACL_REVISION),
-                0
-            );
+            assert_ne!(InitializeAcl(acl, (storage.len() * 4) as u32, ACL_REVISION), 0);
             for (allow, sid) in entries {
                 let added = if *allow {
                     AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, sid.as_psid())
@@ -1030,10 +983,7 @@ mod tests {
         let system = well_known_sid(WinLocalSystemSid).unwrap();
         let everyone = well_known_sid(WinWorldSid).unwrap();
         let only_user = [current_user_sid().unwrap()];
-        let user_and_system = [
-            current_user_sid().unwrap(),
-            well_known_sid(WinLocalSystemSid).unwrap(),
-        ];
+        let user_and_system = [current_user_sid().unwrap(), well_known_sid(WinLocalSystemSid).unwrap()];
 
         assert!(check(&[(true, &user)], &only_user).is_ok());
         assert!(check(&[(true, &user), (false, &everyone)], &only_user).is_ok());
@@ -1067,9 +1017,7 @@ mod tests {
             )
         };
         assert_eq!(status, ERROR_SUCCESS);
-        assert!(
-            verify_private_directory(&path, AllowedDirectoryUsers::CurrentUserAndSystem).is_err()
-        );
+        assert!(verify_private_directory(&path, AllowedDirectoryUsers::CurrentUserAndSystem).is_err());
     }
 
     #[test]
@@ -1077,10 +1025,7 @@ mod tests {
         // Inbox binaries are catalog-signed (or embedded-signed on some builds).
         let root = std::env::var_os("SystemRoot").unwrap();
         let notepad = Path::new(&root).join("System32").join("notepad.exe");
-        assert!(matches!(
-            authenticode(&notepad).unwrap(),
-            Authenticode::Signed { .. }
-        ));
+        assert!(matches!(authenticode(&notepad).unwrap(), Authenticode::Signed { .. }));
         verify_update_signature(&notepad, &notepad, UnsignedPolicy::PreserveUnsigned).unwrap();
     }
 
@@ -1105,8 +1050,7 @@ mod tests {
         image[pe + 20..pe + 22].copy_from_slice(&optional_size.to_le_bytes());
         let optional = pe + 24;
         image[optional..optional + 2].copy_from_slice(&magic.to_le_bytes());
-        image[optional + count_offset..optional + count_offset + 4]
-            .copy_from_slice(&count.to_le_bytes());
+        image[optional + count_offset..optional + count_offset + 4].copy_from_slice(&count.to_le_bytes());
         let entry = optional + directories + 4 * 8;
         if entry + 8 <= image.len() {
             image[entry..entry + 4].copy_from_slice(&security.0.to_le_bytes());
@@ -1123,14 +1067,8 @@ mod tests {
     #[test]
     fn certificate_table_entry_reads_pe32_and_pe32_plus_headers() {
         for magic in [0x10b, 0x20b] {
-            assert_eq!(
-                entry(pe_image(magic, 16, 240, (0, 0))).unwrap(),
-                Some((0, 0))
-            );
-            assert_eq!(
-                entry(pe_image(magic, 16, 240, (0x400, 0x20))).unwrap(),
-                Some((0x400, 0x20))
-            );
+            assert_eq!(entry(pe_image(magic, 16, 240, (0, 0))).unwrap(), Some((0, 0)));
+            assert_eq!(entry(pe_image(magic, 16, 240, (0x400, 0x20))).unwrap(), Some((0x400, 0x20)));
             assert_eq!(entry(pe_image(magic, 4, 240, (0x400, 0x20))).unwrap(), None);
         }
     }
@@ -1154,12 +1092,7 @@ mod tests {
 
     /// Copies the unsigned test binary and points its certificate table at
     /// `address`/`size`, appending `table` at 8-byte alignment first.
-    fn declared_table_fixture(
-        dir: &Path,
-        name: &str,
-        table: &[u8],
-        past_end: bool,
-    ) -> std::path::PathBuf {
+    fn declared_table_fixture(dir: &Path, name: &str, table: &[u8], past_end: bool) -> std::path::PathBuf {
         let mut image = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let offset = certificate_table_entry(std::io::Cursor::new(&image))
             .unwrap()
@@ -1188,8 +1121,7 @@ mod tests {
             assert!(authenticode(&fixture).is_err(), "{name}");
             assert!(verify_local_signature(&fixture).is_err(), "{name}");
             assert!(
-                verify_update_signature(&fixture, &fixture, UnsignedPolicy::AllowSignedUpgrade)
-                    .is_err(),
+                verify_update_signature(&fixture, &fixture, UnsignedPolicy::AllowSignedUpgrade).is_err(),
                 "{name}"
             );
         }
