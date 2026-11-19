@@ -388,6 +388,18 @@ jobs:
             printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/paseo-release.keystore"
             echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/paseo-release.keystore" >> "$GITHUB_ENV"
           fi
+      - name: Stage optional Firebase configuration for Android push
+        if: matrix.platform == 'android'
+        shell: bash
+        env:
+          GOOGLE_SERVICES: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [[ -n "$GOOGLE_SERVICES" ]]; then
+            printf '%s' "$GOOGLE_SERVICES" | base64 --decode > "$RUNNER_TEMP/google-services.json"
+            echo "GOOGLE_SERVICES_FILE_SESSIONS=$RUNNER_TEMP/google-services.json" >> "$GITHUB_ENV"
+          else
+            echo "::notice::ANDROID_GOOGLE_SERVICES_JSON_BASE64 is not set; this Android build cannot receive push notifications."
+          fi
       - name: Compile planned components for native finalization
         if: matrix.finalizer
         shell: bash
