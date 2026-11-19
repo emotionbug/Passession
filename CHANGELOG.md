@@ -2,11 +2,33 @@
 
 ## Unreleased
 
+### Added
+
+- Screen readers: Android TalkBack and iOS VoiceOver can read and activate labeled controls, move through session lists, and focus the message field. The app builds this information only while a screen reader is on. It has not yet been tried on a phone with TalkBack or VoiceOver.
+
 ### Changed
 
 - Search in terminals and execution logs keeps what it has already read. Typing more of the search term or switching to another term no longer reads the whole scrollback again, and new output is searched only where it arrived. With 100,000 lines (optimized test build on Linux), a different term took 1.54 s before and 5 ms now, and refreshing after 100 new lines took 1.53 s before and 4 ms now. The first search after opening still reads the scrollback once: about 80 ms for the default 10,000 lines.
 - Text cursors, scrollbars and lists follow each platform. On Android, iPhone and iPad the scrollbar fades out 300 ms after scrolling stops. On iPhone, iPad and Mac, pulling a list past its top stretches with resistance and springs back; Android and Windows/Linux lists stop at the edge. The cursor blinks every 500 ms, fades on Apple platforms, and stops all blink work while its field is unfocused or hidden.
 - When the app falls far behind a very busy session, it no longer queues chat updates without limit. Past 256 queued updates or about 8 MB, it drops the queued chat rows for that host and reloads them from the daemon over the same connection. Replies, prompts, notifications and terminal output are never dropped.
+- On phones, the app stops trying to reconnect to unreachable hosts and stops probing other connection paths while it is in the background. It retries right away when you reopen it or the network changes. Connected hosts stay connected.
+- Phones retry push registration after temporary failures and no longer lose a permission or token change that arrives during registration. Settings -> Notifications now says when the installed build cannot receive push notifications (Android builds without Firebase configuration, which includes 0.13.44 and earlier); notifications still appear while the app is open.
+- Editing a Markdown file no longer re-parses it on every keystroke while the preview is closed, and scrolling the preview only processes the visible part.
+- Large diffs keep their file order and block positions between frames, so scrolling a change with hundreds of files no longer recomputes the whole layout each frame.
+- Large images pasted into the composer are no longer hashed and copied each time they are drawn.
+- On hosts with many agents, a status update no longer searches and copies the whole agent list.
+- The daemon limits uploads: 50 MiB per file, 8 uploads and 100 MiB at a time per connection, and 32 uploads and 512 MiB in total. An upload over a limit is refused with a clear error, and other requests on the same connection keep working. Upload data is written to disk outside the connection's message loop, so a slow disk no longer delays terminal input or other replies.
+- The daemon deletes uploaded files it no longer needs. Files used by a live or restorable agent are kept; unclaimed uploads are removed after 30 days. Uploads from before this version are kept while any agent remains.
+- The daemon limits each message from Claude, Codex, Muse, Antigravity and Pi/OMP. An oversized or unterminated message ends that agent's connection with a clear error instead of growing memory without limit. Muse pauses reading notifications when 256 or 128 MiB are waiting, while still receiving replies. OpenCode requests have time limits and a 128 MiB response limit instead of waiting forever.
+- On Linux and macOS, saving a file in the editor also flushes its folder to disk, and a failed flush is reported instead of claiming the save succeeded.
+- iOS no longer wakes the app every 8 ms while idle; it wakes only when there is work.
+- iOS keyboards compose Korean and Japanese text in place, and autocorrect, deleting a selection and editing in the middle of text change the right characters.
+
+### Fixed
+
+- Dropping a file into a terminal keeps every character of its path. Characters such as `$`, `#`, `;` and `*` were removed, and paths containing an apostrophe were quoted incorrectly.
+- A connection link can be opened again after you close its pairing dialog. Previously the same link was ignored until the app restarted.
+- Diff loading and empty states, pull request ages and check durations are shown in Korean.
 
 ## 0.13.44 - 2026-11-19
 
