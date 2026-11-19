@@ -27,6 +27,7 @@ pub struct NotificationsState {
     pub settings: Value,
     /// `granted` / `denied` / `blocked` / `notDetermined`; `None` until known.
     pub permission: Option<String>,
+    push_available: Option<bool>,
     /// A shown page reads the permission: returning to the app reads it again.
     pub watched: bool,
     /// The non-prompting status query is in flight.
@@ -238,6 +239,11 @@ pub fn ensure_notifications(s: &mut Settings, env: &mut Env) {
         load_notifications(s, env);
     }
     check_notification_permission(s, env);
+    if let Some(token) = env.bridge.push_availability() {
+        s.bridge_job(token, |s, _, result| {
+            s.notifications.push_available = result.ok().and_then(|value| value.as_bool());
+        });
+    }
 }
 
 /// Reads the notification permission without prompting. Pages that show it call this once;
@@ -379,6 +385,12 @@ pub fn draw_notifications(ui: &mut Ui, s: &Settings) {
             .hint(status_hint)
             .control(control),
     );
+    if state.push_available == Some(false) {
+        ui.row(
+            row(t("settings.notifications.pushTitle"))
+                .hint(t("settings.notifications.pushUnavailable")),
+        );
+    }
     if DESKTOP {
         let play_sound = get(&state.settings, "notifications")
             .get("playSound")

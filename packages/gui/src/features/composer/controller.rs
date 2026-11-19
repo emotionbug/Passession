@@ -16,6 +16,7 @@ use crate::common::{UiContext, UiEffect};
 use paseo_gui_core::{CoreError, CoreEvent};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -287,8 +288,8 @@ impl Controller {
         service::with(|svc| svc.supports(&self.target.host_id, feature))
     }
 
-    pub fn draft(&self) -> Value {
-        service::with(|svc| svc.drafts.draft(&self.key).clone())
+    pub fn draft(&self) -> Rc<Value> {
+        service::with(|svc| svc.drafts.draft_snapshot(&self.key))
     }
 
     pub fn sending(&self) -> bool {

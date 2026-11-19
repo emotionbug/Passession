@@ -252,6 +252,17 @@ impl Modal {
         }
     }
 
+    fn accessibility_scope(&self) -> u64 {
+        match self {
+            Self::Menu(menu) => crate::common::accessibility::id((
+                menu.id,
+                menu.pages.len(),
+                menu.pages.last().and_then(|(label, _)| label.as_deref()),
+            )),
+            _ => self.id(),
+        }
+    }
+
     fn kind(&self, compact: bool) -> ModalKind {
         match self {
             Self::Menu(menu) if compact && menu.sheet => ModalKind::Sheet,
@@ -350,6 +361,7 @@ pub struct Overlays {
     pub stack: Vec<Modal>,
     layers: Vec<ModalLayer>,
     pub hits: HitMap<String>,
+    accessibility_owner: u64,
     pub pointer: Pointer,
     pub area: Area,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
@@ -377,6 +389,7 @@ impl Default for Overlays {
             stack: Vec::new(),
             layers: Vec::new(),
             hits: HitMap::default(),
+            accessibility_owner: 0,
             pointer: Pointer::default(),
             area: Area::Empty,
             touch_scroll: crate::common::widgets::touch_scroll(),
@@ -500,6 +513,13 @@ impl Overlays {
     fn top_layer(&self) -> Option<&ModalLayer> {
         let id = self.stack.last()?.id();
         self.layers.iter().rev().find(|layer| layer.id == id)
+    }
+
+    pub(super) fn accessibility_root(&self) -> Option<DrawListId> {
+        if self.top_waits_for_paint() {
+            return None;
+        }
+        self.top_layer()?.list.as_ref().map(|list| list.id())
     }
 
     fn top_waits_for_paint(&self) -> bool {
@@ -1025,6 +1045,7 @@ fn overlay_ui(shell: &mut PaseoShell) -> Ui<'_> {
         p: theme::current_palette(),
         t: theme::current_typography(),
         compact,
+        semantics: super::ui::HitScope::Overlay(overlays.accessibility_owner),
     }
 }
 
@@ -1221,6 +1242,9 @@ fn draw_modal(
             ok_focused: true,
         },
     );
+    if cx.accessibility_enabled() {
+        shell.data.overlays.accessibility_owner = modal.accessibility_scope();
+    }
     crate::shell::sheets::set_fields_active(autofocus);
     let bounds = match &mut modal {
         Modal::Menu(menu) => draw_menu(shell, cx, menu, window, compact, top),
@@ -1311,6 +1335,7 @@ fn draw_modal(
         }
     };
     crate::shell::sheets::set_fields_active(true);
+    shell.data.overlays.accessibility_owner = 0;
     shell.data.overlays.stack[index] = modal;
     bounds
 }
@@ -1418,7 +1443,7 @@ fn draw_menu(
             let back = rect(x, y + 4.0, 24.0, 24.0);
             ui.icon(cx, back, "chevron-left", 18.0, p.muted);
             if top {
-                ui.hit(back, "menu:back");
+                ui.hit_tip(cx, back, "menu:back", &tr("common.actions.back"));
             }
             x += 32.0;
         }
@@ -1433,6 +1458,18 @@ fn draw_menu(
             ),
             spec,
             &title,
+        );
+        ui.semantic_text(
+            cx,
+            rect(
+                x,
+                y + 4.0,
+                surface.size.x - (x - surface.pos.x) - 12.0,
+                header_h - if sheet { 16.0 } else { 20.0 },
+            ),
+            "menu:title",
+            &title,
+            AccessibilityRole::Header,
         );
         y += header_h - 8.0;
     }
@@ -1840,12 +1877,20 @@ fn draw_select(
                     selected,
                     top && select.active == Some(i),
                 );
-                if top && option.enabled {
-                    let clipped = clip_rect(r, viewport);
-                    if clipped.size.y > 0.0 {
-                        ui.hit(clipped, id);
-                    }
-                }
+                let clipped = clip_rect(r, viewport);
+                ui.control(
+                    cx,
+                    clipped,
+                    &id,
+                    &option.label,
+                    AccessibilityRole::ListItem,
+                    AccessibilityState {
+                        enabled: top && option.enabled,
+                        selected,
+                        checked: selected,
+                        focused: top && select.active == Some(i),
+                    },
+                );
                 ry += r.size.y + mb;
             }
         }
@@ -2042,6 +2087,18 @@ fn dialog_frame(
         ),
         spec,
         title,
+    );
+    ui.semantic_text(
+        cx,
+        rect(
+            title_x,
+            frame.pos.y + 16.0,
+            frame.pos.x + frame.size.x - 56.0 - title_x,
+            title_h,
+        ),
+        "dialog:title",
+        title,
+        AccessibilityRole::Header,
     );
     let close = rect(
         frame.pos.x + frame.size.x - 16.0 - 32.0,
@@ -2890,6 +2947,32 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     // While a modal is open the layer holds the sweep lock on `area`, so pointer events only
     // reach it through its own sweep area. Resolve the hit once (moves mark the event handled)
     // and share it.
+    if let Event::AccessibilityAction(action) = event {
+        use super::accessibility;
+        let owner = shell
+            .data
+            .overlays
+            .stack
+            .last()
+            .map_or(0, Modal::accessibility_scope);
+        if let Some((id, bounds, actions)) = accessibility_scroll(shell)
+            && action.id == id
+            && actions.contains(action.action)
+            && let Some(delta) = accessibility::page_delta(action.action, bounds)
+        {
+            scroll_top(shell, delta);
+            area.redraw(cx);
+        } else if action.action == AccessibilityAction::Activate
+            && let Some(id) = accessibility::hit(
+                &shell.data.overlays.hits,
+                super::ui::HitScope::Overlay(owner),
+                action.id,
+            )
+        {
+            click(shell, cx, scope, &id);
+        }
+        return shell.data.overlays.is_modal();
+    }
     let swept = event.hits_with_sweep_area(cx, area, area);
     if let Hit::FingerScroll(e) = &swept
         && scroll_viewport(shell).contains(e.abs)
@@ -3251,6 +3334,49 @@ fn scroll_viewport(shell: &PaseoShell) -> Rect {
     }
 }
 
+pub(super) fn accessibility_scroll(
+    shell: &PaseoShell,
+) -> Option<(u64, Rect, AccessibilityActions)> {
+    if shell.data.overlays.top_waits_for_paint() {
+        return None;
+    }
+    let modal = shell.data.overlays.stack.last()?;
+    let (offset, max) = match modal {
+        Modal::Menu(menu) => (menu.scroll, menu.max_scroll),
+        Modal::Select(select) => (select.scroll, select.max_scroll),
+        Modal::Sheet {
+            scroll,
+            content_height,
+            viewport,
+            sheet,
+            ..
+        } => (
+            *scroll,
+            sheet_scroll_max(
+                shell.data.compact,
+                sheet.style(),
+                *content_height,
+                *viewport,
+            ),
+        ),
+        _ => return None,
+    };
+    Some((
+        crate::common::accessibility::id(("modal-scroll", modal.accessibility_scope())),
+        scroll_viewport(shell),
+        super::accessibility::scroll_actions(offset, max),
+    ))
+}
+
+fn sheet_scroll_max(compact: bool, style: SheetStyle, height: f64, viewport: Rect) -> f64 {
+    let padding = if compact && matches!(style, SheetStyle::Draggable { .. }) {
+        36.0
+    } else {
+        48.0
+    };
+    height + padding - viewport.size.y
+}
+
 fn scroll_top(shell: &mut PaseoShell, delta: f64) {
     let overlays = &mut shell.data.overlays;
     let (scroll, max) = match overlays.stack.last_mut() {
@@ -3260,15 +3386,15 @@ fn scroll_top(shell: &mut PaseoShell, delta: f64) {
             viewport,
             sheet,
             ..
-        }) => {
-            let padding =
-                if shell.data.compact && matches!(sheet.style(), SheetStyle::Draggable { .. }) {
-                    36.0
-                } else {
-                    48.0
-                };
-            (scroll, *content_height + padding - viewport.size.y)
-        }
+        }) => (
+            scroll,
+            sheet_scroll_max(
+                shell.data.compact,
+                sheet.style(),
+                *content_height,
+                *viewport,
+            ),
+        ),
         Some(Modal::Menu(menu)) => (&mut menu.scroll, menu.max_scroll),
         Some(Modal::Select(select)) => (&mut select.scroll, select.max_scroll),
         _ => {

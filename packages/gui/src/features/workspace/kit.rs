@@ -12,7 +12,7 @@ use makepad_widgets::*;
 use crate::common::paint::{Font, Painter, TextSpec, rect};
 use crate::common::transition::Loop;
 use crate::common::widgets::{PLabelWidgetExt, PLabelWidgetRefExt, TextRole};
-use crate::common::{UiContext, UiEffect, overlay};
+use crate::common::{UiContext, UiEffect, accessibility, overlay};
 use crate::theme::{
     self, ControlSize, Palette, control_height, control_icon_size, fade, with_alpha,
 };
@@ -600,6 +600,16 @@ impl Widget for WaButton {
             return;
         }
         let disabled = !self.enabled || self.busy;
+        if !disabled
+            && accessibility::widget_action(event, self.widget_uid(), AccessibilityAction::Activate)
+        {
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                WaButtonAction::Clicked(KeyModifiers::default()),
+            );
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(fe) => {
                 cx.set_cursor(if disabled {
@@ -845,6 +855,19 @@ impl Widget for WaButton {
                 0.0,
             );
         }
+        accessibility::record_button(
+            cx,
+            self.widget_uid(),
+            self.area,
+            &label,
+            self.tooltip.as_ref(),
+            &icon,
+            AccessibilityState {
+                enabled: !disabled,
+                selected: self.selected,
+                ..AccessibilityState::default()
+            },
+        );
         DrawStep::done()
     }
 
@@ -1053,6 +1076,16 @@ impl Widget for WaTrigger {
         if !self.visible {
             return;
         }
+        if self.enabled
+            && accessibility::widget_action(event, self.widget_uid(), AccessibilityAction::Activate)
+        {
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                WaButtonAction::Clicked(KeyModifiers::default()),
+            );
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(fe) => {
                 cx.set_cursor(if self.enabled {
@@ -1214,6 +1247,18 @@ impl Widget for WaTrigger {
             &value,
             0.0,
         );
+        accessibility::record_button(
+            cx,
+            self.widget_uid(),
+            self.area,
+            &value,
+            &self.label,
+            "chevron-down",
+            AccessibilityState {
+                enabled: self.enabled,
+                ..AccessibilityState::default()
+            },
+        );
         DrawStep::done()
     }
 }
@@ -1325,9 +1370,15 @@ pub struct WaInput {
 
 impl Widget for WaInput {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view
-            .text_input(id!(input))
-            .set_is_multiline(cx, self.multiline);
+        let input = self.view.text_input(id!(input));
+        if accessibility::focus_requested(event, self.widget_uid())
+            && !input.is_read_only()
+            && input.area().is_attached(cx)
+        {
+            input.set_key_focus(cx);
+            return;
+        }
+        input.set_is_multiline(cx, self.multiline);
         self.view.handle_event(cx, event, scope);
         if let Event::Actions(actions) = event {
             let input = self.view.text_input(id!(input));
@@ -1357,6 +1408,18 @@ impl Widget for WaInput {
         self.apply_empty(cx);
         let step = self.view.draw_walk(cx, scope, walk);
         self.settle_height(cx);
+        if cx.accessibility_enabled()
+            && step.is_ok()
+            && let Some(input) = self.view.text_input(id!(input)).borrow()
+        {
+            accessibility::record_field(
+                cx,
+                self.widget_uid(),
+                input.area(),
+                input.empty_text(),
+                !input.is_read_only(),
+            );
+        }
         step
     }
 

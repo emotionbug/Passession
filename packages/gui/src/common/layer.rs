@@ -40,6 +40,17 @@ impl Layer {
         }
     }
 
+    /// Replays retained geometry in the shell after a paint-only viewport move.
+    pub(crate) fn redraw_parent(&self, cx: &mut Cx) {
+        if let Some(parent) = self
+            .list
+            .as_ref()
+            .and_then(|list| cx.draw_lists[list.id()].codeflow_parent_id)
+        {
+            cx.redraw_list(parent);
+        }
+    }
+
     /// Shell hit ids recorded by the last paint.
     pub fn owns_hit(&self, id: &str) -> bool {
         self.hits.iter().any(|hit| hit.item == id)

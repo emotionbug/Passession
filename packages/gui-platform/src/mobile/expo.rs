@@ -2,6 +2,7 @@
 //! expo_push_client.dart). The daemon accepts Expo tokens, never the device's
 //! FCM or APNs token.
 
+use super::PushFailure;
 use crate::{action::PlatformError, platform::Shared};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
@@ -9,10 +10,7 @@ use std::{sync::Arc, time::Duration};
 pub(crate) const PROJECT_ID: &str = "0e7f65ce-0367-46c8-a238-2b65963d235a";
 const INSTALLATION_KEY: &str = "mobile.expo.installationId";
 
-pub(crate) async fn issue(
-    shared: &Arc<Shared>,
-    device_token: &str,
-) -> Result<String, PlatformError> {
+pub(super) async fn issue(shared: &Arc<Shared>, device_token: &str) -> Result<String, PushFailure> {
     let installation = match shared.mobile.prefs.get_string(INSTALLATION_KEY) {
         Some(id) => id,
         None => {
@@ -35,9 +33,8 @@ pub(crate) async fn issue(
     };
     let environment = crate::native::push_environment()?;
     if environment != "development" && environment != "production" {
-        return Err(PlatformError::native(
-            "Cannot determine the signing profile APNs environment.",
-        ));
+        let error = PlatformError::native("Cannot determine the signing profile APNs environment.");
+        return Err(error.into());
     }
     let body = json!({
         "type": if cfg!(target_os = "ios") { "apns" } else { "fcm" },
@@ -57,19 +54,28 @@ pub(crate) async fn issue(
         .json(&body)
         .send()
         .await
-        .map_err(|e| PlatformError::native(format!("Expo push token issuance failed: {e}")))?;
+        .map_err(|error| {
+            PushFailure::Transient(PlatformError::native(format!(
+                "Expo push token issuance failed: {error}"
+            )))
+        })?;
     let status = response.status();
+    if !status.is_success() {
+        // Do not expose the response body: the upstream can echo device tokens.
+        let error = PlatformError::native(format!(
+            "Expo push token issuance failed (HTTP {}). Check the EAS project push credentials.",
+            status.as_u16()
+        ));
+        return Err(if retryable_status(status) {
+            PushFailure::Transient(error)
+        } else {
+            PushFailure::Permanent(error)
+        });
+    }
     let text = response
         .text()
         .await
-        .map_err(|e| PlatformError::native(e.to_string()))?;
-    if !status.is_success() {
-        // Do not expose the response body: the upstream can echo device tokens.
-        return Err(PlatformError::native(format!(
-            "Expo push token issuance failed (HTTP {}). Check the EAS project push credentials.",
-            status.as_u16()
-        )));
-    }
+        .map_err(|e| PushFailure::Transient(PlatformError::native(e.to_string())))?;
     let token = serde_json::from_str::<Value>(&text)
         .ok()
         .and_then(|v| {
@@ -83,6 +89,12 @@ pub(crate) async fn issue(
     Ok(token)
 }
 
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// `^(ExponentPushToken|ExpoPushToken)\[[^\]]+\]$`
 fn valid_token(token: &str) -> bool {
     let rest = token
@@ -94,6 +106,16 @@ fn valid_token(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn token_exchange_retries_service_failures_but_not_bad_credentials() {
+        use reqwest::StatusCode;
+        assert!(super::retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(super::retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(super::retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(!super::retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!super::retryable_status(StatusCode::BAD_REQUEST));
+    }
+
     #[test]
     fn token_shape() {
         assert!(super::valid_token("ExponentPushToken[abc]"));

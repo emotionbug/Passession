@@ -120,6 +120,12 @@ impl HistoryAgent {
     fn key(&self) -> String {
         format!("{}:{}", self.server_id, j::text(&self.agent, "id"))
     }
+
+    fn matches_key(&self, key: &str) -> bool {
+        key.strip_prefix(self.server_id.as_str())
+            .and_then(|rest| rest.strip_prefix(':'))
+            == Some(j::text(&self.agent, "id"))
+    }
 }
 
 /// One in-flight `fetchAgentHistoryBatch`.
@@ -216,6 +222,16 @@ impl HistoryPage {
         for (_, area) in self.row_clocks.drain() {
             clock::cancel(cx, area);
         }
+    }
+
+    pub(in crate::shell) fn accessibility_scroll(&self) -> (Rect, AccessibilityActions) {
+        (
+            self.viewport,
+            crate::shell::accessibility::scroll_actions(
+                self.scroll,
+                self.content_h - self.viewport.size.y,
+            ),
+        )
     }
 
     pub(crate) fn invalidate(&self, cx: &mut Cx) {
@@ -570,13 +586,20 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
             shell.layers.sessions.invalidate(cx);
         }
     }
-    if !covered
-        && let Event::Scroll(e) = event
-        && page.viewport.contains(e.abs)
-    {
+    let wheel = match event {
+        Event::Scroll(e) if page.viewport.contains(e.abs) => Some(e.scroll.y),
+        Event::AccessibilityAction(e)
+            if e.id == crate::shell::accessibility::history_id()
+                && page.accessibility_scroll().1.contains(e.action) =>
+        {
+            crate::shell::accessibility::page_delta(e.action, page.viewport)
+        }
+        _ => None,
+    };
+    if !covered && let Some(delta) = wheel {
         page.touch_scroll.reset();
         let max = (page.content_h - page.viewport.size.y).max(0.0);
-        page.scroll = (page.scroll + e.scroll.y).clamp(0.0, max);
+        page.scroll = (page.scroll + delta).clamp(0.0, max);
         shell.layers.sessions.invalidate(cx);
     }
     if let Some(append) = page.fetch.take() {
@@ -603,6 +626,7 @@ fn is_input(event: &Event) -> bool {
             | Event::TextInput(_)
             | Event::TextCopy(_)
             | Event::TextCut(_)
+            | Event::AccessibilityAction(_)
     )
 }
 
@@ -761,16 +785,13 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) 
             );
         }
         _ => {
-            if let Some(index) = rest
-                .strip_prefix("row:")
-                .and_then(|i| i.parse::<usize>().ok())
-            {
+            if let Some(key) = rest.strip_prefix("row:") {
                 // agent-list.tsx `handleAgentPress`: opening any row only navigates to it.
                 let Some(row) = shell
                     .data
                     .history
                     .as_ref()
-                    .and_then(|p| p.agents.get(index).cloned())
+                    .and_then(|p| p.agents.iter().find(|row| row.matches_key(key)).cloned())
                 else {
                     return;
                 };
@@ -803,17 +824,14 @@ pub fn select_host(shell: &mut PaseoShell, cx: &mut Cx, server_id: &str) {
 /// Right-click / long-press: the sidebar's session menu (Open, Rename, Archive with its
 /// confirmation, …) for that row.
 pub fn secondary(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) {
-    let Some(index) = id
-        .strip_prefix("hist:row:")
-        .and_then(|i| i.parse::<usize>().ok())
-    else {
+    let Some(key) = id.strip_prefix("hist:row:") else {
         return;
     };
     let Some(row) = shell
         .data
         .history
         .as_ref()
-        .and_then(|p| p.agents.get(index).cloned())
+        .and_then(|p| p.agents.iter().find(|row| row.matches_key(key)).cloned())
     else {
         return;
     };
@@ -984,6 +1002,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             island
         };
         ui.hit_tip(
+            cx,
             island_hit,
             "hist:menu",
             &tr(if compact {
@@ -998,11 +1017,14 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             p.foreground,
         );
         let tx = island.pos.x + extent + 8.0;
-        ui.text(
+        let heading = rect(tx, row_y, area.pos.x + area.size.x - 12.0 - tx, row_h);
+        ui.text(cx, heading, spec, &title);
+        ui.semantic_text(
             cx,
-            rect(tx, row_y, area.pos.x + area.size.x - 12.0 - tx, row_h),
-            spec,
+            heading,
+            "history:title",
             &title,
+            AccessibilityRole::Header,
         );
         y = row_y + row_h;
         if !compact {
@@ -1092,7 +1114,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                         14.0,
                         p.muted,
                     );
-                    ui.hit_tip(clear, "hist:clear", &tr("sessions.actions.clearSearch"));
+                    ui.hit_tip(cx, clear, "hist:clear", &tr("sessions.actions.clearSearch"));
                 }
                 if stacked {
                     y += field_h + 2.0 + 8.0;
@@ -1152,7 +1174,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                     14.0,
                     p.muted,
                 );
-                ui.hit(r, "hist:filter");
+                ui.hit_tip(cx, r, "hist:filter", &label);
             }
             y += field_h + 2.0;
         }
@@ -1357,12 +1379,9 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             let section_rect = rect(lx + 12.0, ry + 8.0, lw - 24.0, line_h);
             let section_layer = page.section_layers.entry(key).or_default();
             if section_layer.begin(cx, section_rect, 0, ui.hits, ui.tooltips) {
-                ui.text(
-                    cx,
-                    section_rect,
-                    section_spec,
-                    &tr(&format!("agentList.dateSections.{key}")),
-                );
+                let label = tr(&format!("agentList.dateSections.{key}"));
+                ui.text(cx, section_rect, section_spec, &label);
+                ui.semantic_text(cx, section_rect, key, &label, AccessibilityRole::Header);
                 section_layer.end(cx, ui.hits, ui.tooltips);
             }
             ry += line_h + 20.0;
@@ -1393,7 +1412,6 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                             lx,
                             ry,
                             lw,
-                            index,
                             agent,
                             &host_label,
                             &query,
@@ -1488,7 +1506,6 @@ fn session_row(
     x: f64,
     y: f64,
     w: f64,
-    index: usize,
     row: &HistoryAgent,
     host_label: &str,
     query: &str,
@@ -1515,7 +1532,7 @@ fn session_row(
     let h = row_metrics.height(0.0, 8.0, 14.0);
     let slots = row_metrics.layout(rect(x, y, w, h), 12.0, 0.0, 0.0, 0.0);
     let r = slots.bounds;
-    let id = format!("hist:row:{index}");
+    let id = format!("hist:row:{}:{}", row.server_id, j::text(&row.agent, "id"));
     let bg = if ui.is_pressed(&id) {
         Some(p.surface2)
     } else if ui.is_hover(&id) {
@@ -1526,7 +1543,14 @@ fn session_row(
     if let Some(bg) = bg {
         ui.fill(cx, r, bg, if compact { 8.0 } else { 0.0 });
     }
-    ui.hit(r, id);
+    ui.control(
+        cx,
+        r,
+        &id,
+        &title,
+        AccessibilityRole::ListItem,
+        AccessibilityState::default(),
+    );
     let cx0 = slots.title.pos.x;
     let inner_w = slots.title.size.x;
     let workspace_title = if workspace_name.is_empty() {
@@ -1932,7 +1956,14 @@ impl Sheet for ImportSheet {
             let r = rect(x + sw + 8.0, y + 2.0, lw, small_h + 4.0);
             ui.text_centered(cx, r, spec, &label);
             if interactive {
-                ui.hit(r, "showall".to_string());
+                ui.control(
+                    cx,
+                    r,
+                    "showall",
+                    &label,
+                    AccessibilityRole::Button,
+                    AccessibilityState::default(),
+                );
             }
         }
         if self.busy {
@@ -2025,7 +2056,7 @@ impl Sheet for ImportSheet {
                 p.muted,
             );
             if interactive {
-                ui.hit_tip(r, "provider", &tr("sessions.filter.byProvider"));
+                ui.hit_tip(cx, r, "provider", &tr("sessions.filter.byProvider"));
             }
             self.filter_rect = r;
             y += button_h + 8.0;
@@ -2099,7 +2130,14 @@ impl Sheet for ImportSheet {
                 } else if ui.is_hover(&id) {
                     ui.fill(cx, r, p.surface1, 8.0);
                 }
-                ui.hit(r, id);
+                ui.control(
+                    cx,
+                    r,
+                    &id,
+                    &title,
+                    AccessibilityRole::ListItem,
+                    AccessibilityState::default(),
+                );
             }
             ProviderIcon::paint(
                 ui.painter,

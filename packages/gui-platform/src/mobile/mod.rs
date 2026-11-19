@@ -4,6 +4,8 @@
 //! links a daemon.
 
 pub(crate) mod expo;
+#[cfg(target_os = "ios")]
+mod network_ios;
 
 use crate::{
     action::*,
@@ -15,12 +17,16 @@ use paseo_gui_core::CoreEvent;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::{OnceCell, watch};
 
 const TOKEN_PREFIX: &str = "mobile.expo.host.";
 const BACKGROUND_ERROR: &str = "mobile.push.backgroundError";
+const PUSH_RETRY_INITIAL: Duration = Duration::from_secs(5);
+const PUSH_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// Events native code raises from any thread; drained on the GUI thread.
 #[derive(Debug, Clone)]
@@ -50,9 +56,6 @@ struct PushState {
     /// Expo token issued for the current device token.
     token: Option<String>,
     device_token: Option<String>,
-    /// Builds without push credentials: a packaging fact, not a runtime error.
-    unavailable: bool,
-    busy: bool,
     /// host id → whether `pushTokenRevocation` is advertised, for connected hosts.
     connected: HashMap<String, bool>,
     /// host id → token sent on the current connection.
@@ -63,12 +66,43 @@ struct PushState {
 struct Routing {
     ready: bool,
     pending: VecDeque<PlatformEvent>,
-    links: VecDeque<String>,
+    /// Links waiting for window readiness or sitting in Makepad's action queue.
+    queued_links: HashSet<String>,
+}
+
+impl Routing {
+    fn window_ready(&mut self) -> std::collections::vec_deque::Drain<'_, PlatformEvent> {
+        self.ready = true;
+        self.pending.drain(..)
+    }
+
+    fn route(&mut self, event: PlatformEvent) -> Option<PlatformEvent> {
+        if let PlatformEvent::ConnectionLink { url } = &event
+            && !self.queued_links.insert(url.clone())
+        {
+            return None;
+        }
+        if self.ready {
+            Some(event)
+        } else {
+            self.pending.push_back(event);
+            None
+        }
+    }
+
+    fn link_delivered(&mut self, url: &str) {
+        self.queued_links.remove(url);
+    }
 }
 
 pub(crate) struct MobileShared {
     pub prefs: PlatformPrefs,
     push: Mutex<PushState>,
+    /// Only successful provisioning checks are cached, including unprovisioned builds.
+    push_available: OnceCell<bool>,
+    permission_check: tokio::sync::Mutex<()>,
+    push_requests: watch::Sender<Option<PermissionState>>,
+    push_task: Mutex<Option<tokio::task::AbortHandle>>,
     routing: Mutex<Routing>,
     handled_notifications: Mutex<HashSet<String>>,
 }
@@ -78,46 +112,33 @@ impl MobileShared {
         Self {
             prefs: PlatformPrefs::new(),
             push: Mutex::new(PushState::default()),
+            push_available: OnceCell::new(),
+            permission_check: tokio::sync::Mutex::new(()),
+            push_requests: watch::channel(None).0,
+            push_task: Mutex::new(None),
             routing: Mutex::new(Routing::default()),
             handled_notifications: Mutex::new(HashSet::new()),
         }
     }
 
     pub fn window_ready(&self) {
-        let pending: Vec<_> = {
-            let mut routing = self.routing.lock().unwrap();
-            routing.ready = true;
-            routing.pending.drain(..).collect()
-        };
-        for event in pending {
+        for event in self.routing.lock().unwrap().window_ready() {
             post_event(event);
         }
     }
 
     fn route(&self, event: PlatformEvent) {
-        let mut routing = self.routing.lock().unwrap();
-        if routing.ready {
-            drop(routing);
-            post_event(event);
-        } else {
-            routing.pending.push_back(event);
+        let next = self.routing.lock().unwrap().route(event);
+        if let Some(next) = next {
+            post_event(next);
         }
     }
 
-    /// Original `_receiveLink`: parsing and approval belong to the existing host
-    /// dialog; duplicates of a queued link are dropped.
-    fn receive_link(&self, url: String) {
-        {
-            let mut routing = self.routing.lock().unwrap();
-            if routing.links.contains(&url) {
-                return;
-            }
-            routing.links.push_back(url.clone());
-            if routing.links.len() > 32 {
-                routing.links.pop_front();
-            }
-        }
-        self.route(PlatformEvent::ConnectionLink { url });
+    pub async fn push_available(&self) -> Result<bool, PlatformError> {
+        self.push_available
+            .get_or_try_init(crate::native::push_provisioned)
+            .await
+            .copied()
     }
 
     fn report(&self, message: impl Into<String>) {
@@ -129,9 +150,43 @@ impl MobileShared {
 
 pub(crate) fn start(cx: &mut Cx, shared: &Arc<Shared>, state: &mut PlatformState) {
     crate::native::start_services(cx, shared, state);
+    #[cfg(target_os = "ios")]
+    network_ios::start(shared.core.clone());
+    let requests = shared.mobile.push_requests.subscribe();
+    let task_shared = shared.clone();
+    let task = shared.runtime.spawn(async move {
+        let shared = &task_shared;
+        run_push_sync(
+            requests,
+            |permission| sync_push(shared, permission),
+            |message| shared.mobile.report(message),
+        )
+        .await;
+    });
+    *shared.mobile.push_task.lock().unwrap() = Some(task.abort_handle());
     // Links first (they do not depend on push provisioning), then a silent
     // push sync. The permission is only asked from in-context GUI flows.
     request_notifications(shared, false, None);
+}
+
+pub(crate) fn shutdown(shared: &Shared) {
+    if let Some(task) = shared.mobile.push_task.lock().unwrap().take() {
+        task.abort();
+    }
+    #[cfg(target_os = "ios")]
+    network_ios::stop();
+}
+
+pub(crate) fn finish_event(shared: &Shared, event: &Event) {
+    if let Event::Actions(actions) = event {
+        for action in actions.iter() {
+            if let Some(PlatformAction::Event(PlatformEvent::ConnectionLink { url })) =
+                action.downcast_ref::<PlatformAction>()
+            {
+                shared.mobile.routing.lock().unwrap().link_delivered(url);
+            }
+        }
+    }
 }
 
 pub(crate) fn handle_event(
@@ -140,10 +195,14 @@ pub(crate) fn handle_event(
     state: &mut PlatformState,
     event: &Event,
 ) {
+    if matches!(event, Event::Shutdown) {
+        shutdown(shared);
+        return;
+    }
     let signals = std::mem::take(&mut *SIGNALS.lock().unwrap());
     for signal in signals {
         match signal {
-            MobileSignal::Link(url) => shared.mobile.receive_link(url),
+            MobileSignal::Link(url) => shared.mobile.route(PlatformEvent::ConnectionLink { url }),
             MobileSignal::NotificationTap(id, data) => receive_tap(shared, id, data),
             MobileSignal::Resumed => {
                 // Original didChangeAppLifecycleState(resumed). The badge is not reset here:
@@ -337,41 +396,91 @@ pub(crate) fn request_notifications(
 ) {
     let task_shared = shared.clone();
     shared.spawn(async move {
-        let permission = match crate::native::notification_permission(request_permission).await {
-            Ok(permission) => permission,
-            Err(error) => {
-                match done {
-                    Some(done) => done.fail(error),
-                    None => task_shared.mobile.report(error.message),
+        // An OS read must not replace a prompt's result with a permission
+        // observed before the user answered it.
+        let check = task_shared.mobile.permission_check.lock().await;
+        let permission = crate::native::notification_permission(request_permission).await;
+        if let Ok(permission) = &permission {
+            let _ = task_shared
+                .mobile
+                .push_requests
+                .send_replace(Some(*permission));
+        }
+        drop(check);
+        match permission {
+            Ok(permission) => {
+                if let Some(done) = done {
+                    done.ok(PlatformValue::Permission(permission));
                 }
-                return;
             }
-        };
-        if let Some(done) = done {
-            done.ok(PlatformValue::Permission(permission));
-        }
-        {
-            let mut push = task_shared.mobile.push.lock().unwrap();
-            if push.busy {
-                return;
-            }
-            push.busy = true;
-        }
-        let result = sync_push(&task_shared, permission).await;
-        task_shared.mobile.push.lock().unwrap().busy = false;
-        if let Err(error) = result {
-            task_shared.mobile.report(error.message);
+            Err(error) => match done {
+                Some(done) => done.fail(error),
+                None => task_shared.mobile.report(error.message),
+            },
         }
     });
 }
 
-/// Original `requestNotifications` after the permission step.
-async fn sync_push(shared: &Arc<Shared>, permission: PermissionState) -> Result<(), PlatformError> {
-    if shared.mobile.push.lock().unwrap().unavailable {
-        return Ok(());
+#[derive(Debug)]
+enum PushFailure {
+    Permanent(PlatformError),
+    Transient(PlatformError),
+}
+
+impl From<PlatformError> for PushFailure {
+    fn from(error: PlatformError) -> Self {
+        Self::Permanent(error)
     }
-    if !crate::native::push_provisioned().await {
-        shared.mobile.push.lock().unwrap().unavailable = true;
+}
+
+fn next_push_retry(delay: Duration) -> Duration {
+    (delay * 2).min(PUSH_RETRY_MAX)
+}
+
+async fn run_push_sync<F>(
+    mut requests: watch::Receiver<Option<PermissionState>>,
+    sync: impl Fn(PermissionState) -> F,
+    report: impl Fn(String),
+) where
+    F: Future<Output = Result<(), PushFailure>>,
+{
+    let mut changed = Ok(());
+    while changed.is_ok() {
+        let permission = *requests.borrow_and_update();
+        let Some(permission) = permission else {
+            changed = requests.changed().await;
+            continue;
+        };
+        let mut delay = PUSH_RETRY_INITIAL;
+        changed = loop {
+            // Each run reads the current device token, including after a refresh.
+            let result = sync(permission).await;
+            if requests.has_changed().unwrap_or(true) {
+                break requests.changed().await;
+            }
+            match result {
+                Ok(()) => break requests.changed().await,
+                Err(PushFailure::Permanent(error)) => {
+                    report(error.message);
+                    break requests.changed().await;
+                }
+                Err(PushFailure::Transient(error)) => {
+                    if delay == PUSH_RETRY_INITIAL {
+                        report(error.message);
+                    }
+                }
+            }
+            tokio::select! { biased;
+                updated = requests.changed() => break updated,
+                _ = tokio::time::sleep(delay) => delay = next_push_retry(delay),
+            }
+        };
+    }
+}
+
+/// Original `requestNotifications` after the permission step.
+async fn sync_push(shared: &Arc<Shared>, permission: PermissionState) -> Result<(), PushFailure> {
+    if !shared.mobile.push_available().await? {
         return Ok(());
     }
     if !permission.allowed() {
@@ -385,11 +494,18 @@ async fn sync_push(shared: &Arc<Shared>, permission: PermissionState) -> Result<
         }
         return Ok(());
     }
-    let device_token = crate::native::device_push_token().await?;
+    let device_token = crate::native::device_push_token().await.map_err(|error| {
+        if error.code == "push_retryable" {
+            PushFailure::Transient(error)
+        } else {
+            PushFailure::Permanent(error)
+        }
+    })?;
     if device_token.is_empty() {
-        return Err(PlatformError::native(
+        let error = PlatformError::native(
             "The operating system has not issued a push token. Check notification signing and Firebase configuration, then retry.",
-        ));
+        );
+        return Err(error.into());
     }
     let (changed, has_token) = {
         let push = shared.mobile.push.lock().unwrap();
@@ -437,5 +553,95 @@ pub(crate) fn notification_data(raw: &Map<String, Value>) -> Map<String, Value> 
         },
         Some(Value::Object(map)) => map.clone(),
         _ => raw.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_link_is_deduplicated_only_until_gui_delivery() {
+        let url = "paseo://pair#offer=example";
+        let link = || PlatformEvent::ConnectionLink { url: url.into() };
+        let mut routing = Routing::default();
+        assert!(routing.route(link()).is_none());
+        assert!(routing.route(link()).is_none());
+        assert_eq!(routing.window_ready().count(), 1);
+
+        // The startup queue has drained, but its posted action is still pending.
+        assert!(routing.route(link()).is_none());
+        routing.link_delivered(url);
+        assert!(matches!(
+            routing.route(link()),
+            Some(PlatformEvent::ConnectionLink { url: received }) if received == url
+        ));
+        assert!(routing.route(link()).is_none());
+        routing.link_delivered(url);
+        assert!(routing.route(link()).is_some());
+    }
+
+    #[tokio::test]
+    async fn newer_push_requests_coalesce_and_replace_a_pending_retry() {
+        use tokio::sync::{mpsc, oneshot};
+
+        let (updates, requests) = watch::channel(None);
+        let (performed, mut runs) = mpsc::unbounded_channel();
+        let (reports, mut errors) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_push_sync(
+            requests,
+            move |permission| {
+                let (done, result) = oneshot::channel();
+                performed.send((permission, done)).unwrap();
+                async move { result.await.unwrap() }
+            },
+            move |message| reports.send(message).unwrap(),
+        ));
+        let timeout = Duration::from_secs(1);
+        let assert_next = async |runs: &mut mpsc::UnboundedReceiver<_>, expected| {
+            let (permission, done) = tokio::time::timeout(timeout, runs.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(permission, expected);
+            done
+        };
+
+        let _ = updates.send_replace(Some(PermissionState::Granted));
+        let first = assert_next(&mut runs, PermissionState::Granted).await;
+        let _ = updates.send_replace(Some(PermissionState::Denied));
+        let _ = updates.send_replace(Some(PermissionState::Provisional));
+        first.send(Ok(())).unwrap();
+
+        let latest = assert_next(&mut runs, PermissionState::Provisional).await;
+        latest
+            .send(Err(PushFailure::Transient(PlatformError::native(
+                "offline",
+            ))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(timeout, errors.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("offline"),
+        );
+        let _ = updates.send_replace(Some(PermissionState::Blocked));
+        let next = assert_next(&mut runs, PermissionState::Blocked).await;
+        next.send(Ok(())).unwrap();
+
+        drop(updates);
+        worker.await.unwrap();
+    }
+
+    #[test]
+    fn push_retry_backoff_doubles_until_five_minutes() {
+        let waits: Vec<_> = std::iter::successors(Some(PUSH_RETRY_INITIAL), |wait| {
+            Some(next_push_retry(*wait))
+        })
+        .take(9)
+        .map(|wait| wait.as_secs())
+        .collect();
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
     }
 }

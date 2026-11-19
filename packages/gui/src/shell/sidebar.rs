@@ -108,13 +108,20 @@ impl SidebarState {
         }
     }
 
+    fn place_scrolled_tree(&self, cx: &mut Cx) {
+        self.place_tree(cx);
+        if cx.accessibility_enabled() {
+            self.tree_layer.redraw_parent(cx);
+        }
+    }
+
     /// True once this touch owns vertical scrolling, including at an edge.
     pub fn touch_move(&mut self, cx: &mut Cx, abs: DVec2, time: f64) -> bool {
         let Some(delta) = self.motion.move_to(abs, time) else {
             return false;
         };
         if self.scroll_by(delta) {
-            self.place_tree(cx);
+            self.place_scrolled_tree(cx);
         }
         true
     }
@@ -123,7 +130,7 @@ impl SidebarState {
         if let Some(delta) = self.motion.frame(cx, event)
             && self.scroll_by(delta)
         {
-            self.place_tree(cx);
+            self.place_scrolled_tree(cx);
         }
     }
 }
@@ -527,7 +534,11 @@ fn session_tree(
             .map(|workspace| (j::text(workspace, "id"), workspace))
             .collect();
         let mut by_project: HashMap<&str, Vec<SessionRow>> = HashMap::new();
-        for row in host.1.into_iter().flat_map(|directory| &directory.agents) {
+        for row in host
+            .1
+            .into_iter()
+            .flat_map(|directory| directory.agents.iter())
+        {
             let agent = j::agent_of(row);
             if !top_level(agent) {
                 continue;
@@ -1129,11 +1140,15 @@ fn draw_header(
     {
         let mut ui = make_ui(shell);
         let spec = ui.small_muted();
-        ui.text(
+        let heading = rect(r.pos.x + 8.0, y, r.size.x - 48.0, header_h);
+        let label = tr("sessionNavigation.sessions");
+        ui.text(cx, heading, spec, &label);
+        ui.semantic_text(
             cx,
-            rect(r.pos.x + 8.0, y, r.size.x - 48.0, header_h),
-            spec,
-            &tr("sessionNavigation.sessions"),
+            heading,
+            "sidebar:sessions",
+            &label,
+            AccessibilityRole::Header,
         );
         let trigger = rect(
             r.pos.x + r.size.x - 4.0 - 28.0,
@@ -1147,7 +1162,7 @@ fn draw_header(
         }
         let muted = ui.p.muted;
         ui.icon(cx, trigger, "settings-2", 14.0, muted);
-        ui.hit_tip(trigger, "side:display", &tr("sidebar.display.trigger"));
+        ui.hit_tip(cx, trigger, "side:display", &tr("sidebar.display.trigger"));
         if compact {
             // Phone: the filter trigger takes a 44px square over the full header height.
             ui.hit(
@@ -1280,7 +1295,14 @@ fn header_row(ui: &mut Ui, cx: &mut Cx2d, r: Rect, id: &str, icon: &str, label: 
     let slots = metrics.layout(body, 8.0, 16.0, 0.0, 8.0);
     ui.icon(cx, slots.leading, icon, 16.0, p.muted);
     ui.text(cx, slots.title, spec, label);
-    ui.hit(body, id);
+    ui.control(
+        cx,
+        body,
+        id,
+        label,
+        AccessibilityRole::Button,
+        AccessibilityState::default(),
+    );
 }
 
 fn toolbar_button(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, id: &str, icon: &str, tooltip: &str) {
@@ -1483,7 +1505,14 @@ fn draw_tree(
             waiting_badge(&mut ui, cx, plus_x - 4.0, mid, waiting);
         }
         // The whole row toggles; the trailing button, registered after it, wins its own square.
-        ui.hit(row, format!("host:{sid}"));
+        ui.control(
+            cx,
+            row,
+            &format!("host:{sid}"),
+            &label,
+            AccessibilityRole::ListItem,
+            AccessibilityState::default(),
+        );
         toolbar_button(
             &mut ui,
             cx,
@@ -1629,7 +1658,14 @@ fn draw_tree(
             if waiting > 0 {
                 waiting_badge(&mut ui, cx, plus_x - 4.0, mid, waiting);
             }
-            ui.hit(row, format!("project:{key}"));
+            ui.control(
+                cx,
+                row,
+                &format!("project:{key}"),
+                name,
+                AccessibilityRole::ListItem,
+                AccessibilityState::default(),
+            );
             toolbar_button(
                 &mut ui,
                 cx,
@@ -1731,7 +1767,17 @@ fn draw_tree(
                         agent_status_label(agent, bucket)
                     ),
                 );
-                ui.hit(row, id.clone());
+                ui.control(
+                    cx,
+                    row,
+                    &id,
+                    &title,
+                    AccessibilityRole::ListItem,
+                    AccessibilityState {
+                        selected: is_selected,
+                        ..AccessibilityState::default()
+                    },
+                );
                 if hovered {
                     toolbar_button(
                         &mut ui,
@@ -1794,7 +1840,17 @@ fn draw_tree(
                         terminal_status(&terminal.activity)
                     ),
                 );
-                ui.hit(row, format!("sideterm:{sid}:{}", terminal.id));
+                ui.control(
+                    cx,
+                    row,
+                    &format!("sideterm:{sid}:{}", terminal.id),
+                    &terminal.label,
+                    AccessibilityRole::ListItem,
+                    AccessibilityState {
+                        selected: is_selected,
+                        ..AccessibilityState::default()
+                    },
+                );
                 toolbar_button(
                     &mut ui,
                     cx,
@@ -1821,8 +1877,9 @@ fn draw_tree(
                 p.muted,
             );
             let spec = ui.spec(Font::Regular, 14.0, p.muted);
-            ui.text(cx, slots.title, spec, &tr("sidebar.actions.addProject"));
-            ui.hit(row, format!("addproject:{sid}"));
+            let label = tr("sidebar.actions.addProject");
+            ui.text(cx, slots.title, spec, &label);
+            ui.hit_tip(cx, row, &format!("addproject:{sid}"), &label);
             y += group_h;
         }
     }
@@ -1916,7 +1973,7 @@ fn draw_footer(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
                 ui.p.muted
             };
             ui.icon(cx, b, glyph, size, color);
-            ui.hit_tip(b, id, tooltip);
+            ui.hit_tip(cx, b, id, tooltip);
         };
     let mut x = r.pos.x + 8.0;
     button(
@@ -1973,7 +2030,7 @@ pub fn scroll(shell: &mut PaseoShell, cx: &mut Cx, delta: f64) {
     let s = &mut shell.data.sidebar;
     s.stop_motion();
     if s.scroll_by(delta) {
-        s.place_tree(cx);
+        s.place_scrolled_tree(cx);
     }
 }
 
@@ -2189,9 +2246,9 @@ mod tests {
             };
             let directory = DirectorySnapshot {
                 revision: key,
-                projects: rows("projects"),
-                workspaces: rows("workspaces"),
-                agents: rows("agents"),
+                projects: Arc::new(rows("projects")),
+                workspaces: Arc::new(rows("workspaces")),
+                agents: rows("agents").into_iter().collect(),
                 cached_at: None,
             };
             record.insert("directoryKey".into(), key.into());
@@ -2412,7 +2469,18 @@ mod tests {
 
         let directory = Arc::make_mut(Arc::make_mut(&mut state.directories).get_mut(&1).unwrap());
         directory.revision += 1;
-        Arc::make_mut(&mut directory.agents[0])["updatedAt"] = "2027-01-01T00:00:00Z".into();
+        directory.agents = directory
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut row = row.clone();
+                if index == 0 {
+                    Arc::make_mut(&mut row)["updatedAt"] = "2027-01-01T00:00:00Z".into();
+                }
+                row
+            })
+            .collect();
         let updated = cache.tree(&state, "", None);
         assert!(!Arc::ptr_eq(&initial, &updated));
         assert!(Arc::ptr_eq(&updated, &cache.tree(&state, "", None)));

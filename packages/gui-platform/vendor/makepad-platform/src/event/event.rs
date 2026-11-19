@@ -140,6 +140,7 @@ pub enum Event {
     WindowGeomChange(WindowGeomChangeEvent),
     VirtualKeyboard(VirtualKeyboardEvent),
     ClearAtlasses,
+    AccessibilityAction(crate::AccessibilityActionEvent),
 
     /// The raw event that occurs when the user presses a mouse button down.
     ///
@@ -313,6 +314,7 @@ impl Event{
             56=>"TextSelectAll",
             57=>"TextHandle",
             58=>"TextPasteShortcut",
+            59=>"AccessibilityAction",
             _=>panic!()
         }
     }
@@ -365,6 +367,7 @@ impl Event{
             Self::TextSelectAll=>56,
             Self::TextHandle(_)=>57,
             Self::TextPasteShortcut(_)=>58,
+            Self::AccessibilityAction(_)=>59,
 
             Self::Drag(_)=>36,
             Self::Drop(_)=>37,

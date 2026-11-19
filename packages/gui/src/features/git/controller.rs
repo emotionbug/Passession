@@ -1,11 +1,11 @@
-//! Historical commit files and lazy per-file patches. Generation and patch
-//! revision reject replies from a previous refresh or visibility lifetime.
+//! Historical commit files and lazy per-file patches. Request generations
+//! reject replies from a previous refresh or visibility lifetime.
 
 use super::host;
-use super::json::{array, error_message, flag, object, text};
+use super::json::{array, flag, object, text};
 use super::store::GitStore;
 use super::text::t;
-use super::wire::{self, Failure};
+use super::wire;
 use crate::common::{PanelTarget, UiContext};
 use paseo_gui_core::{CoreError, CoreEvent, RequestId};
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ enum Pending {
     FileDiff {
         path: String,
         generation: u64,
-        revision: u64,
+        patch_generation: u64,
     },
 }
 
@@ -40,6 +40,7 @@ pub struct DiffController {
     patch_loads_deferred: bool,
     pub status: Option<Value>,
     pub files: Vec<Value>,
+    pub files_revision: u64,
     pub patches: HashMap<String, Value>,
     pub loading_patches: HashSet<String>,
     pub patch_errors: HashMap<String, String>,
@@ -47,6 +48,9 @@ pub struct DiffController {
     pub loading: bool,
     pub error: Option<String>,
     generation: u64,
+    /// Changes when existing patches can be replaced.
+    pub patch_generation: u64,
+    /// Changes on every patch/cache mutation that affects document geometry.
     pub patch_revision: u64,
     pending: HashMap<RequestId, Pending>,
     pub dirty: bool,
@@ -78,12 +82,14 @@ impl DiffController {
             status: None,
             files: Vec::new(),
             patches: HashMap::new(),
+            files_revision: 0,
             loading_patches: HashSet::new(),
             patch_errors: HashMap::new(),
             selected_path,
             loading: false,
             error: None,
             generation: 0,
+            patch_generation: 0,
             patch_revision: 0,
             pending: HashMap::new(),
             dirty: true,
@@ -119,8 +125,13 @@ impl DiffController {
         if std::mem::take(&mut self.stale) {
             self.refresh(ui, store, true);
         } else if deferred {
-            self.patch_revision += 1;
+            self.invalidate_patches();
         }
+    }
+
+    fn invalidate_patches(&mut self) {
+        self.patch_generation += 1;
+        self.patch_revision += 1;
     }
 
     /// A resumed immutable commit keeps already loaded patches.
@@ -133,7 +144,7 @@ impl DiffController {
         self.loading = true;
         self.error = None;
         self.stale = false;
-        self.patch_revision += 1;
+        self.invalidate_patches();
         if !resume {
             self.patches.clear();
             self.patch_errors.clear();
@@ -160,6 +171,7 @@ impl DiffController {
         if self.files.is_empty() && !self.selected_path.is_empty() {
             self.files = vec![json!({ "path": self.selected_path })];
         }
+        self.files_revision += 1;
         if !self.selected_path.is_empty() {
             let path = self.selected_path.clone();
             self.select_file(ui, &path);
@@ -195,7 +207,9 @@ impl DiffController {
 
     fn fetch(&mut self, ui: &UiContext, path: &str) {
         self.loading_patches.insert(path.to_owned());
-        self.patch_errors.remove(path);
+        if self.patch_errors.remove(path).is_some() {
+            self.patch_revision += 1;
+        }
         self.dirty = true;
         let request = wire::send(
             &ui.core,
@@ -208,7 +222,7 @@ impl DiffController {
             Pending::FileDiff {
                 path: path.to_owned(),
                 generation: self.generation,
-                revision: self.patch_revision,
+                patch_generation: self.patch_generation,
             },
         );
     }
@@ -221,7 +235,7 @@ impl DiffController {
                 }
                 CoreEvent::Disconnected { host_id, .. } if *host_id == self.host => {
                     self.dispose(&ui.core, store);
-                    self.patch_revision += 1;
+                    self.invalidate_patches();
                     self.loading_patches.clear();
                     self.loading = false;
                     self.stale = true;
@@ -248,18 +262,7 @@ impl DiffController {
                     return;
                 }
                 self.dirty = true;
-                let payload = wire::checkout_result(result).and_then(|payload| {
-                    if let Some(message) = error_message(&payload) {
-                        return Err(Failure::message(message));
-                    }
-                    if payload.get("success") == Some(&Value::Bool(false))
-                        || payload.get("accepted") == Some(&Value::Bool(false))
-                    {
-                        return Err(Failure::message("The host did not accept this operation."));
-                    }
-                    Ok(payload)
-                });
-                let status = match payload {
+                let status = match wire::git_result(result) {
                     Ok(status) => status,
                     Err(failure) => {
                         self.error = Some(failure.message);
@@ -338,28 +341,71 @@ impl DiffController {
             Pending::FileDiff {
                 path,
                 generation,
-                revision,
-            } => {
-                if generation != self.generation || revision != self.patch_revision {
-                    return;
-                }
-                self.loading_patches.remove(&path);
-                match wire::git_result(result) {
-                    Ok(payload) => {
-                        let file = object(&payload, "file");
-                        let patch = if file.is_null() {
-                            json!({ "path": path, "hunks": [], "status": "binary" })
-                        } else {
-                            file.clone()
-                        };
-                        self.patches.insert(path, patch);
-                    }
-                    Err(failure) => {
-                        self.patch_errors.insert(path, failure.message);
-                    }
-                }
-                self.dirty = true;
+                patch_generation,
+            } => self.on_file_diff_response(path, generation, patch_generation, result),
+        }
+    }
+
+    fn on_file_diff_response(
+        &mut self,
+        path: String,
+        generation: u64,
+        patch_generation: u64,
+        result: &Result<Value, CoreError>,
+    ) {
+        if generation != self.generation || patch_generation != self.patch_generation {
+            return;
+        }
+        self.loading_patches.remove(&path);
+        match wire::git_result(result) {
+            Ok(payload) => {
+                let file = object(&payload, "file");
+                let patch = if file.is_null() {
+                    json!({ "path": path, "hunks": [], "status": "binary" })
+                } else {
+                    file.clone()
+                };
+                self.patches.insert(path, patch);
+            }
+            Err(failure) => {
+                self.patch_errors.insert(path, failure.message);
             }
         }
+        self.patch_revision += 1;
+        self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_arrivals_and_errors_revise_layout_without_invalidating_other_pending_patches() {
+        let target = PanelTarget::new("diff", "host", "workspace", "/repo");
+        let mut controller = DiffController::new(&target, &GitStore::default());
+        let generation = controller.generation;
+        let patch_generation = controller.patch_generation;
+        let patch = Ok(json!({ "file": { "status": "modified", "hunks": [] } }));
+
+        controller.on_file_diff_response("a".into(), generation, patch_generation, &patch);
+        assert_eq!(controller.patch_revision, 1);
+        assert!(controller.patches.contains_key("a"));
+        controller.on_file_diff_response(
+            "b".into(),
+            generation,
+            patch_generation,
+            &Ok(json!({ "error": "patch failed" })),
+        );
+        assert_eq!(controller.patch_revision, 2);
+        assert_eq!(controller.patch_errors["b"], "patch failed");
+        controller.on_file_diff_response("c".into(), generation, patch_generation, &patch);
+        assert_eq!(controller.patch_revision, 3);
+        assert!(controller.patches.contains_key("c"));
+
+        controller.invalidate_patches();
+        controller.on_file_diff_response("d".into(), generation, patch_generation, &patch);
+        assert_eq!(controller.patch_revision, 4);
+        assert!(!controller.patches.contains_key("d"));
     }
 }

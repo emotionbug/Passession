@@ -5,12 +5,12 @@ use {
         animator::Ease,
         os::{
             apple::ios_app::IosApp,
-            apple::apple_util::nsstring_to_string,
             apple::apple_sys::*,
             apple::ios_app::with_ios_app,
         },
     }
 };
+use super::{ios_event::IosEvent, ios_text_input, ios_wake};
 
 
 pub fn define_ios_app_delegate() -> *const Class {
@@ -46,6 +46,13 @@ pub fn define_ios_app_delegate() -> *const Class {
     extern "C" fn scene_inactive(_: &Object, _: Sel, notification: ObjcId) {
         IosApp::surface_scene_changed(notification, false);
     }
+
+    extern "C" fn voice_over_status_changed(_: &Object, _: Sel, _: ObjcId) {
+        extern "C" fn update(_: *mut c_void) {
+            IosApp::do_callback(IosEvent::AccessibilityStatus);
+        }
+        ios_wake::dispatch_main(update);
+    }
     
     unsafe {
         decl.add_method(
@@ -59,6 +66,7 @@ pub fn define_ios_app_delegate() -> *const Class {
         decl.add_method(sel!(applicationDidReceiveMemoryWarning:), memory_warning as extern "C" fn(&Object, Sel, ObjcId));
         decl.add_method(sel!(surfaceSceneActivated:), scene_active as extern "C" fn(&Object, Sel, ObjcId));
         decl.add_method(sel!(surfaceSceneSuspended:), scene_inactive as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(voiceOverStatusChanged:), voice_over_status_changed as extern "C" fn(&Object, Sel, ObjcId));
     }
     
     return decl.register();
@@ -200,6 +208,10 @@ pub fn define_ios_timer_delegate() -> *const Class {
     extern "C" fn received_timer(_this: &Object, _: Sel, nstimer: ObjcId) {
         IosApp::send_timer_received(nstimer);
     }
+
+    extern "C" fn executor_tick(_: &Object, _: Sel, _: ObjcId) {
+        IosApp::do_callback(IosEvent::ExecutorTick);
+    }
     
     extern "C" fn display_frame(_: &Object, _: Sel, _: ObjcId) {
         IosApp::surface_frame(true);
@@ -211,17 +223,17 @@ pub fn define_ios_timer_delegate() -> *const Class {
     // Add callback methods
     unsafe {
         decl.add_method(sel!(receivedTimer:), received_timer as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(executorTick:), executor_tick as extern "C" fn(&Object, Sel, ObjcId));
         decl.add_method(sel!(displayFrame:), display_frame as extern "C" fn(&Object, Sel, ObjcId));
     }
     
     return decl.register();
 }
 
-pub fn define_textfield_delegate() -> *const Class {
-    let mut decl = ClassDecl::new("NSTexfieldDlg", class!(NSObject)).unwrap();
-    
-    // those 3 callbacks are for resizing the canvas when keyboard is opened
-    // which is not currenlty supported by miniquad
+pub fn define_input_delegate() -> *const Class {
+    let mut decl = ClassDecl::new("MakepadInputDelegate", class!(NSObject)).unwrap();
+    decl.add_protocol(Protocol::get("UITextViewDelegate").unwrap());
+
     fn get_height_delta(notif: ObjcId) -> f64 {
         unsafe {
             let info: ObjcId = msg_send![notif, userInfo];
@@ -267,7 +279,7 @@ pub fn define_textfield_delegate() -> *const Class {
         let height = get_height_delta(notif);
         let (duration, ease) = get_curve_duration(notif);
         let time = with_ios_app(|app| app.time_now());
-        with_ios_app(|app| app.queue_virtual_keyboard_event(VirtualKeyboardEvent::WillHide {
+        IosApp::defer_callback(IosEvent::VirtualKeyboard(VirtualKeyboardEvent::WillHide {
             time,
             ease,
             height: -height,
@@ -277,46 +289,23 @@ pub fn define_textfield_delegate() -> *const Class {
     
     extern "C" fn keyboard_did_hide(_: &Object, _: Sel, _notif: ObjcId) {
         let time = with_ios_app(|app| app.time_now());
-        IosApp::send_virtual_keyboard_event(VirtualKeyboardEvent::DidHide {
-            time,
-        });
+        IosApp::defer_callback(IosEvent::VirtualKeyboard(VirtualKeyboardEvent::DidHide { time }));
     }
     extern "C" fn keyboard_will_show(_: &Object, _: Sel, notif: ObjcId) {
         let height = get_height_delta(notif);
         let (duration, ease) = get_curve_duration(notif);
         let time = with_ios_app(|app| app.time_now());
-        IosApp::send_virtual_keyboard_event(VirtualKeyboardEvent::WillShow {
+        IosApp::defer_callback(IosEvent::VirtualKeyboard(VirtualKeyboardEvent::WillShow {
             time,
             height,
             ease,
             duration
-        });
+        }));
     }
     extern "C" fn keyboard_did_show(_: &Object, _: Sel, notif: ObjcId) {
         let height = get_height_delta(notif);
         let time = with_ios_app(|app| app.time_now());
-        IosApp::send_virtual_keyboard_event(VirtualKeyboardEvent::DidShow {
-            time,
-            height: height
-        });
-    }
-    extern "C" fn should_change_characters_in_range(
-        _this: &Object,
-        _: Sel,
-        _textfield: ObjcId,
-        range: NSRange,
-        string: ObjcId,
-    ) -> BOOL {
-        unsafe {
-            let len: u64 = msg_send![string, length];
-            if len > 0 {
-                let string = nsstring_to_string(string);
-                IosApp::send_text_input(string, range.length != 0);
-            } else {
-                IosApp::send_backspace();
-            }
-        }
-        NO
+        IosApp::defer_callback(IosEvent::VirtualKeyboard(VirtualKeyboardEvent::DidShow { time, height }));
     }
     
     unsafe {
@@ -326,12 +315,9 @@ pub fn define_textfield_delegate() -> *const Class {
         decl.add_method(sel!(keyboardDidShow:), keyboard_did_show as extern "C" fn(&Object, Sel, ObjcId),);
         decl.add_method(sel!(keyboardWillHide:), keyboard_will_hide as extern "C" fn(&Object, Sel, ObjcId),);
         decl.add_method(sel!(keyboardDidHide:), keyboard_did_hide as extern "C" fn(&Object, Sel, ObjcId),);
-        decl.add_method(
-            sel!(textField: shouldChangeCharactersInRange: replacementString:),
-            should_change_characters_in_range
-            as extern "C" fn(&Object, Sel, ObjcId, NSRange, ObjcId) -> BOOL,
-        );
+        decl.add_method(sel!(textViewDidChange:), ios_text_input::text_changed as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(textViewDidChangeSelection:), ios_text_input::text_changed as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(textViewDidEndEditing:), ios_text_input::text_ended as extern "C" fn(&Object, Sel, ObjcId));
     }
-    decl.add_ivar::<*mut c_void>("display_ptr");
     return decl.register();
 }

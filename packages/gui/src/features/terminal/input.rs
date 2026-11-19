@@ -1,11 +1,9 @@
 //! Keyboard, text and input-method mapping for the interactive terminal.
 //!
-//! Desktop platforms deliver a `KeyDown` for every key and a separate `TextInput` with the
-//! committed text of printable keys and input methods (X11, macOS and Windows deliver only
-//! committed text; composition stays in the system IME). Printable keys are therefore sent
-//! from `TextInput` as UTF-8, while `KeyDown` encodes only non-text keys and Ctrl/Alt
-//! combinations through Ghostty's key encoder (application cursor keys, kitty keyboard,
-//! modifyOtherKeys).
+//! Desktop platforms deliver a `KeyDown` for physical keys and separate text events for
+//! printable characters and input methods. `KeyDown` encodes only non-text keys and
+//! Ctrl/Alt combinations through Ghostty's key encoder (application cursor keys, kitty
+//! keyboard, modifyOtherKeys).
 //!
 //! Clipboard shortcuts follow terminal conventions: Ctrl+Shift+C/V on Linux and Windows,
 //! Cmd+C/V on Apple platforms; Ctrl+C with a selection on Linux and Windows copies it like
@@ -16,10 +14,8 @@
 //! Wheel and touch scrolling over a full-screen program ([`wheel_route`]) are sent to it:
 //! negotiated mouse wheel reports while it tracks the mouse, else arrow keys (alternate scroll).
 //!
-//! Android edits a hidden editor ([`ImeBridge`]); its composing region is shown at the cursor
-//! ([`composing_text`], [`preedit_cells`]) until the input method commits it. iOS reports Korean
-//! syllable updates as replacements of the previous input, rubbed out with DEL like the
-//! original native input.
+//! Android and iOS edit a hidden editor ([`ImeBridge`]); its composing region is shown
+//! at the cursor ([`composing_text`], [`preedit_cells`]) until the input method commits it.
 
 use makepad_widgets::{KeyCode, KeyModifiers};
 use paseo_terminal::{Key, Modes, Modifiers};
@@ -259,7 +255,7 @@ pub fn sticky_key(text: &str, mods: Modifiers) -> Option<(Key, Modifiers)> {
     ))
 }
 
-/// The hidden editor Android's input method edits. Each snapshot's committed text (the
+/// The hidden editor the input method edits. Each snapshot's committed text (the
 /// editor minus its composing region) is diffed against the previous snapshot's: removals
 /// become DEL, insertions are sent; the composing region (Hangul syllables, predicted words)
 /// is sent only once committed. The editor starts as one no-break space, which makes
@@ -269,7 +265,7 @@ pub fn sticky_key(text: &str, mods: Modifiers) -> Option<(Key, Modifiers)> {
 /// The bridge never rewrites the editor while edits are in flight: an echo the platform
 /// refuses (the IME already sent a newer revision) would make every later snapshot repeat
 /// text. Instead it asks for a reset after Enter, an emptied editor or a long line, which the
-/// view publishes as a new input session; that session fences edits of the old editor.
+/// view republishes rather than amending a native edit in progress.
 pub struct ImeBridge {
     /// The committed text the editor holds.
     base: String,
@@ -364,8 +360,8 @@ pub fn preedit_cells(text: &str) -> Vec<(&str, usize)> {
         .collect()
 }
 
-/// iOS input: the previous input is replaced (`replace_last`) while a Korean syllable is
-/// composed (`ㅎ` → `하` → `한`); rub it out and send the replacement.
+/// Incremental `TextInput` can also replace the previous input without a document
+/// snapshot; rub out the tracked text and send the replacement.
 #[derive(Default)]
 pub struct ReplaceTracker {
     last: String,

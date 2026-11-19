@@ -527,7 +527,7 @@ pub(crate) struct PaintedHit<T> {
 }
 
 impl<T> PaintedHit<T> {
-    fn visible_rect(&self) -> Rect {
+    pub(crate) fn visible_rect(&self) -> Rect {
         self.viewport.as_ref().map_or(self.rect, |viewport| {
             let (clip, shift) = viewport.0.get();
             intersect(self.rect.translate(shift), clip)
@@ -570,11 +570,13 @@ impl<T: Clone + PartialEq> HitMap<T> {
         self.viewport = viewport;
     }
 
+    /// Clips semantic bounds with the same paint-time clip as the pointer hit.
+    pub(crate) fn clip_bounds(&self, rect: Rect) -> Rect {
+        self.clip.map_or(rect, |clip| intersect(rect, clip))
+    }
+
     pub fn push(&mut self, rect: Rect, item: T) {
-        let rect = match self.clip {
-            Some(clip) => intersect(rect, clip),
-            None => rect,
-        };
+        let rect = self.clip_bounds(rect);
         if rect.size.x > 0.0 && rect.size.y > 0.0 {
             self.items.push(PaintedHit {
                 rect,

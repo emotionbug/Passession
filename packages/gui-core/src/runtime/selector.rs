@@ -207,16 +207,51 @@ impl Selector {
         self.run_cycle_now();
     }
 
-    /// Connection and foreground notifications can change which interval is due.
+    /// Connection notifications can change which interval is due.
     pub fn connection_changed(self: &Rc<Self>) {
         self.arm_deadline();
     }
 
-    fn arm_deadline(self: &Rc<Self>) {
+    /// Stop spare sockets as well as scheduled work; the host owns its live socket.
+    pub fn pause(&self) {
+        self.cancel_deadline();
+        self.cancel_cycle();
+    }
+
+    pub fn network_changed(self: &Rc<Self>) {
+        if !self.can_probe() {
+            return;
+        }
+        self.cancel_cycle();
+        self.last_probed.borrow_mut().clear();
+        *self.switch_candidate.borrow_mut() = None;
+        self.switch_hits.set(0);
+        self.run_cycle_now();
+    }
+
+    fn can_probe(&self) -> bool {
+        !self.stopped.get()
+            && self
+                .core
+                .upgrade()
+                .is_some_and(|core| !core.network_paused())
+    }
+
+    fn cancel_cycle(&self) {
+        self.sockets.borrow().cancel();
+        self.probe_version.set(self.probe_version.get() + 1);
+        self.cycle_running.set(false);
+    }
+
+    fn cancel_deadline(&self) {
         if let Some(timer) = self.deadline.borrow_mut().take() {
             timer.abort();
         }
-        if self.stopped.get() || self.cycle_running.get() {
+    }
+
+    fn arm_deadline(self: &Rc<Self>) {
+        self.cancel_deadline();
+        if !self.can_probe() || self.cycle_running.get() {
             return;
         }
         let Some(host) = self.host.upgrade() else {
@@ -265,27 +300,17 @@ impl Selector {
     }
 
     pub fn stop(&self) {
-        self.sockets.borrow().cancel();
         self.stopped.set(true);
-        self.probe_version.set(self.probe_version.get() + 1);
-        if let Some(timer) = self.deadline.borrow_mut().take() {
-            timer.abort();
-        }
+        self.pause();
     }
 
     /// Original `updateHost`: edits restart first-seen tracking; a changed password forgets
     /// credential rejections and reprobes everything.
     pub fn connections_changed(self: &Rc<Self>, credentials_changed: bool) {
-        self.sockets.borrow().cancel();
-        *self.sockets.borrow_mut() = tokio_util::sync::CancellationToken::new();
-        self.probe_version.set(self.probe_version.get() + 1);
-        self.cycle_running.set(false);
+        self.cancel_cycle();
         if credentials_changed {
-            self.probe_version.set(self.probe_version.get() + 1);
             self.auth_rejected.borrow_mut().clear();
             self.last_probed.borrow_mut().clear();
-            // A cycle of the old version publishes nothing; the next one runs now.
-            self.cycle_running.set(false);
         }
         self.track_first_seen();
         self.run_cycle_now();
@@ -324,16 +349,22 @@ impl Selector {
     }
 
     fn run_cycle_now(self: &Rc<Self>) {
-        if let Some(timer) = self.deadline.borrow_mut().take() {
-            timer.abort();
-        }
-        if self.stopped.get() || self.cycle_running.replace(true) {
+        self.cancel_deadline();
+        if !self.can_probe() || self.cycle_running.replace(true) {
             return;
         }
+        if self.sockets.borrow().is_cancelled()
+            && let Some(core) = self.core.upgrade()
+        {
+            *self.sockets.borrow_mut() = core.cancel.child_token();
+        }
+        let version = self.probe_version.get() + 1;
+        self.probe_version.set(version);
         let selector = self.clone();
         tokio::task::spawn_local(async move {
-            let version = selector.probe_version.get() + 1;
-            selector.probe_version.set(version);
+            if selector.probe_version.get() != version {
+                return;
+            }
             selector.run_cycle(version).await;
             if selector.probe_version.get() == version {
                 selector.cycle_running.set(false);
@@ -442,6 +473,9 @@ impl Selector {
             let active = connection["id"] == active_id.as_str();
             tasks.push(tokio::task::spawn_local(async move {
                 let id = connection["id"].as_str().unwrap_or_default().to_owned();
+                if selector.probe_version.get() != version {
+                    return (id, Ok(None));
+                }
                 let outcome = if active {
                     selector.probe_active(&host)
                 } else {
@@ -673,6 +707,58 @@ mod tests {
         assert_eq!(due(28, Some(28), false, false), seconds(38));
         assert_eq!(due(58, Some(58), false, false), seconds(88));
         assert_eq!(due(90, None, false, true), seconds(90));
+    }
+
+    #[tokio::test]
+    async fn mobile_background_cancels_probe_sockets_and_resume_probes_immediately() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut core = Core::new(
+                    crate::CoreConfig {
+                        state_dir: dir.path().to_owned(),
+                        daemon_home: None,
+                        default_endpoint: None,
+                        tailnet_key_store: None,
+                    },
+                    std::sync::Arc::new(crate::events::EventQueue::new(std::sync::Arc::new(|| {}))),
+                );
+                Rc::get_mut(&mut core).unwrap().pause_background_network = true;
+                let active = json!({"id":"active"});
+                let host = Host::new(
+                    1,
+                    active.clone(),
+                    "server".into(),
+                    None,
+                    vec![active, json!({"id":"alternate"})],
+                    None,
+                );
+                let selector = Selector::new(&core, &host);
+                *host.selector.borrow_mut() = Some(selector.clone());
+                core.hosts.borrow_mut().push(host.clone());
+                selector.track_first_seen();
+                let now = selector.clock.elapsed();
+                for id in ["active", "alternate"] {
+                    selector.last_probed.borrow_mut().insert(id.into(), now);
+                }
+                selector.arm_deadline();
+                let sockets = selector.sockets.borrow().clone();
+                assert!(selector.deadline.borrow().is_some());
+
+                hosts::set_app_visible(&core, false);
+                assert!(sockets.is_cancelled());
+                selector.connection_changed();
+                selector.network_changed();
+                selector.run_cycle_now();
+                assert!(selector.deadline.borrow().is_none());
+                assert!(!selector.cycle_running.get());
+
+                hosts::set_app_visible(&core, true);
+                assert!(selector.cycle_running.get());
+                assert!(selector.last_probed.borrow().is_empty());
+                assert!(!selector.sockets.borrow().is_cancelled());
+            })
+            .await;
     }
 
     #[test]

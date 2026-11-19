@@ -36,7 +36,7 @@ pub struct HostView {
     pub error: Option<String>,
     pub config: Value,
     pub connections: Vec<Value>,
-    pub projects: Vec<std::sync::Arc<Value>>,
+    pub projects: std::sync::Arc<Vec<std::sync::Arc<Value>>>,
     pub loading_projects: bool,
     pub project_error: Option<String>,
     pub maintenance_operation: Option<String>,

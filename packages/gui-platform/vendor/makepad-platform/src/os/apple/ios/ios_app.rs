@@ -1,10 +1,10 @@
-use super::ios_surface::{DisplayLink, SurfaceMetrics};
+use super::{ios_accessibility, ios_surface::{DisplayLink, SurfaceMetrics}, ios_text_input, ios_wake};
 use std::collections::VecDeque;
 
 use {
     crate::{
         area::Area, event::{
-            KeyCode, KeyEvent, KeyModifiers, LongPressEvent, TextInputEvent, TimerEvent, TouchPoint, TouchState, TouchUpdateEvent, VirtualKeyboardEvent, WindowGeom, WindowGeomChangeEvent
+            KeyModifiers, LongPressEvent, TimerEvent, TouchPoint, TouchState, TouchUpdateEvent, WindowGeom, WindowGeomChangeEvent
         }, makepad_math::*, os::{
             apple::{apple_sys::*, apple_util::str_to_nsstring}, cx_native::EventFlow, ios::{
                 ios_delegates::*,
@@ -17,9 +17,7 @@ use {
     }
 };
 
-// this value will be fetched from multiple threads (post signal uses it)
 pub static mut IOS_CLASSES: *const IosClasses = 0 as *const _;
-// this value should not. Todo: guard this somehow proper
 
 thread_local! {
     pub static IOS_APP: RefCell<Option<IosApp>> = RefCell::new(None);
@@ -58,7 +56,9 @@ pub struct IosClasses {
     pub app_delegate: *const Class,
     pub view: *const Class,
     pub gesture_recognizer_handler: *const Class,
-    pub textfield_delegate: *const Class,
+    pub text_view: *const Class,
+    pub(super) accessibility_element: *const Class,
+    pub input_delegate: *const Class,
     pub timer_delegate: *const Class,
 }
 impl IosClasses {
@@ -67,7 +67,9 @@ impl IosClasses {
             app_delegate: define_ios_app_delegate(),
             view: define_ios_view(),
             gesture_recognizer_handler: define_gesture_recognizer_handler(),
-            textfield_delegate: define_textfield_delegate(),
+            text_view: ios_text_input::define_text_view(),
+            accessibility_element: ios_accessibility::define_element(),
+            input_delegate: define_input_delegate(),
             timer_delegate: define_ios_timer_delegate()
         }
     }
@@ -75,18 +77,18 @@ impl IosClasses {
 
 pub struct IosApp {
     pub time_start: Instant,
-    pub virtual_keyboard_event:  Option<VirtualKeyboardEvent>,
     pub timer_delegate_instance: ObjcId,
     timers: Vec<IosTimer>,
+    executor_timer: ObjcId,
     touches: Vec<TouchPoint>,
     pub last_window_geom: WindowGeom,
     pub(super) view: ObjcId,
     pub(super) surface_active: bool,
     pub(super) surface_metrics: Option<SurfaceMetrics>,
     display_link: Option<DisplayLink>,
-    pending_lifecycle: VecDeque<IosEvent>,
+    pending_events: VecDeque<IosEvent>,
     layout_pending: bool,
-    pub textfield: Option<ObjcId>,
+    input_delegate: ObjcId,
     event_callback: Option<Box<dyn FnMut(IosEvent) -> EventFlow >>,
     pasteboard: ObjcId
 }
@@ -96,19 +98,19 @@ impl IosApp {
         unsafe {
             let pasteboard: ObjcId = msg_send![class!(UIPasteboard), generalPasteboard];
             IosApp {
-                virtual_keyboard_event: None,
                 touches: Vec::new(),
                 last_window_geom: WindowGeom::default(),
                 view: nil,
                 surface_active: false,
                 surface_metrics: None,
                 display_link: None,
-                pending_lifecycle: VecDeque::new(),
+                pending_events: VecDeque::new(),
                 layout_pending: false,
-                textfield: None,
+                input_delegate: nil,
                 time_start: Instant::now(),
                 timer_delegate_instance: msg_send![get_ios_class_global().timer_delegate, new],
                 timers: Vec::new(),
+                executor_timer: nil,
                 event_callback: Some(event_callback),
                 pasteboard,
             }
@@ -149,27 +151,20 @@ impl IosApp {
             let () = msg_send![view, setUserInteractionEnabled: YES];
             let () = msg_send![view, setMultipleTouchEnabled: YES];
             
-            let textfield_dlg: ObjcId = msg_send![get_ios_class_global().textfield_delegate, alloc];
-            let textfield_dlg: ObjcId = msg_send![textfield_dlg, init];
-             
-            let textfield: ObjcId = msg_send![class!(UITextField), alloc];
-            let textfield: ObjcId =  msg_send![textfield, initWithFrame: NSRect {origin: NSPoint {x: 10.0, y: 10.0}, size: NSSize {width: 100.0, height: 50.0}}];
-            let () = msg_send![textfield, setAutocapitalizationType: 0]; // UITextAutocapitalizationTypeNone
-            let () = msg_send![textfield, setAutocorrectionType: 1]; // UITextAutocorrectionTypeNo
-            let () = msg_send![textfield, setSpellCheckingType: 1]; // UITextSpellCheckingTypeNo
-            let () = msg_send![textfield, setHidden: YES];
-            let () = msg_send![textfield, setDelegate: textfield_dlg];
-            // to make backspace work - with empty text there is no event on text removal
-            let () = msg_send![textfield, setText: str_to_nsstring("x")];
-            let () = msg_send![view, addSubview: textfield];
-            
+            let input_delegate: ObjcId = msg_send![get_ios_class_global().input_delegate, new];
             let notification_center: ObjcId = msg_send![class!(NSNotificationCenter), defaultCenter];
-            let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardDidChangeFrame:) name: UIKeyboardDidChangeFrameNotification object: nil];
-            let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardWillChangeFrame:) name: UIKeyboardWillChangeFrameNotification object: nil];
-            let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardDidShow:) name: UIKeyboardDidShowNotification object: nil];
-            let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardWillShow:) name: UIKeyboardWillShowNotification object: nil];
-            let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardDidHide:) name: UIKeyboardDidHideNotification object: nil];
-            let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardWillHide:) name: UIKeyboardWillHideNotification object: nil];
+            for (name, selector) in [
+                (UIKeyboardDidChangeFrameNotification, sel!(keyboardDidChangeFrame:)),
+                (UIKeyboardWillChangeFrameNotification, sel!(keyboardWillChangeFrame:)),
+                (UIKeyboardDidShowNotification, sel!(keyboardDidShow:)),
+                (UIKeyboardWillShowNotification, sel!(keyboardWillShow:)),
+                (UIKeyboardDidHideNotification, sel!(keyboardDidHide:)),
+                (UIKeyboardWillHideNotification, sel!(keyboardWillHide:)),
+            ] {
+                let () = msg_send![notification_center, addObserver: input_delegate selector: selector name: name object: nil];
+            }
+            let () = msg_send![view, setIsAccessibilityElement: NO];
+            let () = msg_send![notification_center, addObserver: delegate selector: sel!(voiceOverStatusChanged:) name: ios_accessibility::status_notification() object: nil];
             
             let () = msg_send![window_obj, addSubview: view];
             
@@ -177,7 +172,7 @@ impl IosApp {
             
             let () = msg_send![window_obj, makeKeyAndVisible];
             
-            self.textfield = Some(textfield);
+            self.input_delegate = input_delegate;
             self.view = view;
             self.display_link = Some(DisplayLink::new(self.timer_delegate_instance));
 
@@ -199,10 +194,12 @@ impl IosApp {
             app.surface_active = active;
             if !active {
                 if let Some(link) = &mut app.display_link { link.set_running(false); }
+                app.update_executor_timer(false);
             }
             true
         });
         if changed {
+            ios_wake::set_active(active);
             Self::do_callback(if active { IosEvent::SurfaceResumed } else { IosEvent::SurfaceSuspended });
             if active { Self::surface_frame(false); }
         }
@@ -317,21 +314,24 @@ impl IosApp {
         }
     }
     
-    pub fn show_keyboard() {
-        let textfield = with_ios_app(|app| app.textfield.unwrap());
-        let () = unsafe {msg_send![textfield, becomeFirstResponder]};
+    pub(super) fn text_input_host() -> Option<(ObjcId, ObjcId)> {
+        with_ios_app(|app| (app.view != nil).then_some((app.view, app.input_delegate)))
     }
 
-    pub fn hide_keyboard(){
-        let textfield = with_ios_app(|app| app.textfield.unwrap());
-        let () = unsafe {msg_send![textfield, resignFirstResponder]};
+    pub(super) fn defer_callback(event: IosEvent) {
+        let needs_wake = with_ios_app(|app| {
+            app.pending_events.push_back(event);
+            app.event_callback.is_some()
+        });
+        if needs_wake { ios_wake::post(); }
     }
     
     pub fn do_callback(mut event: IosEvent) {
         let callback = with_ios_app(|app| app.event_callback.take());
         let Some(mut callback) = callback else {
-            if matches!(event, IosEvent::SurfaceResumed | IosEvent::SurfaceSuspended | IosEvent::SurfaceMemoryWarning) {
-                with_ios_app(|app| app.pending_lifecycle.push_back(event));
+            if matches!(event, IosEvent::Wake | IosEvent::SurfaceResumed | IosEvent::SurfaceSuspended
+                | IosEvent::SurfaceMemoryWarning | IosEvent::AccessibilityStatus | IosEvent::TextEdit { .. }) {
+                with_ios_app(|app| app.pending_events.push_back(event));
             }
             return;
         };
@@ -341,7 +341,7 @@ impl IosApp {
                 if let Some(link) = &mut app.display_link {
                     link.set_running(app.surface_active && matches!(flow, EventFlow::Poll));
                 }
-                app.pending_lifecycle.pop_front()
+                app.pending_events.pop_front()
             });
             if let Some(pending) = pending { event = pending; } else { break; }
         }
@@ -352,21 +352,38 @@ impl IosApp {
         if layout_pending { Self::surface_frame(false); }
     }
     
+    // makepad-futures does not expose a task-ready hook on its mpsc executor.
+    // Do not poll it at all unless a client asks for Cx::spawner().
+    pub(super) fn update_executor_timer(&mut self, spawner_requested: bool) {
+        unsafe {
+            if self.surface_active && spawner_requested {
+                if self.executor_timer != nil { return; }
+                self.executor_timer = self.add_timer(0.250, sel!(executorTick:), YES);
+            } else if self.executor_timer != nil {
+                let () = msg_send![self.executor_timer, invalidate];
+                self.executor_timer = nil;
+            }
+        }
+    }
+
+    unsafe fn add_timer(&self, interval: f64, selector: Sel, repeats: BOOL) -> ObjcId {
+        let timer: ObjcId = msg_send![
+            class!(NSTimer),
+            timerWithTimeInterval: interval
+            target: self.timer_delegate_instance
+            selector: selector
+            userInfo: nil
+            repeats: repeats
+        ];
+        let run_loop: ObjcId = msg_send![class!(NSRunLoop), mainRunLoop];
+        let () = msg_send![run_loop, addTimer: timer forMode: NSRunLoopCommonModes];
+        timer
+    }
     
     pub fn start_timer(&mut self, timer_id: u64, interval: f64, repeats: bool) {
         unsafe {
             let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
-            
-            let nstimer: ObjcId = msg_send![
-                class!(NSTimer),
-                timerWithTimeInterval: interval
-                target: self.timer_delegate_instance
-                selector: sel!(receivedTimer:)
-                userInfo: nil
-                repeats: repeats
-            ];
-            let nsrunloop: ObjcId = msg_send![class!(NSRunLoop), mainRunLoop];
-            let () = msg_send![nsrunloop, addTimer: nstimer forMode: NSRunLoopCommonModes];
+            let nstimer = self.add_timer(interval, sel!(receivedTimer:), if repeats { YES } else { NO });
             
             self.timers.push(IosTimer {
                 timer_id: timer_id,
@@ -377,13 +394,6 @@ impl IosApp {
         }
     }
     
-    pub fn send_virtual_keyboard_event(event:VirtualKeyboardEvent){
-        IosApp::do_callback(IosEvent::VirtualKeyboard(event));
-    }
-    
-    pub fn queue_virtual_keyboard_event(&mut self, event:VirtualKeyboardEvent){
-        self.virtual_keyboard_event = Some(event);
-    }
 
     pub fn stop_timer(&mut self, timer_id: u64) {
         for i in 0..self.timers.len() {
@@ -397,29 +407,6 @@ impl IosApp {
         }
     }
     
-    pub fn send_text_input(input: String, replace_last: bool) {
-        IosApp::do_callback(IosEvent::TextInput(TextInputEvent {
-            input: input,
-            was_paste: false,
-            replace_last: replace_last
-        }))
-    }
-    
-    pub fn send_backspace() {
-        let time = with_ios_app(|app| app.time_now());
-        IosApp::do_callback(IosEvent::KeyDown(KeyEvent {
-            key_code: KeyCode::Backspace,
-            is_repeat: false,
-            modifiers: Default::default(),
-            time,
-        }));
-        IosApp::do_callback(IosEvent::KeyUp(KeyEvent {
-            key_code: KeyCode::Backspace,
-            is_repeat: false,
-            modifiers: Default::default(),
-            time,
-        }));
-    }
     
     pub fn send_timer_received(nstimer: ObjcId) {
         let len = with_ios_app(|app| app.timers.len());

@@ -2,6 +2,7 @@
 //! (tabs, panes, Explorer, sidebar), mounts feature roots per tab, routes commands and
 //! shortcuts, and draws the chrome (header, tab strips, sidebar, overlays).
 
+mod accessibility;
 pub mod activity;
 pub mod chrome;
 pub mod commands;
@@ -1240,6 +1241,7 @@ impl Widget for PaseoShell {
                 panel.layer.finish_frame(cx);
             }
         }
+        accessibility::publish(self, cx, rect);
         DrawStep::done()
     }
 }

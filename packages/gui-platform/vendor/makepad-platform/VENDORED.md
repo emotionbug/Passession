@@ -123,6 +123,26 @@ the Return that commits a syllable, rather than reaching chat submission or
 editor navigation afterward. `ime_composer` tests cover Hangul steps, commit,
 unmark, cancellation, editor switches and supplementary Unicode ranges.
 
+## iOS input-method composition
+
+The old hidden `UITextField` held a sentinel and rejected each native change,
+so it could neither retain marked text nor name the affected selection.
+`ios_text_input.rs` keeps a native `UITextView` as the focused Rust editor's
+invisible `UITextInput` document. UIKit applies selection, replacement and
+marked-text edits to real surrounding text; Rust receives the same UTF-16
+`TextImeEvent` snapshots that Android uses, including selection-only and unmark
+changes. The view is not a second pointer or accessibility target. Standard
+iOS suggestions and autocorrection remain enabled for ordinary inputs, not for
+terminal, secure, or numeric input.
+
+The responder's session and the snapshot's revision fence old edits across
+focus changes. A Rust echo preserves the mark; a changed Rust text or selection
+ends the mark without inserting it again. A standalone Return on a single-line
+field routes to the focused editor, not a newline edit. The mobile terminal
+uses the same marked-text bridge and sends only committed composition to the PTY.
+The `ios_state` tests cover UTF-16 ranges, edit application, composition and stale
+revisions; UIKit keyboard behavior needs device verification.
+
 ## Windows input-method composition
 
 Upstream ignored input-method compositions on Windows: the input method drew the
@@ -266,6 +286,20 @@ See development's [macOS](../../../../docs/development.md#macos-iosurface-verifi
 and [iOS](../../../../docs/development.md#ios-iosurface-verification) verification
 procedures for switches, native regression scenarios and timing/trace fields.
 
+## iOS run-loop wakeups
+
+`SignalToUI`, Apple HTTP completions and simulator live-file notifications wake
+the main queue instead of depending on the former 8 ms iOS timer. Studio's
+socket already posts `SignalToUI` on receive. The foreground wake is coalesced;
+pending producer work stays queued while inactive and is drained on resume.
+UIKit keyboard notifications wait for the current callback to finish or post
+one wake. Platform operations run before returning to the native loop, so an
+idle app does not need a timer to show its keyboard, start a request or repaint.
+
+Makepad's optional executor has no task-ready callback. Its 250 ms fallback
+starts only if a caller obtains `Cx::spawner()` and stops on suspension.
+Paseo does not use that spawner; it has no periodic iOS signal poll.
+
 ## Android Surface lifetime
 
 `os/linux/android/android.rs` gates drawing and `SurfaceTexture.updateTexImage`
@@ -342,6 +376,29 @@ focus request. A closing/hidden field cannot overwrite a newer field's focus.
 areas before publishing native state. Undrawn fields must not register phantom
 editors when the real field blurs, restart the IME or cancel its pending hide.
 The focus regression covers initial state, pending ownership, activation and blur.
+
+## Native mobile accessibility
+
+`accessibility.rs` publishes a revisioned, platform-neutral tree with stable
+IDs, labels, roles, actions and clipped bounds in logical window coordinates.
+Only enabled consumers request a tree. Native actions return by ID and dispatch
+only if the latest Rust tree still allows the action. Accessibility focus
+remains separate from keyboard focus.
+
+Android enables semantics while AccessibilityManager reports an active service
+or touch exploration. The render loop sends a UTF-8 virtual tree when the
+revision or surface/density changes, in pixels relative to the surface.
+`MakepadAccessibility` exposes it through the SurfaceView's
+AccessibilityNodeProvider and sends subtree change and virtual focus events
+on the Java UI thread. Activation, input focus and directional scrolling return
+to the current Rust tree.
+
+iOS enables semantics while VoiceOver runs. `ios_accessibility.rs` supplies
+ordered `UIAccessibilityElement` children with the Makepad view as container
+and logical point bounds as their container-relative frames. Existing elements
+keep their native identity across tree revisions; VoiceOver receives a layout
+change notification when the tree changes. The hidden keyboard responder is
+not exposed, and double-tap activation checks the current node and its action.
 
 ## Native text-action ownership
 

@@ -77,9 +77,112 @@ impl CoreState {
 pub struct DirectorySnapshot {
     pub revision: u64,
     pub cached_at: Option<String>,
-    pub projects: Vec<Arc<Value>>,
-    pub workspaces: Vec<Arc<Value>>,
-    pub agents: Vec<Arc<Value>>,
+    pub projects: Arc<Vec<Arc<Value>>>,
+    pub workspaces: Arc<Vec<Arc<Value>>>,
+    pub agents: DirectoryAgents,
+}
+
+const AGENT_PAGE_SIZE: usize = 32;
+type AgentPage = Arc<Vec<Option<Arc<Value>>>>;
+
+/// Insertion-ordered agent rows. A publication shares the spine and all pages. A mutation
+/// copies one page and, when published, the spine (one pointer per 32 slots), not all rows.
+#[derive(Clone, Debug, Default)]
+pub struct DirectoryAgents {
+    pages: Arc<Vec<AgentPage>>,
+    order: Arc<()>,
+    len: usize,
+    slots: usize,
+}
+
+impl DirectoryAgents {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<Value>> {
+        self.pages.iter().flat_map(|page| page.iter().flatten())
+    }
+
+    /// Visits row replacements for snapshots with unchanged order, skipping shared pages.
+    /// Returns false without visiting when insertion, removal or hydration changed the order.
+    pub fn for_each_replacement(
+        &self,
+        old: &Self,
+        mut visit: impl FnMut(&Arc<Value>, &Arc<Value>),
+    ) -> bool {
+        if !Arc::ptr_eq(&self.order, &old.order) {
+            return false;
+        }
+        if !Arc::ptr_eq(&self.pages, &old.pages) {
+            for (old, new) in old.pages.iter().zip(self.pages.iter()) {
+                if !Arc::ptr_eq(old, new) {
+                    for (old, new) in old.iter().flatten().zip(new.iter().flatten()) {
+                        if !Arc::ptr_eq(old, new) {
+                            visit(old, new);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn slots(&self) -> usize {
+        self.slots
+    }
+
+    pub(crate) fn row_at(&self, slot: usize) -> &Arc<Value> {
+        self.pages[slot / AGENT_PAGE_SIZE][slot % AGENT_PAGE_SIZE]
+            .as_ref()
+            .expect("indexed directory agent")
+    }
+
+    pub(crate) fn replace_at(&mut self, slot: usize, row: Arc<Value>) {
+        *self.slot_mut(slot) = Some(row);
+    }
+
+    pub(crate) fn remove_at(&mut self, slot: usize) {
+        *self.slot_mut(slot) = None;
+        self.len -= 1;
+        self.order = Arc::new(());
+    }
+
+    fn slot_mut(&mut self, slot: usize) -> &mut Option<Arc<Value>> {
+        &mut Arc::make_mut(&mut Arc::make_mut(&mut self.pages)[slot / AGENT_PAGE_SIZE])
+            [slot % AGENT_PAGE_SIZE]
+    }
+
+    pub(crate) fn push(&mut self, row: Arc<Value>) -> usize {
+        self.order = Arc::new(());
+        self.append(row)
+    }
+
+    fn append(&mut self, row: Arc<Value>) -> usize {
+        let slot = self.slots;
+        let pages = Arc::make_mut(&mut self.pages);
+        if slot.is_multiple_of(AGENT_PAGE_SIZE) {
+            pages.push(Arc::new(Vec::with_capacity(AGENT_PAGE_SIZE)));
+        }
+        Arc::make_mut(&mut pages[slot / AGENT_PAGE_SIZE]).push(Some(row));
+        self.len += 1;
+        self.slots += 1;
+        slot
+    }
+}
+
+impl FromIterator<Arc<Value>> for DirectoryAgents {
+    fn from_iter<T: IntoIterator<Item = Arc<Value>>>(rows: T) -> Self {
+        let mut agents = Self::default();
+        for row in rows {
+            agents.append(row);
+        }
+        agents
+    }
 }
 
 /// Startup configuration supplied by the shell/platform layer.
@@ -203,6 +306,8 @@ pub(crate) enum Command {
     SetAppVisible {
         visible: bool,
     },
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    NetworkChanged,
     SaveState {
         key: String,
         value: Value,
@@ -406,6 +511,12 @@ impl CoreHandle {
 
     pub fn set_app_visible(&self, visible: bool) {
         self.send(Command::SetAppVisible { visible });
+    }
+
+    /// Re-evaluate host connections after the OS reports a changed network path.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn network_changed(&self) {
+        self.send(Command::NetworkChanged);
     }
 
     pub fn save_state(&self, key: &str, value: Value) {

@@ -138,6 +138,18 @@ impl Bridge {
         }
     }
 
+    /// Mobile build provisioning, not the user's notification permission.
+    pub fn push_availability(&self) -> Option<PlatformRequestId> {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            platform().map(|handle| handle.push_availability())
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            None
+        }
+    }
+
     /// The app's notification settings; `channel` opens one Android channel's settings.
     pub fn open_notification_settings(&mut self, channel: Option<&str>) -> PlatformRequestId {
         self.open_permission_settings(match channel {

@@ -15,7 +15,7 @@ use crate::common::widgets::{StatusBucket, agent_live_status_bucket, paint_statu
 use crate::common::{PanelTarget, Route, UiContext, icons, json as j, layer, tr, tr_args};
 use crate::shell::hosts::{self, Host};
 use crate::shell::layout::{Axis, CompactDestination, Node};
-use crate::shell::ui::{Ui, Variant};
+use crate::shell::ui::{HitScope, Ui, Variant};
 use crate::shell::{PaseoShell, commands, panels, sidebar};
 use crate::theme::{self, ControlSize, Palette, with_alpha};
 
@@ -565,6 +565,11 @@ pub(crate) fn make_ui(shell: &mut PaseoShell) -> Ui<'_> {
         p: theme::current_palette(),
         t: theme::current_typography(),
         compact,
+        semantics: if data.chrome.overlay_pass {
+            HitScope::Overlay(0)
+        } else {
+            HitScope::Shell
+        },
     }
 }
 
@@ -594,7 +599,7 @@ fn island(
     } else {
         r
     };
-    ui.hit_tip(hit, id, tooltip);
+    ui.hit_tip(cx, hit, id, tooltip);
     r
 }
 
@@ -1532,7 +1537,20 @@ fn draw_tab_strip(
             };
             // A shrunk tab keeps its full title as a tooltip.
             let truncated = ui.measure(cx, label_spec, &label) > text_rect.size.x + 0.5;
-            ui.hit_tip(tab_hit, &tab_id, if truncated { &label } else { "" });
+            ui.control(
+                cx,
+                tab_hit,
+                &tab_id,
+                &label,
+                AccessibilityRole::ListItem,
+                AccessibilityState {
+                    selected: active,
+                    ..AccessibilityState::default()
+                },
+            );
+            if truncated {
+                ui.tooltip(&tab_id, &label);
+            }
             if actions {
                 let menu = rect(
                     chip.pos.x + chip.size.x - 58.0,
@@ -1607,6 +1625,7 @@ fn draw_tab_strip(
             let spec = ui.spec(Font::Medium, 12.0, p.muted);
             ui.text_centered(cx, button, spec, &format!("+{}", hidden.len()));
             ui.hit_tip(
+                cx,
                 button,
                 &id,
                 &tr_args(
@@ -1921,6 +1940,19 @@ pub fn draw_compact_explorer(
     place_explorer(shell, cx);
 }
 
+pub(super) fn accessibility_explorer_root(shell: &PaseoShell) -> Option<DrawListId> {
+    (!shell.data.chrome.explorer.is_moving())
+        .then(|| {
+            shell
+                .data
+                .chrome
+                .explorer_list
+                .as_ref()
+                .map(|list| list.id())
+        })
+        .flatten()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Events
 
@@ -1944,6 +1976,28 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     let sidebar_visible = sidebar_visible(shell);
     if !sidebar_visible {
         shell.data.sidebar.stop_motion();
+    }
+    if let Event::AccessibilityAction(action) = event {
+        use super::accessibility;
+        if shell.data.app_inactive
+            || (shell.data.compact && shell.data.chrome.explorer_visible())
+            || crate::common::overlay::window_modal_open(&shell.data.window_id)
+        {
+            return;
+        }
+        if action.id == accessibility::sidebar_id() && sidebar_visible {
+            if let Some(delta) =
+                accessibility::page_delta(action.action, shell.data.sidebar.viewport)
+            {
+                sidebar::scroll(shell, cx, delta);
+            }
+        } else if action.action == AccessibilityAction::Activate
+            && let Some(id) = accessibility::hit(&shell.data.hits, HitScope::Shell, action.id)
+            && let Some(ui) = scope.data.get_mut::<UiContext>()
+        {
+            commands::click(shell, cx, ui, &id, KeyModifiers::default());
+        }
+        return;
     }
     let area = shell.layers.bg;
     match event.hits(cx, area) {

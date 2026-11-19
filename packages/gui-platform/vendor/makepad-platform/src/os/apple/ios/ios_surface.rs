@@ -1,5 +1,5 @@
 //! UIKit host for the shared Metal IOSurface presenter.
-use super::{ios_app::IosApp, ios_event::IosEvent};
+use super::{ios_app::IosApp, ios_event::IosEvent, ios_wake::dispatch_main};
 use crate::{
     event::WindowGeom,
     makepad_math::dvec2,
@@ -12,14 +12,6 @@ extern "C" {
     static kCAGravityBottomLeft: ObjcId;
 }
 
-// dispatch_get_main_queue() in the public dispatch header is an inline accessor
-// for this exported queue. Only UIKit/main-thread code may inspect IosApp.
-#[link(name = "System")]
-extern "C" {
-    static _dispatch_main_q: u8;
-    fn dispatch_async_f(queue: *const c_void, context: *mut c_void, callback: extern "C" fn(*mut c_void));
-}
-
 static READY_QUEUED: AtomicBool = AtomicBool::new(false);
 
 pub(in crate::os::apple) fn post_surface_ready() {
@@ -30,7 +22,7 @@ pub(in crate::os::apple) fn post_surface_ready() {
         IosApp::do_callback(IosEvent::SurfaceReady);
     }
     if !READY_QUEUED.swap(true, Ordering::AcqRel) {
-        unsafe { dispatch_async_f(std::ptr::addr_of!(_dispatch_main_q).cast(), std::ptr::null_mut(), wake) };
+        dispatch_main(wake);
     }
 }
 

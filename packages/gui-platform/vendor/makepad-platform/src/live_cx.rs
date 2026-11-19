@@ -233,7 +233,7 @@ impl Cx {
             }
             if changed_files.len()>0{
                 send.send(changed_files).unwrap();
-                #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
+                #[cfg(any(target_os = "ios", all(target_os = "linux", not(any(linux_direct, target_env = "ohos")))))]
                 crate::thread::SignalToUI::set_ui_signal();
             }
             std::thread::sleep(std::time::Duration::from_millis(milis));
@@ -243,7 +243,7 @@ impl Cx {
     pub fn reload_ui_dsl(&mut self){
         let send = self.live_file_change_sender.clone();
         send.send(vec![]).ok();
-        #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
+        #[cfg(any(target_os = "ios", all(target_os = "linux", not(any(linux_direct, target_env = "ohos")))))]
         crate::thread::SignalToUI::set_ui_signal();
     }
     

@@ -108,6 +108,8 @@ pub fn define_url_session_data_delegate() -> *const Class {
             };
             
             let _ = context_box.sender.send(message);
+            #[cfg(target_os = "ios")]
+            crate::os::apple::ios::ios_wake::post();
             // keep the sender_box
             let _ = Box::into_raw(context_box);
         }
@@ -149,6 +151,8 @@ pub fn define_url_session_data_delegate() -> *const Class {
                 };
                 context_box.sender.send(message).unwrap();
             }
+            #[cfg(target_os = "ios")]
+            crate::os::apple::ios::ios_wake::post();
         }
     }
 
@@ -422,6 +426,8 @@ impl AppleHttpRequests{
                             })
                         };
                         networking_sender.send(message).unwrap();
+                        #[cfg(target_os = "ios")]
+                        crate::os::apple::ios::ios_wake::post();
                         return;
                     }
                                             
@@ -453,6 +459,8 @@ impl AppleHttpRequests{
                         response: NetworkResponse::HttpResponse(response)
                     };
                     networking_sender.send(message).unwrap();
+                    #[cfg(target_os = "ios")]
+                    crate::os::apple::ios::ios_wake::post();
                 });
                 
                 let data_task: ObjcId = msg_send![session, dataTaskWithRequest: ns_request completionHandler: &response_handler];

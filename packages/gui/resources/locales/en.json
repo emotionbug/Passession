@@ -1,4 +1,11 @@
 {
+  "accessibility": {
+    "sidebarSessions": "Session list",
+    "options": "Options",
+    "textField": "Text field",
+    "toggle": "Toggle",
+    "filter": "Filter"
+  },
   "mermaid": {
     "source": "Source",
     "hideSource": "Hide source",
@@ -1419,6 +1426,8 @@
         "jumpToFile": { "title": "Jump to file" },
         "binaryFile": "Binary file",
         "tooLarge": "Diff too large to display",
+        "loadingPatch": "Loading patch",
+        "noTextualChanges": "No textual changes.",
         "previewTooLargeTitle": "This diff is too large to preview",
         "previewTooLargeDescription": "Narrow the comparison to preview it here",
         "unified": "Unified diff",
@@ -1521,9 +1530,17 @@
           "passedLabel": "passed",
           "failedLabel": "failed",
           "runningLabel": "running",
+          "runningDuration": "running {{duration}}",
           "passedAccessible": "Checks passed",
           "failedAccessible": "Checks failed",
           "runningAccessible": "Checks running"
+        },
+        "duration": {
+          "seconds": "{{seconds}}s",
+          "minutes": "{{minutes}}m",
+          "minutesSeconds": "{{minutes}}m {{seconds}}s",
+          "hours": "{{hours}}h",
+          "hoursMinutes": "{{hours}}h {{minutes}}m"
         },
         "sections": {
           "checks": "Checks",
@@ -1671,7 +1688,9 @@
           "justNow": "just now",
           "minutesAgo": "{{count}}m ago",
           "hoursAgo": "{{count}}h ago",
-          "daysAgo": "{{count}}d ago"
+          "daysAgo": "{{count}}d ago",
+          "monthsAgo": "{{count}}mo ago",
+          "yearsAgo": "{{count}}y ago"
         }
       }
     }
@@ -2677,6 +2696,8 @@
     "notifications": {
       "title": "Notifications",
       "permission": "Notification permission",
+      "pushTitle": "Push notifications",
+      "pushUnavailable": "Push notifications aren’t available in this build. If you allow notifications, the app can still show alerts while it’s open.",
       "status": {
         "allowed": "Notifications are on.",
         "notDetermined": "Allow notifications to hear when an agent needs you or finishes.",

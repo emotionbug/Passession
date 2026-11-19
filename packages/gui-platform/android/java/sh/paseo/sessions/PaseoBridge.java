@@ -110,6 +110,39 @@ final class PaseoBridge {
     private boolean systemBarsDark;
     private int systemBarsBackground;
     private boolean destroyed;
+    private ConnectivityManager pathManager;
+    private Network pathNetwork;
+    private LinkProperties pathProperties;
+    // These callbacks can run while the GUI is suspended. Handle them on
+    // the bridge's main handler so destruction and path updates are ordered.
+    private final ConnectivityManager.NetworkCallback pathCallback = new ConnectivityManager.NetworkCallback() {
+        @Override public void onAvailable(Network network) {
+            main.post(() -> {
+                if (destroyed || current != PaseoBridge.this || network.equals(pathNetwork)) return;
+                pathNetwork = network;
+                pathProperties = null;
+                nativeEvent("networkChanged", "{}");
+            });
+        }
+
+        @Override public void onLost(Network network) {
+            main.post(() -> {
+                if (destroyed || current != PaseoBridge.this || !network.equals(pathNetwork)) return;
+                pathNetwork = null;
+                pathProperties = null;
+                nativeEvent("networkChanged", "{}");
+            });
+        }
+
+        @Override public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+            main.post(() -> {
+                if (destroyed || current != PaseoBridge.this
+                        || !network.equals(pathNetwork) || properties.equals(pathProperties)) return;
+                pathProperties = properties;
+                nativeEvent("networkChanged", "{}");
+            });
+        }
+    };
     // Main-thread owned, including completion after an IO task. Keep the request
     // alive while copying so native callers retain the generated source.
     private SaveRequest pendingSave;
@@ -320,6 +353,19 @@ final class PaseoBridge {
      * (packaging/android/makepad/PATCHES.diff) and are left in place.
      */
     void attachViews() {
+        // Host connections need the default path even when Embedded Tailscale is off.
+        ConnectivityManager manager = (ConnectivityManager)
+                activity.getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (manager != null) {
+            try {
+                pathNetwork = manager.getActiveNetwork();
+                pathProperties = pathNetwork == null ? null : manager.getLinkProperties(pathNetwork);
+                manager.registerDefaultNetworkCallback(pathCallback);
+                pathManager = manager;
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Cannot observe default network changes", error);
+            }
+        }
         ViewGroup content = activity.findViewById(android.R.id.content);
         if (content == null) return;
         content.getViewTreeObserver().addOnGlobalLayoutListener(this::publishInsets);
@@ -342,6 +388,10 @@ final class PaseoBridge {
 
     void onDestroy() {
         destroyed = true;
+        if (pathManager != null) {
+            pathManager.unregisterNetworkCallback(pathCallback);
+            pathManager = null;
+        }
         if (pendingSave != null && !pendingSave.preparing && !pendingSave.copying) {
             finishSave(pendingSave, error("native", "The activity closed before the document was saved."));
         }

@@ -98,7 +98,7 @@ pub struct WaTerminalView {
     ime_caret: Area,
     #[rust]
     ime: ImeBridge,
-    /// The Android editor's text and UTF-8 selection as last reported or published.
+    /// The input method's text and UTF-8 selection as last reported or published.
     #[rust(IME_SENTINEL.to_owned())]
     ime_text: String,
     #[rust((IME_SENTINEL.len(), IME_SENTINEL.len()))]
@@ -358,7 +358,7 @@ impl WaTerminalView {
         self.has_focus = false;
         self.preedit.clear();
         self.replaced.clear();
-        self.ime_reset |= ANDROID;
+        self.ime_reset |= MOBILE;
         self.suppress_text = false;
         self.touch_pan = None;
         self.scroll_bars.cancel_touch_scroll();
@@ -516,7 +516,7 @@ impl WaTerminalView {
             KeyCommand::Send(code, mods) => {
                 self.suppress_text = matches!(code, Key::Char(_) | Key::Space);
                 // A finished line starts the input method's editor over (`ImeBridge`).
-                self.ime_reset |= ANDROID && code == Key::Enter;
+                self.ime_reset |= MOBILE && code == Key::Enter;
                 core.is_some_and(|core| self.key(cx, core, code, mods))
             }
             KeyCommand::Copy => {

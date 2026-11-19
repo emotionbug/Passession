@@ -2,10 +2,13 @@ use {
     std::{
         time::Instant,
         rc::Rc,
-        cell::{RefCell},
+        cell::{Cell, RefCell},
     },
 
     crate::{
+        area::Area,
+        makepad_math::{dvec2, Rect},
+        AccessibilityAction,
         makepad_live_id::*,
         os::{
             cx_native::EventFlow,
@@ -26,12 +29,14 @@ use {
         window::CxWindowPool,
         event::{
             Event,
-            NetworkResponseChannel
+            KeyCode, KeyEvent, NetworkResponseChannel, TextImeEvent,
         },
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
         cx::{Cx, OsType},
     }
 };
+
+use super::{ios_accessibility::{self, Accessibility}, ios_text_input::TextInput, ios_wake};
 
 impl Cx {
 
@@ -48,19 +53,16 @@ impl Cx {
             move | event | {
                 let mut cx_ref = cx.borrow_mut();
                 let mut metal_cx = metal_cx.borrow_mut();
-                let event_flow = cx_ref.ios_event_callback(event, &mut metal_cx);
+                cx_ref.ios_event_callback(event, &mut metal_cx);
                 let executor = cx_ref.executor.take().unwrap();
                 drop(cx_ref);
                 executor.run_until_stalled();
                 let mut cx_ref = cx.borrow_mut();
                 cx_ref.executor = Some(executor);
-                event_flow
+                cx_ref.ios_flush_platform_ops();
+                cx_ref.ios_event_flow()
             }
         }));
-        // lets set our signal poll timer
-
-        // final bit of initflow
-
         IosApp::event_loop();
     }
 
@@ -136,6 +138,7 @@ impl Cx {
             self.call_draw_event();
             // A synchronous UIKit callback can suspend the app during Draw.
             if !with_ios_app(|app| app.surface_active) { return; }
+            self.ios_sync_accessibility();
             self.mtl_compile_shaders(metal_cx);
         }
         self.repaint_ios_surface(metal_cx, display_tick, layout);
@@ -156,49 +159,39 @@ impl Cx {
         &mut self,
         event: IosEvent,
         metal_cx: &mut MetalCx,
-    ) -> EventFlow {
+    ) {
 
         self.handle_platform_ops();
 
-        match &event {
-            IosEvent::Timer(te) => {
-                if te.timer_id == 0 {
-                    let vk = with_ios_app(|app| app.virtual_keyboard_event.take());
-                    if let Some(vk) = vk{
-                        self.call_event_handler(&Event::VirtualKeyboard(vk));
-                    }
-                    // check signals
-                    if SignalToUI::check_and_clear_ui_signal(){
+        match event {
+            IosEvent::Wake => {
+                if with_ios_app(|app| app.surface_active) {
+                    if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_media_signals();
                         self.call_event_handler(&Event::Signal);
                     }
                     if SignalToUI::check_and_clear_action_signal() {
                         self.handle_action_receiver();
                     }
-
-                    if self.handle_live_edit(){
-                        // self.draw_shaders.ptr_to_item.clear();
-                        // self.draw_shaders.fingerprints.clear();
+                    if self.handle_live_edit() {
                         self.call_event_handler(&Event::LiveEdit);
                         self.redraw_all();
                     }
                     self.handle_networking_events();
                 }
             }
-            _ => ()
-        }
-
-        match event {
+            IosEvent::ExecutorTick => {}
             IosEvent::VirtualKeyboard(vk)=>{
                 self.call_event_handler(&Event::VirtualKeyboard(vk));
             }
             IosEvent::Init=>{
-                with_ios_app(|app| app.start_timer(0, 0.008, true));
+                self.ios_accessibility_status();
                 self.start_studio_websocket_delayed();
                 self.call_event_handler(&Event::Startup);
                 self.redraw_all();
             }
             IosEvent::SurfaceResumed => {
+                self.ios_accessibility_status();
                 if with_ios_app(|app| app.surface_metrics.is_some()) {
                     self.call_event_handler(&Event::AppGotFocus);
                     self.redraw_all();
@@ -206,6 +199,9 @@ impl Cx {
                 }
             }
             IosEvent::SurfaceSuspended => {
+                if let Some(edit) = self.os.text_input.end_composition() {
+                    self.ios_deliver_text_ime(edit);
+                }
                 metal_cx.drain_surface_queue();
                 if let Some(surface) = &mut self.os.surface { surface.invalidate(); }
                 self.call_event_handler(&Event::AppLostFocus);
@@ -232,6 +228,12 @@ impl Cx {
             IosEvent::SurfaceLayout => transaction(|| self.ios_surface_frame(metal_cx, false, true)),
             IosEvent::DisplayFrame => self.ios_surface_frame(metal_cx, true, false),
             IosEvent::SurfaceReady => self.present_ios_surface(),
+            IosEvent::AccessibilityStatus => self.ios_accessibility_status(),
+            IosEvent::AccessibilityActivate { id, handled } => {
+                if ios_accessibility::is_running() && with_ios_app(|app| app.surface_active) {
+                    handled.set(self.perform_accessibility_action(id, AccessibilityAction::Activate));
+                }
+            }
             IosEvent::TouchUpdate(e)=>{
                 self.fingers.process_touch_update_start(e.time, &e.touches);
                 let e = Event::TouchUpdate(e);
@@ -264,28 +266,36 @@ impl Cx {
             IosEvent::Scroll(e) => {
                 self.call_event_handler(&Event::Scroll(e.into()))
             }
-            IosEvent::TextInput(e) => {
-                self.call_event_handler(&Event::TextInput(e))
+            IosEvent::TextEdit { session, text, selection, composing, ended } => {
+                if self.has_key_focus(self.os.text_input.area()) && with_ios_app(|app| app.surface_active) {
+                    if ended {
+                        if !self.os.text_input.did_end_editing(session) { return; }
+                        self.keyboard.set_text_ime_dismissed();
+                    }
+                    if let Some(edit) = self.os.text_input.observe(session, text, selection, composing) {
+                        self.ios_deliver_text_ime(edit);
+                    }
+                }
+            }
+            IosEvent::TextCompositionEnded(edit) => self.ios_deliver_text_ime(edit),
+            IosEvent::TextSubmit(session) => {
+                if self.has_key_focus(self.os.text_input.area()) && self.os.text_input.can_submit(session)
+                    && with_ios_app(|app| app.surface_active) {
+                    let key = KeyEvent {
+                        key_code: KeyCode::ReturnKey,
+                        is_repeat: false,
+                        modifiers: Default::default(),
+                        time: with_ios_app(|app| app.time_now()),
+                    };
+                    self.call_event_handler(&Event::KeyDown(key));
+                }
             }
 
-            IosEvent::KeyDown(e) => {
-                self.keyboard.process_key_down(e.clone());
-                self.call_event_handler(&Event::KeyDown(e))
-            }
-            IosEvent::KeyUp(e) => {
-                self.keyboard.process_key_up(e.clone());
-                self.call_event_handler(&Event::KeyUp(e))
-            }
-            IosEvent::TextCopy(e) => {
-                self.call_event_handler(&Event::TextCopy(e))
-            }
-            IosEvent::TextCut(e) => {
-                self.call_event_handler(&Event::TextCut(e))
-            }
-            IosEvent::Timer(e) => if e.timer_id != 0 {
-                self.call_event_handler(&Event::Timer(e))
-            }
+            IosEvent::Timer(e) => self.call_event_handler(&Event::Timer(e)),
         }
+    }
+
+    fn ios_event_flow(&self) -> EventFlow {
 
         let waiting_for_gpu = self.os.surface.as_ref().is_some_and(SurfacePresenter::frame_in_flight);
         let repaint = !waiting_for_gpu && (self.any_passes_dirty() || self.demo_time_repaint)
@@ -297,7 +307,48 @@ impl Cx {
         }
     }
 
+    fn ios_accessibility_status(&mut self) {
+        self.set_accessibility_enabled(ios_accessibility::is_running());
+        if !self.accessibility_enabled() { self.ios_sync_accessibility(); }
+    }
+
+    fn ios_sync_accessibility(&mut self) {
+        let view = with_ios_app(|app| app.view);
+        let enabled = self.accessibility_enabled();
+        self.os.accessibility.sync(view, &self.accessibility, enabled);
+    }
+
+    pub(crate) fn ios_update_text_input(&mut self, area: Area, editor: u64, text: &str,
+        selection: (usize, usize), traits: (bool, bool, bool, bool)) {
+        if !area.is_valid(self) || !self.has_key_focus(area) { return; }
+        if let Some(edit) = self.os.text_input.publish(area, editor, text, selection, traits) {
+            IosApp::defer_callback(IosEvent::TextCompositionEnded(edit));
+        }
+    }
+
+    pub(crate) fn ios_clear_text_input(&mut self, area: Area) {
+        self.os.text_input.clear(area);
+    }
+
+    fn ios_deliver_text_ime(&mut self, edit: TextImeEvent) {
+        if self.has_key_focus(self.os.text_input.area()) && self.os.text_input.admit(&edit) {
+            self.call_event_handler(&Event::TextIme(edit));
+        }
+    }
+
+    pub(crate) fn ios_spawner_requested(&self) {
+        if !self.os.spawner_requested.replace(true) { ios_wake::post(); }
+    }
+
+    fn ios_flush_platform_ops(&mut self) {
+        self.handle_platform_ops();
+        let area = self.os.text_input.area();
+        if !self.has_key_focus(area) { self.os.text_input.clear(area); }
+        with_ios_app(|app| app.update_executor_timer(self.os.spawner_requested.get()));
+    }
+
     fn handle_platform_ops(&mut self) {
+        let mut handled_ime = false;
         while let Some(op) = self.platform_ops.pop() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
@@ -306,11 +357,18 @@ impl Cx {
                     window.os_dpi_factor = Some(window.window_geom.dpi_factor);
                     window.is_created = true;
                 },
-                CxOsOp::ShowTextIME(_area, _pos) => {
-                    IosApp::show_keyboard();
+                CxOsOp::ShowTextIME(area, pos) => {
+                    if !std::mem::replace(&mut handled_ime, true) && area.is_valid(self)
+                        && self.has_key_focus(self.os.text_input.area()) && !self.keyboard.text_ime_dismissed
+                        && with_ios_app(|app| app.surface_active) {
+                        let caret = Rect { pos: area.rect(self).pos + pos, size: dvec2(1.0, self.ime_caret_height) };
+                        self.os.text_input.show(caret);
+                    }
                 },
                 CxOsOp::HideTextIME => {
-                    IosApp::hide_keyboard();
+                    if !std::mem::replace(&mut handled_ime, true) {
+                        if let Some(edit) = self.os.text_input.hide() { self.ios_deliver_text_ime(edit); }
+                    }
                 },
                 CxOsOp::StartTimer {timer_id, interval, repeats} => {
                     with_ios_app(|app| app.start_timer(timer_id, interval, repeats));
@@ -401,6 +459,9 @@ pub struct CxOs {
     pub (crate) draw_calls_done: usize,
     pub (crate) network_response: NetworkResponseChannel,
     pub (crate) http_requests: AppleHttpRequests,
+    text_input: TextInput,
+    accessibility: Accessibility,
+    spawner_requested: Cell<bool>,
     surface: Option<SurfacePresenter>,
     passes_todo: Vec<PassId>,
 }

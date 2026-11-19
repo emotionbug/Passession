@@ -87,6 +87,7 @@ pub struct Cx {
     pub(crate) keyboard_window: Option<crate::window::WindowId>,
     pub(crate) keyboard_event_window: Option<crate::window::WindowId>,
     pub fingers: CxFingers,
+    pub(crate) accessibility: crate::accessibility::AccessibilityTree,
     /// Paseo: pointer shape resolution and hover re-tests (`crate::pointer`).
     pub (crate) pointer: crate::pointer::CxPointer,
     pub (crate) ime_area: Area,
@@ -300,6 +301,7 @@ impl Cx {
             keyboard_window: None,
             keyboard_event_window: None,
             fingers: Default::default(),
+            accessibility: Default::default(),
             pointer: Default::default(),
             drag_drop: Default::default(),
             ime_area: Default::default(),

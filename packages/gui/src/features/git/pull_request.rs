@@ -4,6 +4,7 @@
 
 use super::json::{array, flag, int, object, text};
 use super::policy::url_path;
+use crate::common::tr_args;
 use serde_json::{Value, json};
 
 /// Original `mapPrPaneData` number: the status number, else `/pull/<n>` of its URL.
@@ -274,7 +275,10 @@ pub fn check_timing(check: &Value) -> Option<String> {
         return None;
     }
     Some(if check_status(text(check, "status")) == "pending" {
-        format!("running {duration}")
+        tr_args(
+            "workspace.git.pr.checksSummary.runningDuration",
+            &[("duration", duration)],
+        )
     } else {
         duration.to_owned()
     })
@@ -509,6 +513,22 @@ pub fn repo_identity(pr: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_checks_translate_the_wrapper_and_preserve_provider_duration() {
+        use crate::common::i18n::{locale_tag, set_language};
+
+        let previous = json!(locale_tag());
+        let pending = json!({"status": "pending", "duration": "12s"});
+        let complete = json!({"status": "success", "duration": "12s"});
+        for (locale, expected) in [("en", "running 12s"), ("ko", "12s 동안 진행 중")] {
+            set_language(Some(&json!(locale)));
+            assert_eq!(check_timing(&pending).as_deref(), Some(expected));
+            assert_eq!(check_timing(&complete).as_deref(), Some("12s"));
+            assert_eq!(check_timing(&json!({"status": "pending"})), None);
+        }
+        set_language(Some(&previous));
+    }
 
     #[test]
     fn number_comes_from_status_or_pull_url() {

@@ -3,4 +3,8 @@ pub mod ios_app;
 pub mod ios_event;
 pub mod ios_delegates;
 pub(in crate::os::apple) mod ios_surface;
+mod ios_state;
+mod ios_text_input;
+mod ios_accessibility;
+pub(crate) mod ios_wake;
 pub use self::ios::*;

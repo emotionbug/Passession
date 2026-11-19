@@ -64,7 +64,7 @@ pub struct ChangesView {
     banner: Retained<Hit>,
     body: Retained<Hit>,
     content_revision: u64,
-    layout_revision: u64,
+    collapse_revision: u64,
 }
 
 fn preferences(ui: &UiContext) -> Map<String, Value> {
@@ -108,7 +108,7 @@ impl ChangesView {
             banner: Retained::default(),
             body: Retained::default(),
             content_revision: 0,
-            layout_revision: 0,
+            collapse_revision: 0,
         }
     }
 
@@ -207,7 +207,7 @@ impl ChangesView {
             .unwrap_or("one");
         crate::common::layer::inputs((
             self.content_revision,
-            self.layout_revision,
+            self.collapse_revision,
             self.doc.presentation_key(),
             Self::can_split(compact) && prefs["layout"].as_str() == Some("split"),
             prefs["wrapLines"].as_bool() == Some(true),
@@ -217,8 +217,7 @@ impl ChangesView {
                 self.controller.loading,
                 self.controller.patch_revision,
                 &self.controller.error,
-                self.controller.patches.len(),
-                self.controller.patch_errors.len(),
+                self.controller.files_revision,
             ),
         ))
     }
@@ -259,16 +258,16 @@ impl ChangesView {
     }
 
     fn toggle_collapse_all(&mut self) {
+        self.collapse_revision = self.collapse_revision.wrapping_add(1);
         if self.all_files_collapsed() {
             self.collapsed_files.clear();
         } else {
-            let paths: Vec<String> = self
-                .controller
-                .files
-                .iter()
-                .map(|f| text(f, "path").to_owned())
-                .collect();
-            self.collapsed_files.extend(paths);
+            self.collapsed_files.extend(
+                self.controller
+                    .files
+                    .iter()
+                    .map(|f| text(f, "path").to_owned()),
+            );
         }
     }
 
@@ -293,8 +292,9 @@ impl ChangesView {
 
     /// Expands, selects and scrolls to `path`.
     pub fn focus(&mut self, ui: &UiContext, path: &str) {
-        self.layout_revision = self.layout_revision.wrapping_add(1);
-        self.collapsed_files.remove(path);
+        if self.collapsed_files.remove(path) {
+            self.collapse_revision = self.collapse_revision.wrapping_add(1);
+        }
         self.controller.select_file(ui, path);
         self.doc.reveal(path);
     }
@@ -376,12 +376,6 @@ impl ChangesView {
         compact: bool,
     ) {
         let prefs = preferences(ui);
-        if matches!(
-            &hit,
-            Hit::Toggle("collapse") | Hit::Doc(DocHit::Header(_) | DocHit::Expand { .. })
-        ) {
-            self.layout_revision = self.layout_revision.wrapping_add(1);
-        }
         match hit {
             Hit::Refresh => self.controller.refresh(ui, store, false),
             Hit::ShowInLog => {
@@ -433,8 +427,11 @@ impl ChangesView {
             DocHit::Header(path) => {
                 if secondary {
                     self.file_menu(&path, anchor);
-                } else if !self.collapsed_files.remove(&path) {
-                    self.collapsed_files.insert(path);
+                } else {
+                    if !self.collapsed_files.remove(&path) {
+                        self.collapsed_files.insert(path);
+                    }
+                    self.collapse_revision = self.collapse_revision.wrapping_add(1);
                 }
             }
             DocHit::Expand { path, start } => self.doc.toggle_expand(&path, start),
@@ -1101,10 +1098,13 @@ impl ChangesView {
             .to_owned();
         let input = DocInput {
             files: &self.controller.files,
+            files_revision: self.controller.files_revision,
             patches: &self.controller.patches,
+            patch_generation: self.controller.patch_generation,
             patch_errors: &self.controller.patch_errors,
             patch_revision: self.controller.patch_revision,
             collapsed: &self.collapsed_files,
+            collapse_revision: self.collapse_revision,
             split,
             wrap,
             syntax_theme: &syntax,
@@ -1115,8 +1115,7 @@ impl ChangesView {
                 .push_clipped(*rect_area, clip.unwrap_or(area), Hit::Doc(hit.clone()));
         }
         // Placeholders near the viewport request their patch once.
-        let wanted = std::mem::take(&mut self.doc.wanted);
-        for path in wanted {
+        for path in self.doc.wanted.drain(..) {
             self.controller.ensure_patch(ui, &path);
         }
     }

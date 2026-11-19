@@ -24,7 +24,9 @@ static TOKEN_WAITERS: Mutex<Vec<tokio::sync::oneshot::Sender<Result<String, Plat
 
 pub(crate) fn token_waiter() -> tokio::sync::oneshot::Receiver<Result<String, PlatformError>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    TOKEN_WAITERS.lock().unwrap().push(tx);
+    let mut waiters = TOKEN_WAITERS.lock().unwrap();
+    waiters.retain(|waiter| !waiter.is_closed());
+    waiters.push(tx);
     rx
 }
 

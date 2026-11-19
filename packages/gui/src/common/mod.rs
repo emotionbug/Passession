@@ -3,6 +3,7 @@
 //! The frozen contract items (`UiContext` core fields, `Route`, `UiEffect` first variants)
 //! come first; additions follow and never change the frozen shapes.
 
+pub(crate) mod accessibility;
 pub mod clock;
 pub mod file_drop;
 pub mod host_http;
@@ -127,6 +128,7 @@ pub(crate) fn is_user_input(event: &Event) -> bool {
             | Event::TextSelectAll
             | Event::TextHandle(_)
             | Event::BackPressed { .. }
+            | Event::AccessibilityAction(_)
             | Event::Drag(_)
             | Event::Drop(_)
     )

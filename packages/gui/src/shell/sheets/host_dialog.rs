@@ -279,9 +279,18 @@ fn toggle_row(
         p.muted,
     );
     ui.text(cx, rect(x + 24.0, y, w - 24.0, row_h), spec, label);
-    if enabled {
-        ui.hit(r, id.to_string());
-    }
+    ui.control(
+        cx,
+        r,
+        id,
+        label,
+        AccessibilityRole::Button,
+        AccessibilityState {
+            enabled,
+            selected: open,
+            ..AccessibilityState::default()
+        },
+    );
     row_h
 }
 
@@ -321,8 +330,20 @@ fn eye_button(
         18.0,
         p.muted,
     );
+    ui.control(
+        cx,
+        r,
+        id,
+        tooltip,
+        AccessibilityRole::Button,
+        AccessibilityState {
+            enabled,
+            selected: visible,
+            ..AccessibilityState::default()
+        },
+    );
     if enabled {
-        ui.hit_tip(r, id, tooltip);
+        ui.tooltip(id, tooltip);
     }
 }
 
@@ -469,7 +490,14 @@ impl Sheet for MethodSheet {
                 &description,
             );
             if interactive {
-                ui.hit(r, hit);
+                ui.control(
+                    cx,
+                    r,
+                    &hit,
+                    &title,
+                    AccessibilityRole::ListItem,
+                    AccessibilityState::default(),
+                );
             }
             y += h;
         }
@@ -1360,9 +1388,18 @@ impl ConnectionSheet {
                         );
                     }
                     ui.text(cx, rect(x + 34.0, y, lw, 22.0), spec, &label);
-                    if enabled {
-                        ui.hit(rect(x, y, 34.0 + lw, 22.0), "tls".to_string());
-                    }
+                    ui.control(
+                        cx,
+                        rect(x, y, 34.0 + lw, 22.0),
+                        "tls",
+                        &label,
+                        AccessibilityRole::Checkbox,
+                        AccessibilityState {
+                            enabled,
+                            checked: self.use_tls,
+                            ..AccessibilityState::default()
+                        },
+                    );
                     y += 22.0 + 16.0;
                 }
                 y += field_label(ui, cx, x, y, w, &tr("pairing.direct.fields.password"), true);
@@ -1882,6 +1919,7 @@ impl PairingSheet {
         );
         if interactive {
             ui.hit_tip(
+                cx,
                 rect(x, y, dw + 16.0, 16.0),
                 "docs",
                 &tr("pairing.device.relayDocsAccessibility"),
@@ -2425,7 +2463,14 @@ impl ScanSheet {
         ui.fill(cx, button, argb(0xff3b82f6), 8.0);
         ui.text_centered(cx, button, action_spec, action);
         if interactive {
-            ui.hit(button, "card".to_string());
+            ui.control(
+                cx,
+                button,
+                "card",
+                action,
+                AccessibilityRole::Button,
+                AccessibilityState::default(),
+            );
         }
         24.0 + h
     }

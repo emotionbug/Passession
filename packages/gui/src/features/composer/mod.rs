@@ -173,10 +173,11 @@ pub fn sent_message_attachments(agent_id: &str, client_message_id: &str) -> Opti
 /// A stable cached texture for a composer image reference (`{blobId}` or legacy inline
 /// `{data}`); None while it decodes off the GUI thread.
 pub fn image_texture(_cx: &mut Cx, image: &Value, thumbnail: bool) -> Option<Texture> {
+    let identity = blobs::ImageContent::from_value(image).map(blobs::ImageContent::identity);
     service::with(|svc| {
         let texture = svc
             .blobs
-            .texture(image, thumbnail)
+            .texture(image, identity.as_ref(), thumbnail)
             .ok()
             .flatten()
             .map(|(texture, _)| texture);

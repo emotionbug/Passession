@@ -39,6 +39,7 @@ import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.WindowManager.LayoutParams;
+import android.view.accessibility.AccessibilityNodeProvider;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
@@ -84,6 +85,7 @@ class MakepadSurface
     private long inputSession;
     private MakepadInputConnection inputConnection;
     private boolean inputPassword, inputNumeric, inputTerminal;
+    private final MakepadAccessibility accessibility;
 
     private static final int CAN_COPY = 1, CAN_CUT = 2, CAN_PASTE = 4, CAN_SELECT_ALL = 8;
     private static final int ACTION_DISMISS = 0, ACTION_COPY = 1, ACTION_CUT = 2,
@@ -315,6 +317,22 @@ class MakepadSurface
         super.onDetachedFromWindow();
     }
 
+    void startAccessibility() { accessibility.start(); }
+    void stopAccessibility() { accessibility.stop(); }
+    void updateAccessibilityTree(byte[] tree) {
+        if (textActionsSurfaceReady) accessibility.update(tree);
+    }
+
+    @Override
+    public AccessibilityNodeProvider getAccessibilityNodeProvider() {
+        return accessibility != null && accessibility.isActive() ? accessibility : super.getAccessibilityNodeProvider();
+    }
+
+    @Override
+    public boolean dispatchHoverEvent(MotionEvent event) {
+        return (accessibility != null && accessibility.hover(event)) || super.dispatchHoverEvent(event);
+    }
+
     private final class TextActions extends ActionMode.Callback2
             implements ClipboardManager.OnPrimaryClipChangedListener {
         final long token;
@@ -463,6 +481,8 @@ class MakepadSurface
 
     public MakepadSurface(Context context){
         super(context);
+        accessibility = new MakepadAccessibility(this);
+        setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
         textActionClipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
         getHolder().addCallback(this);
 
@@ -493,6 +513,7 @@ class MakepadSurface
         Log.i("SAPP", "surfaceDestroyed");
         textActionsSurfaceReady = false;
         cancelTextActions();
+        accessibility.clear();
         if (!MakepadActivity.isLive(getContext())) return;
         Surface surface = holder.getSurface();
         MakepadNative.surfaceOnSurfaceDestroyed(surface);
@@ -808,6 +829,7 @@ public class MakepadActivity
         }
 */      
         if (sLive == this) MakepadNative.activityOnStart();
+        if (sLive == this) view.startAccessibility();
     }
 
     @Override
@@ -829,12 +851,14 @@ public class MakepadActivity
 
     @Override
     protected void onStop() {
+        view.stopAccessibility();
         super.onStop();
         if (sLive == this) MakepadNative.activityOnStop();
     }
 
     @Override
     protected void onDestroy() {
+        view.stopAccessibility();
         view.cancelTextActions();
         super.onDestroy();
         // Paseo: only the live instance finishing quits the native app; the
@@ -907,6 +931,12 @@ public class MakepadActivity
     public void updateTextInput(long session, long revision, String text, int start, int end,
                                 boolean password, boolean numeric, boolean terminal, boolean singleLine, boolean restart) {
         runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, terminal, singleLine, restart));
+    }
+
+    public void updateAccessibilityTree(byte[] tree) {
+        runOnUiThread(() -> {
+            if (isLiveActivity()) view.updateAccessibilityTree(tree);
+        });
     }
 
     // Paseo: these calls originate on the render thread. The Surface fences

@@ -42,6 +42,9 @@ pub(crate) struct Core {
     pub buffers: Arc<Semaphore>,
     pub cancel: CancellationToken,
     pub app_visible: tokio::sync::watch::Sender<bool>,
+    pause_background_network: bool,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    network_change: RefCell<Option<tokio::task::AbortHandle>>,
     /// Relay daemon keys seen protected in this process (Flutter `_protectedIdentities`).
     pub protected_keys: RefCell<HashSet<String>>,
     /// Routes being opened (`origin/server`), Flutter `_routing`.
@@ -72,6 +75,9 @@ impl Core {
             buffers: Arc::new(Semaphore::new(256 * 1024 * 1024)),
             cancel: CancellationToken::new(),
             app_visible: tokio::sync::watch::channel(true).0,
+            pause_background_network: cfg!(any(target_os = "android", target_os = "ios")),
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            network_change: RefCell::new(None),
             protected_keys: RefCell::new(HashSet::new()),
             routing: RefCell::new(HashSet::new()),
             initialized: Cell::new(false),
@@ -81,6 +87,10 @@ impl Core {
             last_state: Cell::new(None),
             published: RefCell::new(CoreState::default()),
         })
+    }
+
+    fn network_paused(&self) -> bool {
+        self.pause_background_network && !*self.app_visible.borrow()
     }
 
     pub fn emit(&self, event: CoreEvent) {
@@ -346,6 +356,8 @@ async fn handle(core: &Rc<Core>, command: Command) {
             hosts::refresh_hosts(core).await;
         }
         Command::SetAppVisible { visible } => hosts::set_app_visible(core, visible),
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        Command::NetworkChanged => hosts::network_changed(core),
         Command::ProbeHost { request_id, config } => hosts::probe_host(core, request_id, config),
         Command::SaveState { key, value, ack } => store::save_state(core, key, value, ack).await,
         Command::Shutdown => {}

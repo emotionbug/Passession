@@ -368,6 +368,7 @@ impl Sheet for LabelsSheet {
                     }
                     if !self.offline && !self.busy && interactive {
                         ui.hit_tip(
+                            cx,
                             r,
                             &format!("color:{color}"),
                             &tr(&format!("workspaceLabels.colors.{color}")),

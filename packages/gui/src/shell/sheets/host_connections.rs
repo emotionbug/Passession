@@ -240,12 +240,8 @@ impl Sheet for ChooserSheet {
                     let tx = r.pos.x + 16.0 + 18.0 + 12.0;
                     let tw = r.size.x - (tx - r.pos.x) - 16.0 - 14.0 - 12.0;
                     let label_spec = ui.spec(Font::Regular, 14.0, p.foreground);
-                    ui.text(
-                        cx,
-                        rect(tx, r.pos.y + 10.0, tw, 18.0),
-                        label_spec,
-                        &host.display_label(),
-                    );
+                    let label = host.display_label();
+                    ui.text(cx, rect(tx, r.pos.y + 10.0, tw, 18.0), label_spec, &label);
                     let id_spec = ui.spec(Font::Regular, 12.0, p.muted);
                     ui.text(cx, rect(tx, r.pos.y + 30.0, tw, 16.0), id_spec, id);
                     ui.icon(
@@ -256,7 +252,17 @@ impl Sheet for ChooserSheet {
                         p.muted,
                     );
                     if interactive {
-                        ui.hit(r, row_id);
+                        ui.control(
+                            cx,
+                            r,
+                            &row_id,
+                            &label,
+                            AccessibilityRole::ListItem,
+                            AccessibilityState {
+                                selected: index == active,
+                                ..AccessibilityState::default()
+                            },
+                        );
                     }
                     y += 56.0;
                 }
@@ -298,7 +304,14 @@ impl Sheet for ChooserSheet {
                         );
                     }
                     if interactive {
-                        ui.hit(r, row_id);
+                        ui.control(
+                            cx,
+                            r,
+                            &row_id,
+                            &label,
+                            AccessibilityRole::ListItem,
+                            AccessibilityState::default(),
+                        );
                     }
                     let tip = tr_args("pairing.hosts.openSettings", &[("name", &label)]);
                     let gear_id = if interactive {
@@ -332,14 +345,22 @@ impl Sheet for ChooserSheet {
                 p.muted,
             );
             let spec = ui.spec(Font::Regular, 14.0, p.foreground);
+            let label = tr("settings.addHost");
             ui.text(
                 cx,
                 rect(r.pos.x + 12.0 + 16.0 + 8.0, r.pos.y, r.size.x - 48.0, row_h),
                 spec,
-                &tr("settings.addHost"),
+                &label,
             );
             if interactive {
-                ui.hit(r, "add");
+                ui.control(
+                    cx,
+                    r,
+                    "add",
+                    &label,
+                    AccessibilityRole::Button,
+                    AccessibilityState::default(),
+                );
             }
             y += row_h;
         }
@@ -515,9 +536,19 @@ impl Sheet for ConnectionsSheet {
                     11.0,
                 );
             }
-            if enabled {
-                ui.hit(r, row_id);
-            }
+            let label = connection_label(connection);
+            ui.control(
+                cx,
+                r,
+                &row_id,
+                &label,
+                AccessibilityRole::ListItem,
+                AccessibilityState {
+                    enabled,
+                    selected: is_active,
+                    ..AccessibilityState::default()
+                },
+            );
             let label_spec = ui.spec(Font::Regular, 14.0, p.foreground);
             let tw = (right - (r.pos.x + 16.0)).max(0.0);
             if is_active {
@@ -525,7 +556,7 @@ impl Sheet for ConnectionsSheet {
                     cx,
                     rect(r.pos.x + 16.0, r.pos.y + 10.0, tw, 20.0),
                     label_spec,
-                    &connection_label(connection),
+                    &label,
                 );
                 let spec = ui.spec(Font::Regular, 12.0, p.muted);
                 ui.text(
@@ -539,7 +570,7 @@ impl Sheet for ConnectionsSheet {
                     cx,
                     rect(r.pos.x + 16.0, r.pos.y, tw, row_h),
                     label_spec,
-                    &connection_label(connection),
+                    &label,
                 );
             }
             // Inner buttons sit on the row's hover fill: a distinct highlight, darker when pressed.
@@ -557,16 +588,32 @@ impl Sheet for ConnectionsSheet {
                 let id = format!("use:{index}");
                 button_fill(ui, cx, &id, ur);
                 ui.text_centered(cx, ur, spec, &use_label);
-                if enabled {
-                    ui.hit(ur, id);
-                }
+                ui.control(
+                    cx,
+                    ur,
+                    &id,
+                    &use_label,
+                    AccessibilityRole::Button,
+                    AccessibilityState {
+                        enabled,
+                        ..AccessibilityState::default()
+                    },
+                );
             }
             let id = format!("remove:{index}");
             button_fill(ui, cx, &id, remove);
             ui.text_centered(cx, remove, remove_spec, &remove_label);
-            if enabled {
-                ui.hit(remove, id);
-            }
+            ui.control(
+                cx,
+                remove,
+                &id,
+                &remove_label,
+                AccessibilityRole::Button,
+                AccessibilityState {
+                    enabled,
+                    ..AccessibilityState::default()
+                },
+            );
             y += row_h;
         }
         if connections.is_empty() {

@@ -327,9 +327,13 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
         );
         // Phone layout: a 44px-tall touch target centred on the text line.
         let hit_h = if ui.compact { line.max(44.0) } else { line };
-        ui.hit(
+        ui.control(
+            cx,
             rect(x, y + (line - hit_h) * 0.5, total, hit_h),
             "welcome:website",
+            &label,
+            AccessibilityRole::Button,
+            AccessibilityState::default(),
         );
         y += line;
     }
@@ -437,7 +441,14 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
             spec,
             &action.label,
         );
-        ui.hit(r, id);
+        ui.control(
+            cx,
+            r,
+            &id,
+            &action.label,
+            AccessibilityRole::Button,
+            AccessibilityState::default(),
+        );
         y += button_h + 12.0;
     }
     y += 24.0 - 12.0;

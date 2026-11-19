@@ -10,6 +10,7 @@ use crate::common::overlay::{fit_in_viewport, take_dismissal};
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::{Route, UiContext, UiEffect};
 use crate::features::composer::autocomplete::clean_label;
+use crate::features::composer::blobs::ImageIdentity;
 use crate::features::composer::controller::Outputs;
 use crate::features::composer::controls_model::ControlsModel;
 use crate::features::composer::i18n::{t, t_args};
@@ -125,7 +126,17 @@ impl ComposerPanel {
                 self.draw_sheet(cx, ui, look)
             }
             Overlay::Forge => self.draw_forge(cx, look, size),
-            Overlay::Preview(image) => self.draw_preview(cx, look, size, &image),
+            Overlay::Preview {
+                draft,
+                image_index,
+                identity,
+            } => self.draw_preview(
+                cx,
+                look,
+                size,
+                &draft["images"][image_index],
+                identity.as_deref(),
+            ),
             Overlay::Fullscreen => self.draw_fullscreen(cx, look, size),
             Overlay::Context => self.draw_context_sheet(cx, look, size),
         }
@@ -1392,13 +1403,20 @@ impl ComposerPanel {
         self.st.ohits.push(full, OItem::Scrim);
     }
 
-    fn draw_preview(&mut self, cx: &mut Cx2d, look: &Look, size: DVec2, image: &Value) {
+    fn draw_preview(
+        &mut self,
+        cx: &mut Cx2d,
+        look: &Look,
+        size: DVec2,
+        image: &Value,
+        identity: Option<&ImageIdentity>,
+    ) {
         let p = look.p;
         let full = rect(0.0, 0.0, size.x, size.y);
         self.painter.fill(cx, full, p.background, 0.0);
         self.overlay_bg.draw_abs(cx, full);
         self.st.ohits.push(full, OItem::Panel);
-        match service::with(|svc| svc.blobs.texture(image, false)) {
+        match service::with(|svc| svc.blobs.texture(image, identity, false)) {
             Ok(Some((texture, px))) => self.draw_image.paint(
                 cx,
                 rect(16.0, 16.0, size.x - 32.0, size.y - 32.0),

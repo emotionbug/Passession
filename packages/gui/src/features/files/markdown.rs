@@ -524,6 +524,73 @@ enum Item {
     },
 }
 
+/// Starts are sorted for binary search, but paint order is independent of position:
+/// e.g. a table outline is emitted after its last row and starts above its first row.
+#[derive(Default)]
+struct PaintIndex {
+    starts: Vec<(f64, usize)>,
+    max_ends: Vec<f64>,
+    visible: Vec<usize>,
+    #[cfg(test)]
+    probes: usize,
+}
+
+impl PaintIndex {
+    fn rebuild(&mut self, items: &[(f64, f64, Item)]) {
+        self.starts.clear();
+        self.starts
+            .extend(items.iter().enumerate().map(|(i, &(y, _, _))| (y, i)));
+        self.starts.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let leaves = items.len().next_power_of_two();
+        self.max_ends.clear();
+        self.max_ends.resize(leaves * 2, f64::NEG_INFINITY);
+        for (offset, &(_, index)) in self.starts.iter().enumerate() {
+            let (y, height, _) = items[index];
+            self.max_ends[leaves + offset] = y + height;
+        }
+        for i in (1..leaves).rev() {
+            self.max_ends[i] = self.max_ends[i * 2].max(self.max_ends[i * 2 + 1]);
+        }
+    }
+
+    fn visible(&mut self, top: f64, bottom: f64) -> &[usize] {
+        self.visible.clear();
+        #[cfg(test)]
+        {
+            self.probes = 0;
+        }
+        let limit = self.starts.partition_point(|&(y, _)| {
+            #[cfg(test)]
+            {
+                self.probes += 1;
+            }
+            y <= bottom
+        });
+        if limit != 0 {
+            self.collect(1, 0, self.max_ends.len() / 2, limit, top);
+            self.visible.sort_unstable();
+        }
+        &self.visible
+    }
+
+    fn collect(&mut self, node: usize, lo: usize, hi: usize, limit: usize, top: f64) {
+        #[cfg(test)]
+        {
+            self.probes += 1;
+        }
+        if lo >= limit || self.max_ends[node] < top {
+            return;
+        }
+        if hi - lo == 1 {
+            self.visible.push(self.starts[lo].1);
+            return;
+        }
+        let mid = lo + (hi - lo) / 2;
+        self.collect(node * 2, lo, mid, limit, top);
+        self.collect(node * 2 + 1, mid, hi, limit, top);
+    }
+}
+
 /// What the owner tells the preview about an image source.
 pub enum ImageState {
     Loading,
@@ -548,13 +615,18 @@ pub enum PreviewEvent {
 }
 
 pub struct MarkdownPreview {
-    source: Option<String>,
+    source_revision: Option<(u64, u64)>,
     front: Vec<(String, String)>,
     blocks: Vec<Block>,
     links: Vec<String>,
-    layout_key: Option<(u64, u64, u64, u64)>,
+    layout_key: Option<(u64, u64, u64)>,
     runs: Vec<Run>,
     items: Vec<(f64, f64, Item)>,
+    paint_index: PaintIndex,
+    #[cfg(test)]
+    parses: usize,
+    #[cfg(test)]
+    layouts: usize,
     height: f64,
     pub scroll_y: f64,
     area: Rect,
@@ -577,13 +649,18 @@ pub struct MarkdownPreview {
 impl Default for MarkdownPreview {
     fn default() -> Self {
         MarkdownPreview {
-            source: None,
+            source_revision: None,
             front: Vec::new(),
             blocks: Vec::new(),
             links: Vec::new(),
             layout_key: None,
             runs: Vec::new(),
             items: Vec::new(),
+            paint_index: PaintIndex::default(),
+            #[cfg(test)]
+            parses: 0,
+            #[cfg(test)]
+            layouts: 0,
             height: 0.0,
             scroll_y: 0.0,
             area: Rect::default(),
@@ -1035,18 +1112,17 @@ impl Ctx<'_> {
     }
 }
 
-fn hash_text(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
-}
-
 impl MarkdownPreview {
-    /// Re-parses when the text changed.
-    pub fn set_text(&mut self, text: &str) {
-        if self.source.as_deref() == Some(text) {
-            return;
+    /// Prepares only the visible document, once per (editor session, buffer revision).
+    pub fn prepare(&mut self, visible: bool, source: Option<((u64, u64), &str)>) -> bool {
+        let Some((revision, text)) =
+            source.filter(|(revision, _)| visible && self.source_revision != Some(*revision))
+        else {
+            return false;
+        };
+        #[cfg(test)]
+        {
+            self.parses += 1;
         }
         let (front, body) = front_matter(text);
         let (blocks, links) = parse(body);
@@ -1055,7 +1131,7 @@ impl MarkdownPreview {
         self.links = links;
         self.image_sources.clear();
         collect_images(&self.blocks, &mut self.image_sources);
-        self.source = Some(text.to_owned());
+        self.source_revision = Some(revision);
         self.layout_key = None;
         self.selection = None;
         self.dragging = false;
@@ -1063,6 +1139,7 @@ impl MarkdownPreview {
         self.touch_scroll.reset();
         self.show_actions = false;
         self.selection_invalidated = true;
+        true
     }
 
     fn layout(
@@ -1074,16 +1151,16 @@ impl MarkdownPreview {
         images: &dyn Fn(&str) -> ImageState,
         image_epoch: u64,
     ) {
-        let key = (
-            hash_text(self.source.as_deref().unwrap_or("")),
-            width.to_bits(),
-            crate::theme::epoch(),
-            image_epoch,
-        );
+        // A new source revision invalidates the key in `prepare`; no source bytes are needed.
+        let key = (width.to_bits(), crate::theme::epoch(), image_epoch);
         if self.layout_key == Some(key) {
             return;
         }
         self.layout_key = Some(key);
+        #[cfg(test)]
+        {
+            self.layouts += 1;
+        }
         let p = look.palette;
         let t = look.typography;
         let outer = if look.compact_width { 12.0 } else { 16.0 };
@@ -1103,7 +1180,7 @@ impl MarkdownPreview {
             let key_w = (inner * 0.3).clamp(0.0, 180.0);
             let base = t.ui_base_font_size;
             let top = y;
-            for (index, (key, value)) in self.front.clone().iter().enumerate() {
+            for (index, (key, value)) in self.front.iter().enumerate() {
                 let key_h = ctx
                     .kit
                     .layout_rich(
@@ -1164,11 +1241,10 @@ impl MarkdownPreview {
             ctx.border(rect(x, top, inner, y - top), p.border, 8.0);
             y += 24.0;
         }
-        let blocks = std::mem::take(&mut self.blocks);
-        y = ctx.blocks(cx, &blocks, x, y, inner);
-        self.blocks = blocks;
+        y = ctx.blocks(cx, &self.blocks, x, y, inner);
         self.runs = ctx.runs;
         self.items = ctx.items;
+        self.paint_index.rebuild(&self.items);
         self.height = y + 16.0;
     }
 
@@ -1196,11 +1272,8 @@ impl MarkdownPreview {
         // Selection highlights under their text.
         let selection = self.ordered_selection();
         let mut action_anchor = None;
-        for (y, h, item) in &self.items {
-            if y + h < top || *y > bottom {
-                continue;
-            }
-            match item {
+        for &index in self.paint_index.visible(top, bottom) {
+            match &self.items[index].2 {
                 Item::Fill {
                     rect: r,
                     color,
@@ -1313,7 +1386,7 @@ impl MarkdownPreview {
     /// Adopts the host widget's area. Makepad reissues it on every repaint
     /// (`Cx2d::add_aligned_rect_area` stamps the pass's redraw id) and moves its own references
     /// along, so a different value is the same panel painted again: gestures and the selection
-    /// carry over. Only a replaced document (`set_text`) ends them.
+    /// carry over. Only a replaced document (`prepare`) ends them.
     fn set_owner(&mut self, cx: &mut Cx, owner: Area) {
         self.owner = owner;
         if self.selection_invalidated {
@@ -1627,6 +1700,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hidden_markdown_changes_prepare_only_the_revealed_revision() {
+        let mut preview = MarkdownPreview::default();
+        assert!(!preview.prepare(false, Some(((1, 0), "# Old"))));
+        assert!(!preview.prepare(false, Some(((1, 1), "# Intermediate"))));
+        assert_eq!(preview.parses, 0);
+        assert!(preview.prepare(true, Some(((1, 2), "![a](latest.png)"))));
+        assert_eq!(preview.image_keys(), ["latest.png"]);
+        assert!(!preview.prepare(true, Some(((1, 2), "![a](latest.png)"))));
+        assert_eq!(preview.parses, 1);
+
+        assert!(!preview.prepare(false, Some(((2, 2), "![b](other.png)"))));
+        assert!(preview.prepare(true, Some(((2, 2), "![b](other.png)"))));
+        assert_eq!(preview.image_keys(), ["other.png"]);
+        assert_eq!(preview.parses, 2);
+    }
+
+    #[test]
+    fn paint_index_keeps_overlapping_decorations_in_paint_order_without_scanning() {
+        let mut items = Vec::new();
+        items.push((0.0, 20_000.0, Item::Text(0)));
+        items.extend((1..=10_000).map(|i| (i as f64 * 2.0, 1.0, Item::Text(i))));
+        // Outlines may come after thousands of later-starting items in paint order.
+        items.push((0.0, 20_000.0, Item::Text(10_001)));
+        items.push((9_998.0, 2.0, Item::Text(10_002)));
+        let mut index = PaintIndex::default();
+        index.rebuild(&items);
+        assert_eq!(
+            index.visible(10_000.0, 10_004.0),
+            [0, 5000, 5001, 5002, 10_001, 10_002]
+        );
+        assert!(
+            index.probes < 100,
+            "visited {} nodes for a short viewport",
+            index.probes
+        );
+    }
+
+    #[test]
     fn front_matter_table_and_body() {
         let (rows, body) =
             front_matter("---\ntitle: Hello\ntags: [a, b]\nnested: {x: 1}\n---\n# Body\n");
@@ -1879,7 +1990,7 @@ mod tests {
 
         // A replaced document does end the gesture made on the previous one.
         panel.hit(touch_down(PRESS, 1.0, 1));
-        panel.preview.set_text("# Other");
+        panel.preview.prepare(true, Some(((1, 0), "# Other")));
         swipe_up(&mut panel, PRESS);
         assert_eq!(panel.preview.scroll_y, 300.0);
     }
@@ -1912,7 +2023,7 @@ mod tests {
             typography: crate::theme::current_typography(),
             compact_width: true,
         };
-        panel.preview.set_text(&source);
+        panel.preview.prepare(true, Some(((1, 0), &source)));
         panel.preview.layout(
             &mut panel.cx,
             &mut kit,
@@ -1921,6 +2032,15 @@ mod tests {
             &|_| ImageState::Loading,
             0,
         );
+        panel.preview.layout(
+            &mut panel.cx,
+            &mut kit,
+            &look,
+            357.0,
+            &|_| panic!("unchanged layout must reuse cached image geometry"),
+            0,
+        );
+        assert_eq!(panel.preview.layouts, 1);
         panel.preview.origin = panel.preview.area.pos;
         panel.repaint();
         // The extent the thumb and the scroll limit share reaches the last table row.

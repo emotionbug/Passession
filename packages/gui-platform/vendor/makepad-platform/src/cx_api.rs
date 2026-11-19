@@ -313,8 +313,8 @@ impl Cx {
         }
     }
 
-    /// Publish the focused native editor. Selection offsets are UTF-8 bytes. Android
-    /// mirrors it in the input method; Windows and macOS compose into it inline.
+    /// Publish the focused native editor for inline composition. Selection offsets
+    /// are UTF-8 bytes.
     pub fn update_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
         _end: usize, _password: bool, _numeric: bool, _single_line: bool) {
         #[cfg(target_os = "android")]
@@ -323,9 +323,11 @@ impl Cx {
         self.windows_update_text_input(_area, _editor, _text, _start, _end);
         #[cfg(target_os = "macos")]
         self.macos_update_text_input(_area, _editor, _text, _start, _end);
+        #[cfg(target_os = "ios")]
+        self.ios_update_text_input(_area, _editor, _text, (_start, _end), (_password, _numeric, false, _single_line));
     }
 
-    /// Publish a terminal's hidden editor: Android asks the input method for plain text
+    /// Publish a terminal's hidden editor. Mobile keyboards use plain text
     /// without auto-capitalization, suggestions or autocorrect. Offsets are UTF-8 bytes.
     pub fn update_terminal_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
         _end: usize) {
@@ -335,6 +337,8 @@ impl Cx {
         self.windows_update_text_input(_area, _editor, _text, _start, _end);
         #[cfg(target_os = "macos")]
         self.macos_update_text_input(_area, _editor, _text, _start, _end);
+        #[cfg(target_os = "ios")]
+        self.ios_update_text_input(_area, _editor, _text, (_start, _end), (false, false, true, false));
     }
 
     pub fn clear_text_input(&mut self, _area: Area) {
@@ -345,6 +349,8 @@ impl Cx {
         self.windows_clear_text_input(_area);
         #[cfg(target_os = "macos")]
         self.macos_clear_text_input(_area);
+        #[cfg(target_os = "ios")]
+        self.ios_clear_text_input(_area);
     }
 
     pub fn hide_text_ime(&mut self) {
@@ -894,6 +900,8 @@ impl Cx {
     }
 
     pub fn spawner(&self) -> &Spawner {
+        #[cfg(target_os = "ios")]
+        self.ios_spawner_requested();
         &self.spawner
     }
 

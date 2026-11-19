@@ -9,9 +9,11 @@
 //! - receipts apply monotonically by revision per message id; a dismissal is sticky.
 
 use super::attachments::wire_attachment;
+use super::blobs::{ImageContent, ImageIdentity};
 use super::json::*;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 pub const DRAFTS_STORAGE_KEY: &str = "paseo.chat.drafts.v1";
 /// A send that was in flight when the drafts were last saved (`sending` on load).
@@ -104,7 +106,9 @@ pub fn agent_message_fields(agent_id: &str, message: &Value) -> Value {
 
 #[derive(Default)]
 pub struct DraftStore {
-    drafts: HashMap<String, Value>,
+    drafts: HashMap<String, Rc<Value>>,
+    /// Identities for the top-level image objects, in the order shown in the attachment tray.
+    image_ids: HashMap<String, Vec<Option<Rc<ImageIdentity>>>>,
     inbox: BTreeMap<String, Vec<Value>>,
     intents: Vec<String>,
     dirty_drafts: HashSet<String>,
@@ -189,7 +193,8 @@ impl DraftStore {
                     })
                     .collect();
                 set(&mut value, "queue", Value::Array(queue));
-                self.drafts.insert(key.clone(), value);
+                self.replace_image_ids(key, get(&value, "images"));
+                self.drafts.insert(key.clone(), Rc::new(value));
                 self.changed.insert(key.clone());
                 if let Some(server) = delivery_server(key) {
                     self.delivery_changed.insert(server);
@@ -220,24 +225,64 @@ impl DraftStore {
 
     /// `draft(key)`: the draft, created with defaults when absent.
     pub fn draft(&mut self, key: &str) -> &Value {
+        self.draft_entry(key)
+    }
+
+    pub fn draft_snapshot(&mut self, key: &str) -> Rc<Value> {
+        self.draft_entry(key).clone()
+    }
+
+    fn draft_entry(&mut self, key: &str) -> &mut Rc<Value> {
         self.drafts
             .entry(key.to_owned())
-            .or_insert_with(default_draft)
+            .or_insert_with(|| Rc::new(default_draft()))
     }
 
     fn draft_mut(&mut self, key: &str) -> &mut Value {
-        self.drafts
-            .entry(key.to_owned())
-            .or_insert_with(default_draft)
+        Rc::make_mut(self.draft_entry(key))
     }
 
     /// Read-only view; None when the draft was never touched.
     pub fn peek(&self, key: &str) -> Option<&Value> {
-        self.drafts.get(key)
+        self.drafts.get(key).map(Rc::as_ref)
     }
 
     pub fn field(&mut self, key: &str, field: &str) -> Value {
         get(self.draft(key), field).clone()
+    }
+
+    pub fn image_identity(&self, key: &str, index: usize) -> Option<&Rc<ImageIdentity>> {
+        self.image_ids.get(key)?.get(index)?.as_ref()
+    }
+
+    fn replace_image_ids(&mut self, key: &str, images: &Value) {
+        let previous = self.image_ids.get(key).into_iter().flatten();
+        let current = self
+            .peek(key)
+            .map_or(&Value::Null, |draft| get(draft, "images"));
+        let previous = list_ref(current)
+            .iter()
+            .filter(|image| image.is_object())
+            .zip(previous)
+            .filter_map(|(image, id)| Some((ImageContent::from_value(image)?, id.as_ref()?)));
+        let next: Vec<_> = list_ref(images)
+            .iter()
+            .filter(|image| image.is_object())
+            .map(|image| {
+                let content = ImageContent::from_value(image)?;
+                // Compare payloads only on image-list mutations; removing an earlier image does
+                // not force the remaining inline content through SHA-256 again.
+                let retained = previous
+                    .clone()
+                    .find_map(|(old, id)| (old == content).then(|| Rc::clone(id)));
+                Some(retained.unwrap_or_else(|| Rc::new(content.identity())))
+            })
+            .collect();
+        if next.is_empty() {
+            self.image_ids.remove(key);
+        } else {
+            self.image_ids.insert(key.to_owned(), next);
+        }
     }
 
     pub fn update(&mut self, key: &str, fields: Value) {
@@ -248,15 +293,16 @@ impl DraftStore {
         let delivery = ["queue", "pending", "receipts", "dismissedMessageIds"]
             .iter()
             .any(|f| fields.get(*f).is_some());
+        if let Some(images) = fields.get("images") {
+            self.replace_image_ids(key, images);
+        }
         let current = self.draft_mut(key);
         if editor {
             let generation = get(current, "editorGeneration").as_i64().unwrap_or(0) + 1;
             set(current, "editorGeneration", json!(generation));
         }
-        if let (Some(target), Some(source)) = (current.as_object_mut(), fields.as_object()) {
-            for (field, value) in source {
-                target.insert(field.clone(), value.clone());
-            }
+        if let (Some(target), Value::Object(source)) = (current.as_object_mut(), fields) {
+            target.extend(source);
         }
         self.save(Some(key), delivery);
     }
@@ -354,9 +400,9 @@ impl DraftStore {
         }
         // Equality of content is not ownership: identical retyping is a new edit.
         let submitted_generation = get(submitted, "editorGeneration");
-        if !submitted_generation.is_null()
-            && get(current, "editorGeneration") == submitted_generation
-        {
+        let clears_editor = !submitted_generation.is_null()
+            && get(current, "editorGeneration") == submitted_generation;
+        if clears_editor {
             let generation = get(current, "editorGeneration").as_i64().unwrap_or(0) + 1;
             set(current, "text", json!(""));
             set(current, "attachments", json!([]));
@@ -369,6 +415,9 @@ impl DraftStore {
         if s(get(current, "sendErrorMessageId")) == id && !id.is_empty() {
             remove(current, "sendError");
             remove(current, "sendErrorMessageId");
+        }
+        if clears_editor {
+            self.image_ids.remove(key);
         }
         self.save(Some(key), true);
     }
@@ -573,7 +622,7 @@ impl DraftStore {
         let drafts: Map<String, Value> = self
             .drafts
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), v.as_ref().clone()))
             .collect();
         let inbox: Map<String, Value> = self
             .inbox
@@ -624,5 +673,39 @@ impl DraftStore {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn inline_identity_survives_typing_and_attachment_reordering() {
+        let mut store = DraftStore::default();
+        let image = json!({"data": "A".repeat(128 * 1024), "mimeType": "image/png"});
+        let blob = json!({"blobId": "other"});
+        store.load(&json!({"drafts":{"key":{"images":[blob, image]}}}));
+        let snapshot = store.draft_snapshot("key");
+        let identity = store.image_identity("key", 1).unwrap().clone();
+        assert!(Rc::ptr_eq(&snapshot, &store.draft_snapshot("key")));
+
+        store.update("key", json!({"text":"new"}));
+        assert!(Rc::ptr_eq(
+            &identity,
+            store.image_identity("key", 1).unwrap()
+        ));
+        assert!(get(&snapshot, "text").is_null());
+        drop(snapshot);
+
+        store.update("key", json!({"images":[image, blob]}));
+        assert!(Rc::ptr_eq(
+            &identity,
+            store.image_identity("key", 0).unwrap()
+        ));
+        let submitted = store.snapshot("key");
+        store.acknowledge("key", &submitted);
+        assert!(store.image_identity("key", 0).is_none());
+        assert!(list_ref(get(store.draft("key"), "images")).is_empty());
     }
 }

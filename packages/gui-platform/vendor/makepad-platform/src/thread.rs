@@ -29,12 +29,16 @@ impl SignalToUI {
         UI_SIGNAL.store(true, Ordering::SeqCst);
         #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
         crate::os::linux::x11::ui_wake::wake_ui();
+        #[cfg(target_os = "ios")]
+        crate::os::apple::ios::ios_wake::post();
     }
     
     pub fn set_action_signal() {
         ACTION_SIGNAL.store(true, Ordering::SeqCst);
         #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
         crate::os::linux::x11::ui_wake::wake_ui();
+        #[cfg(target_os = "ios")]
+        crate::os::apple::ios::ios_wake::post();
     }
     
     pub (crate) fn check_and_clear_ui_signal() -> bool {

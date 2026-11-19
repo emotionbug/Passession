@@ -1,9 +1,8 @@
 //! Retained composer images. Pasted, picked and dropped images become immutable,
 //! content-addressed files (`<blob_dir>/<sha256>`); drafts keep only
-//! `{blobId, mimeType, byteSize}`. All file IO, hashing and image decoding runs on one worker
-//! thread; results return through a `ToUIReceiver` (waking the UI with a signal). Decoded
-//! pixels become GPU textures on the GUI thread and are cached, so redraws never reload or
-//! flicker an attachment.
+//! `{blobId, mimeType, byteSize}`. The worker handles retained-blob IO and hashing, plus
+//! image decoding. Legacy inline drafts fingerprint each attachment when admitted. Decoded
+//! pixels arrive through a `ToUIReceiver` and become cached textures on the GUI thread.
 
 use super::attachments::{raster_image_mime_type, sniff_image_mime};
 use makepad_widgets::image_cache::ImageBuffer;
@@ -51,6 +50,69 @@ pub enum ImageSource {
     Blob(String),
     /// Legacy inline base64 (`{data, mimeType}`), with or without a `data:` prefix.
     Inline(String),
+}
+
+/// The decode input borrowed from a draft; owning it is only necessary for a queued job.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ImageContent<'a> {
+    Blob(&'a str),
+    Inline(&'a str),
+}
+
+impl<'a> ImageContent<'a> {
+    pub fn from_value(image: &'a Value) -> Option<Self> {
+        if let Some(id) = image.get("blobId").and_then(Value::as_str) {
+            return Some(Self::Blob(id));
+        }
+        image
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|data| !data.is_empty())
+            .map(Self::Inline)
+    }
+
+    pub fn identity(self) -> ImageIdentity {
+        let base = match self {
+            Self::Blob(id) => format!("blob:{id}"),
+            Self::Inline(data) => {
+                #[cfg(test)]
+                INLINE_HASHES.with(|count| count.set(count.get() + 1));
+                format!("inline:{:x}", Sha256::digest(data.as_bytes()))
+            }
+        };
+        ImageIdentity {
+            thumbnail: format!("{base}:thumb"),
+            preview: format!("{base}:full"),
+        }
+    }
+
+    fn into_source(self) -> ImageSource {
+        match self {
+            Self::Blob(id) => ImageSource::Blob(id.to_owned()),
+            Self::Inline(data) => ImageSource::Inline(data.to_owned()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ImageIdentity {
+    thumbnail: String,
+    preview: String,
+}
+
+impl ImageIdentity {
+    fn key(&self, thumbnail: bool) -> &str {
+        if thumbnail {
+            &self.thumbnail
+        } else {
+            &self.preview
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INLINE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub struct DecodedImage {
@@ -244,6 +306,8 @@ pub struct BlobStore {
     thumb_order: VecDeque<String>,
     preview_order: VecDeque<String>,
     next_token: u64,
+    #[cfg(test)]
+    decode_sources: usize,
 }
 
 impl BlobStore {
@@ -256,6 +320,8 @@ impl BlobStore {
             thumb_order: VecDeque::new(),
             preview_order: VecDeque::new(),
             next_token: 0,
+            #[cfg(test)]
+            decode_sources: 0,
         }
     }
 
@@ -290,41 +356,33 @@ impl BlobStore {
         self.results.try_recv().ok()
     }
 
-    fn cache_key(image: &Value, thumbnail: bool) -> Option<(String, ImageSource)> {
-        let suffix = if thumbnail { "thumb" } else { "full" };
-        if let Some(id) = image.get("blobId").and_then(Value::as_str) {
-            return Some((
-                format!("blob:{id}:{suffix}"),
-                ImageSource::Blob(id.to_owned()),
-            ));
-        }
-        let data = image
-            .get("data")
-            .and_then(Value::as_str)
-            .filter(|d| !d.is_empty())?;
-        let digest = format!("{:x}", Sha256::digest(data.as_bytes()));
-        Some((
-            format!("inline:{digest}:{suffix}"),
-            ImageSource::Inline(data.to_owned()),
-        ))
-    }
-
     /// A cached texture for an image reference, or None while it decodes (the decode is
     /// queued once). `Err` when it cannot be decoded.
     pub fn texture(
         &mut self,
         image: &Value,
+        identity: Option<&ImageIdentity>,
         thumbnail: bool,
     ) -> Result<Option<CachedTexture>, String> {
-        let Some((key, source)) = Self::cache_key(image, thumbnail) else {
+        let Some(identity) = identity else {
             return Err("Image has no content".into());
         };
-        if let Some(entry) = self.textures.get(&key) {
+        let key = identity.key(thumbnail);
+        if let Some(entry) = self.textures.get(key) {
             if let Some(error) = &entry.failed {
                 return Err(error.clone());
             }
             return Ok(entry.texture.clone().map(|t| (t, entry.size)));
         }
+        let Some(content) = ImageContent::from_value(image) else {
+            return Err("Image has no content".into());
+        };
+        #[cfg(test)]
+        {
+            self.decode_sources += 1;
+        }
+        let source = content.into_source();
+        let key = key.to_owned();
         self.textures.insert(
             key.clone(),
             TextureEntry {
@@ -384,5 +442,59 @@ impl BlobStore {
                 self.textures.remove(&old);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_texture_hits_reuse_identity_without_opening_decode_source() {
+        let image = json!({"data": "A".repeat(128 * 1024)});
+        let before = INLINE_HASHES.with(|count| count.get());
+        let identity = ImageContent::from_value(&image).unwrap().identity();
+        assert_eq!(INLINE_HASHES.with(|count| count.get()), before + 1);
+
+        let mut store = BlobStore::new(PathBuf::new());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (jobs, queued) = channel();
+        store.jobs = Some(jobs);
+        assert!(
+            store
+                .texture(&image, Some(&identity), true)
+                .unwrap()
+                .is_none()
+        );
+        let BlobJob::Decode {
+            key,
+            source: ImageSource::Inline(data),
+            max,
+        } = queued.try_recv().unwrap()
+        else {
+            panic!("one inline thumbnail decode")
+        };
+        assert_eq!(data, image["data"].as_str().unwrap());
+        assert_eq!(max, THUMBNAIL_PIXELS);
+        assert_eq!(store.decode_sources, 1);
+        store.install(
+            &mut cx,
+            key,
+            Ok(DecodedImage {
+                width: 1,
+                height: 1,
+                pixels: vec![0],
+            }),
+        );
+        for _ in 0..5 {
+            let (_, size) = store
+                .texture(&image, Some(&identity), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(size, (1, 1));
+        }
+        assert_eq!(INLINE_HASHES.with(|count| count.get()), before + 1);
+        assert_eq!(store.decode_sources, 1);
+        assert!(queued.try_recv().is_err());
     }
 }

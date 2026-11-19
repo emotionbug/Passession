@@ -660,7 +660,14 @@ pub fn row(
             let c = ui.p.surface2;
             ui.fill(cx, r, c, 6.0);
         }
-        ui.hit(r, id.to_string());
+        ui.control(
+            cx,
+            r,
+            id,
+            label,
+            AccessibilityRole::ListItem,
+            AccessibilityState::default(),
+        );
     }
     let fg = if id.is_none() {
         ui.p.muted

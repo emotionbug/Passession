@@ -227,6 +227,8 @@ impl Platform {
     }
 
     pub fn finish_event(&mut self, cx: &mut Cx, event: &Event) {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        crate::mobile::finish_event(&self.shared, event);
         if let Event::BackPressed { handled } = event
             && !handled.get()
         {
@@ -251,6 +253,13 @@ impl Platform {
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+impl Drop for Platform {
+    fn drop(&mut self) {
+        crate::mobile::shutdown(&self.shared);
+    }
+}
+
 fn validate_external_url(url: &str) -> Result<String, PlatformError> {
     let parsed = url::Url::parse(url.trim())
         .map_err(|_| PlatformError::invalid(format!("Not a valid URL: {url}")))?;
@@ -265,6 +274,11 @@ fn validate_external_url(url: &str) -> Result<String, PlatformError> {
 impl PlatformHandle {
     fn shared(&self) -> &Arc<Shared> {
         &self.0
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn network_changed(&self) {
+        self.0.core.network_changed();
     }
 
     pub fn capabilities(&self) -> Capabilities {
@@ -398,6 +412,24 @@ impl PlatformHandle {
         let done = self.0.completion();
         let id = done.id();
         native::notification_permission_status(self.shared(), done);
+        id
+    }
+
+    /// Whether this mobile build has push credentials, independent of permission.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub fn push_availability(&self) -> PlatformRequestId {
+        let done = self.0.completion();
+        let id = done.id();
+        let shared = self.0.clone();
+        self.0.spawn(async move {
+            done.finish(
+                shared
+                    .mobile
+                    .push_available()
+                    .await
+                    .map(PlatformValue::Bool),
+            );
+        });
         id
     }
 

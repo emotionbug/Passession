@@ -13,7 +13,8 @@ use super::look::Look;
 use super::sheet::{Page, SheetState};
 use crate::common::overlay::{self, MenuEntry, MenuItem};
 use crate::common::paint::{HitMap, Painter};
-use crate::common::{UiCommand, UiContext, UiEffect};
+use crate::common::{UiCommand, UiContext, UiEffect, accessibility};
+use crate::features::composer::blobs::ImageIdentity;
 use crate::features::composer::controller::*;
 use crate::features::composer::i18n::t;
 use crate::features::composer::json::*;
@@ -23,6 +24,7 @@ use makepad_widgets::makepad_draw::text::selection::Cursor;
 use makepad_widgets::*;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 live_design! {
     use link::theme::*;
@@ -70,7 +72,7 @@ live_design! {
 }
 
 /// Interactive items of the inline composer.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum Item {
     Attach,
     Model,
@@ -119,9 +121,14 @@ pub enum OItem {
 #[derive(Clone, Debug)]
 pub enum Overlay {
     None,
-    Sheet(SheetState),
+    /// Boxed: the sheet's rows dwarf every other overlay state.
+    Sheet(Box<SheetState>),
     Forge,
-    Preview(Value),
+    Preview {
+        draft: Rc<Value>,
+        image_index: usize,
+        identity: Option<Rc<ImageIdentity>>,
+    },
     Fullscreen,
     /// Compact context window details sheet.
     Context,
@@ -438,6 +445,15 @@ impl Widget for ComposerPanel {
                 || matches!(self.st.overlay(), Overlay::Fullscreen)
                 || !crate::common::is_user_input(event);
 
+            if !overlay_consumed
+                && input_allowed
+                && accessibility::focus_requested(event, self.input.widget_uid())
+                && self.input.area().is_attached(cx)
+                && !self.input.is_read_only()
+            {
+                self.input.set_key_focus(cx);
+            }
+
             // Keys on the focused editor (autocomplete, Enter policy, paste, Escape).
             let mut swallow = overlay_consumed;
             if let Event::KeyDown(ke) = event
@@ -474,7 +490,27 @@ impl Widget for ComposerPanel {
             }
 
             if !modal {
-                self.pointer_event(cx, event, ui, &path, uid);
+                if let Event::AccessibilityAction(action) = event
+                    && action.action == AccessibilityAction::Activate
+                {
+                    let target = self
+                        .st
+                        .hits
+                        .since(0)
+                        .iter()
+                        .rev()
+                        .find(|hit| {
+                            self.accessibility_id(&hit.item) == action.id
+                                && hit.visible_rect().size.x > 0.0
+                                && hit.visible_rect().size.y > 0.0
+                        })
+                        .map(|hit| hit.item.clone());
+                    if let Some(item) = target {
+                        self.click(cx, ui, &path, uid, item);
+                    }
+                } else {
+                    self.pointer_event(cx, event, ui, &path, uid);
+                }
             }
         }
 
@@ -518,6 +554,9 @@ impl Widget for ComposerPanel {
         let look = Look::new(cx, ui, window);
         self.theme_input(cx, &look);
         self.draw_composer(cx, ui, &look, walk);
+        if cx.accessibility_enabled() && !self.st.modal_open() {
+            self.record_accessible_controls(cx);
+        }
         self.draw_overlays(cx, ui, &look);
         let editor_walk = self.profile_editor.walk(cx);
         self.profile_editor.draw_walk(cx, scope, editor_walk)?;
@@ -1089,7 +1128,7 @@ impl ComposerPanel {
             owner: self.input.widget_uid(),
             scope: None,
         });
-        self.st.overlay = Some(Overlay::Sheet(state));
+        self.st.overlay = Some(Overlay::Sheet(Box::new(state)));
         self.st.search_text.clear();
         self.search.set_text(cx, "");
         self.st.search_focus_pending = !ui.compact;
@@ -1323,9 +1362,23 @@ impl ComposerPanel {
             }
             Item::Image(index) => {
                 if !sending {
-                    let images = maps(get(&self.ctl_ref().draft(), "images"));
-                    if let Some(image) = images.get(index) {
-                        self.st.overlay = Some(Overlay::Preview(image.clone()));
+                    let ctl = self.ctl_ref();
+                    let draft = ctl.draft();
+                    let image_index = list_ref(get(&draft, "images"))
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, image)| image.is_object())
+                        .nth(index)
+                        .map(|(image_index, _)| image_index);
+                    if let Some(image_index) = image_index {
+                        let identity = service::with(|svc| {
+                            svc.drafts.image_identity(&ctl.key, index).cloned()
+                        });
+                        self.st.overlay = Some(Overlay::Preview {
+                            draft,
+                            image_index,
+                            identity,
+                        });
                     }
                 }
                 Outputs {

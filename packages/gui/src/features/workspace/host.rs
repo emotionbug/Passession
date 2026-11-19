@@ -168,16 +168,17 @@ impl<'a> Host<'a> {
             || str_of(self.value, "kind") == "local"
     }
 
-    pub fn agents(&self) -> &'a [Arc<Value>] {
+    pub fn agents(&self) -> impl Iterator<Item = &'a Arc<Value>> {
         self.directory
-            .map(|directory| directory.agents.as_slice())
-            .unwrap_or(&[])
+            .into_iter()
+            .flat_map(|directory| directory.agents.iter())
     }
 
     /// Whether the agent directory has been hydrated at least once. A missing agent only
     /// counts as gone once the directory is known.
     pub fn agents_loaded(&self) -> bool {
-        !self.agents().is_empty()
+        self.directory
+            .is_some_and(|directory| !directory.agents.is_empty())
     }
 
     pub fn projects(&self) -> &'a [Arc<Value>] {
@@ -195,7 +196,6 @@ impl<'a> Host<'a> {
     /// An agent row, unwrapping the `{agent: {...}}` directory envelope.
     pub fn agent(&self, agent_id: &str) -> Option<&'a Value> {
         self.agents()
-            .iter()
             .map(|row| agent_of(row))
             .find(|agent| str_of(agent, "id") == agent_id)
     }

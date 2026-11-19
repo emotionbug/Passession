@@ -476,11 +476,11 @@ pub(crate) fn insets_from_json(value: &Value) -> SafeInsets {
 // ----- push -----
 
 /// Firebase is optional: builds without `google-services.json` cannot issue tokens.
-pub(crate) async fn push_provisioned() -> bool {
-    matches!(
-        call_await("pushProvisioned", json!({})).await,
-        Ok(Value::Bool(true))
-    )
+pub(crate) async fn push_provisioned() -> Result<bool, PlatformError> {
+    call_await("pushProvisioned", json!({}))
+        .await?
+        .as_bool()
+        .ok_or_else(|| PlatformError::native("Invalid Android push provisioning response."))
 }
 
 pub(crate) async fn notification_permission(

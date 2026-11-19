@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use makepad_widgets::*;
 
 use crate::common::paint::{Font, HitMap, Painter, TextSpec, inset, rect};
+use crate::common::{accessibility, i18n::with_translation};
 use crate::theme::{ControlSize, Palette, Typography, control_icon_size, fade};
 
 /// Per-frame drawing context.
@@ -20,6 +21,19 @@ pub struct Ui<'a> {
     pub p: Palette,
     pub t: Typography,
     pub compact: bool,
+    pub semantics: HitScope,
+}
+
+#[derive(Clone, Copy, Hash)]
+pub enum HitScope {
+    Shell,
+    Overlay(u64),
+}
+
+impl HitScope {
+    pub(super) fn id(self, hit: &str) -> u64 {
+        accessibility::id(("shell-hit", self, hit))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,10 +58,96 @@ impl<'a> Ui<'a> {
         self.hits.push(r, id.into());
     }
 
-    pub fn hit_tip(&mut self, r: Rect, id: &str, tooltip: &str) {
-        self.hits.push(r, id.to_string());
+    pub fn hit_tip(&mut self, cx: &mut Cx2d, r: Rect, id: &str, tooltip: &str) {
+        self.control(
+            cx,
+            r,
+            id,
+            tooltip,
+            AccessibilityRole::Button,
+            AccessibilityState::default(),
+        );
+        self.tooltip(id, tooltip);
+    }
+
+    pub fn tooltip(&mut self, id: &str, tooltip: &str) {
         if !tooltip.is_empty() && !self.compact {
             self.tooltips.insert(id.to_string(), tooltip.to_string());
+        }
+    }
+
+    pub fn control(
+        &mut self,
+        cx: &mut Cx2d,
+        r: Rect,
+        id: &str,
+        label: &str,
+        role: AccessibilityRole,
+        state: AccessibilityState,
+    ) {
+        if !id.is_empty() {
+            if state.enabled {
+                self.hit(r, id);
+            }
+            self.semantic(
+                cx,
+                r,
+                id,
+                label,
+                role,
+                state,
+                if state.enabled {
+                    AccessibilityActions::ACTIVATE
+                } else {
+                    AccessibilityActions::NONE
+                },
+            );
+        }
+    }
+
+    pub fn semantic_text(
+        &self,
+        cx: &mut Cx2d,
+        r: Rect,
+        id: &str,
+        label: &str,
+        role: AccessibilityRole,
+    ) {
+        self.semantic(
+            cx,
+            r,
+            id,
+            label,
+            role,
+            AccessibilityState::default(),
+            AccessibilityActions::NONE,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn semantic(
+        &self,
+        cx: &mut Cx2d,
+        r: Rect,
+        id: &str,
+        label: &str,
+        role: AccessibilityRole,
+        state: AccessibilityState,
+        actions: AccessibilityActions,
+    ) {
+        if cx.accessibility_enabled() {
+            accessibility::record_rect(
+                cx,
+                AccessibilityNode {
+                    id: self.semantics.id(id),
+                    parent: None,
+                    role,
+                    label,
+                    bounds: self.hits.clip_bounds(r),
+                    state,
+                    actions,
+                },
+            );
         }
     }
 
@@ -129,8 +229,19 @@ impl<'a> Ui<'a> {
             icon_size,
             if enabled { color } else { fade(color, 0.5) },
         );
+        let state = AccessibilityState {
+            enabled,
+            ..AccessibilityState::default()
+        };
+        if tooltip.is_empty() && cx.accessibility_enabled() {
+            with_translation(accessibility::icon_label(icon), |label| {
+                self.control(cx, r, id, label, AccessibilityRole::Button, state);
+            });
+        } else {
+            self.control(cx, r, id, tooltip, AccessibilityRole::Button, state);
+        }
         if enabled {
-            self.hit_tip(r, id, tooltip);
+            self.tooltip(id, tooltip);
         }
     }
 
@@ -251,8 +362,19 @@ impl<'a> Ui<'a> {
             let w = (r.pos.x + r.size.x - x - 8.0).max(0.0);
             self.text(cx, rect(x, r.pos.y, w, r.size.y), spec, label);
         }
-        if enabled {
-            self.hit(r, id);
+        let state = AccessibilityState {
+            enabled,
+            ..AccessibilityState::default()
+        };
+        if label.is_empty() && cx.accessibility_enabled() {
+            with_translation(
+                accessibility::icon_label(icon.unwrap_or_default()),
+                |label| {
+                    self.control(cx, r, id, label, AccessibilityRole::Button, state);
+                },
+            );
+        } else {
+            self.control(cx, r, id, label, AccessibilityRole::Button, state);
         }
     }
 
@@ -347,9 +469,19 @@ impl<'a> Ui<'a> {
             spec,
             label,
         );
-        if enabled {
-            self.hit(r, id);
-        }
+        self.control(
+            cx,
+            r,
+            id,
+            label,
+            AccessibilityRole::ListItem,
+            AccessibilityState {
+                enabled,
+                selected: checked,
+                checked,
+                focused: active,
+            },
+        );
     }
 
     /// Original `MenuSeparator`: 1px borderAccent with 4px above and below (9px tall).

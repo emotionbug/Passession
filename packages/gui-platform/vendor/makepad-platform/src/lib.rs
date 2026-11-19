@@ -14,8 +14,13 @@ mod cx_api;
 mod frame_trace;
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod ime_composer;
+#[cfg(all(test, not(target_os = "ios")))]
+#[path = "os/apple/ios/ios_state.rs"]
+mod ios_state;
 
 pub mod action;
+mod accessibility;
+pub use accessibility::*;
 
 pub mod live_traits;
 pub mod live_cx;

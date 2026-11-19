@@ -254,6 +254,11 @@ pub extern "system" fn Java_sh_paseo_sessions_PaseoBridge_nativeEvent(
         "insets" => deliver(MobileSignal::Insets(native::insets_from_json(&payload))),
         "audioInterrupted" => deliver(MobileSignal::AudioInterrupted),
         "tokenRefreshed" => deliver(MobileSignal::TokenRefreshed),
+        "networkChanged" => {
+            if let Some(platform) = crate::platform::platform() {
+                platform.network_changed();
+            }
+        }
         // PaseoTailnetService notification actions.
         "tailnetControl" => {
             let control = match text("action").as_str() {

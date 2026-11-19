@@ -174,6 +174,22 @@ pub fn tr(key: &str) -> String {
     template(key, None)
 }
 
+/// Uses a plain catalog entry without allocating a temporary translated String.
+pub(crate) fn with_translation<T>(key: &str, use_label: impl FnOnce(&str) -> T) -> T {
+    let lang = LANG.with(Cell::get);
+    CATALOGS.with(|(en, ko)| {
+        let primary = match lang {
+            Lang::Ko => ko,
+            Lang::En => en,
+        };
+        use_label(
+            lookup(primary, key)
+                .or_else(|| lookup(en, key))
+                .unwrap_or(key),
+        )
+    })
+}
+
 /// `{{name}}` interpolation; a numeric `count` argument selects the plural form.
 pub fn tr_args(key: &str, args: &[(&str, &str)]) -> String {
     let count = args

@@ -1,6 +1,8 @@
 //! Historical diff document model and shared Git presentation helpers.
 
 use super::json::{array, flag, int, text};
+use super::text::{t, tr};
+use crate::common::tr_args;
 use serde_json::Value;
 use std::cmp::Ordering;
 
@@ -341,34 +343,6 @@ pub fn changed_tree_rows(
 // ---------------------------------------------------------------------------
 // Time formatting.
 
-/// Original commit row `_timeAgo` (relative to `now_ms`, both epoch ms).
-pub fn commit_time_ago(date_ms: i64, now_ms: i64) -> String {
-    let elapsed = (now_ms - date_ms).max(0) / 1000;
-    let minutes = elapsed / 60;
-    let hours = minutes / 60;
-    let days = hours / 24;
-    if minutes < 1 {
-        return "just now".into();
-    }
-    if hours < 1 {
-        return format!("{minutes}m ago");
-    }
-    if days < 1 {
-        return format!("{hours}h ago");
-    }
-    if days < 7 {
-        return format!("{days}d ago");
-    }
-    use chrono::{Datelike, Local, TimeZone};
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    match Local.timestamp_millis_opt(date_ms).single() {
-        Some(local) => format!("{} {}", MONTHS[local.month0() as usize], local.day()),
-        None => String::new(),
-    }
-}
-
 /// Original PR activity `formatAge`.
 pub fn format_age(created_at_ms: i64, now_ms: i64) -> String {
     if created_at_ms <= 0 {
@@ -376,46 +350,58 @@ pub fn format_age(created_at_ms: i64, now_ms: i64) -> String {
     }
     let seconds = (now_ms - created_at_ms).max(0) / 1000;
     if seconds < 60 {
-        return "just now".into();
+        return t("workspace.git.log.time.justNow");
     }
     let minutes = seconds / 60;
-    if minutes < 60 {
-        return format!("{minutes}m ago");
-    }
     let hours = minutes / 60;
-    if hours < 24 {
-        return format!("{hours}h ago");
-    }
     let days = hours / 24;
-    if days < 30 {
-        return format!("{days}d ago");
-    }
-    if days < 365 {
-        return format!("{}mo ago", days / 30);
-    }
-    format!("{}y ago", days / 365)
+    let (key, count) = if minutes < 60 {
+        ("workspace.git.log.time.minutesAgo", minutes)
+    } else if hours < 24 {
+        ("workspace.git.log.time.hoursAgo", hours)
+    } else if days < 30 {
+        ("workspace.git.log.time.daysAgo", days)
+    } else if days < 365 {
+        ("workspace.git.log.time.monthsAgo", days / 30)
+    } else {
+        ("workspace.git.log.time.yearsAgo", days / 365)
+    };
+    tr(key, &[("count", count.to_string())])
 }
 
 /// Original `formatDuration` for pipeline job durations.
 pub fn format_duration(total_seconds: i64) -> String {
     if total_seconds < 60 {
-        return format!("{total_seconds}s");
+        return tr_args(
+            "workspace.git.pr.duration.seconds",
+            &[("seconds", &total_seconds.to_string())],
+        );
     }
     let minutes = total_seconds / 60;
     if minutes < 60 {
         let seconds = total_seconds % 60;
+        let minutes = minutes.to_string();
         return if seconds == 0 {
-            format!("{minutes}m")
+            tr_args(
+                "workspace.git.pr.duration.minutes",
+                &[("minutes", &minutes)],
+            )
         } else {
-            format!("{minutes}m {seconds}s")
+            tr_args(
+                "workspace.git.pr.duration.minutesSeconds",
+                &[("minutes", &minutes), ("seconds", &seconds.to_string())],
+            )
         };
     }
-    let hours = minutes / 60;
-    let rem = minutes % 60;
-    if rem == 0 {
-        format!("{hours}h")
+    let hours = (minutes / 60).to_string();
+    let remaining = minutes % 60;
+    if remaining == 0 {
+        tr_args("workspace.git.pr.duration.hours", &[("hours", &hours)])
     } else {
-        format!("{hours}h {rem}m")
+        tr_args(
+            "workspace.git.pr.duration.hoursMinutes",
+            &[("hours", &hours), ("minutes", &remaining.to_string())],
+        )
     }
 }
 
@@ -447,6 +433,47 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn pull_request_ages_and_durations_follow_the_active_locale() {
+        use crate::common::i18n::{locale_tag, set_language};
+
+        let previous = json!(locale_tag());
+        let day = 86_400_000;
+        for (locale, ages, durations) in [
+            (
+                "en",
+                [
+                    "just now", "1m ago", "1h ago", "29d ago", "1mo ago", "1y ago",
+                ],
+                ["59s", "1m", "1m 1s", "1h", "1h 1m"],
+            ),
+            (
+                "ko",
+                [
+                    "방금 전",
+                    "1분 전",
+                    "1시간 전",
+                    "29일 전",
+                    "1개월 전",
+                    "1년 전",
+                ],
+                ["59초", "1분", "1분 1초", "1시간", "1시간 1분"],
+            ),
+        ] {
+            set_language(Some(&json!(locale)));
+            for (elapsed, expected) in [59_999, 60_000, 3_600_000, 29 * day, 30 * day, 365 * day]
+                .into_iter()
+                .zip(ages)
+            {
+                assert_eq!(format_age(1, elapsed + 1), expected);
+            }
+            for (seconds, expected) in [59, 60, 61, 3600, 3660].into_iter().zip(durations) {
+                assert_eq!(format_duration(seconds), expected);
+            }
+        }
+        set_language(Some(&previous));
+    }
 
     #[test]
     fn numbering_skips_wire_headers_and_counts_each_side() {

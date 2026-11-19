@@ -62,7 +62,6 @@ enum Row {
 /// Per-patch projection retained across draws: numbered lines, syntax runs,
 /// collapsed context and unified/split rows with their heights.
 struct FileModel {
-    revision: u64,
     lines: Vec<DiffLine>,
     max_line: i64,
     /// Widest line in display columns (see [`display_columns`]).
@@ -75,12 +74,12 @@ struct FileModel {
 }
 
 /// (split, wrap, text width, typography epoch).
-type HeightKey = (bool, bool, i64, u64);
+type HeightKey = (bool, bool, f64, u64);
 /// Cache key, row tops relative to the body, total body height.
 type RowHeights = (HeightKey, Vec<f64>, f64);
 
 impl FileModel {
-    fn new(patch: &Value, revision: u64) -> Self {
+    fn new(patch: &Value) -> Self {
         let lines = number_diff(patch);
         let mut max_line = 0;
         let mut max_columns = 0;
@@ -91,7 +90,6 @@ impl FileModel {
             max_columns = max_columns.max(display_columns(&line.content));
         }
         Self {
-            revision,
             lines,
             max_line,
             max_columns,
@@ -255,19 +253,53 @@ pub struct LineTarget {
 /// Inputs of one document draw.
 pub struct DocInput<'a> {
     pub files: &'a [Value],
+    pub files_revision: u64,
     pub patches: &'a HashMap<String, Value>,
+    /// Existing patches are immutable within this generation.
+    pub patch_generation: u64,
     pub patch_errors: &'a HashMap<String, String>,
+    /// Changes on patch or error arrival, removal, or replacement.
     pub patch_revision: u64,
     pub collapsed: &'a HashSet<String>,
+    pub collapse_revision: u64,
     pub split: bool,
     pub wrap: bool,
     pub syntax_theme: &'a str,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct GeometryKey {
+    files_revision: u64,
+    patch_generation: u64,
+    patch_revision: u64,
+    collapse_revision: u64,
+    expansion_revision: u64,
+    width: f64,
+    split: bool,
+    wrap: bool,
+    theme_epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Block {
+    top: f64,
+    bottom: f64,
+    collapsed: bool,
 }
 
 pub struct DiffDoc {
     pub scroll_y: f64,
     pub scroll_x: f64,
     models: HashMap<String, FileModel>,
+    geometry_key: Option<GeometryKey>,
+    /// Indices into the summary, sorted by document order.
+    file_indices: Vec<usize>,
+    /// Blocks share document order; both edges increase monotonically.
+    blocks: Vec<Block>,
+    /// Largest line number and display width among loaded patches.
+    widest: (i64, usize),
+    #[cfg(test)]
+    layout_builds: (usize, usize),
     pub hits: Hits<DocHit>,
     pub hovered: Option<DocHit>,
     viewport: Rect,
@@ -278,7 +310,7 @@ pub struct DiffDoc {
     /// offset into it, plus the scroll it was taken at. Blocks above the
     /// viewport change height as their patches load; the anchor keeps the
     /// visible content still (Flutter keeps ensureVisible targets in place).
-    anchor: Option<(String, f64)>,
+    anchor: Option<(usize, f64)>,
     anchored_scroll_y: f64,
     /// Files whose placeholders were drawn near the viewport this frame.
     pub wanted: Vec<String>,
@@ -288,8 +320,6 @@ pub struct DiffDoc {
     order: Vec<String>,
     /// Split layout at the last draw (piece rows).
     split: bool,
-    /// Collapsed files at the last draw (their bodies hold no text).
-    collapsed: HashSet<String>,
     /// `(anchor, focus)` of the `SelectionArea` selection.
     pub selection: Option<(TextPos, TextPos)>,
     /// A mouse drag is extending the selection; the pointer drives
@@ -362,6 +392,12 @@ impl Default for DiffDoc {
             scroll_y: 0.0,
             scroll_x: 0.0,
             models: HashMap::new(),
+            geometry_key: None,
+            file_indices: Vec::new(),
+            blocks: Vec::new(),
+            widest: (0, 0),
+            #[cfg(test)]
+            layout_builds: (0, 0),
             hits: Hits::default(),
             hovered: None,
             viewport: Rect::default(),
@@ -374,7 +410,6 @@ impl Default for DiffDoc {
             pieces: Vec::new(),
             order: Vec::new(),
             split: false,
-            collapsed: HashSet::new(),
             selection: None,
             drag_pointer: None,
             bars: [ScrollBar::default(); 2],
@@ -701,7 +736,7 @@ impl DiffDoc {
         let mut out = String::new();
         let last = end.piece.0.min(self.order.len().saturating_sub(1));
         for file in start.piece.0..=last {
-            let Some(path) = self.order.get(file).cloned() else {
+            let Some(path) = self.order.get(file) else {
                 break;
             };
             let mut texts: Vec<(PieceKey, String)> = Vec::new();
@@ -714,8 +749,8 @@ impl DiffDoc {
                 texts.push(((file, 0, 1), directory.to_owned()));
             }
             let split = self.split;
-            if !self.collapsed.contains(&path)
-                && let Some(model) = self.models.get_mut(&path)
+            if !self.blocks[file].collapsed
+                && let Some(model) = self.models.get_mut(path)
             {
                 let rows = model.rows(split).to_vec();
                 let lines = &model.lines;
@@ -952,9 +987,10 @@ impl DiffDoc {
     }
 
     pub fn toggle_expand(&mut self, path: &str, start: usize) {
-        self.expansion_revision = self.expansion_revision.wrapping_add(1);
-        if let Some(model) = self.models.get_mut(path) {
-            model.expanded.insert(start);
+        if let Some(model) = self.models.get_mut(path)
+            && model.expanded.insert(start)
+        {
+            self.expansion_revision = self.expansion_revision.wrapping_add(1);
             model.invalidate();
         }
     }
@@ -965,15 +1001,6 @@ impl DiffDoc {
             path: path.to_owned(),
             line: model.lines.get(index)?.clone(),
         })
-    }
-
-    fn model(&mut self, path: &str, patch: &Value, revision: u64) -> &mut FileModel {
-        let stale = self.models.get(path).is_none_or(|m| m.revision != revision);
-        if stale {
-            self.models
-                .insert(path.to_owned(), FileModel::new(patch, revision));
-        }
-        self.models.get_mut(path).unwrap()
     }
 
     fn cell_text_height(cx: &mut Cx2d, paint: &mut GitPaint, content: &str, width: f64) -> f64 {
@@ -994,12 +1021,7 @@ impl DiffDoc {
     ) -> f64 {
         let lh = line_height();
         let gutter = gutter_width(model.max_line);
-        let key = (
-            input.split,
-            input.wrap,
-            column_width.round() as i64,
-            crate::theme::epoch(),
-        );
+        let key = (input.split, input.wrap, column_width, crate::theme::epoch());
         if let Some((cached, _, total)) = &model.heights
             && *cached == key
         {
@@ -1066,16 +1088,149 @@ impl DiffDoc {
                 if status == "binary" || status == "too_large" {
                     return message;
                 }
-                let empty = {
-                    let model = self.model(path, patch, input.patch_revision);
-                    model.rows(input.split).is_empty()
-                };
-                if empty {
+                let model = self
+                    .models
+                    .get_mut(path)
+                    .expect("loaded patch indexed above");
+                if model.lines.is_empty() {
                     return message;
                 }
-                let model = self.model(path, patch, input.patch_revision);
                 Self::ensure_heights(cx, paint, input, model, column_width)
             }
+        }
+    }
+
+    fn order_index(order: &[String], path: &str) -> Option<usize> {
+        let i = order.partition_point(|other| compare_diff_paths(other, path).is_lt());
+        (order.get(i).is_some_and(|other| other == path)).then_some(i)
+    }
+
+    fn rebuild_order(&mut self, files: &[Value]) {
+        #[cfg(test)]
+        {
+            self.layout_builds.0 += 1;
+        }
+        self.file_indices.clear();
+        self.file_indices.extend(0..files.len());
+        let path = |i: usize| text(&files[i], "path");
+        self.file_indices
+            .sort_by(|&a, &b| compare_diff_paths(path(a), path(b)));
+        let paths = self.file_indices.iter().map(|&i| path(i));
+        if !paths.clone().eq(self.order.iter().map(String::as_str)) {
+            let order = paths.map(str::to_owned).collect::<Vec<_>>();
+            self.anchor = self.anchor.and_then(|(i, offset)| {
+                Self::order_index(&order, &self.order[i]).map(|i| (i, offset))
+            });
+            // Piece keys index files by order; another file list drops the selection.
+            self.selection = None;
+            self.order = order;
+        }
+    }
+
+    fn ensure_geometry(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        input: &DocInput<'_>,
+        width: f64,
+    ) {
+        let key = GeometryKey {
+            files_revision: input.files_revision,
+            patch_generation: input.patch_generation,
+            patch_revision: input.patch_revision,
+            collapse_revision: input.collapse_revision,
+            expansion_revision: self.expansion_revision,
+            width,
+            split: input.split,
+            wrap: input.wrap,
+            theme_epoch: crate::theme::epoch(),
+        };
+        let previous = self.geometry_key;
+        if previous == Some(key) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.layout_builds.1 += 1;
+        }
+        let files_changed = previous.is_none_or(|old| old.files_revision != key.files_revision);
+        if files_changed {
+            self.rebuild_order(input.files);
+        }
+        let patches_replaced =
+            previous.is_none_or(|old| old.patch_generation != key.patch_generation);
+        if patches_replaced {
+            self.models.clear();
+        } else if files_changed && !self.models.is_empty() {
+            let live: HashSet<&str> = self.order.iter().map(String::as_str).collect();
+            self.models.retain(|path, _| live.contains(path.as_str()));
+        }
+        if files_changed
+            || patches_replaced
+            || previous.is_none_or(|old| old.patch_revision != key.patch_revision)
+        {
+            self.widest = (0, 0);
+            for path in &self.order {
+                let Some(patch) = input.patches.get(path) else {
+                    continue;
+                };
+                let (max_line, max_columns) = self
+                    .models
+                    .get(path)
+                    .map(|model| (model.max_line, model.max_columns))
+                    .unwrap_or_else(|| {
+                        let model = FileModel::new(patch);
+                        let dimensions = (model.max_line, model.max_columns);
+                        self.models.insert(path.clone(), model);
+                        dimensions
+                    });
+                self.widest.0 = self.widest.0.max(max_line);
+                self.widest.1 = self.widest.1.max(max_columns);
+            }
+        }
+        if self.split != input.split {
+            self.selection = None;
+            self.split = input.split;
+        }
+        let column = gutter_width(self.widest.0) + self.widest.1 as f64 * char_width() + 48.0;
+        self.content_width = if input.wrap {
+            width
+        } else {
+            width.max(if input.split {
+                column * 2.0 + 1.0
+            } else {
+                column
+            })
+        };
+        let column_width = self.column_width();
+        self.blocks.clear();
+        self.blocks.reserve(self.file_indices.len());
+        let mut top = 0.0;
+        for i in 0..self.file_indices.len() {
+            let file = &input.files[self.file_indices[i]];
+            let collapsed = input.collapsed.contains(text(file, "path"));
+            let body = if collapsed {
+                0.0
+            } else {
+                self.body_height(cx, paint, input, file, column_width) + 1.0
+            };
+            let bottom = top + HEADER_HEIGHT + body;
+            self.blocks.push(Block {
+                top,
+                bottom,
+                collapsed,
+            });
+            top = bottom;
+        }
+        self.content_height = top + 24.0;
+        self.geometry_key = Some(key);
+    }
+
+    fn column_width(&self) -> f64 {
+        if self.split {
+            (self.content_width - 1.0) / 2.0
+        } else {
+            self.content_width
         }
     }
 
@@ -1093,70 +1248,11 @@ impl DiffDoc {
             paint.fill(cx, area, colors.surface0);
             self.background.end(cx, &self.hits);
         }
-        let mut files: Vec<&Value> = input.files.iter().collect();
-        files.sort_by(|a, b| compare_diff_paths(text(a, "path"), text(b, "path")));
-        let live: HashSet<&str> = files.iter().map(|f| text(f, "path")).collect();
-        self.models.retain(|path, model| {
-            live.contains(path.as_str())
-                && input.patches.contains_key(path)
-                && model.revision == input.patch_revision
-        });
+        self.ensure_geometry(cx, paint, input, area.size.x);
         // Selection context of this frame: pieces register as they are drawn.
         self.pieces.clear();
-        let order: Vec<String> = files.iter().map(|f| text(f, "path").to_owned()).collect();
-        if order != self.order {
-            // Piece keys index files by order; another file list drops the selection.
-            self.selection = None;
-            self.order = order;
-        }
-        if self.split != input.split {
-            self.selection = None;
-            self.split = input.split;
-        }
-        if self.collapsed != *input.collapsed {
-            self.collapsed = input.collapsed.clone();
-        }
-        // Column width: the widest loaded line, at least the viewport.
-        let mut widest = 0usize;
-        let mut max_line = 0i64;
-        for file in &files {
-            let path = text(file, "path");
-            if let Some(patch) = input.patches.get(path) {
-                let model = self.model(path, patch, input.patch_revision);
-                widest = widest.max(model.max_columns);
-                max_line = max_line.max(model.max_line);
-            }
-        }
-        let column = gutter_width(max_line) + widest as f64 * char_width() + 48.0;
-        let content_width = if input.wrap {
-            area.size.x
-        } else {
-            area.size.x.max(if input.split {
-                column * 2.0 + 1.0
-            } else {
-                column
-            })
-        };
-        self.content_width = content_width;
-        let column_width = if input.split {
-            (content_width - 1.0) / 2.0
-        } else {
-            content_width
-        };
-        // Block layout.
-        let mut blocks: Vec<(String, f64, f64)> = Vec::with_capacity(files.len());
-        let mut y = 0.0;
-        for file in &files {
-            let path = text(file, "path").to_owned();
-            let body = if input.collapsed.contains(&path) {
-                0.0
-            } else {
-                self.body_height(cx, paint, input, file, column_width) + 1.0
-            };
-            blocks.push((path, y, HEADER_HEIGHT + body));
-            y += HEADER_HEIGHT + body;
-        }
-        self.content_height = y + 24.0;
+        let content_width = self.content_width;
+        let column_width = self.column_width();
         // Original `SelectionArea` edge auto-scroll while a selection drag is
         // held beyond the viewport: faster the farther out, frames only while it runs.
         let mut autoscroll = false;
@@ -1173,22 +1269,26 @@ impl DiffDoc {
                 autoscroll = true;
             }
         }
-        if let Some(path) = self.reveal.take()
-            && let Some((_, top, _)) = blocks.iter().find(|(p, _, _)| *p == path)
+        if let Some(file) = self
+            .reveal
+            .take()
+            .and_then(|path| Self::order_index(&self.order, &path))
         {
-            self.scroll_y = *top;
-        } else if let Some((path, offset)) = &self.anchor
-            && let Some((_, top, _)) = blocks.iter().find(|(p, _, _)| p == path)
-        {
+            self.scroll_y = self.blocks[file].top;
+        } else if let Some((file, offset)) = self.anchor {
+            let top = self.blocks[file].top;
             // Scrolling since the last draw moves relative to the anchor.
             self.scroll_y = top + offset + (self.scroll_y - self.anchored_scroll_y);
         }
         let max_y = (self.content_height - area.size.y).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_y);
-        self.anchor = blocks
-            .iter()
-            .find(|(_, top, height)| top + height > self.scroll_y)
-            .map(|(path, top, _)| (path.clone(), self.scroll_y - top));
+        let anchor = self
+            .blocks
+            .partition_point(|block| block.bottom <= self.scroll_y);
+        self.anchor = self
+            .blocks
+            .get(anchor)
+            .map(|block| (anchor, self.scroll_y - block.top));
         self.anchored_scroll_y = self.scroll_y;
         self.scroll_x = if input.wrap {
             0.0
@@ -1198,6 +1298,13 @@ impl DiffDoc {
         };
         let view_top = self.scroll_y;
         let view_bottom = self.scroll_y + area.size.y;
+        let first = self.blocks.partition_point(|block| block.bottom < view_top);
+        let last = self
+            .blocks
+            .partition_point(|block| block.top <= view_bottom);
+        let preload = self
+            .blocks
+            .partition_point(|block| block.top < view_bottom + area.size.y);
         let syntax = SyntaxThemeId::from_name(input.syntax_theme).unwrap_or(SyntaxThemeId::One);
         let syntax_colors = resolve_syntax_colors(
             syntax,
@@ -1209,24 +1316,26 @@ impl DiffDoc {
         );
         paint.begin_clip(cx, area);
         let origin = dvec2(area.pos.x - self.scroll_x, area.pos.y - self.scroll_y);
-        for (file_index, (path, top, height)) in blocks.iter().enumerate() {
-            if top + height < view_top || *top > view_bottom {
+        for file_index in first..last.max(preload) {
+            let Block {
+                top,
+                bottom,
+                collapsed,
+            } = self.blocks[file_index];
+            if collapsed {
+                continue;
+            }
+            let file = &input.files[self.file_indices[file_index]];
+            let path = text(file, "path");
+            if file_index >= last {
                 // Placeholders just below the viewport preload.
-                if *top > view_bottom
-                    && *top < view_bottom + area.size.y
-                    && !input.collapsed.contains(path)
-                    && !input.patches.contains_key(path)
-                    && !input.patch_errors.contains_key(path)
-                {
-                    self.wanted.push(path.clone());
+                if !input.patches.contains_key(path) && !input.patch_errors.contains_key(path) {
+                    self.wanted.push(path.to_owned());
                 }
                 continue;
             }
-            if input.collapsed.contains(path) {
-                continue;
-            }
             let body_top = origin.y + top + HEADER_HEIGHT;
-            let body_height = height - HEADER_HEIGHT - 1.0;
+            let body_height = bottom - top - HEADER_HEIGHT - 1.0;
             self.draw_body(
                 cx,
                 paint,
@@ -1252,22 +1361,21 @@ impl DiffDoc {
         }
         // Sticky headers paint over the rows.
         paint.new_layer(cx);
-        for (file_index, (file, (path, top, height))) in files.iter().zip(blocks.iter()).enumerate()
-        {
-            if top + height < view_top || *top > view_bottom {
-                continue;
-            }
+        for file_index in first..last {
+            let Block { top, bottom, .. } = self.blocks[file_index];
+            let file = &input.files[self.file_indices[file_index]];
+            let path = text(file, "path");
             let natural = area.pos.y + top - self.scroll_y;
             let pinned = natural
                 .max(area.pos.y)
-                .min(area.pos.y + top + height - self.scroll_y - HEADER_HEIGHT);
+                .min(area.pos.y + bottom - self.scroll_y - HEADER_HEIGHT);
             let header = rect(area.pos.x, pinned, area.size.x, HEADER_HEIGHT);
             let key = crate::common::layer::inputs((
                 path,
                 int(file, "additions"),
                 int(file, "deletions"),
                 text(file, "status"),
-                self.hovered.as_ref() == Some(&DocHit::Header(path.clone())),
+                matches!(self.hovered.as_ref(), Some(DocHit::Header(hovered)) if hovered == path),
                 rect_key(area),
                 crate::theme::epoch(),
                 self.row_selection(file_index, 0),
@@ -1553,7 +1661,7 @@ impl DiffDoc {
                 band.pos.x + 12.0 + 8.0,
                 band.pos.y,
                 lh,
-                "Loading patch",
+                &t("workspace.git.diff.loadingPatch"),
                 band.size.x - 20.0,
             );
             self.wanted.push(path.to_owned());
@@ -1576,49 +1684,48 @@ impl DiffDoc {
             );
             return;
         }
-        let mut model = {
-            self.model(path, patch, input.patch_revision);
-            self.models.remove(path).expect("model inserted above")
-        };
-        if model.rows(input.split).is_empty() {
-            self.models.insert(path.to_owned(), model);
+        let (model_path, mut model) = self
+            .models
+            .remove_entry(path)
+            .expect("loaded patch indexed above");
+        if model.lines.is_empty() {
+            self.models.insert(model_path, model);
             Self::draw_message(
                 cx,
                 paint,
                 dvec2(clip.pos.x, origin.y),
                 clip.size.x,
-                "No textual changes.",
+                &t("workspace.git.diff.noTextualChanges"),
                 None,
             );
             return;
         }
-        Self::ensure_heights(cx, paint, input, &mut model, column_width);
         let lh = line_height();
         let view_top = clip.pos.y;
         let view_bottom = clip.pos.y + clip.size.y;
         // The visible row range by binary search over the cached row tops.
-        let visible: Vec<(usize, Row, f64, f64)> = {
-            let tops = &model.heights.as_ref().expect("heights ensured above").1;
-            let rows = &model.rows.as_ref().expect("rows computed above").1;
-            let first = tops
-                .partition_point(|top| origin.y + top < view_top)
-                .saturating_sub(1);
-            let last = tops
-                .partition_point(|top| origin.y + top <= view_bottom)
-                .min(rows.len());
-            (first..last.max(first))
-                .map(|index| {
-                    let top = origin.y + tops[index];
-                    let bottom = tops
-                        .get(index + 1)
-                        .map(|next| origin.y + next)
-                        .unwrap_or(origin.y + body_height);
-                    (index, rows[index], top, bottom)
-                })
-                .collect()
-        };
+        let tops = &model
+            .heights
+            .as_ref()
+            .expect("visible patch has geometry")
+            .1;
+        let first = tops
+            .partition_point(|top| origin.y + top < view_top)
+            .saturating_sub(1);
+        let last = tops.partition_point(|top| origin.y + top <= view_bottom);
         let gutter = gutter_width(model.max_line);
-        for (row_index, row, top, bottom) in visible {
+        for row_index in first..last {
+            let tops = &model
+                .heights
+                .as_ref()
+                .expect("visible patch has geometry")
+                .1;
+            let row = model.rows.as_ref().expect("visible patch has rows").1[row_index];
+            let top = origin.y + tops[row_index];
+            let bottom = tops
+                .get(row_index + 1)
+                .map(|next| origin.y + next)
+                .unwrap_or(origin.y + body_height);
             let row_key = row_index + 1;
             if bottom < view_top {
                 continue;
@@ -1654,7 +1761,7 @@ impl DiffDoc {
             let key = crate::common::layer::inputs((
                 path,
                 row,
-                input.patch_revision,
+                input.patch_generation,
                 input.split,
                 input.wrap,
                 input.syntax_theme,
@@ -1793,7 +1900,7 @@ impl DiffDoc {
             presentation.end(cx, &self.hits, &self.pieces);
             self.presentations.insert(id, presentation);
         }
-        self.models.insert(path.to_owned(), model);
+        self.models.insert(model_path, model);
     }
 
     /// Syntax runs of a line (none for headers and wrapped lines).
@@ -2033,6 +2140,132 @@ pub fn sorted_paths(files: &[Value]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use makepad_widgets::makepad_draw::CxDraw;
+    use serde_json::json;
+
+    #[test]
+    fn draw_reuses_diff_geometry_until_layout_inputs_change() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::live_design(&mut cx);
+        crate::theme::live_design(&mut cx);
+        crate::common::paint::live_design(&mut cx);
+        crate::features::files::kit::live_design(&mut cx);
+        super::super::paint::live_design(&mut cx);
+        GitPaint::register_main_module(&mut cx);
+        cx.live_expand();
+        cx.live_scan_dependencies();
+        cx.native_load_dependencies();
+        let mut paint = GitPaint::new_local(&mut cx);
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(400.0, 300.0));
+        let mut root = DrawList2d::new(&mut cx);
+        let event = DrawEvent::default();
+        let height = HEADER_HEIGHT + 4.0 * line_height();
+        let mut draw = |doc: &mut DiffDoc, input: &DocInput<'_>, width| {
+            let mut draw = CxDraw::new(&mut cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            root.begin_always(&mut draw);
+            let mut draw = Cx2d::new(&mut draw);
+            draw.begin_pass_sized_turtle(Layout::default());
+            doc.draw(&mut draw, &mut paint, rect(0.0, 0.0, width, height), input);
+            draw.end_pass_sized_turtle();
+            root.end(&mut draw);
+            draw.end_pass(&pass);
+        };
+
+        let files = [
+            json!({"path": "c.rs", "additions": 40}),
+            json!({"path": "b.rs", "additions": 4}),
+            json!({"path": "dir/a.rs", "additions": 50}),
+        ];
+        let no_patches = HashMap::new();
+        let no_errors = HashMap::new();
+        let open = HashSet::new();
+        let mut input = DocInput {
+            files: &files,
+            files_revision: 0,
+            patches: &no_patches,
+            patch_generation: 0,
+            patch_errors: &no_errors,
+            patch_revision: 0,
+            collapsed: &open,
+            collapse_revision: 0,
+            split: false,
+            wrap: false,
+            syntax_theme: "one",
+        };
+        let mut doc = DiffDoc::default();
+        draw(&mut doc, &input, 220.0);
+        assert_eq!(doc.layout_builds, (1, 1));
+        assert_eq!(doc.order, ["dir/a.rs", "b.rs", "c.rs"]);
+        assert_eq!(doc.wanted, ["dir/a.rs"]);
+        doc.scroll_y = 8.0;
+        draw(&mut doc, &input, 220.0);
+        assert_eq!(doc.layout_builds, (1, 1));
+        let header = doc
+            .hits
+            .rect_of(&DocHit::Header("dir/a.rs".into()))
+            .unwrap();
+        assert_eq!(header.pos.y, 0.0);
+
+        let collapsed = HashSet::from(["dir/a.rs".to_owned()]);
+        input.collapsed = &collapsed;
+        input.collapse_revision += 1;
+        doc.scroll_y = 0.0;
+        draw(&mut doc, &input, 220.0);
+        assert_eq!(doc.layout_builds, (1, 2));
+        assert_eq!(doc.blocks[1].top, HEADER_HEIGHT);
+        assert_eq!(doc.wanted, ["b.rs", "c.rs"]);
+
+        draw(&mut doc, &input, 240.0);
+        assert_eq!(doc.layout_builds, (1, 3));
+        assert_eq!(doc.content_width, 240.0);
+        let old_end = doc.blocks[1].bottom;
+        let context = vec![json!({"type": "context", "content": "unchanged"}); 12];
+        let patches = HashMap::from([(
+            "b.rs".to_owned(),
+            json!({"hunks": [{"oldStart": 1, "newStart": 1, "lines": context}]}),
+        )]);
+        input.patches = &patches;
+        input.patch_revision += 1;
+        draw(&mut doc, &input, 240.0);
+        assert_eq!(doc.layout_builds, (1, 4));
+        assert!(doc.blocks[1].bottom > old_end);
+        assert!(!doc.wanted.iter().any(|path| path == "b.rs"));
+
+        let old_end = doc.blocks[1].bottom;
+        doc.toggle_expand("b.rs", 1);
+        draw(&mut doc, &input, 240.0);
+        assert_eq!(doc.layout_builds, (1, 5));
+        assert!(doc.blocks[1].bottom > old_end);
+
+        let errors = HashMap::from([("c.rs".to_owned(), "Patch error".to_owned())]);
+        input.patch_errors = &errors;
+        input.patch_revision += 1;
+        let old_end = doc.blocks[2].bottom;
+        draw(&mut doc, &input, 240.0);
+        assert_eq!(doc.layout_builds, (1, 6));
+        assert!(doc.blocks[2].bottom < old_end);
+
+        doc.reveal("b.rs");
+        draw(&mut doc, &input, 240.0);
+        assert_eq!(doc.layout_builds, (1, 6));
+        assert_eq!(doc.scroll_y, doc.blocks[1].top);
+        doc.select_all();
+        let updated_files = [
+            files[0].clone(),
+            json!({"path": "aaa/new.rs"}),
+            files[1].clone(),
+            files[2].clone(),
+        ];
+        input.files = &updated_files;
+        input.files_revision += 1;
+        draw(&mut doc, &input, 240.0);
+        assert_eq!(doc.layout_builds, (2, 7));
+        assert_eq!(doc.order, ["aaa/new.rs", "dir/a.rs", "b.rs", "c.rs"]);
+        assert_eq!(doc.scroll_y, doc.blocks[2].top);
+        assert!(doc.selection.is_none());
+    }
 
     #[test]
     fn hidden_document_releases_scrollbars_and_selection() {

@@ -28,6 +28,8 @@ public class MakepadNative {
     public native static void surfaceOnKeyDown(int keycode, int meta_state);
     public native static void surfaceOnKeyUp(int keycode, int meta_state);
     public native static void surfaceOnCharacter(int character);
+    static native void setAccessibilityEnabled(boolean enabled);
+    static native void performAccessibilityAction(long id, long revision, int action);
     // Paseo: positions are UTF-16 code units, not Rust UTF-8 byte offsets.
     public native static void surfaceOnTextEdit(long session, long revision, String text,
         int selectionStart, int selectionEnd, int composingStart, int composingEnd);

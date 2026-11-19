@@ -150,8 +150,13 @@ impl StateDelta {
         old: &DirectorySnapshot,
         new: &DirectorySnapshot,
     ) -> bool {
-        let rows_differ = |old: &[Arc<Value>], new: &[Arc<Value>]| {
-            old.len() != new.len() || old.iter().zip(new).any(|(old, new)| !Arc::ptr_eq(old, new))
+        let rows_differ = |old: &Arc<Vec<Arc<Value>>>, new: &Arc<Vec<Arc<Value>>>| {
+            !Arc::ptr_eq(old, new)
+                && (old.len() != new.len()
+                    || old
+                        .iter()
+                        .zip(new.iter())
+                        .any(|(old, new)| !Arc::ptr_eq(old, new)))
         };
         if rows_differ(&old.projects, &new.projects)
             || rows_differ(&old.workspaces, &new.workspaces)
@@ -164,37 +169,47 @@ impl StateDelta {
         if old.agents.len() != new.agents.len() {
             return true;
         }
-        let mut by_id: Option<HashMap<&str, &Arc<Value>>> = None;
-        let mut content = false;
-        for (index, row) in new.agents.iter().enumerate() {
-            let id = j::text(j::agent_of(row), "id");
-            let previous = match old.agents.get(index) {
-                Some(candidate) if j::text(j::agent_of(candidate), "id") == id => candidate,
-                _ => {
-                    let map = by_id.get_or_insert_with(|| {
-                        old.agents
-                            .iter()
-                            .map(|row| (j::text(j::agent_of(row), "id"), row))
-                            .collect()
-                    });
-                    let Some(previous) = map.get(id) else {
-                        content = true;
-                        continue;
-                    };
-                    *previous
-                }
-            };
+        let mut inspect = |previous: &Arc<Value>, row: &Arc<Value>| {
             if Arc::ptr_eq(previous, row) {
-                continue;
+                return false;
             }
             match agent_difference(previous, row) {
-                Difference::Content => content = true,
+                Difference::Content => true,
                 Difference::Activity => {
+                    let id = j::text(j::agent_of(row), "id");
                     self.agent_activity
                         .insert((server.to_owned(), id.to_owned()));
+                    false
                 }
-                Difference::None => {}
+                Difference::None => false,
             }
+        };
+        let mut content = false;
+        if new
+            .agents
+            .for_each_replacement(&old.agents, |old, new| content |= inspect(old, new))
+        {
+            return content;
+        }
+        let mut by_id: Option<HashMap<&str, &Arc<Value>>> = None;
+        for (candidate, row) in old.agents.iter().zip(new.agents.iter()) {
+            let id = j::text(j::agent_of(row), "id");
+            let previous = if j::text(j::agent_of(candidate), "id") == id {
+                candidate
+            } else {
+                let map = by_id.get_or_insert_with(|| {
+                    old.agents
+                        .iter()
+                        .map(|row| (j::text(j::agent_of(row), "id"), row))
+                        .collect()
+                });
+                let Some(previous) = map.get(id) else {
+                    content = true;
+                    continue;
+                };
+                *previous
+            };
+            content |= inspect(previous, row);
         }
         content
     }
@@ -281,7 +296,9 @@ mod tests {
     fn changed_directory_preserves_other_host_and_classifies_only_its_rows() {
         let a = Arc::new(DirectorySnapshot {
             revision: 1,
-            agents: vec![Arc::new(json!({"id":"x","title":"old"}))],
+            agents: [Arc::new(json!({"id":"x","title":"old"}))]
+                .into_iter()
+                .collect(),
             ..DirectorySnapshot::default()
         });
         let b = Arc::new(DirectorySnapshot {
@@ -291,7 +308,9 @@ mod tests {
         let old = state(HashMap::from([(1, a), (2, b.clone())]));
         let changed = Arc::new(DirectorySnapshot {
             revision: 3,
-            agents: vec![Arc::new(json!({"id":"x","title":"new"}))],
+            agents: [Arc::new(json!({"id":"x","title":"new"}))]
+                .into_iter()
+                .collect(),
             ..DirectorySnapshot::default()
         });
         let new = state(HashMap::from([(1, changed), (2, b)]));

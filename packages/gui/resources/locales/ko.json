@@ -1,4 +1,11 @@
 {
+  "accessibility": {
+    "sidebarSessions": "세션 목록",
+    "options": "옵션",
+    "textField": "텍스트 입력란",
+    "toggle": "전환",
+    "filter": "필터"
+  },
   "mermaid": {
     "source": "소스",
     "hideSource": "소스 숨기기",
@@ -1420,6 +1427,8 @@
         "jumpToFile": { "title": "파일로 이동" },
         "binaryFile": "바이너리 파일",
         "tooLarge": "표시하기에 diff가 너무 큽니다",
+        "loadingPatch": "패치 불러오는 중",
+        "noTextualChanges": "텍스트 변경 사항이 없습니다.",
         "previewTooLargeTitle": "Diff가 너무 커서 미리 볼 수 없습니다",
         "previewTooLargeDescription": "여기에서 미리 보려면 비교 범위를 좁히세요.",
         "unified": "통합 diff",
@@ -1522,9 +1531,17 @@
           "passedLabel": "통과",
           "failedLabel": "실패",
           "runningLabel": "진행 중",
+          "runningDuration": "{{duration}} 동안 진행 중",
           "passedAccessible": "검사 통과",
           "failedAccessible": "검사 실패",
           "runningAccessible": "검사 진행 중"
+        },
+        "duration": {
+          "seconds": "{{seconds}}초",
+          "minutes": "{{minutes}}분",
+          "minutesSeconds": "{{minutes}}분 {{seconds}}초",
+          "hours": "{{hours}}시간",
+          "hoursMinutes": "{{hours}}시간 {{minutes}}분"
         },
         "sections": {
           "checks": "검사",
@@ -1668,7 +1685,9 @@
           "justNow": "방금 전",
           "minutesAgo": "{{count}}분 전",
           "hoursAgo": "{{count}}시간 전",
-          "daysAgo": "{{count}}일 전"
+          "daysAgo": "{{count}}일 전",
+          "monthsAgo": "{{count}}개월 전",
+          "yearsAgo": "{{count}}년 전"
         }
       }
     }
@@ -2689,6 +2708,8 @@
     "notifications": {
       "title": "알림",
       "permission": "알림 권한",
+      "pushTitle": "푸시 알림",
+      "pushUnavailable": "이 빌드에서는 푸시 알림을 사용할 수 없습니다. 알림을 허용하면 앱이 열려 있는 동안 알림이 표시됩니다.",
       "status": {
         "allowed": "알림이 켜져 있습니다.",
         "notDetermined": "에이전트가 기다리거나 작업을 마치면 알림을 받으려면 알림을 허용하세요.",

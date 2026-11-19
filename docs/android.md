@@ -58,6 +58,26 @@ wait for a replacement Surface and current EGL context. Background events may
 still update the model; pending redraws remain queued. See the vendored
 [Surface lifetime constraint](../packages/gui-platform/vendor/makepad-platform/VENDORED.md#android-surface-lifetime).
 
+## Verify screen-reader support
+
+Enable TalkBack in Android's Accessibility settings, then open Passession.
+Swipe through the sidebar and a session: TalkBack should announce headings,
+session names, selected items, and names for icon-only buttons. Double-tap a
+session or menu item to activate it, focus the composer to open the keyboard,
+and scroll a list past the initially visible rows. Open a dialog and verify
+that TalkBack stays inside it until it closes.
+
+With the app in the foreground, inspect the same virtual nodes through ADB:
+
+```sh
+adb shell uiautomator dump /sdcard/paseo-window.xml
+adb pull /sdcard/paseo-window.xml
+```
+
+Check the nodes' `text` or `content-desc`, `class`, `bounds`, and action state
+such as `clickable`, `selected`, and `checked`. Test TalkBack gestures on the
+device too; the XML alone does not establish speech, traversal, or activation.
+
 ## One activity per process
 
 The native app serves exactly one activity. `MainActivity` is `singleTop` with

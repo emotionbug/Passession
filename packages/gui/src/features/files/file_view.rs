@@ -158,6 +158,8 @@ pub struct FileView {
     match_index: usize,
     focus: Focus,
     markdown: MarkdownPreview,
+    /// Store epoch and the corresponding layout fingerprint of the preview's image sources.
+    markdown_image_epochs: Option<(u64, u64)>,
     html: Option<HtmlPreview>,
     overlays: HashMap<u64, Pending>,
     settings_open: bool,
@@ -223,6 +225,7 @@ impl FileView {
             match_index: 0,
             focus: Focus::None,
             markdown: MarkdownPreview::default(),
+            markdown_image_epochs: None,
             html: None,
             overlays: HashMap::new(),
             settings_open: false,
@@ -276,6 +279,7 @@ impl FileView {
         self.editor_session = None;
         self.session_id = None;
         self.markdown = MarkdownPreview::default();
+        self.markdown_image_epochs = None;
         if let Some(mut html) = self.html.take() {
             html.close();
         }
@@ -358,7 +362,7 @@ impl FileView {
         }
     }
 
-    /// Mounts the session for the target and keeps editor and preview in step with the model.
+    /// Mounts the session and keeps the source editor and an open HTML view in step with it.
     fn sync(&mut self, cx: &mut Cx, ui: &mut UiContext, observing: bool) {
         let Some(target) = self.target.clone() else {
             return;
@@ -425,7 +429,8 @@ impl FileView {
         let Some((reset, presentation, has_text, changed_text, editable)) = snapshot else {
             return;
         };
-        if changed_text.is_some() {
+        let editor_text_changed = changed_text.is_some();
+        if editor_text_changed {
             self.clear_text_selection(cx);
         }
         if reset {
@@ -450,24 +455,19 @@ impl FileView {
                     editor.clear_selection(cx);
                 }
                 let key = format!("{owner}\u{0}{id}");
-                let text = changed_text.clone().unwrap_or_default();
+                let text = changed_text.unwrap_or_default();
                 self.editor = Some(SourceEditor::new(text, &target.path, key, !editable));
                 self.editor_session = Some(id);
             }
         }
-        if changed_text.is_some() {
+        if editor_text_changed {
             self.match_index = 0;
             if self.find_visible {
                 self.count_matches();
             }
         }
-        let text = self
-            .editor
-            .as_ref()
-            .map(|e| e.text().to_owned())
-            .unwrap_or_default();
-        if let Some(html) = self.html.as_ref() {
-            html.update(&text);
+        if let (Some(html), Some(editor)) = (&self.html, &self.editor) {
+            html.update(editor.text());
         }
         if !self.location_applied {
             self.location_applied = true;
@@ -482,15 +482,6 @@ impl FileView {
                 }
             }
         }
-        // Markdown preview images.
-        if self.is_markdown() {
-            self.markdown.set_text(&text);
-        }
-    }
-
-    fn is_markdown(&self) -> bool {
-        store::with(|s| s.session(&self.owner).and_then(|session| session.panel()))
-            == Some(MARKDOWN_FILE_PANEL)
     }
 
     fn clear_http_images(&mut self) {
@@ -515,6 +506,7 @@ impl FileView {
             self.http_scope = format!("{host}\0{generation:?}");
             self.http_host = host;
             self.http_generation = generation;
+            self.markdown_image_epochs = None;
         }
         self.http_core.get_or_insert_with(|| ui.core.clone());
     }
@@ -526,6 +518,7 @@ impl FileView {
         };
         self.sync_http_scope(ui);
         let sources: Vec<String> = self.markdown.image_keys().to_vec();
+        let mut started_web_fetch = false;
         for source in sources {
             if source.starts_with("http://") || source.starts_with("https://") {
                 let cache_key = format!("{}\0{source}", self.http_scope);
@@ -537,7 +530,8 @@ impl FileView {
                     &source,
                     crate::common::host_http::IMAGE_MAX_BYTES,
                 );
-                self.http_images.insert(source.clone(), Some(id));
+                self.http_images.insert(source, Some(id));
+                started_web_fetch = true;
                 continue;
             }
             let Some(path) = self.resolve_link_path(&target, &source) else {
@@ -552,6 +546,10 @@ impl FileView {
             if let Asset::Ready { bytes, mime } = asset {
                 images::request(&key, bytes, &mime, 0);
             }
+        }
+        if started_web_fetch {
+            // Starting a fetch can also replace a failed slot shared with another panel.
+            store::with(|s| s.epoch = s.epoch.wrapping_add(1));
         }
     }
 
@@ -1259,7 +1257,7 @@ impl FileView {
         if matches!(event, Event::TouchUpdate(update) if update.cancelled) {
             self.pressed = None;
         }
-        let mut changed = false;
+        let mut web_images_changed = false;
         for event in &ui.events {
             let paseo_gui_core::CoreEvent::Response {
                 request_id, result, ..
@@ -1281,8 +1279,12 @@ impl FileView {
                 .map(|(bytes, _)| bytes);
             *request = None;
             images::finish_web_fetch(&format!("{}\0{source}", self.http_scope), body);
-            changed = true;
+            web_images_changed = true;
         }
+        if web_images_changed {
+            store::with(|s| s.epoch = s.epoch.wrapping_add(1));
+        }
+        let mut changed = web_images_changed;
         if let Event::Signal = event
             && let Some(html) = self.html.as_mut()
         {
@@ -2417,7 +2419,19 @@ impl FileView {
         if !has_text {
             return;
         }
-        if show_preview && panel == MARKDOWN_FILE_PANEL {
+        let show_markdown = show_preview && panel == MARKDOWN_FILE_PANEL;
+        let editor_source = self
+            .editor_session
+            .zip(self.editor.as_ref())
+            .map(|(session, editor)| ((session, editor.buffer.revision), editor.text()));
+        if self.markdown.prepare(show_markdown, editor_source) {
+            self.markdown_image_epochs = None;
+            if !self.markdown.image_keys().is_empty() {
+                // Draw has no dispatch context; start newly discovered image work on Signal.
+                SignalToUI::set_ui_signal();
+            }
+        }
+        if show_markdown {
             let look = MarkdownLook {
                 palette: p,
                 typography: ty,
@@ -2482,7 +2496,16 @@ impl FileView {
         }
     }
 
-    fn markdown_images_epoch(&self, target: &FileTarget) -> u64 {
+    fn markdown_images_epoch(&mut self, target: &FileTarget) -> u64 {
+        if self.markdown.image_keys().is_empty() {
+            return 0;
+        }
+        let store_epoch = store::with(|s| s.epoch);
+        if let Some((cached_store_epoch, image_epoch)) = self.markdown_image_epochs
+            && cached_store_epoch == store_epoch
+        {
+            return image_epoch;
+        }
         let mut epoch = 0u64;
         for source in self.markdown.image_keys() {
             epoch = epoch.wrapping_mul(31).wrapping_add(
@@ -2493,6 +2516,7 @@ impl FileView {
                 },
             );
         }
+        self.markdown_image_epochs = Some((store_epoch, epoch));
         epoch
     }
 

@@ -130,17 +130,31 @@ pub(crate) fn capabilities() -> Capabilities {
 
 static OBSERVERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-pub(crate) fn start_services(_cx: &mut Cx, _shared: &Arc<Shared>, _state: &mut PlatformState) {
+pub(crate) fn start_services(_cx: &mut Cx, shared: &Arc<Shared>, _state: &mut PlatformState) {
     unsafe {
         let center: Id = msg_send![class!(NSNotificationCenter), defaultCenter];
         let queue: Id = msg_send![class!(NSOperationQueue), mainQueue];
-        let active = RcBlock::new(|_note: Id| {
+        let active_core = shared.core.clone();
+        let active = RcBlock::new(move |_note: Id| {
+            active_core.set_app_visible(true);
             end_background_grace();
             deliver(MobileSignal::Resumed);
         });
         let token: Id = msg_send![center, addObserverForName: ns_string("UIApplicationDidBecomeActiveNotification"), object: std::ptr::null_mut::<AnyObject>(), queue: queue, usingBlock: &*active];
-        let background = RcBlock::new(|_note: Id| begin_background_grace());
+        // Makepad's iOS surface callbacks do not emit a Background/Pause event.
+        let background_core = shared.core.clone();
+        let background = RcBlock::new(move |_note: Id| {
+            background_core.set_app_visible(false);
+            begin_background_grace();
+        });
         let token3: Id = msg_send![center, addObserverForName: ns_string("UIApplicationDidEnterBackgroundNotification"), object: std::ptr::null_mut::<AnyObject>(), queue: queue, usingBlock: &*background];
+        let terminating = Arc::downgrade(shared);
+        let terminate = RcBlock::new(move |_note: Id| {
+            if let Some(shared) = terminating.upgrade() {
+                crate::mobile::shutdown(&shared);
+            }
+        });
+        let token4: Id = msg_send![center, addObserverForName: ns_string("UIApplicationWillTerminateNotification"), object: std::ptr::null_mut::<AnyObject>(), queue: queue, usingBlock: &*terminate];
         // AVAudioSessionInterruptionTypeBegan (1): nothing queued may resume.
         let interrupted = RcBlock::new(|note: Id| {
             let info: Id = msg_send![note, userInfo];
@@ -155,10 +169,13 @@ pub(crate) fn start_services(_cx: &mut Cx, _shared: &Arc<Shared>, _state: &mut P
         let _: Id = msg_send![token, retain];
         let _: Id = msg_send![token2, retain];
         let _: Id = msg_send![token3, retain];
-        OBSERVERS
-            .lock()
-            .unwrap()
-            .extend([token as usize, token2 as usize, token3 as usize]);
+        let _: Id = msg_send![token4, retain];
+        OBSERVERS.lock().unwrap().extend([
+            token as usize,
+            token2 as usize,
+            token3 as usize,
+            token4 as usize,
+        ]);
     }
     publish_insets(None);
 }
@@ -960,8 +977,12 @@ pub(crate) fn system_text_scale() -> crate::appearance::TextScale {
 // ----- push -----
 
 /// Push works when the signing profile carries the APNs entitlement.
-pub(crate) async fn push_provisioned() -> bool {
-    push_environment().is_ok()
+pub(crate) async fn push_provisioned() -> Result<bool, PlatformError> {
+    match push_environment() {
+        Ok(_) => Ok(true),
+        Err(error) if error.code == "push_unavailable" => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) async fn notification_permission(
@@ -993,7 +1014,8 @@ pub(crate) async fn device_push_token() -> Result<String, PlatformError> {
     });
     match tokio::time::timeout(Duration::from_secs(30), waiter).await {
         Ok(Ok(result)) => result,
-        _ => Err(PlatformError::native(
+        _ => Err(PlatformError::new(
+            "push_retryable",
             "The operating system has not issued a push token.",
         )),
     }

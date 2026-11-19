@@ -1,7 +1,6 @@
 package sh.paseo.sessions;
 
 import android.content.Context;
-import android.util.Log;
 
 import com.google.firebase.FirebaseApp;
 import com.google.firebase.messaging.FirebaseMessaging;
@@ -15,24 +14,29 @@ final class PaseoPush {
      * packaging fact, not a runtime failure.
      */
     static boolean provisioned(Context context) {
-        try {
-            if (!FirebaseApp.getApps(context).isEmpty()) return true;
-            return FirebaseApp.initializeApp(context) != null;
-        } catch (Throwable error) {
-            Log.i(PaseoBridge.TAG, "Firebase is not provisioned: " + error);
-            return false;
-        }
+        // initializeApp returns the existing default app, or null when the
+        // build has no Firebase resources.
+        return FirebaseApp.initializeApp(context) != null;
     }
 
     /** The FCM registration token Expo exchanges (Messaging 24 `getToken`). */
     static void token(Context context, long id) {
         try {
+            if (!provisioned(context)) {
+                PaseoBridge.nativeResult(id, PaseoBridge.error("push_unavailable", "Push notifications are not available in this build."));
+                return;
+            }
             FirebaseMessaging.getInstance().getToken().addOnCompleteListener(task -> {
                 if (task.isSuccessful() && task.getResult() != null) {
                     PaseoBridge.nativeResult(id, PaseoBridge.ok(task.getResult()));
                 } else {
                     Exception error = task.getException();
-                    PaseoBridge.nativeResult(id, PaseoBridge.error("push_token", error == null ? "No push token was issued." : error.getMessage()));
+                    String message = error == null ? null : error.getMessage();
+                    boolean transientFailure = "SERVICE_NOT_AVAILABLE".equals(message)
+                            || "INTERNAL_SERVER_ERROR".equals(message) || "InternalServerError".equals(message);
+                    PaseoBridge.nativeResult(id, PaseoBridge.error(
+                            transientFailure ? "push_retryable" : "push_token",
+                            message == null ? "No push token was issued." : message));
                 }
             });
         } catch (Throwable error) {

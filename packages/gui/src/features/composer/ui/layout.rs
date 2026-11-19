@@ -7,7 +7,7 @@
 use super::look::Look;
 use super::panel::{ComposerPanel, Item};
 use crate::common::paint::{Font, TextSpec, rect};
-use crate::common::{UiContext, with_combo};
+use crate::common::{UiContext, accessibility, with_combo};
 use crate::features::composer::attachments::{AttachmentGlyph, describe, file_type_label};
 use crate::features::composer::controls_model::*;
 use crate::features::composer::i18n::{t, t_args};
@@ -47,6 +47,48 @@ impl ComposerPanel {
     fn tip(&mut self, r: Rect, text: String) {
         if !text.is_empty() && r.size.x > 0.0 && r.size.y > 0.0 {
             self.st.tips.push((r, text));
+        }
+    }
+
+    pub(super) fn accessibility_id(&self, item: &Item) -> u64 {
+        accessibility::id(("composer-control", self.widget_uid().0, item))
+    }
+
+    fn record_accessible_control(
+        &self,
+        cx: &mut Cx2d,
+        item: &Item,
+        bounds: Rect,
+        label: &str,
+        enabled: bool,
+    ) {
+        accessibility::record_rect(
+            cx,
+            AccessibilityNode {
+                id: self.accessibility_id(item),
+                parent: None,
+                role: AccessibilityRole::Button,
+                label,
+                bounds,
+                state: AccessibilityState {
+                    enabled,
+                    ..AccessibilityState::default()
+                },
+                actions: accessibility::activate_if(enabled),
+            },
+        );
+    }
+
+    pub(super) fn record_accessible_controls(&self, cx: &mut Cx2d) {
+        for hit in self.st.hits.since(0) {
+            // The primary controls record their labels and disabled state while they paint.
+            if matches!(hit.item, Item::Send | Item::Stop) {
+                continue;
+            }
+            let bounds = hit.visible_rect();
+            if let Some((_, label)) = self.st.tips.iter().rev().find(|(r, _)| *r == bounds) {
+                self.record_accessible_control(cx, &hit.item, bounds, label, true);
+            }
         }
     }
 
@@ -567,7 +609,11 @@ impl ComposerPanel {
 
     fn pill_widths(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value) -> Vec<f64> {
         let mut out = Vec::new();
-        out.extend(std::iter::repeat_n(48.0, maps(get(draft, "images")).len()));
+        let image_count = list_ref(get(draft, "images"))
+            .iter()
+            .filter(|image| image.is_object())
+            .count();
+        out.extend(std::iter::repeat_n(48.0, image_count));
         for attachment in maps(get(draft, "attachments")) {
             let (title, subtitle, _) = describe(&attachment);
             out.push(self.label_pill_width(cx, look, &title, subtitle.as_deref()));
@@ -806,6 +852,15 @@ impl ComposerPanel {
             height,
         };
         let _ = self.input.draw_walk(cx, &mut Scope::empty(), walk);
+        if cx.accessibility_enabled() {
+            accessibility::record_field(
+                cx,
+                self.input.widget_uid(),
+                self.input.area(),
+                self.input.empty_text(),
+                !self.input.is_read_only(),
+            );
+        }
         cx.end_turtle();
     }
 
@@ -881,7 +936,10 @@ impl ComposerPanel {
         let sending = self.ctl_ref().sending();
         let show_remove_always = look.native || look.compact;
         let widths = self.pill_widths(cx, look, draft);
-        let images = maps(get(draft, "images"));
+        let mut images = list_ref(get(draft, "images"))
+            .iter()
+            .filter(|image| image.is_object());
+        let image_count = images.clone().count();
         let attachments = maps(get(draft, "attachments"));
         let uploading = self.ctl_ref().uploading.clone();
         self.st.tray_clip = r;
@@ -903,19 +961,23 @@ impl ComposerPanel {
             }
             let frame = rect(x + OVERHANG, y + OVERHANG, widths[index], 48.0);
             let disc = rect(x, y, 24.0, 24.0);
-            let (open, remove, removable) = if index < images.len() {
+            let (open, remove, removable) = if index < image_count {
                 (Item::Image(index), Item::ImageRemove(index), true)
-            } else if index < images.len() + attachments.len() {
-                let i = index - images.len();
+            } else if index < image_count + attachments.len() {
+                let i = index - image_count;
                 (Item::Attachment(i), Item::AttachmentRemove(i), true)
             } else {
                 (Item::Send, Item::Send, false)
             };
-            if index < images.len() {
-                let image = images[index].clone();
+            if let Some(image) = images.next() {
                 self.painter
                     .outline(cx, frame, p.surface1, p.border_accent, 1.0, 6.0);
-                match service::with(|svc| svc.blobs.texture(&image, true)) {
+                let key = &self.ctl_ref().key;
+                let texture = service::with(|svc| {
+                    let identity = svc.drafts.image_identity(key, index).map(|id| id.as_ref());
+                    svc.blobs.texture(image, identity, true)
+                });
+                match texture {
                     Ok(Some((texture, size))) => {
                         let inner = rect(
                             frame.pos.x + 1.0,
@@ -936,9 +998,9 @@ impl ComposerPanel {
                     crate::common::paint::intersect(frame, r),
                     t("composer.attachments.openImage"),
                 );
-            } else if index < images.len() + attachments.len() {
-                let attachment = attachments[index - images.len()].clone();
-                let (title, subtitle, glyph) = describe(&attachment);
+            } else if index < image_count + attachments.len() {
+                let attachment = &attachments[index - image_count];
+                let (title, subtitle, glyph) = describe(attachment);
                 let icon = match glyph {
                     AttachmentGlyph::FileText => "file-text",
                     AttachmentGlyph::CircleDot => "circle-dot",
@@ -953,7 +1015,7 @@ impl ComposerPanel {
                     &subtitle.unwrap_or_else(|| t("message.attachments.file")),
                 );
             } else {
-                let name = uploading[index - images.len() - attachments.len()].clone();
+                let name = uploading[index - image_count - attachments.len()].clone();
                 self.painter
                     .outline(cx, frame, p.surface1, p.border_accent, 1.0, 6.0);
                 self.spinner(
@@ -1177,10 +1239,11 @@ impl ComposerPanel {
             if enabled {
                 self.st.hits.push(r, Item::Stop);
             }
-            let tip = with_combo(
-                t("composer.cancel.interrupt"),
-                self.st.interrupt_shortcut.clone(),
-            );
+            let label = t("composer.cancel.interrupt");
+            if cx.accessibility_enabled() {
+                self.record_accessible_control(cx, &Item::Stop, r, &label, enabled);
+            }
+            let tip = with_combo(label, self.st.interrupt_shortcut.clone());
             self.tip(r, tip);
             return 32.0;
         }
@@ -1221,6 +1284,9 @@ impl ComposerPanel {
         } else {
             t("composer.input.send")
         };
+        if cx.accessibility_enabled() {
+            self.record_accessible_control(cx, &Item::Send, r, &label, !disabled);
+        }
         // input.tsx DEFAULT_SEND_KEYS: the send tooltip shows Enter.
         self.tip(r, with_combo(label, Some("Enter".into())));
         32.0

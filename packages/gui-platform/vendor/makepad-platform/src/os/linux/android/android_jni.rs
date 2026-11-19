@@ -33,6 +33,8 @@ pub enum FromJavaMessage {
     Init(AndroidParams),
     SwitchedActivity(jni_sys::jobject, u64),
     BackPressed,
+    AccessibilityEnabled(bool),
+    AccessibilityAction { id: u64, revision: u64, action: crate::AccessibilityAction },
     SurfaceChanged {
         window: *mut ndk_sys::ANativeWindow,
         width: i32,
@@ -578,6 +580,82 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextAction(
 ) {
     let text = if action == 3 { editor_text_from_java(env, text) } else { None };
     send_from_java_message(FromJavaMessage::TextAction { token: token as u64, action: action as u32, text });
+}
+
+#[no_mangle]
+extern "C" fn Java_dev_makepad_android_MakepadNative_setAccessibilityEnabled(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    enabled: jni_sys::jboolean,
+) {
+    send_from_java_message(FromJavaMessage::AccessibilityEnabled(enabled != 0));
+}
+
+#[no_mangle]
+extern "C" fn Java_dev_makepad_android_MakepadNative_performAccessibilityAction(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    id: jni_sys::jlong,
+    revision: jni_sys::jlong,
+    action: jni_sys::jint,
+) {
+    use crate::AccessibilityAction::*;
+    let action = match action {
+        16 => Activate,
+        1 => Focus,
+        4096 => ScrollForward,
+        8192 => ScrollBackward,
+        _ => return,
+    };
+    send_from_java_message(FromJavaMessage::AccessibilityAction {
+        id: id as u64, revision: revision as u64, action,
+    });
+}
+
+pub unsafe fn to_java_accessibility_tree(tree: &crate::AccessibilityTree, dpi: f64) {
+    use crate::AccessibilityAction::*;
+    // One JNI transfer per change. Use UTF-8 rather than JNI's modified UTF-8.
+    // Revision header followed by id, parent, pixel edges, role, state, actions and UTF-8 label.
+    let nodes = tree.nodes();
+    let mut bytes = Vec::with_capacity(8 + nodes.iter().map(|node| 39 + node.label.len()).sum::<usize>());
+    bytes.extend(tree.revision().to_le_bytes());
+    for node in nodes {
+        bytes.extend(node.id.to_le_bytes());
+        bytes.extend(node.parent.unwrap_or(0).to_le_bytes());
+        let end = node.bounds.pos + node.bounds.size;
+        for edge in [
+            (node.bounds.pos.x * dpi).floor(),
+            (node.bounds.pos.y * dpi).floor(),
+            (end.x * dpi).ceil(),
+            (end.y * dpi).ceil(),
+        ] {
+            bytes.extend((edge as i32).to_le_bytes());
+        }
+        bytes.push(node.role as u8);
+        let state = node.state;
+        bytes.push(state.enabled as u8 | (state.selected as u8) << 1 |
+            (state.checked as u8) << 2 | (state.focused as u8) << 3);
+        bytes.push(node.actions.contains(Activate) as u8 | (node.actions.contains(Focus) as u8) << 1 |
+            (node.actions.contains(ScrollForward) as u8) << 2 | (node.actions.contains(ScrollBackward) as u8) << 3);
+        bytes.extend((node.label.len() as u32).to_le_bytes());
+        bytes.extend(node.label.as_bytes());
+    }
+    let Ok(len) = i32::try_from(bytes.len()) else { return; };
+    let env = attach_jni_env();
+    let activity = get_activity();
+    if activity.is_null() { return; }
+    let class = (**env).GetObjectClass.unwrap()(env, activity);
+    if class.is_null() { return; }
+    let method = (**env).GetMethodID.unwrap()(env, class, c"updateAccessibilityTree".as_ptr() as _, c"([B)V".as_ptr() as _);
+    (**env).DeleteLocalRef.unwrap()(env, class);
+    if method.is_null() { return; }
+    let array = (**env).NewByteArray.unwrap()(env, len);
+    if array.is_null() { return; }
+    if len != 0 {
+        (**env).SetByteArrayRegion.unwrap()(env, array, 0, len, bytes.as_ptr().cast());
+    }
+    (**env).CallVoidMethod.unwrap()(env, activity, method, array);
+    (**env).DeleteLocalRef.unwrap()(env, array);
 }
 
 pub unsafe fn to_java_text_input(session: u64, revision: u64, text: Option<&str>,

@@ -132,6 +132,7 @@ impl Cx {
         match msg {
             FromJavaMessage::SwitchedActivity(activity_handle, activity_thread_id)=>{
                 self.os.activity_thread_id = Some(activity_thread_id);
+                self.os.accessibility_sent = None;
                 if self.os.in_xr_mode{
                     if let Err(e) = self.os.openxr.create_instance(activity_handle){
                         crate::error!("OpenXR init failed: {}", e);
@@ -144,8 +145,17 @@ impl Cx {
             FromJavaMessage::BackPressed => {
                 self.call_event_handler(&Event::BackPressed { handled: Cell::new(false)});
             }
+            FromJavaMessage::AccessibilityEnabled(enabled) => {
+                self.set_accessibility_enabled(enabled);
+            }
+            FromJavaMessage::AccessibilityAction { id, revision, action } => {
+                if revision == self.accessibility_tree().revision() {
+                    self.perform_accessibility_action(id, action);
+                }
+            }
             FromJavaMessage::SurfaceCreated {window} => self.set_android_window(window),
             FromJavaMessage::SurfaceDestroyed => {
+                self.os.accessibility_sent = None;
                 let owner = self.keyboard.text_selection;
                 self.clear_text_selection(owner);
                 self.clear_key_focus_if(owner);
@@ -603,6 +613,18 @@ impl Cx {
             self.hide_text_ime();
         }
         self.android_sync_text_actions();
+        // Publish logical geometry at the surface's actual (possibly overridden) density.
+        if self.accessibility_enabled() {
+            let dpi = self.windows[CxWindowPool::id_zero()].window_geom.dpi_factor;
+            let stamp = (self.accessibility_tree().revision(), dpi);
+            if self.os.accessibility_sent != Some(stamp) {
+                unsafe { to_java_accessibility_tree(self.accessibility_tree(), dpi) };
+                self.os.accessibility_sent = Some(stamp);
+            }
+        } else {
+            // Java drops the provider immediately when its service detaches.
+            self.os.accessibility_sent = None;
+        }
     }
 
     /// Processes events that need to be checked regularly, regardless of incoming messages.
@@ -704,6 +726,9 @@ impl Cx {
                     Ok(FromJavaMessage::Init(params)) => {
                         cx.os.dpi_factor = params.density;
                         cx.os_type = OsType::Android(params);
+                    }
+                    Ok(FromJavaMessage::AccessibilityEnabled(enabled)) => {
+                        cx.set_accessibility_enabled(enabled);
                     }
                     Ok(FromJavaMessage::SurfaceCreated { window }) if !window.is_null() => unsafe {
                         // Startup waits for SurfaceChanged (the first dimensions).
@@ -1291,6 +1316,7 @@ impl Default for CxOs {
         Self {
             text_input: Default::default(),
             text_actions_sent: None,
+            accessibility_sent: None,
             start_time: Instant::now(),
             first_after_resize: true,
             frame_time: 0,
@@ -1333,6 +1359,7 @@ pub struct CxAndroidDisplay {
 pub struct CxOs {
     pub(crate) text_input: AndroidTextInput,
     text_actions_sent: Option<(u64, Rect, TextActionCapabilities, f64)>,
+    accessibility_sent: Option<(u64, f64)>,
     pub first_after_resize: bool,
     pub display_size: DVec2,
     pub dpi_factor: f64,

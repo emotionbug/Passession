@@ -542,6 +542,26 @@ pub(crate) fn window_modal_open(window: &str) -> bool {
     WINDOW_MODALS.with(|modals| modals.borrow().iter().any(|m| m.window == window))
 }
 
+pub(crate) fn accessibility_modal_root(cx: &Cx, window: &str) -> Option<DrawListId> {
+    let owner = WINDOW_MODALS.with(|modals| {
+        modals
+            .borrow()
+            .iter()
+            .rev()
+            .find(|m| m.window == window)
+            .map(|m| m.widget)
+    })?;
+    FLOATS.with(|floats| {
+        floats
+            .borrow()
+            .iter()
+            .rev()
+            .find(|surface| surface.modal == Some(owner) && surface.area.is_valid(cx))?
+            .area
+            .draw_list_id()
+    })
+}
+
 /// Only the top sheet's originating tab receives input; other panes keep receiving updates.
 pub(crate) fn window_modal_accepts_tab(window: &str, tab: &str) -> bool {
     WINDOW_MODALS.with(|modals| {

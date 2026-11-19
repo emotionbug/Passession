@@ -362,9 +362,12 @@ impl Host {
     }
 }
 
-fn write_rows(out: &mut Vec<u8>, rows: &[std::sync::Arc<Value>]) -> serde_json::Result<()> {
+fn write_rows<'a>(
+    out: &mut Vec<u8>,
+    rows: impl IntoIterator<Item = &'a std::sync::Arc<Value>>,
+) -> serde_json::Result<()> {
     out.push(b'[');
-    for (index, row) in rows.iter().enumerate() {
+    for (index, row) in rows.into_iter().enumerate() {
         if index != 0 {
             out.push(b',');
         }
@@ -778,6 +781,9 @@ pub(crate) fn lost(core: &Rc<Core>, host: &Rc<Host>, generation: u64, error: Cor
 }
 
 fn schedule_reconnect(core: &Rc<Core>, host: &Rc<Host>) {
+    if core.network_paused() {
+        return;
+    }
     let delay = {
         let mut link = host.link.borrow_mut();
         let delay = reconnect_delay(link.retry);
@@ -789,7 +795,10 @@ fn schedule_reconnect(core: &Rc<Core>, host: &Rc<Host>) {
     let handle = tokio::task::spawn_local(async move {
         tokio::time::sleep(delay).await;
         task_host.link.borrow_mut().reconnect = None;
-        if task_host.link.borrow().enabled && task_core.contains(&task_host) {
+        if !task_core.network_paused()
+            && task_host.link.borrow().enabled
+            && task_core.contains(&task_host)
+        {
             start_attempt(&task_core, &task_host);
         }
     });
@@ -921,7 +930,9 @@ fn verify_connection(core: &Rc<Core>, host: &Rc<Host>) {
             && host.conn_generation() == Some(conn.generation)
         {
             lost(&core, &host, conn.generation, error);
-            ensure_connected(&core, &host, false);
+            if !core.network_paused() {
+                ensure_connected(&core, &host, false);
+            }
         }
         let mut link = host.link.borrow_mut();
         if link.verifying == Some(conn.generation) {
@@ -931,22 +942,62 @@ fn verify_connection(core: &Rc<Core>, host: &Rc<Host>) {
 }
 
 pub(crate) fn set_app_visible(core: &Rc<Core>, visible: bool) {
-    core.app_visible.send_if_modified(|current| {
+    let changed = core.app_visible.send_if_modified(|current| {
         if *current == visible {
             return false;
         }
         *current = visible;
         true
     });
+    if core.pause_background_network && !changed {
+        return;
+    }
     if !visible {
+        if core.network_paused() {
+            for host in core.hosts.borrow().iter() {
+                if let Some(timer) = host.link.borrow_mut().reconnect.take() {
+                    timer.abort();
+                }
+                if let Some(selector) = host.selector.borrow().as_ref() {
+                    selector.pause();
+                }
+            }
+        }
         return;
     }
     super::tailnet::ensure(core);
-    let hosts: Vec<Rc<Host>> = core.hosts.borrow().clone();
-    for host in hosts {
-        ensure_connected(core, &host, true);
+    wake_network(core, true);
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) fn network_changed(core: &Rc<Core>) {
+    // Default-network handovers can deliver several consecutive OS callbacks.
+    if let Some(timer) = core.network_change.borrow_mut().take() {
+        timer.abort();
+    }
+    let task_core = core.clone();
+    let task = tokio::task::spawn_local(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        task_core.network_change.borrow_mut().take();
+        wake_network(&task_core, !task_core.network_paused());
+    });
+    *core.network_change.borrow_mut() = Some(task.abort_handle());
+}
+
+fn wake_network(core: &Rc<Core>, verify: bool) {
+    if core.closing.get() {
+        return;
+    }
+    for host in core.hosts.borrow().iter() {
+        // A route change while hidden allows one immediate reconnect. If it
+        // fails, the next attempt waits for another change or the foreground.
+        ensure_connected(core, host, verify);
         if let Some(selector) = host.selector.borrow().as_ref() {
-            selector.connection_changed();
+            if core.pause_background_network {
+                selector.network_changed();
+            } else {
+                selector.connection_changed();
+            }
         }
     }
 }
@@ -1671,6 +1722,51 @@ mod tests {
         assert_eq!(reconnect_delay(4), Duration::from_millis(24_000));
         assert_eq!(reconnect_delay(5), Duration::from_millis(30_000));
         assert_eq!(reconnect_delay(40), Duration::from_millis(30_000));
+    }
+
+    #[tokio::test]
+    async fn mobile_reconnect_waits_in_background_but_network_changes_and_resume_wake_it() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut core = Core::new(
+                    crate::CoreConfig {
+                        state_dir: dir.path().to_owned(),
+                        daemon_home: None,
+                        default_endpoint: None,
+                        tailnet_key_store: None,
+                    },
+                    std::sync::Arc::new(crate::events::EventQueue::new(std::sync::Arc::new(|| {}))),
+                );
+                Rc::get_mut(&mut core).unwrap().pause_background_network = true;
+                let host = Host::new(1, json!({"id":"host"}), "server".into(), None, vec![], None);
+                core.hosts.borrow_mut().push(host.clone());
+                schedule_reconnect(&core, &host);
+                assert!(host.link.borrow().reconnect.is_some());
+
+                set_app_visible(&core, false);
+                assert!(host.link.borrow().reconnect.is_none());
+                schedule_reconnect(&core, &host);
+                assert!(host.link.borrow().reconnect.is_none());
+                assert_eq!(host.link.borrow().retry, 1);
+
+                wake_network(&core, false);
+                assert_eq!(host.status(), Status::Connecting);
+                let generation = host.link.borrow().generation;
+                lost(
+                    &core,
+                    &host,
+                    generation,
+                    CoreError::new("DAEMON_CONNECTION_LOST", "Unreachable", true),
+                );
+                assert_eq!(host.status(), Status::Error);
+                assert!(host.link.borrow().reconnect.is_none());
+
+                set_app_visible(&core, true);
+                assert_eq!(host.status(), Status::Connecting);
+                assert!(host.link.borrow().generation > generation);
+            })
+            .await;
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]

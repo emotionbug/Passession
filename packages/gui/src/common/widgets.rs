@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::common::paint::{Font, HitMap, Painter, TextSpec, rect};
 use crate::common::transition::{self, Fling, FlingStyle, Loop};
-use crate::common::{UiContext, UiEffect, clock};
+use crate::common::{UiContext, UiEffect, accessibility, clock, i18n::with_translation};
 use crate::theme::{
     self, ControlSize, Palette, Typography, control_height, control_icon_size, fade,
 };
@@ -799,7 +799,7 @@ impl Widget for PLabel {
         };
         drawer.text_style.font_size = Typography::pt(px);
         drawer.color = color;
-        if self.ellipsis {
+        let bounds = if self.ellipsis {
             let laid = drawer.layout(cx, 0.0, 0.0, None, false, Align::default(), &text);
             let height = laid.size_in_lpxs.height as f64;
             let rect = cx.walk_turtle(Walk {
@@ -808,11 +808,29 @@ impl Widget for PLabel {
             });
             let shown = fit_text(drawer, cx, &text, rect.size.x);
             drawer.draw_abs(cx, rect.pos, &shown);
+            rect
         } else if !self.wrap {
             let laid = drawer.layout(cx, 0.0, 0.0, None, false, Align::default(), &text);
-            drawer.draw_walk_laidout(cx, walk, &laid);
+            drawer.draw_walk_laidout(cx, walk, &laid)
         } else {
-            drawer.draw_walk(cx, walk, self.align, &text);
+            drawer.draw_walk(cx, walk, self.align, &text)
+        };
+        if cx.accessibility_enabled() && !text.is_empty() {
+            let mut area = Area::Empty;
+            cx.add_aligned_rect_area(&mut area, bounds);
+            accessibility::record_widget(
+                cx,
+                self.widget_uid(),
+                area,
+                if self.role == TextRole::Title {
+                    AccessibilityRole::Header
+                } else {
+                    AccessibilityRole::Text
+                },
+                &text,
+                AccessibilityState::default(),
+                AccessibilityActions::NONE,
+            );
         }
         DrawStep::done()
     }
@@ -948,6 +966,16 @@ impl PButton {
 impl Widget for PButton {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let disabled = !self.enabled || self.busy;
+        if !disabled
+            && accessibility::widget_action(event, self.widget_uid(), AccessibilityAction::Activate)
+        {
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                PButtonAction::Clicked(KeyModifiers::default()),
+            );
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(_) => {
                 cx.set_cursor(if disabled {
@@ -1077,6 +1105,18 @@ impl Widget for PButton {
                 0.0,
             );
         }
+        accessibility::record_button(
+            cx,
+            self.widget_uid(),
+            self.area,
+            &label,
+            "",
+            self.icon.as_ref(),
+            AccessibilityState {
+                enabled: self.enabled && !self.busy,
+                ..AccessibilityState::default()
+            },
+        );
         DrawStep::done()
     }
 
@@ -1181,6 +1221,16 @@ pub struct PIconButton {
 
 impl Widget for PIconButton {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.enabled
+            && accessibility::widget_action(event, self.widget_uid(), AccessibilityAction::Activate)
+        {
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                PButtonAction::Clicked(KeyModifiers::default()),
+            );
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(_) => {
                 cx.set_cursor(if self.enabled {
@@ -1259,6 +1309,18 @@ impl Widget for PIconButton {
                 color
             } else {
                 fade(color, 0.5)
+            },
+        );
+        accessibility::record_button(
+            cx,
+            self.widget_uid(),
+            self.area,
+            "",
+            "",
+            &icon,
+            AccessibilityState {
+                enabled: self.enabled,
+                ..AccessibilityState::default()
             },
         );
         DrawStep::done()
@@ -1390,6 +1452,18 @@ pub struct PSwitch {
 
 impl Widget for PSwitch {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.enabled
+            && accessibility::widget_action(event, self.widget_uid(), AccessibilityAction::Activate)
+        {
+            self.value = !self.value;
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                ToggleAction::Changed(self.value),
+            );
+            self.redraw(cx);
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(_) if self.enabled => cx.set_cursor(MouseCursor::Hand),
             Hit::FingerUp(fe)
@@ -1446,6 +1520,23 @@ impl Widget for PSwitch {
             16.0,
             fade(thumb, opacity),
         );
+        if cx.accessibility_enabled() {
+            with_translation("accessibility.toggle", |label| {
+                accessibility::record_widget(
+                    cx,
+                    self.widget_uid(),
+                    self.area,
+                    AccessibilityRole::Switch,
+                    label,
+                    AccessibilityState {
+                        enabled: self.enabled,
+                        checked: self.value,
+                        ..AccessibilityState::default()
+                    },
+                    accessibility::activate_if(self.enabled),
+                );
+            });
+        }
         DrawStep::done()
     }
 }
@@ -1496,6 +1587,18 @@ pub struct PCheckbox {
 
 impl Widget for PCheckbox {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.enabled
+            && accessibility::widget_action(event, self.widget_uid(), AccessibilityAction::Activate)
+        {
+            self.value = !self.value;
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                ToggleAction::Changed(self.value),
+            );
+            self.redraw(cx);
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(_) if self.enabled => cx.set_cursor(MouseCursor::Hand),
             Hit::FingerUp(fe)
@@ -1571,6 +1674,19 @@ impl Widget for PCheckbox {
                 0.0,
             );
         }
+        accessibility::record_widget(
+            cx,
+            self.widget_uid(),
+            self.area,
+            AccessibilityRole::Checkbox,
+            &label,
+            AccessibilityState {
+                enabled: self.enabled,
+                checked: self.value,
+                ..AccessibilityState::default()
+            },
+            accessibility::activate_if(self.enabled),
+        );
         DrawStep::done()
     }
 }
@@ -1638,8 +1754,41 @@ pub struct PSegmented {
     hovered: Option<usize>,
 }
 
+impl PSegmented {
+    fn segment_id(&self, segment: &Segment) -> u64 {
+        accessibility::id(("segmented-control", self.widget_uid().0, &segment.value))
+    }
+
+    fn select(&mut self, cx: &mut Cx, scope: &Scope, index: usize) {
+        let Some(segment) = self.segments.get(index) else {
+            return;
+        };
+        if segment.enabled && segment.value != self.selected {
+            self.selected.clone_from(&segment.value);
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                SegmentAction::Changed(self.selected.clone()),
+            );
+            self.redraw(cx);
+        }
+    }
+}
+
 impl Widget for PSegmented {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Event::AccessibilityAction(action) = event {
+            if action.action == AccessibilityAction::Activate
+                && let Some(index) = self
+                    .segments
+                    .iter()
+                    .position(|segment| self.segment_id(segment) == action.id)
+                && self.hits.rect_of(&index).is_some()
+            {
+                self.select(cx, scope, index);
+            }
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
                 let hovered = self.hits.at(e.abs);
@@ -1659,16 +1808,7 @@ impl Widget for PSegmented {
             }
             Hit::FingerUp(fe) if fe.is_over && (!fe.device.is_touch() || fe.was_tap()) => {
                 if let Some(index) = self.hits.at(fe.abs) {
-                    let segment = &self.segments[index];
-                    if segment.enabled && segment.value != self.selected {
-                        self.selected = segment.value.clone();
-                        cx.widget_action(
-                            self.widget_uid(),
-                            &scope.path,
-                            SegmentAction::Changed(self.selected.clone()),
-                        );
-                        self.redraw(cx);
-                    }
+                    self.select(cx, scope, index);
                 }
             }
             _ => {}
@@ -1774,6 +1914,24 @@ impl Widget for PSegmented {
                 );
             }
             self.hits.push(seg, index);
+            if cx.accessibility_enabled() {
+                accessibility::record_rect(
+                    cx,
+                    AccessibilityNode {
+                        id: self.segment_id(segment),
+                        parent: None,
+                        role: AccessibilityRole::Button,
+                        label: &segment.label,
+                        bounds: seg,
+                        state: AccessibilityState {
+                            enabled: segment.enabled,
+                            selected,
+                            ..AccessibilityState::default()
+                        },
+                        actions: accessibility::activate_if(segment.enabled),
+                    },
+                );
+            }
             x += w + 4.0;
         }
         DrawStep::done()
@@ -2174,6 +2332,13 @@ pub struct PTextField {
 impl Widget for PTextField {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let input = self.view.text_input(id!(input));
+        if accessibility::focus_requested(event, self.widget_uid())
+            && !input.is_read_only()
+            && input.area().is_attached(cx)
+        {
+            input.set_key_focus(cx);
+            return;
+        }
         input.set_is_multiline(cx, self.multiline);
         if self.focused && !input.area().is_valid(cx) {
             input.release_focus(cx);
@@ -2229,7 +2394,18 @@ impl Widget for PTextField {
             .text_input(id!(input))
             .set_is_multiline(cx, self.multiline);
         self.apply_theme(cx, false);
-        self.view.draw_walk(cx, scope, walk)
+        let step = self.view.draw_walk(cx, scope, walk);
+        if cx.accessibility_enabled() && step.is_ok() {
+            let input = self.view.text_input(id!(input));
+            accessibility::record_field(
+                cx,
+                self.widget_uid(),
+                input.area(),
+                self.placeholder.as_ref(),
+                !input.is_read_only(),
+            );
+        }
+        step
     }
 
     fn text(&self) -> String {

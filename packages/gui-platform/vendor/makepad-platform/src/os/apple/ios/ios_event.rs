@@ -6,20 +6,21 @@ use {
             MouseMoveEvent,
             ScrollEvent,
             WindowGeomChangeEvent,
-            TextInputEvent,
-            KeyEvent,
-            TextClipboardEvent,
+            TextImeEvent,
             TimerEvent,
             LongPressEvent,
             TouchUpdateEvent,
             VirtualKeyboardEvent,
         },
-    }
+    },
+    std::{cell::Cell, rc::Rc},
 };
 
 #[derive(Debug, Clone)]
 pub enum IosEvent {
     Init,
+    Wake,
+    ExecutorTick,
     WindowGeomChange(WindowGeomChangeEvent),
     DisplayFrame,
     SurfaceLayout,
@@ -27,6 +28,8 @@ pub enum IosEvent {
     SurfaceResumed,
     SurfaceSuspended,
     SurfaceMemoryWarning,
+    AccessibilityStatus,
+    AccessibilityActivate { id: u64, handled: Rc<Cell<bool>> },
     VirtualKeyboard(VirtualKeyboardEvent),
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),
@@ -36,10 +39,14 @@ pub enum IosEvent {
     
     Scroll(ScrollEvent),
     
-    TextInput(TextInputEvent),
-    KeyDown(KeyEvent),
-    KeyUp(KeyEvent),
-    TextCopy(TextClipboardEvent),
-    TextCut(TextClipboardEvent),
+    TextEdit {
+        session: u64,
+        text: String,
+        selection: (usize, usize),
+        composing: Option<(usize, usize)>,
+        ended: bool,
+    },
+    TextCompositionEnded(TextImeEvent),
+    TextSubmit(u64),
     Timer(TimerEvent),
 }
