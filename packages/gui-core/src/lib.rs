@@ -114,6 +114,10 @@ pub enum CoreEvent {
         host_id: String,
         event: Value,
     },
+    /// Some replayable host updates were skipped. Refresh affected projections on the live link.
+    HostResync {
+        host_id: String,
+    },
     Response {
         host_id: String,
         request_id: RequestId,
@@ -492,8 +496,8 @@ impl GuiCore {
     }
 
     /// Stages one FIFO chunk without holding the queue lock during dispatch.
-    /// Returns whether more events were queued; a later push to an empty
-    /// queue wakes the GUI independently.
+    /// Returns whether the GUI should schedule another turn (queued work
+    /// or producer contention). A later push to an empty queue wakes it independently.
     pub fn stage_events(&mut self, output: &mut Vec<CoreEvent>) -> bool {
         self.queue.stage(output)
     }

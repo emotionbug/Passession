@@ -1034,7 +1034,7 @@ impl ChatSession {
             }
             return;
         }
-        let supersede = supersede || gap;
+        let gap = gap || self.gap_pending;
         match self.catch_up {
             Some(CatchUp::Running) => {
                 // keep-and-park: the running fetch owns the request; the gap runs next.
@@ -1043,7 +1043,7 @@ impl ChatSession {
                 }
                 return;
             }
-            Some(CatchUp::Complete) if !supersede => return,
+            Some(CatchUp::Complete) if !supersede && !gap => return,
             _ => {}
         }
         io.stop_timer(self.catch_up_retry);
@@ -1056,6 +1056,17 @@ impl ChatSession {
         self.catch_up = Some(CatchUp::Running);
         self.gap_pending = false;
         self.enqueue(io, LoadOp::CatchUp { generation, gap });
+    }
+
+    /// The core skipped replayable updates, but this session still owns its
+    /// live subscription. Walk forward from the last accepted cursor, even
+    /// if the dropped messages were the final ones in the stream.
+    pub fn recover_delivery_gap(&mut self, io: &mut Io) {
+        if !self.disposed && !self.visibility.suspended {
+            self.pending = true;
+            self.start_catch_up(io, true, true);
+            self.notify();
+        }
     }
 
     fn owns_catch_up(&self, generation: u64) -> bool {
@@ -1292,8 +1303,9 @@ impl ChatSession {
 
     fn load_failed(&mut self, io: &mut Io, active: ActiveLoad, message: String) {
         match active.op {
-            LoadOp::CatchUp { generation, .. } => {
+            LoadOp::CatchUp { generation, gap } => {
                 if !self.disposed && generation == self.catch_up_generation {
+                    self.gap_pending |= gap;
                     let delay = next_retry_delay(self.catch_up_delay);
                     self.catch_up_delay = Some(delay);
                     self.catch_up = Some(CatchUp::Error);

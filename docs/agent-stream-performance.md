@@ -82,12 +82,20 @@ The daemon publishes an agent's state as soon as a displayed field changes; chan
 latest value. Directory followers skip agent and project upserts whose serialized form is
 unchanged.
 
-The core keeps only the latest undelivered `State`: it is a complete presentation
-snapshot, so older snapshots add no information. Connection, host, response and
-error events remain FIFO. Each wake handles small chunks for about 4 ms, including
-delivery to features and windows. If events remain, the app signals the next
-loop turn without a frame-rate timer, including when no window is drawing. The
-budget does not preempt a chunk or cap the bytes in the ordered queue.
+The core keeps only the latest undelivered `State`, at its arrival position.
+Each wake handles small FIFO chunks for about 4 ms, including delivery to
+features and windows. If events remain, the app signals the next loop turn
+even when no window is drawing. The budget does not preempt a chunk.
+
+The queue retains up to 256 replayable updates or about 8 MiB of their data,
+whichever fills first. At the limit it replaces that host's queued replayable
+updates with one refresh marker and skips more of those updates until the app
+takes the marker. Other hosts keep their queued events. The core still applies
+directory updates, and open chats fetch missing history from their last accepted
+cursor over the same connection. One-time messages such as replies, prompts,
+notifications, terminal output, and connection changes stay in order and are
+never discarded. Slowing socket reads instead would also delay replies and
+heartbeats; a daemon disconnects clients whose outgoing queue stays full.
 
 Timeline sessions apply matching events in order. Publish one projection per
 dirty session after the batch; an unrelated UI event does not visit retained histories.

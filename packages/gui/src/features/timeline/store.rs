@@ -358,6 +358,11 @@ impl TimelineStore {
                     self.with_session(cx, effects, &key, |s, io| s.connection_changed(io, false));
                 }
             }
+            CoreEvent::HostResync { host_id } => {
+                for key in self.keys_for_host(host_id) {
+                    self.with_session(cx, effects, &key, |s, io| s.recover_delivery_gap(io));
+                }
+            }
             CoreEvent::HostEvent { host_id, event } => {
                 let ty = str_of(get(event, "type"));
                 if ty == "host.identity_changed" || ty == "host.merged" {
@@ -650,5 +655,121 @@ mod hidden_subagent_tests {
         store.flush_projections();
         assert_eq!(store.sessions[&dirty].version, dirty_version + 1);
         assert_eq!(store.sessions[&clean].version, clean_version);
+    }
+}
+
+#[cfg(test)]
+mod queue_recovery_tests {
+    use super::*;
+    use paseo_gui_core::{CoreConfig, GuiCore};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn overflow_recovers_missing_rows_once_across_repeated_markers() {
+        let dir = std::env::temp_dir().join(format!("paseo-timeline-{}", uuid::Uuid::new_v4()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.join("state"),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut store = TimelineStore::new();
+        store.core = Some(core.handle());
+        let key = SessionKey {
+            host_id: "host".into(),
+            agent_id: "agent".into(),
+            subagent_id: None,
+        };
+        store
+            .sessions
+            .insert(key.clone(), ChatSession::new(key.clone(), true));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut effects = Vec::new();
+        // A shown chat subscribes; hidden sessions stay suspended.
+        store.with_session(&mut cx, &mut effects, &key, |s, io| s.set_visible(io, true));
+        let only_request = |store: &TimelineStore| {
+            assert_eq!(store.requests.len(), 1);
+            store.requests.keys().next().unwrap().clone()
+        };
+        let response =
+            |store: &mut TimelineStore, cx: &mut Cx, effects: &mut Vec<UiEffect>, body| {
+                let request_id = only_request(store);
+                store.on_core_event(
+                    cx,
+                    effects,
+                    &CoreEvent::Response {
+                        host_id: "host".into(),
+                        request_id,
+                        result: Ok(body),
+                    },
+                );
+            };
+        let page = |seq: i64, has_newer| {
+            json!({
+                "epoch": "current", "hasNewer": has_newer,
+                "startCursor": {"epoch": "current", "seq": seq},
+                "endCursor": {"epoch": "current", "seq": seq},
+                "entries": [{"seqStart": seq, "seqEnd": seq,
+                    "item": {"type": "assistant_message", "messageId": seq.to_string(), "text": "row"}}],
+            })
+        };
+        response(&mut store, &mut cx, &mut effects, json!({}));
+        response(&mut store, &mut cx, &mut effects, page(1, false));
+        assert!(store.requests.is_empty());
+
+        let marker = CoreEvent::HostResync {
+            host_id: "host".into(),
+        };
+        store.on_core_event(&mut cx, &mut effects, &marker);
+        let first = only_request(&store);
+        assert!(matches!(
+            store.requests[&first].pending,
+            Pending::Fetch {
+                direction: "after",
+                ..
+            }
+        ));
+        for _ in 0..3 {
+            store.on_core_event(&mut cx, &mut effects, &marker);
+            assert_eq!(only_request(&store), first, "no overlapping fetch");
+        }
+        response(&mut store, &mut cx, &mut effects, page(2, true));
+        assert_eq!(store.sessions[&key].end_cursor.as_ref().unwrap().seq, 2);
+        assert!(matches!(
+            store.requests[&only_request(&store)].pending,
+            Pending::Fetch {
+                direction: "after",
+                force_replace: false,
+                ..
+            }
+        ));
+        response(&mut store, &mut cx, &mut effects, page(3, false));
+        assert_eq!(store.sessions[&key].end_cursor.as_ref().unwrap().seq, 3);
+        // Markers from during the first fetch can refer to newer data; they
+        // share one extra check, which can only start at the advanced cursor.
+        response(
+            &mut store,
+            &mut cx,
+            &mut effects,
+            json!({"epoch": "current", "entries": []}),
+        );
+        assert!(store.requests.is_empty());
+        let session = &store.sessions[&key];
+        assert!(session.connected);
+        assert_eq!(
+            session
+                .timeline
+                .iter()
+                .map(|row| row["seqEnd"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

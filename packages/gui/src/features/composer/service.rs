@@ -545,6 +545,9 @@ impl ComposerService {
                     }
                 }
                 CoreEvent::HostEvent { host_id, event } => self.on_host_event(host_id, event),
+                // Agent upserts can wake a held send. Recheck readiness when
+                // the queue folded those upserts into an overflow marker.
+                CoreEvent::HostResync { host_id } => self.schedule(host_id),
                 CoreEvent::Error {
                     host_id: None,
                     error,
@@ -948,6 +951,62 @@ impl ComposerService {
             Some(error) => Err(format!("Draft persistence failed: {error}")),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_recovery_tests {
+    use super::*;
+    use paseo_gui_core::{CoreConfig, GuiCore};
+
+    #[test]
+    fn overflow_wakes_pending_delivery_on_the_same_connection() {
+        let dir = std::env::temp_dir().join(format!("paseo-delivery-{}", uuid::Uuid::new_v4()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.join("state"),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut service = ComposerService::new();
+        service.collected = true; // Do not run file maintenance for this fixture.
+        service.hosts.insert(
+            "host".into(),
+            HostState {
+                connected: true,
+                generation: 7,
+                ..HostState::default()
+            },
+        );
+        let key = draft_key("host", "workspace", "agent");
+        service.drafts.load(&json!({"drafts": {
+            (&key): {"queue": [{"state": "queued", "messageId": "held"}]}
+        }}));
+        let _ = service.drafts.drain_delivery_changed();
+        let mut ui = UiContext::new(core.handle());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        service.handle_core_events(&mut cx, &mut ui);
+        assert!(service.pending.is_empty());
+
+        ui.events.push(CoreEvent::HostResync {
+            host_id: "host".into(),
+        });
+        service.handle_core_events(&mut cx, &mut ui);
+        service.handle_core_events(&mut cx, &mut ui);
+        assert_eq!(service.hosts["host"].generation, 7);
+        assert!(service.connected("host"));
+        assert_eq!(service.pending.len(), 1);
+        assert!(matches!(
+            service.pending.values().next(),
+            Some(Pending::TimelineObservation { host, key: observed })
+                if host == "host" && observed == &key
+        ));
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

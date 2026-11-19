@@ -614,7 +614,7 @@ impl PaseoShell {
                         permissions::host_connected(self, ui);
                     }
                 }
-                CoreEvent::Disconnected { .. } => {}
+                CoreEvent::Disconnected { .. } | CoreEvent::HostResync { .. } => {}
                 CoreEvent::Error { error, .. } => {
                     if error.code != "INVALID_STATE_KEY" {
                         overlays::toast(
