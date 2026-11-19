@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Search in terminals and execution logs keeps what it has already read. Typing more of the search term or switching to another term no longer reads the whole scrollback again, and new output is searched only where it arrived. With 100,000 lines (optimized test build on Linux), a different term took 1.54 s before and 5 ms now, and refreshing after 100 new lines took 1.53 s before and 4 ms now. The first search after opening still reads the scrollback once: about 80 ms for the default 10,000 lines.
+- Text cursors, scrollbars and lists follow each platform. On Android, iPhone and iPad the scrollbar fades out 300 ms after scrolling stops. On iPhone, iPad and Mac, pulling a list past its top stretches with resistance and springs back; Android and Windows/Linux lists stop at the edge. The cursor blinks every 500 ms, fades on Apple platforms, and stops all blink work while its field is unfocused or hidden.
+- When the app falls far behind a very busy session, it no longer queues chat updates without limit. Past 256 queued updates or about 8 MB, it drops the queued chat rows for that host and reloads them from the daemon over the same connection. Replies, prompts, notifications and terminal output are never dropped.
+
 ## 0.13.44 - 2026-11-19
 
 ### Added
