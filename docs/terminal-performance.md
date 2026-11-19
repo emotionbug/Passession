@@ -14,10 +14,20 @@ Ghostty bounds scrollback in bytes and prunes whole pages. `paseo_terminal::Opti
 
 An interactive terminal sends input and its claimed size. A log observer sends neither and drops emulator replies; its local viewport size is not a PTY resize request. Restore authoritative dimensions and remap the observation slot before consuming binary frames after reconnect.
 
-Terminal and log Find reuse match positions when the query and screen generations
-are unchanged. Output, restored snapshots, and local reflow invalidate those
-positions; the open find card refreshes after its debounce without scrolling away
-from the reader.
+Terminal and log Find index the folded text of the presented rows separately from
+the query. Extending a query filters earlier candidates; changing it searches the
+index without fetching scrollback from Ghostty again. Live refresh rereads the
+previously editable screen rows and newly appended rows while the history origin
+is intact, then searches only where matches could have changed. Reflow, replacement,
+and trimming invalidate the cached history coordinates. Refresh keeps the active
+match near the reader without scrolling.
+
+`perf_terminal_find_cold_extension_and_append` (ignored by default; run with
+`--profile dev-fast -- --ignored --nocapture`) measured on Linux x64 with 100,000
+rows: the first search 1.58 s (it reads the scrollback once, as before; 81 ms at
+10,000 rows), a longer query 12 µs, a different query 5.3 ms, and a refresh after
+100 new rows 4.0 ms. Before this index, every new query and every refresh took
+about 1.54 s.
 
 ## Boundaries to measure
 

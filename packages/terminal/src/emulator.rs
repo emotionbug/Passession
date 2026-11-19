@@ -6,11 +6,11 @@ use std::rc::Rc;
 use libghostty_vt::key::{self, Mods};
 use libghostty_vt::mouse;
 use libghostty_vt::render::{CursorVisualStyle, RenderState};
-use libghostty_vt::screen::{CellContentTag, CellWide, GridRef, Screen};
+use libghostty_vt::screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef};
 use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 use libghostty_vt::terminal::{
     ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point, PointCoordinate,
-    PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
+    PointSpace, PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{paste, Error, Terminal, TerminalOptions};
 
@@ -64,6 +64,13 @@ pub struct Modes {
 struct Effects {
     replies: RefCell<Vec<u8>>,
     title_changed: Flag<bool>,
+}
+
+/// A tracked origin for deciding whether displayed history coordinates still refer
+/// to the same rows after output. Discard it on resize/reflow.
+pub struct HistoryStart {
+    origin: TrackedGridRef,
+    hidden: usize,
 }
 
 /// A headless Ghostty terminal: grid, scrollback, modes and the VT parser.
@@ -168,6 +175,36 @@ impl Emulator {
 
     fn retained_history(&self) -> usize {
         self.terminal.scrollback_rows().unwrap_or(0)
+    }
+
+    /// Track the start of history only for consumers that need an immutable row prefix.
+    pub fn history_start(&self) -> Option<HistoryStart> {
+        let retained = self.retained_history();
+        if retained == 0 || self.scrollback == 0 || self.cols() < 2 {
+            return None;
+        }
+        // Track the first *retained* row for constant-time lookup even beyond the
+        // presentation cap. Ghostty snaps refs erased by CSI 3 J to column zero
+        // instead of always invalidating them, so use column one as a sentinel.
+        let origin = self
+            .terminal
+            .track_grid_ref(Point::Screen(PointCoordinate { x: 1, y: 0 }))
+            .ok()?;
+        let hidden = retained.saturating_sub(self.scrollback);
+        Some(HistoryStart { origin, hidden })
+    }
+
+    /// Does the old displayed history prefix still start on the same row?
+    pub fn has_history_start(&self, start: &HistoryStart) -> bool {
+        let retained = self.retained_history();
+        retained > 0
+            && retained.saturating_sub(self.scrollback) == start.hidden
+            && start
+                .origin
+                .snapshot(&self.terminal)
+                .is_ok_and(|grid| grid.is_some())
+            && start.origin.point(PointSpace::Screen).ok().flatten()
+                == Some(PointCoordinate { x: 1, y: 0 })
     }
 
     pub fn cursor(&mut self) -> Cursor {
@@ -446,6 +483,36 @@ mod tests {
         let first = term.row(0);
         assert!(first.wrapped);
         assert_eq!(first.text(), "abcd");
+    }
+
+    #[test]
+    fn history_origin_survives_append_but_not_erase_and_regrow_or_trimming() {
+        let mut term = Emulator::new(Options {
+            rows: 2,
+            cols: 10,
+            scrollback: 3,
+            respond: false,
+        })
+        .unwrap();
+        term.write(b"a\r\nb\r\nc");
+        let first = term.history_start().unwrap();
+        term.write(b"\r\nd");
+        assert!(term.has_history_start(&first));
+
+        // Erase and regrow in one write, so a before/after row count cannot detect it.
+        let count = term.history();
+        term.write(b"\x1b[3J\r\ne\r\nf");
+        assert_eq!(term.history(), count);
+        assert!(!term.has_history_start(&first));
+        let after_erase = term.history_start().unwrap();
+        assert!(term.has_history_start(&after_erase));
+
+        term.write(b"\r\ng");
+        assert!(term.has_history_start(&after_erase));
+        let at_limit = term.history_start().unwrap();
+        term.write(b"\r\nh");
+        assert_eq!(term.history(), 3);
+        assert!(!term.has_history_start(&at_limit));
     }
 
     #[test]

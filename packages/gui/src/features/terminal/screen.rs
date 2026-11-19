@@ -7,14 +7,20 @@
 //! until the next mutation (output, resize, replacement).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use paseo_terminal::{Cursor, Emulator, Error, Key, Line, Modes, Modifiers, Options};
+use paseo_terminal::{Cursor, Emulator, Error, HistoryStart, Key, Line, Modes, Modifiers, Options};
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 
 /// Cached rows beyond this are dropped instead of growing with every scrolled-past row.
 const CACHE_LIMIT: usize = 4096;
+
+fn next_search_epoch() -> u64 {
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+    EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 pub struct Screen {
     emulator: Option<Emulator>,
@@ -26,6 +32,8 @@ pub struct Screen {
     revision: u64,
     /// Raw row changes, including writes and reflow not yet published.
     row_revision: u64,
+    /// Unchanged only while indexed history belongs to this screen and layout.
+    search_epoch: u64,
     line_count: usize,
     has_dimensions: bool,
     /// Keep scroll geometry while a snapshot is in flight, so a paused viewport does not
@@ -52,6 +60,7 @@ impl Screen {
             title: String::new(),
             revision: 0,
             row_revision: 0,
+            search_epoch: next_search_epoch(),
             line_count: 0,
             has_dimensions: false,
             dormant_size: (DEFAULT_ROWS, DEFAULT_COLS),
@@ -79,9 +88,9 @@ impl Screen {
     ) -> Result<(), Error> {
         let (rows, cols) = size.unwrap_or((self.rows(), self.cols()));
         self.emulator = Some(emulator(rows, cols, self.scrollback)?);
-        self.lines.clear();
+        self.search_epoch = next_search_epoch();
         self.has_dimensions = true;
-        self.emulator.as_mut().unwrap().write(text.as_bytes());
+        self.write(text.as_bytes());
         if let Some(title) = title.filter(|title| !title.is_empty()) {
             self.title = title.to_owned();
         }
@@ -100,6 +109,7 @@ impl Screen {
         emulator.resize(rows, cols)?;
         self.lines.clear();
         self.row_revision = self.row_revision.wrapping_add(1);
+        self.search_epoch = next_search_epoch();
         Ok(true)
     }
 
@@ -163,6 +173,7 @@ impl Screen {
         self.emulator = None;
         self.lines = HashMap::new();
         self.has_dimensions = false;
+        self.search_epoch = next_search_epoch();
         self.revision += 1;
         replay.into_boxed_str()
     }
@@ -178,6 +189,20 @@ impl Screen {
     /// Rows can change before their searchable extent is counted at publication.
     pub(super) fn row_revision(&self) -> u64 {
         self.row_revision
+    }
+
+    pub(super) fn search_epoch(&self) -> u64 {
+        self.search_epoch
+    }
+
+    pub(super) fn history_start(&self) -> Option<HistoryStart> {
+        self.emulator.as_ref()?.history_start()
+    }
+
+    pub(super) fn has_history_start(&self, start: &HistoryStart) -> bool {
+        self.emulator
+            .as_ref()
+            .is_some_and(|emulator| emulator.has_history_start(start))
     }
 
     /// Presented rows through the cursor and the last non-blank row (`_countLines`), as of

@@ -11,7 +11,7 @@ mod input;
 mod model;
 mod thread;
 
-pub use emulator::{Emulator, Modes, Options};
+pub use emulator::{Emulator, HistoryStart, Modes, Options};
 pub use input::{Key, Modifiers};
 pub use libghostty_vt::Error;
 pub use model::{CellStyle, CellWidth, Color, Cursor, CursorShape, Line, Row, RowCell, Run};
