@@ -20,6 +20,7 @@ pub mod radio_button;
 pub mod text_input;
 pub mod text_selection_handles;
 pub use text_selection_handles::TextSelectionHandles;
+pub mod motion;
 pub mod slider;
 pub mod scroll_bar;
 pub mod scroll_bars;

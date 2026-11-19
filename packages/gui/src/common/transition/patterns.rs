@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use makepad_widgets::DVec2;
 
-use super::{Spec, ease, tokens};
+use super::{Spec, StyleFamily, ease, tokens};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -30,25 +30,6 @@ pub enum Intent {
     ScrollTo,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StyleFamily {
-    Material,
-    Cupertino,
-    Desktop,
-}
-
-impl StyleFamily {
-    pub const fn current() -> Self {
-        if cfg!(target_os = "android") {
-            Self::Material
-        } else if cfg!(target_os = "ios") {
-            Self::Cupertino
-        } else {
-            Self::Desktop
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct Style {
     pub spec: Spec,
@@ -57,7 +38,7 @@ pub struct Style {
 
 impl Intent {
     pub fn resolve(self) -> Style {
-        self.resolve_for(StyleFamily::current())
+        self.resolve_for(StyleFamily::mobile_or_desktop())
     }
 
     pub fn resolve_for(self, family: StyleFamily) -> Style {
@@ -88,7 +69,7 @@ impl Intent {
                 }
             }
             SwitchPeer => match family {
-                Material => (Pattern::FadeThrough, Tween(MEDIUM_2, [0.0, 0.0, 1.0, 1.0])),
+                Material => (Pattern::FadeThrough, Tween(MEDIUM_2, LINEAR)),
                 Cupertino => (Pattern::Crossfade, Tween(SHORT_4, STANDARD)),
                 Desktop => (Pattern::Crossfade, Tween(SHORT_3, STANDARD)),
             },

@@ -28,17 +28,17 @@ Windows. The platform patch gives Windows the standard overlapped frame, so the 
 draws the caption, its buttons and Snap; see makepad-platform's "Native window chrome".
 The caption bar stays defined for consumers that enable it explicitly.
 
-## Desktop scrollbar visibility
+## Scrollbar visibility
 
-`src/scroll_bar.rs` adds desktop auto-hide, enabled by `fade_when_idle` by
-default. Scrolling reveals the thumb, holds it for 600 ms, then fades it over
-300 ms. Hover or drag holds it visible. A new interaction cancels the pending
-fade. Both upstream scrollbar shaders multiply their premultiplied output by
-opacity, preserving hit testing and geometry while invisible.
+`src/motion.rs` shares platform choices, timing, curves and springs with the
+client. `src/scroll_bar.rs` hides the thumb after 300 ms on Android and iOS
+and fades it over 250 ms. Desktop keeps its 600 ms hold and 300 ms fade.
+`fade_when_idle` stays enabled by default; hover and drag hold the thumb
+visible, and new interaction cancels a pending fade. Both scrollbar shaders
+fade the painted thumb without changing its hit area or geometry.
 
-The hold uses one timeout, not a repeating timer or an animation. Frames run
-only during the fade and stop at zero opacity. A non-overflowing bar cancels
-its timeout and fade. Android and iOS bypass this behavior entirely.
+The hold uses one timeout. Frames run only during the fade and stop when
+it finishes. A non-overflowing bar cancels both the timeout and fade.
 
 `src/portal_list.rs` reports pixel scrolling within an item to the scrollbar.
 Its index-based scroll position can stay unchanged during such a scroll, so
@@ -53,11 +53,10 @@ ownership; mobile and consumers not setting a color retain upstream colors.
 
 ## Caret blink
 
-`src/text_input.rs` retains the upstream cursor fade on macOS and iOS. On other
-platforms, blink transitions cut the existing animator track and repaint once
-instead of scheduling opacity-animation frames. The 500 ms blink interval,
-focus handling, selection and editing behavior remain unchanged. This central
-change applies to every TextInput, including feature-owned fields.
+`src/text_input.rs` uses the shared 500 ms blink interval unless `blink_speed`
+overrides it. The caret fades on macOS and iOS and switches immediately on
+other platforms. Typing and caret movement restore full opacity. Focus loss,
+backgrounding and hidden caret areas stop the timer and any fade.
 
 The caret is a solid bar on whole device pixels. Upstream filled it through
 `Sdf2d::box`, whose antialiasing leaves a 2px bar at about a third of its colour on
@@ -201,11 +200,14 @@ physics and scheduling without depending on the GUI crate.
 
 `ScrollBars`, `PortalList` and the app's manually drawn scroll surfaces consume
 this controller. PortalList's duplicate drag/flick samples and per-frame decay
-are removed; its separate smooth-scroll and pull-down behavior remains, with
-pull-down decay expressed in elapsed time. Nested children handle input first;
-selection and horizontal child drags retain their gesture ownership. Sticky tap
-qualification prevents a pan ending over its original control from becoming a
-click. Eighteen `touch_scroll_tests` cover slop, subdivision, reversal, bounds,
+are removed. Its separate smooth scroll remains. At the top edge, Apple lists
+resist outward movement and spring back; Android lists clamp. Other desktops
+clamp unless the list explicitly sets `max_pull_down`, in which case it eases
+back into place. Programmatic scrolling and selection still clamp on all
+platforms. The rebound stops requesting frames at rest. Nested children handle
+input first; selection and horizontal child drags retain their gesture ownership.
+Sticky tap qualification prevents a pan ending over its original control from
+becoming a click. Eighteen `touch_scroll_tests` cover slop, subdivision, reversal, bounds,
 interruption, frame-rate/clock independence, release velocity and selection.
 
 `TouchScroll::begin` rejects non-touch gestures even for direct callers such as

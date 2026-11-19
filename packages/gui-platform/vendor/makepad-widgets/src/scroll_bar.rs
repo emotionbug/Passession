@@ -1,4 +1,5 @@
 use crate::makepad_draw::*;
+use crate::motion::{ScrollbarStyle, StyleFamily};
 
 thread_local! {
     static DESKTOP_THUMB_COLOR: std::cell::Cell<Option<Vec4>> = const { std::cell::Cell::new(None) };
@@ -205,7 +206,7 @@ pub struct ScrollBar {
     
     #[live] use_vertical_finger_scroll: bool,
     #[live] smoothing: Option<f64>,
-    /// Desktop auto-hide; touch platforms retain the upstream scrollbar behavior.
+    /// Hide the thumb after scrolling, unless hovered or dragged.
     #[live(true)] fade_when_idle: bool,
     #[rust] fade_timer: Timer,
     #[rust] fade_frame: NextFrame,
@@ -246,10 +247,6 @@ pub enum ScrollBarAction {
 }
 
 impl ScrollBar {
-    fn fades(&self) -> bool {
-        self.fade_when_idle && !cfg!(any(target_os = "android", target_os = "ios"))
-    }
-
     fn set_opacity(&mut self, cx: &mut Cx, opacity: f32) {
         if self.opacity != opacity {
             self.opacity = opacity;
@@ -258,45 +255,49 @@ impl ScrollBar {
     }
 
     fn stop_fade(&mut self, cx: &mut Cx) {
-        if self.fade_timer.0 != 0 {
-            cx.stop_timer(self.fade_timer);
-        }
-        self.fade_timer = Timer::default();
+        cx.stop_timer(std::mem::take(&mut self.fade_timer));
         self.fade_frame = NextFrame::default();
         self.fade_started = None;
     }
 
     pub(crate) fn show_thumb(&mut self, cx: &mut Cx) {
-        if !self.fades() || !self.visible {
+        if !self.fade_when_idle || !self.visible {
             return;
         }
         self.stop_fade(cx);
         self.set_opacity(cx, 1.0);
         if !self.hovered && self.drag_point.is_none() {
             // One wake at the end of the hold, then frames only during the fade.
-            self.fade_timer = cx.start_timeout(0.6);
+            let style = ScrollbarStyle::resolve(StyleFamily::mobile_or_desktop());
+            self.fade_timer = cx.start_timeout(style.hold.as_secs_f64());
         }
     }
 
     fn handle_fade(&mut self, cx: &mut Cx, event: &Event) {
-        if !self.fades() || !self.visible {
+        let timer_fired = self.fade_timer.is_event(event).is_some();
+        let frame_due =
+            matches!(event, Event::NextFrame(frame) if frame.set.contains(&self.fade_frame));
+        if !timer_fired && !frame_due {
             return;
         }
-        if self.fade_timer.is_event(event).is_some() {
+        if timer_fired {
             self.fade_timer = Timer::default();
+        }
+        if !self.fade_when_idle || !self.visible || !self.draw_bg.area().is_attached(cx) {
+            self.stop_fade(cx);
+        } else if timer_fired {
             self.fade_started = Some(std::time::Instant::now());
             self.fade_frame = cx.new_next_frame();
-        }
-        if self.fade_frame.is_event(event).is_some() {
-            if let Some(started) = self.fade_started {
-                let opacity = fade_opacity(started.elapsed().as_secs_f64());
-                self.set_opacity(cx, opacity);
-                if opacity > 0.0 {
-                    self.fade_frame = cx.new_next_frame();
-                } else {
-                    self.fade_frame = NextFrame::default();
-                    self.fade_started = None;
-                }
+        } else if let Some(started) = self.fade_started {
+            let style = ScrollbarStyle::resolve(StyleFamily::mobile_or_desktop());
+            let sample = style
+                .fade
+                .sample(1.0, 0.0, 0.0, started.elapsed().as_secs_f64());
+            self.set_opacity(cx, sample.value as f32);
+            if sample.settled {
+                self.stop_fade(cx);
+            } else {
+                self.fade_frame = cx.new_next_frame();
             }
         }
     }
@@ -599,8 +600,12 @@ impl ScrollBar {
     pub fn draw_scroll_bar(&mut self, cx: &mut Cx2d, axis: ScrollAxis, view_rect: Rect, view_total: DVec2) -> f64 {
         
         self.axis = axis;
-        self.draw_bg.opacity = if self.fades() { self.opacity } else { 1.0 };
-        if !cfg!(any(target_os = "android", target_os = "ios")) {
+        self.draw_bg.opacity = if self.fade_when_idle {
+            self.opacity
+        } else {
+            1.0
+        };
+        if StyleFamily::mobile_or_desktop() == StyleFamily::Desktop {
             let theme_color = DESKTOP_THUMB_COLOR.with(|current| current.get());
             if self.theme_color != theme_color {
                 self.theme_color = theme_color;
@@ -671,10 +676,12 @@ impl ScrollBar {
                 }
             }
         }
-        if !self.visible && self.fades() {
+        if !self.visible || !self.fade_when_idle {
             self.stop_fade(cx);
-            self.hovered = false;
-            self.opacity = 0.0;
+            if !self.visible {
+                self.hovered = false;
+                self.opacity = 0.0;
+            }
         }
         
         
@@ -691,19 +698,19 @@ impl ScrollBar {
     }
 }
 
-fn fade_opacity(elapsed: f64) -> f32 {
-    (1.0 - elapsed / 0.3).clamp(0.0, 1.0) as f32
-}
-
 #[cfg(test)]
 mod paseo_scrollbar_tests {
-    use super::fade_opacity;
+    use super::{ScrollbarStyle, StyleFamily};
 
     #[test]
     fn fade_reaches_zero_and_stays_there() {
-        assert_eq!(fade_opacity(0.0), 1.0);
-        assert!((fade_opacity(0.15) - 0.5).abs() < f32::EPSILON);
-        assert_eq!(fade_opacity(0.3), 0.0);
-        assert_eq!(fade_opacity(2.0), 0.0);
+        let fade = ScrollbarStyle::resolve(StyleFamily::Desktop).fade;
+        assert_eq!(fade.sample(1.0, 0.0, 0.0, 0.0).value, 1.0);
+        assert_eq!(fade.sample(1.0, 0.0, 0.0, 0.15).value, 0.5);
+        for elapsed in [0.3, 2.0] {
+            let sample = fade.sample(1.0, 0.0, 0.0, elapsed);
+            assert_eq!(sample.value, 0.0);
+            assert!(sample.settled);
+        }
     }
 }

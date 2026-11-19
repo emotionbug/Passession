@@ -3,73 +3,14 @@
 
 mod patterns;
 
-pub use patterns::{Axis, Frame, Intent, Pattern, Style, StyleFamily, Visual};
+pub use makepad_widgets::motion::{Spec, StyleFamily, tokens};
+pub use patterns::{Axis, Frame, Intent, Pattern, Style, Visual};
 
 use std::cell::Cell;
 use std::time::Duration;
 
+use makepad_widgets::motion::{Motion, ease};
 use makepad_widgets::{Cx, Event, NextFrame};
-
-pub mod tokens {
-    use super::{Duration, Spec};
-
-    pub const SHORT_1: Duration = Duration::from_millis(50);
-    pub const SHORT_2: Duration = Duration::from_millis(100);
-    pub const SHORT_3: Duration = Duration::from_millis(150);
-    pub const SHORT_4: Duration = Duration::from_millis(200);
-    pub const MEDIUM_1: Duration = Duration::from_millis(250);
-    pub const MEDIUM_2: Duration = Duration::from_millis(300);
-    pub const MEDIUM_3: Duration = Duration::from_millis(350);
-    pub const MEDIUM_4: Duration = Duration::from_millis(400);
-    pub const LONG_1: Duration = Duration::from_millis(450);
-    pub const LONG_2: Duration = Duration::from_millis(500);
-    pub const HOVER_DWELL: Duration = SHORT_3;
-    pub const COPY_FEEDBACK: Duration = Duration::from_millis(1500);
-    pub const TIMESTAMP_PEEK: Duration = Duration::from_secs(3);
-
-    pub const EMPHASIZED: [f64; 4] = [0.2, 0.0, 0.0, 1.0];
-    pub const EMPHASIZED_DECELERATE: [f64; 4] = [0.05, 0.7, 0.1, 1.0];
-    pub const EMPHASIZED_ACCELERATE: [f64; 4] = [0.3, 0.0, 0.8, 0.15];
-    pub const STANDARD: [f64; 4] = [0.2, 0.0, 0.0, 1.0];
-    pub const STANDARD_DECELERATE: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
-    pub const STANDARD_ACCELERATE: [f64; 4] = [0.3, 0.0, 1.0, 1.0];
-
-    // AndroidX Compose Material3 StandardMotionTokens.
-    pub const FAST_SPATIAL: Spec = Spec::Spring {
-        damping: 0.9,
-        stiffness: 1400.0,
-    };
-    pub const SPATIAL: Spec = Spec::Spring {
-        damping: 0.9,
-        stiffness: 700.0,
-    };
-    pub const SLOW_SPATIAL: Spec = Spec::Spring {
-        damping: 0.9,
-        stiffness: 300.0,
-    };
-    pub const FAST_EFFECTS: Spec = Spec::Spring {
-        damping: 1.0,
-        stiffness: 3800.0,
-    };
-    pub const EFFECTS: Spec = Spec::Spring {
-        damping: 1.0,
-        stiffness: 1600.0,
-    };
-    pub const SLOW_EFFECTS: Spec = Spec::Spring {
-        damping: 1.0,
-        stiffness: 800.0,
-    };
-}
-
-#[derive(Clone, Copy)]
-pub enum Spec {
-    Tween(Duration, [f64; 4]),
-    Spring { damping: f64, stiffness: f64 },
-}
-
-impl Spec {
-    pub const IMMEDIATE: Self = Self::Tween(Duration::ZERO, tokens::STANDARD);
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Loop {
@@ -94,7 +35,7 @@ pub struct LoopStyle {
 impl Loop {
     /// Loop styles are data only. Schedule visible indicators with `common::clock`.
     pub const fn resolve(self) -> LoopStyle {
-        self.resolve_for(StyleFamily::current())
+        self.resolve_for(StyleFamily::mobile_or_desktop())
     }
 
     pub const fn resolve_for(self, family: StyleFamily) -> LoopStyle {
@@ -114,7 +55,10 @@ impl Loop {
             (Shimmer, StyleFamily::Cupertino) => (33, 1500),
             (Shimmer, _) => (33, 1600),
             (CaretBlink, StyleFamily::Cupertino) => (530, 1060),
-            (CaretBlink, _) => (500, 1000),
+            (CaretBlink, _) => {
+                let half_period_ms = tokens::LONG_2.as_millis() as u64;
+                (half_period_ms, 2 * half_period_ms)
+            }
             (SkeletonPulse, _) => (33, 2000),
             (IndeterminateRing, StyleFamily::Material) => (33, 1333),
             (IndeterminateRing, _) => (33, 900),
@@ -173,7 +117,7 @@ pub struct FlingStyle {
 
 impl Fling {
     pub const fn resolve() -> FlingStyle {
-        Self::resolve_for(StyleFamily::current())
+        Self::resolve_for(StyleFamily::mobile_or_desktop())
     }
 
     pub const fn resolve_for(family: StyleFamily) -> FlingStyle {
@@ -217,14 +161,6 @@ pub(crate) fn frame_time(event: &Event, token: NextFrame) -> Option<f64> {
         Event::NextFrame(frame) if frame.set.contains(&token) => Some(frame.time),
         _ => None,
     }
-}
-
-struct Motion {
-    from: f64,
-    to: f64,
-    velocity: f64,
-    spec: Spec,
-    start: Option<f64>,
 }
 
 /// A scalar transition (typically position, scale, or opacity progress from 0 to 1).
@@ -302,25 +238,17 @@ impl Transition {
     }
 
     fn set_target(&mut self, target: f64, spec: Spec) -> bool {
-        if matches!(spec, Spec::Tween(duration, _) if duration.is_zero())
-            || (self.value == target && self.velocity == 0.0)
-        {
+        if spec.is_immediate() || (self.value == target && self.velocity == 0.0) {
             return self.snap(target);
         }
         if self
             .motion
             .as_ref()
-            .is_some_and(|motion| motion.to == target)
+            .is_some_and(|motion| motion.target() == target)
         {
             return false;
         }
-        self.motion = Some(Motion {
-            from: self.value,
-            to: target,
-            velocity: self.velocity,
-            spec,
-            start: None,
-        });
+        self.motion = Some(Motion::new(self.value, target, self.velocity, spec));
         true
     }
 
@@ -328,89 +256,15 @@ impl Transition {
         let Some(motion) = &mut self.motion else {
             return false;
         };
-        let start = *motion.start.get_or_insert(now);
-        let elapsed = (now - start).max(0.0);
-        let (value, velocity, settled) = match motion.spec {
-            Spec::Tween(duration, curve) => {
-                let t = elapsed / duration.as_secs_f64();
-                (
-                    motion.from + (motion.to - motion.from) * ease(t, curve),
-                    0.0,
-                    t >= 1.0,
-                )
-            }
-            Spec::Spring { damping, stiffness } => {
-                let (delta, velocity) = spring(
-                    motion.from - motion.to,
-                    motion.velocity,
-                    elapsed,
-                    damping,
-                    stiffness,
-                );
-                (
-                    motion.to + delta,
-                    velocity,
-                    delta.abs() < 0.001 && velocity.abs() < 0.01,
-                )
-            }
-        };
-        if settled {
-            let to = motion.to;
-            return self.snap(to);
+        let sample = motion.sample(now);
+        if sample.settled {
+            return self.snap(sample.value);
         }
-        self.velocity = velocity;
-        let changed = self.value != value;
-        self.value = value;
+        self.velocity = sample.velocity;
+        let changed = self.value != sample.value;
+        self.value = sample.value;
         changed
     }
-}
-
-/// Analytic unit-mass damped spring. Sample at the frame time rather than integrating steps.
-fn spring(x: f64, velocity: f64, t: f64, damping: f64, stiffness: f64) -> (f64, f64) {
-    let w = stiffness.sqrt();
-    let decay = damping * w;
-    let envelope = (-decay * t).exp();
-    let b = velocity + decay * x;
-    let (position, slope) = if damping < 1.0 {
-        let frequency = w * (1.0 - damping * damping).sqrt();
-        let (sin, cos) = (frequency * t).sin_cos();
-        let position = x * cos + b / frequency * sin;
-        (position, -x * frequency * sin + b * cos)
-    } else if damping == 1.0 {
-        (x + b * t, b)
-    } else {
-        let frequency = w * (damping * damping - 1.0).sqrt();
-        let first = -decay + frequency;
-        let second = -decay - frequency;
-        let a = (velocity - second * x) / (first - second);
-        let left = a * (first * t).exp();
-        let right = (x - a) * (second * t).exp();
-        return (left + right, first * left + second * right);
-    };
-    (envelope * position, envelope * (slope - decay * position))
-}
-
-fn ease(t: f64, [x1, y1, x2, y2]: [f64; 4]) -> f64 {
-    if t <= 0.0 || t >= 1.0 {
-        return t.clamp(0.0, 1.0);
-    }
-    if x1 == y1 && x2 == y2 {
-        return t;
-    }
-    let bezier = |a: f64, b: f64, s: f64| {
-        let inv = 1.0 - s;
-        3.0 * a * s * inv * inv + 3.0 * b * s * s * inv + s * s * s
-    };
-    let (mut lo, mut hi) = (0.0, 1.0);
-    for _ in 0..24 {
-        let mid = (lo + hi) * 0.5;
-        if bezier(x1, x2, mid) < t {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    bezier(y1, y2, (lo + hi) * 0.5)
 }
 
 #[cfg(test)]

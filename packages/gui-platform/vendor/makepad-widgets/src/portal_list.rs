@@ -3,6 +3,7 @@ use crate::{
     makepad_derive_widget::*,
     makepad_draw::*,
     makepad_draw::event::TouchState,
+    motion::{Motion, Spec, StyleFamily, pulldown_style},
     scroll_bar::{ScrollBar, ScrollAxis, ScrollBarAction},
     scroll_bars::TouchScroll,
 };
@@ -28,8 +29,21 @@ const SMOOTH_SCROLL_MAXIMUM_WINDOW: usize = 20;
 
 enum ScrollState {
     Stopped,
-    Pulldown {next_frame: NextFrame, time: Option<f64>},
+    Pulldown {next_frame: NextFrame, motion: Motion},
     ScrollingTo {target_id: usize, delta: f64, next_frame: NextFrame},
+}
+
+fn top_scroll_offset(previous: f64, delta: f64, limit: f64, family: StyleFamily) -> f64 {
+    let next = previous + delta;
+    if next <= 0.0 || limit == 0.0 || family != StyleFamily::Cupertino || delta <= 0.0 {
+        return next.min(limit);
+    }
+    // Resist additional pull, not the part of the movement still in bounds
+    // or movement back towards the list.
+    let pull = previous.max(0.0).min(limit);
+    let remaining = 1.0 - pull / limit;
+    let friction = 0.52 * remaining * remaining;
+    (pull + (next - previous.max(0.0)) * friction).min(limit)
 }
 
 #[derive(Clone)]
@@ -65,7 +79,9 @@ pub struct PortalList {
     #[rust(usize::MAX)] range_end: usize,
     #[rust(0usize)] view_window: usize,
     #[rust(0usize)] visible_items: usize,
-    #[live(80.0)] max_pull_down: f64,
+    /// Top-edge pull distance. Cupertino defaults to 80px; desktop lists opt in
+    /// with a positive distance. Set to zero to turn off the Cupertino rebound.
+    #[live] max_pull_down: Option<f64>,
     #[live(true)] align_top_when_empty: bool,
     #[live(false)] grab_key_focus: bool,
     #[live(true)] drag_scrolling: bool,
@@ -336,22 +352,35 @@ impl PortalList {
                 
                 // in this case we manage the 'pull down' situation when we are at the top;
                 // rows that fit have no pull-down and rest at their edge below
-                if !self.fits_viewport && list.first().unwrap().index == self.range_start && first_pos > 0.0 {
-                    let min = if matches!(self.scroll_state, ScrollState::Stopped)
-                        && !self.touch_scroll.is_dragging() && !self.touch_scroll.is_flinging() {
+                if !self.fits_viewport
+                    && list.first().unwrap().index == self.range_start
+                    && first_pos > 0.0
+                {
+                    let family = StyleFamily::current();
+                    let active_pull = matches!(self.scroll_state, ScrollState::Pulldown { .. })
+                        || self.touch_scroll.is_dragging()
+                        || self.touch_scroll.is_flinging();
+                    let limit = if active_pull {
+                        pulldown_style(family, self.max_pull_down).map_or(0.0, |(limit, _)| limit)
+                    } else {
                         0.0
-                    }
-                    else {
-                        self.max_pull_down
                     };
-                    
-                    let mut pos = first_pos.min(min); // lets do a maximum for first scroll
+                    let offset = if first_index != 0 {
+                        // The gesture crossed the first row before layout updated its anchor.
+                        top_scroll_offset(0.0, first_pos, limit, family)
+                    } else {
+                        first_pos.min(limit)
+                    };
+                    if limit == 0.0 {
+                        self.touch_scroll.stop_at_edge();
+                    }
+                    let mut pos = offset;
                     for item in list {
                         item.position(cx, vi, pos, self.measuring);
                         pos += item.size.index(vi);
                         visible_items += 1;
                     }
-                    self.first_scroll = first_pos.min(min);
+                    self.first_scroll = offset;
                     self.first_id = self.range_start;
                 }
                 else {
@@ -847,10 +876,10 @@ impl PortalList {
     /// * `delta`: The amount to scroll by.
     ///    A positive value scrolls upwards towards the top of the list,
     ///    while a negative value scrolls downwards towards the bottom of the list.
-    /// * `clip_top`: If `true`, the scroll offset will be clamped to `0.0`, meaning that
-    ///    no pulldown "bounce" animation will occur when you scroll upwards beyond the top of the list.
-    /// * `transition_to_pulldown`: Whether to transition an existing scroll action to the `Pulldown`
-    ///    scroll state when an upwards scroll action reaches the top of the list.
+    /// * `clip_top`: Always clamp to the top when `true`, even on lists that allow
+    ///    pulldown. When `false`, the platform and the list's `max_pull_down` decide.
+    /// * `transition_to_pulldown`: Rebound immediately if a wheel or fling moves
+    ///    beyond the top on a list that allows it. A drag can pull until release.
     fn delta_top_scroll(
         &mut self,
         cx: &mut Cx,
@@ -860,21 +889,26 @@ impl PortalList {
     ) {
         let previous_scroll = self.first_scroll;
         if self.range_start == self.range_end {
-            self.first_scroll = 0.0
-        }
-        else {
-            self.first_scroll += delta;
-        }
-
-        if self.first_id == self.range_start {
-            self.first_scroll = self.first_scroll.min(self.max_pull_down);
-            if transition_to_pulldown && self.first_scroll > 0.0 {
-                self.touch_scroll.reset();
-                self.scroll_state = ScrollState::Pulldown {next_frame: cx.new_next_frame(), time: None};
-            }
-        }
-        if clip_top && self.first_id == self.range_start && self.first_scroll > 0.0 {
             self.first_scroll = 0.0;
+        } else if self.first_id == self.range_start {
+            let family = StyleFamily::current();
+            let style = if clip_top {
+                None
+            } else {
+                pulldown_style(family, self.max_pull_down)
+            };
+            let limit = style.map_or(0.0, |(limit, _)| limit);
+            self.first_scroll = top_scroll_offset(previous_scroll, delta, limit, family);
+            if delta > 0.0 && self.first_scroll == 0.0 {
+                self.touch_scroll.stop_at_edge();
+            }
+            if transition_to_pulldown {
+                if let Some((_, spec)) = style {
+                    self.start_pulldown(cx, spec);
+                }
+            }
+        } else {
+            self.first_scroll += delta;
         }
         // Stop a downwards scroll when we reach the end of the list.
         if self.at_end && delta < 0.0 {
@@ -883,11 +917,50 @@ impl PortalList {
             self.touch_scroll.stop_at_edge();
         }
         // Pixel scrolling within one item does not change the index-based bar
-        // position, but must still reveal the desktop thumb.
+        // position, but must still reveal the thumb.
         if self.first_scroll != previous_scroll {
             self.scroll_bar.show_thumb(cx);
         }
         self.update_scroll_bar(cx);
+    }
+
+    fn start_pulldown(&mut self, cx: &mut Cx, spec: Spec) -> bool {
+        if self.fits_viewport || self.first_id != self.range_start || self.first_scroll <= 0.0 {
+            return false;
+        }
+        self.touch_scroll.reset();
+        self.scroll_state = ScrollState::Pulldown {
+            next_frame: cx.new_next_frame(),
+            motion: Motion::new(self.first_scroll, 0.0, 0.0, spec),
+        };
+        true
+    }
+
+    fn advance_pulldown(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        let ScrollState::Pulldown { next_frame, motion } = &mut self.scroll_state else {
+            return false;
+        };
+        let Event::NextFrame(frame) = event else {
+            return false;
+        };
+        if !frame.set.contains(next_frame) {
+            return false;
+        }
+        if self.fits_viewport || self.first_id != self.range_start || self.first_scroll <= 0.0 {
+            self.was_scrolling = false;
+            self.scroll_state = ScrollState::Stopped;
+            return false;
+        }
+        let sample = motion.sample(frame.time);
+        let changed = self.first_scroll != sample.value;
+        self.first_scroll = sample.value;
+        if sample.settled {
+            self.was_scrolling = false;
+            self.scroll_state = ScrollState::Stopped;
+        } else {
+            *next_frame = cx.new_next_frame();
+        }
+        changed
     }
 
     /// Returns `true` if currently at the end of the list, meaning that the lasat item
@@ -1028,6 +1101,16 @@ impl Widget for PortalList {
             self.touch_scroll.reset();
             self.scroll_state = ScrollState::Stopped;
         }
+        if matches!(
+            event,
+            Event::Pause | Event::Background | Event::AppLostFocus
+        ) && matches!(self.scroll_state, ScrollState::Pulldown { .. })
+        {
+            self.scroll_state = ScrollState::Stopped;
+            self.was_scrolling = false;
+            self.first_scroll = 0.0;
+            self.area.redraw(cx);
+        }
         let child_scrolled = if let Event::TouchUpdate(update) = event {
             update.touches.iter().any(|touch| matches!(touch.state, TouchState::Move) && !touch.handled.get().is_empty())
         } else { false };
@@ -1069,29 +1152,11 @@ impl Widget for PortalList {
                     }
                 }
             }
-            ScrollState::Pulldown {next_frame, time} => {
-                if let Some(frame) = next_frame.is_event(event) {
-                    // we have to bounce back
-                    if !self.fits_viewport && self.first_id == self.range_start && self.first_scroll > 0.0 {
-                        let dt = time.map_or(0.0, |previous| (frame.time - previous).max(0.0));
-                        *time = Some(frame.time);
-                        self.first_scroll *= 0.85_f64.powf(dt * 60.0);
-                        if self.first_scroll < 1.0 {
-                            self.first_scroll = 0.0;
-                            // the pulldown animation is finished
-                            self.was_scrolling = false;
-                            self.scroll_state = ScrollState::Stopped;
-                        }
-                        else {
-                            *next_frame = cx.new_next_frame();
-                            cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
-                        }
-                        self.area.redraw(cx);
-                    }
-                    else {
-                        self.was_scrolling = false;
-                        self.scroll_state = ScrollState::Stopped;
-                    }
+            ScrollState::Pulldown { .. } => {
+                if self.advance_pulldown(cx, event) {
+                    self.scroll_bar.show_thumb(cx);
+                    cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
+                    self.area.redraw(cx);
                 }
             }
             _=>()
@@ -1214,10 +1279,9 @@ impl Widget for PortalList {
                 }
                 Hit::FingerUp(fe) if fe.is_primary_hit() => {
                     self.touch_scroll.release(fe.time);
-                    if !self.fits_viewport && self.first_id == self.range_start && self.first_scroll > 0.0 {
-                        self.touch_scroll.reset();
-                        self.scroll_state = ScrollState::Pulldown { next_frame: cx.new_next_frame(), time: None };
-                    } else if !self.touch_scroll.is_flinging() {
+                    let rebound = pulldown_style(StyleFamily::current(), self.max_pull_down)
+                        .is_some_and(|(_, spec)| self.start_pulldown(cx, spec));
+                    if !rebound && !self.touch_scroll.is_flinging() {
                         self.was_scrolling = false;
                     }
                 }
@@ -1586,5 +1650,58 @@ mod scroll_anchor_tests {
         assert_eq!(end_overflow(&rows[..2], 5, 640.0, |r| *r), Some(0.0));
         // The last row is below the laid-out rows: the distance is unknown, not zero.
         assert_eq!(end_overflow(&rows, 9, 600.0, |r| *r), None);
+    }
+}
+
+#[cfg(test)]
+mod pulldown_tests {
+    use super::*;
+
+    #[test]
+    fn cupertino_pull_resists_outward_motion_but_allows_reversal() {
+        let (limit, _) = pulldown_style(StyleFamily::Cupertino, None).unwrap();
+        let pull = top_scroll_offset(-10.0, 30.0, limit, StyleFamily::Cupertino);
+        assert!(pull > 0.0 && pull < 20.0);
+        let further = top_scroll_offset(pull, 20.0, limit, StyleFamily::Cupertino);
+        assert!(further > pull && further - pull < pull);
+        let reversed = top_scroll_offset(pull, -pull - 6.0, limit, StyleFamily::Cupertino);
+        assert!((reversed + 6.0).abs() < 1e-12);
+        assert_eq!(
+            top_scroll_offset(-10.0, 30.0, 0.0, StyleFamily::Material),
+            0.0
+        );
+    }
+
+    #[test]
+    fn pulldown_reaches_rest_and_stops_requesting_frames() {
+        for family in [StyleFamily::Cupertino, StyleFamily::Desktop] {
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            let mut list = PortalList::new(&mut cx);
+            let (limit, spec) = pulldown_style(family, Some(48.0)).unwrap();
+            list.first_scroll = limit;
+            list.was_scrolling = true;
+            assert!(list.start_pulldown(&mut cx, spec));
+
+            for time in [10.0, 10.12, 12.0] {
+                let ScrollState::Pulldown { next_frame, .. } = &list.scroll_state else {
+                    panic!("pulldown stopped before reaching rest");
+                };
+                let wake = Event::NextFrame(NextFrameEvent {
+                    frame: 0,
+                    time,
+                    set: [*next_frame].into(),
+                });
+                assert_eq!(list.advance_pulldown(&mut cx, &wake), time > 10.0);
+                if time == 10.12 {
+                    assert!(list.first_scroll > 0.0 && list.first_scroll < limit);
+                }
+                if time == 12.0 {
+                    assert!(!list.advance_pulldown(&mut cx, &wake));
+                }
+            }
+            assert_eq!(list.first_scroll, 0.0);
+            assert!(!list.was_scrolling);
+            assert!(matches!(list.scroll_state, ScrollState::Stopped));
+        }
     }
 }

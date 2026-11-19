@@ -13,6 +13,7 @@ use {
             },
             *
         },
+        motion::{CaretStyle, Motion, StyleFamily},
         scroll_bars::TouchScroll,
         widget::*,
     },
@@ -310,21 +311,6 @@ live_design! {
                         draw_text: {empty: 1.0}
                         draw_selection: {empty: 1.0}
                         draw_cursor: {empty: 1.0}
-                    }
-                }
-            }
-            blink = {
-                default: off
-                off = {
-                    from: {all: Forward {duration:0.05}}
-                    apply: {
-                        draw_cursor: {blink:0.0}
-                    }
-                }
-                on = {
-                    from: {all: Forward {duration: 0.05}}
-                    apply: {
-                        draw_cursor: {blink:1.0}
                     }
                 }
             }
@@ -827,7 +813,9 @@ pub struct TextInput {
     #[live(false)] return_key_submits: bool,
     #[live] empty_text: String,
     #[rust] text: String,
-    #[live(0.5)] blink_speed: f64,
+    /// Seconds between opacity toggles; omit to use the platform default.
+    /// Zero holds the caret visible.
+    #[live] blink_speed: Option<f64>,
 
     #[rust] password_text: String,
     #[rust] laidout_text: Option<Rc<LaidoutText>>,
@@ -836,6 +824,11 @@ pub struct TextInput {
     #[rust] selection: Selection,
     #[rust] history: History,
     #[rust] blink_timer: Timer,
+    #[rust] blink_frame: NextFrame,
+    #[rust] blink_motion: Option<Motion>,
+    #[rust] blink_hidden: bool,
+    #[rust] blink_amount: f32,
+    #[rust] blink_suspended: bool,
     #[rust] ime_composing: bool,
     #[rust] touch_selection: Option<DVec2>,
     #[rust] touch_focus: Option<DigitId>,
@@ -959,9 +952,12 @@ impl TextInput {
     }
 
     pub fn set_is_read_only(&mut self, cx: &mut Cx, is_read_only: bool) {
-        self.is_read_only = is_read_only;
-        self.laidout_text = None;
-        self.draw_bg.redraw(cx);
+        if self.is_read_only != is_read_only {
+            self.is_read_only = is_read_only;
+            self.stop_blink(cx);
+            self.laidout_text = None;
+            self.draw_bg.redraw(cx);
+        }
     }
 
     pub fn toggle_is_read_only(&mut self, cx: &mut Cx) {
@@ -995,7 +991,6 @@ impl TextInput {
             if self.is_read_only {
                 return;
             }
-            self.reset_blink_timer(cx);
             self.create_or_extend_edit_group(EditKind::Other);
             self.apply_edit(cx, Edit {
                 start: self.selection.start().index,
@@ -1033,6 +1028,9 @@ impl TextInput {
         self.touch_focus = None;
         self.selection = selection;
         self.reveal_cursor = true;
+        // A programmatic selection can be made during draw. Restart from the
+        // next visible event so its timer is routed to the widget.
+        self.stop_blink(cx);
         let area = self.draw_bg.area();
         if cx.has_key_focus(area) {
             if self.touch_handles || self.selection.anchor.index != self.selection.cursor.index {
@@ -1085,21 +1083,114 @@ impl TextInput {
         self.draw_bg.redraw(cx);
     }
 
-    // Flutter animates cursor opacity on Apple platforms only. Cutting the same
-    // animator track elsewhere also updates its state, without requesting fade frames.
-    fn set_blink_state(&mut self, cx: &mut Cx, state: &[LiveId; 2]) {
-        if cfg!(any(target_os = "macos", target_os = "ios")) {
-            self.animator_play(cx, state);
-        } else {
-            self.animator_cut(cx, state);
-            self.draw_bg.redraw(cx);
+    fn blink_half_period(&self) -> Option<f64> {
+        let period = self.blink_speed.unwrap_or_else(|| {
+            CaretStyle::resolve(StyleFamily::current())
+                .half_period
+                .as_secs_f64()
+        });
+        (period.is_finite() && period > 0.0).then_some(period)
+    }
+
+    fn active_blink_period(&self, cx: &Cx) -> Option<f64> {
+        let area = self.draw_bg.area();
+        if self.is_read_only
+            || self.blink_suspended
+            || !cx.has_key_focus(area)
+            || !area.is_attached(cx)
+        {
+            return None;
+        }
+        let size = self.draw_cursor.area().clipped_rect(cx).size;
+        if size.x <= 0.0 || size.y <= 0.0 {
+            return None;
+        }
+        self.blink_half_period()
+    }
+
+    fn set_blink_amount(&mut self, cx: &mut Cx, amount: f32) {
+        if self.blink_amount != amount {
+            self.blink_amount = amount;
+            self.draw_cursor.apply_over(cx, live! { blink: (amount) });
         }
     }
+
+    fn stop_blink(&mut self, cx: &mut Cx) {
+        cx.stop_timer(std::mem::take(&mut self.blink_timer));
+        self.blink_frame = NextFrame::default();
+        self.blink_motion = None;
+        self.blink_hidden = false;
+        self.set_blink_amount(cx, 0.0);
+    }
+
     pub fn reset_blink_timer(&mut self, cx: &mut Cx) {
-        self.animator_cut(cx, id!(blink.off));
-        if !self.is_read_only {
-            cx.stop_timer(self.blink_timer);
-            self.blink_timer = cx.start_timeout(self.blink_speed)
+        self.stop_blink(cx);
+        if let Some(period) = self.active_blink_period(cx) {
+            self.blink_timer = cx.start_timeout(period);
+        }
+    }
+
+    fn handle_blink(&mut self, cx: &mut Cx, event: &Event) {
+        match event {
+            Event::Background | Event::Pause | Event::AppLostFocus => {
+                self.blink_suspended = true;
+                self.stop_blink(cx);
+                return;
+            }
+            Event::Resume | Event::AppGotFocus => {
+                self.blink_suspended = false;
+                self.reset_blink_timer(cx);
+                return;
+            }
+            _ => {}
+        }
+        let tick = self.blink_timer.is_event(event).is_some();
+        let frame_time = match event {
+            Event::NextFrame(frame) if frame.set.contains(&self.blink_frame) => Some(frame.time),
+            _ => None,
+        };
+        if !tick && frame_time.is_none() {
+            return;
+        }
+        if tick {
+            self.blink_timer = Timer::default();
+        }
+        let Some(period) = self.active_blink_period(cx) else {
+            self.stop_blink(cx);
+            return;
+        };
+        if tick {
+            self.blink_timer = cx.start_timeout(period);
+            self.blink_hidden = !self.blink_hidden;
+            let target = if self.blink_hidden { 1.0 } else { 0.0 };
+            let fade = CaretStyle::resolve(StyleFamily::current()).fade;
+            if fade.is_immediate() {
+                self.set_blink_amount(cx, target);
+            } else {
+                self.blink_motion = Some(Motion::new(
+                    self.blink_amount as f64,
+                    target as f64,
+                    0.0,
+                    fade,
+                ));
+                if self.blink_frame.0 == 0 {
+                    self.blink_frame = cx.new_next_frame();
+                }
+            }
+        } else if let Some(time) = frame_time {
+            self.blink_frame = NextFrame::default();
+            if let Some(motion) = &mut self.blink_motion {
+                let sample = motion.sample(time);
+                self.set_blink_amount(cx, sample.value as f32);
+                if sample.settled {
+                    self.blink_motion = None;
+                } else {
+                    self.blink_frame = cx.new_next_frame();
+                }
+            } else {
+                // A returning view asks for one event so its timeout inherits the event owner.
+                self.blink_timer = cx.start_timeout(period);
+            }
         }
     }
 
@@ -1122,9 +1213,7 @@ impl TextInput {
         self.history.force_new_edit_group();
         cx.clear_text_input(self.draw_bg.area());
         self.animator_cut(cx, id!(focus.off));
-        self.animator_cut(cx, id!(blink.on));
-        cx.stop_timer(self.blink_timer);
-        self.blink_timer = Timer::empty();
+        self.stop_blink(cx);
         #[cfg(not(target_os = "android"))]
         if hide_ime {
             cx.hide_text_ime();
@@ -1446,7 +1535,6 @@ impl TextInput {
                     let Ok(cursor) = self.keyboard_target(cx, motion) else { return; };
                     cursor
                 };
-                self.reset_blink_timer(cx);
                 self.set_cursor(cx, cursor, shift);
             }
             TextInputKeyCommand::Delete(motion) if !self.is_read_only => {
@@ -1463,7 +1551,6 @@ impl TextInput {
                     TextInputMotion::Right => EditKind::Delete,
                     _ => EditKind::Other,
                 };
-                self.reset_blink_timer(cx);
                 self.create_or_extend_edit_group(kind);
                 self.apply_edit(cx, Edit { start, end, replace_with: String::new() });
                 self.draw_bg.redraw(cx);
@@ -1640,6 +1727,7 @@ impl TextInput {
         self.selection.anchor.index = self.selection.cursor.index;
         self.history.apply_edit(edit, &mut self.text);
         self.laidout_text = None;
+        self.reset_blink_timer(cx);
         self.check_text_is_empty(cx);
     }
 
@@ -1648,6 +1736,7 @@ impl TextInput {
             self.laidout_text = None;
             self.selection = new_selection;
             self.reveal_cursor = true;
+            self.reset_blink_timer(cx);
             self.check_text_is_empty(cx);
             true
         } else {
@@ -1660,6 +1749,7 @@ impl TextInput {
             self.laidout_text = None;
             self.selection = new_selection;
             self.reveal_cursor = true;
+            self.reset_blink_timer(cx);
             self.check_text_is_empty(cx);
             true
         } else {
@@ -1822,6 +1912,15 @@ impl Widget for TextInput {
             );
         }
         let area = self.draw_bg.area();
+        if cx.has_key_focus(area)
+            && !self.is_read_only
+            && !self.blink_suspended
+            && self.blink_timer.0 == 0
+            && self.blink_frame.0 == 0
+            && self.blink_half_period().is_some()
+        {
+            self.blink_frame = cx.new_next_frame();
+        }
         if cx.has_key_focus(area) {
             if self.touch_handles || self.selection.anchor.index != self.selection.cursor.index {
                 cx.claim_text_selection(area);
@@ -1863,6 +1962,7 @@ impl Widget for TextInput {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.handle_blink(cx, event);
         let area = self.draw_bg.area();
         let handle_action = self.selection_handles.as_mut().and_then(|handles| handles.handle_event(cx, event, area));
         if let Some(action) = handle_action {
@@ -1905,15 +2005,6 @@ impl Widget for TextInput {
         }
         if self.animator_handle_event(cx, event).must_redraw() {
             self.draw_bg.redraw(cx);
-        }
-
-        if self.blink_timer.is_event(event).is_some() {
-            if self.animator_in_state(cx, id!(blink.off)) {
-                self.set_blink_state(cx, id!(blink.on));
-            } else {
-                self.set_blink_state(cx, id!(blink.off));
-            }
-            self.blink_timer = cx.start_timeout(self.blink_speed)
         }
 
         let uid = self.widget_uid();
@@ -1963,7 +2054,6 @@ impl Widget for TextInput {
                 }
                 self.touch_handles = false;
                 if let Some(handles) = &mut self.selection_handles { handles.cancel(cx); }
-                self.reset_blink_timer(cx);
                 self.set_key_focus(cx);
                 self.place_pointer_cursor(cx, fe.abs, fe.tap_count, false);
                 if self.selection.anchor.index != self.selection.cursor.index {
@@ -1977,7 +2067,6 @@ impl Widget for TextInput {
                 self.touch_handles = true;
                 self.touch_selection = Some(fe.abs);
                 self.set_key_focus(cx);
-                self.reset_blink_timer(cx);
                 self.place_pointer_cursor(cx, fe.abs, 2, false);
                 cx.claim_text_selection(self.draw_bg.area());
                 self.open_text_actions(cx);
@@ -1985,7 +2074,6 @@ impl Widget for TextInput {
             Hit::FingerUp(fe) => {
                 if touch_focus {
                     self.touch_handles = true;
-                    self.reset_blink_timer(cx);
                     self.set_key_focus(cx);
                     self.place_pointer_cursor(cx, fe.abs, fe.tap_count, false);
                 }
@@ -2011,7 +2099,6 @@ impl Widget for TextInput {
                     if *previous == fe.abs { return; }
                     *previous = fe.abs;
                 }
-                self.reset_blink_timer(cx);
                 if !fe.device.is_touch() {
                     self.set_key_focus(cx);
                 }
@@ -2087,7 +2174,9 @@ impl Widget for TextInput {
                 self.ime_composing = edit.composing.is_some();
                 self.reveal_cursor = true;
                 if !self.ime_composing && (composition || !changed) { self.history.force_new_edit_group(); }
-                self.reset_blink_timer(cx);
+                if !changed {
+                    self.reset_blink_timer(cx);
+                }
                 self.draw_bg.redraw(cx);
                 if changed {
                     cx.widget_action(uid, &scope.path, TextInputAction::Changed(self.text.clone()));
@@ -2532,6 +2621,41 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while !text.is_char_boundary(index) { index -= 1; }
     index
+}
+
+#[cfg(test)]
+mod caret_blink_tests {
+    use super::*;
+
+    #[test]
+    fn caret_blink_drops_pending_wakes_when_unfocused() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut input = TextInput::new(&mut cx);
+        let style = CaretStyle::resolve(StyleFamily::Cupertino);
+        input.blink_timer = cx.start_timeout(style.half_period.as_secs_f64());
+        input.blink_frame = cx.new_next_frame();
+        input.blink_motion = Some(Motion::new(0.0, 1.0, 0.0, style.fade));
+        input.blink_amount = 0.5;
+        let tick = Event::Timer(TimerEvent {
+            timer_id: input.blink_timer.0,
+            time: None,
+        });
+        let frame = Event::NextFrame(NextFrameEvent {
+            frame: 0,
+            time: 0.5,
+            set: [input.blink_frame].into(),
+        });
+
+        // A retained editor can lose focus before the queued OS events are delivered.
+        input.handle_blink(&mut cx, &frame);
+        input.handle_blink(&mut cx, &tick);
+        assert_eq!(input.blink_amount, 0.0);
+        assert!(input.blink_motion.is_none());
+        assert_eq!(input.blink_frame, NextFrame::default());
+        assert_eq!(input.blink_timer.0, 0);
+        input.reset_blink_timer(&mut cx);
+        assert_eq!(input.blink_timer.0, 0);
+    }
 }
 
 #[cfg(test)]
