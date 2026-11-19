@@ -547,9 +547,11 @@ impl CodexSession {
         let weak = self.self_weak.clone();
         tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
-                let Some(session) = weak.upgrade() else { break };
+                let Some(session) = weak.upgrade() else {
+                    return;
+                };
                 if !session.client.is_current(&transport) {
-                    break;
+                    return;
                 }
                 if let Err(error) = session.handle_frame(message).await {
                     let turn = {
@@ -563,6 +565,13 @@ impl CodexSession {
                     let _ = transport.close().await;
                     break;
                 }
+            }
+            if let Some(session) = weak.upgrade()
+                && session.client.is_current(&transport)
+                && let Some(event) = transport.take_close_event()
+                && let Err(error) = session.handle_frame(event).await
+            {
+                tracing::warn!(%error, "Publishing Codex transport failure failed");
             }
         });
     }
@@ -591,9 +600,9 @@ impl CodexSession {
         if !interactive {
             bail!("A history-only Codex session cannot reconnect for interaction")
         }
-        self.handle_frame(json!({"method":"paseo/transportClosed","params":{
-            "message":format!("Codex app-server disconnected: {}",self.client.current().process.stderr_tail())
-        }})).await?;
+        if let Some(event) = self.client.current().take_close_event() {
+            self.handle_frame(event).await?;
+        }
         if self.client.cancel.is_cancelled() {
             bail!("Codex session is closed")
         }

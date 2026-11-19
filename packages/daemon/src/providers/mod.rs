@@ -6,6 +6,7 @@ pub mod codex;
 pub mod create_config;
 pub mod development;
 pub mod hoplite;
+mod jsonl;
 pub mod manifest;
 pub mod muse;
 pub mod opencode;

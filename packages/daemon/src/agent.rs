@@ -291,6 +291,7 @@ impl AgentManager {
                 .unwrap_or(3_600_000),
         );
         self.start_idle_unload().await;
+        self.app()?.files.start_upload_retention();
         Ok(())
     }
     // Catalogs are read per parent on demand; unrelated corruption cannot abort startup.
@@ -406,6 +407,22 @@ impl AgentManager {
             .get(id)
             .await?
             .map(|record| self.stored_snapshot(record)))
+    }
+
+    pub(crate) async fn upload_owner_exists(&self, id: &str) -> Result<bool> {
+        // A failed runtime close may leave a cell after its record is removed.
+        // Conversely, closed and archived records can still resume a native session.
+        if self.agents.read().await.contains_key(id) {
+            return Ok(true);
+        }
+        self.storage()?.contains(id).await
+    }
+
+    pub(crate) async fn has_upload_owners(&self) -> Result<bool> {
+        if !self.agents.read().await.is_empty() {
+            return Ok(true);
+        }
+        self.storage()?.has_records().await
     }
     /// Nonblocking observation only. Callers must not persist or authorize from
     /// a snapshot marked as last_persisted.

@@ -1,3 +1,4 @@
+use crate::providers::jsonl::LineReader;
 use anyhow::{Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use paseo_client::process::{CommandSpec, ManagedProcess, WriteError};
@@ -10,16 +11,14 @@ use std::{
     },
     time::Duration,
 };
-use tokio::time::Instant;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
     sync::{mpsc, oneshot, watch},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
 const MAX_REASSEMBLED: usize = 64 * 1024 * 1024;
 const MAX_FRAME: usize = 1024 * 1024;
-const MAX_RETAINED_LINE: usize = 1024 * 1024;
 /// After exit, stdout may stay open through a descendant. Frames already written
 /// still precede process_exit, but an inherited pipe cannot postpone it forever.
 const STDOUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -120,14 +119,6 @@ impl Decoder {
     }
 }
 
-fn clear_read_buffer(line: &mut Vec<u8>) {
-    line.clear();
-    // Retention only: legacy frames can grow this buffer without a size ceiling.
-    if line.capacity() > MAX_RETAINED_LINE {
-        *line = Vec::new();
-    }
-}
-
 #[derive(Debug)]
 pub struct CommandError(pub String);
 impl std::fmt::Display for CommandError {
@@ -178,7 +169,7 @@ pub struct Transport {
     sequence: AtomicU64,
     closed: AtomicBool,
     exited: AtomicBool,
-    ready: watch::Sender<Option<Value>>,
+    ready: watch::Sender<Option<std::result::Result<Value, String>>>,
     cancel: CancellationToken,
     timeout: Duration,
     host_tools: Mutex<Weak<super::host_tools::Router>>,
@@ -213,39 +204,40 @@ impl Transport {
         let exit_events = events.clone();
         let stop_reading = CancellationToken::new();
         let reader_stop = stop_reading.clone();
-        let (reader_done, mut drained) = oneshot::channel::<()>();
+        let (reader_done, mut drained) = oneshot::channel::<Option<String>>();
         tokio::spawn(async move {
-            let _done = reader_done;
-            let mut input = BufReader::new(stdout);
-            let mut line = Vec::new();
+            let mut input = LineReader::new(stdout);
             let mut decoder = Decoder::default();
             loop {
-                // Legacy v1 frames have no wire size ceiling. Only the negotiated
-                // v2 chunk envelope enforces the 64 MiB reassembled-frame maximum.
-                let read = async {
-                    let count = input.read_until(b'\n', &mut line).await?;
-                    Ok::<_, std::io::Error>(count > 0 && line.last() == Some(&b'\n'))
+                let result = tokio::select! {
+                    _ = reader_stop.cancelled() => break,
+                    result = input.next_line() => result,
                 };
-                let result = tokio::select! { _ = reader_stop.cancelled() => break, result = read => result };
                 match result {
                     Ok(false) => break,
                     Err(error) => {
-                        reader.fail(&error.to_string());
+                        let message = format!("Invalid JSONL provider stdout frame: {error}");
+                        reader.closed.store(true, Ordering::Release);
+                        reader.fail(&message);
+                        reader.ready.send_replace(Some(Err(message.clone())));
+                        let _ = reader_done.send(Some(message));
+                        drop(input);
                         let _ = reader.process.terminate(Duration::from_secs(2)).await;
-                        break;
+                        return;
                     }
                     Ok(true) => {}
                 }
+                let line = input.line();
                 let decoded = if line.iter().all(u8::is_ascii_whitespace) {
                     Ok(None)
                 } else {
-                    decoder.decode(&line)
+                    decoder.decode(line)
                 };
-                clear_read_buffer(&mut line);
+                input.clear_line();
                 match decoded {
                     Ok(Some(mut frame)) => {
                         if frame["type"] == "ready" {
-                            reader.ready.send_replace(Some(frame.clone()));
+                            reader.ready.send_replace(Some(Ok(frame.clone())));
                         }
                         let pending = if frame["type"] == "response" {
                             frame["id"]
@@ -286,6 +278,7 @@ impl Transport {
                     Err(error) => tracing::warn!(%error, "Ignoring invalid JSONL provider frame"),
                 }
             }
+            let _ = reader_done.send(None);
         });
         let waiter = transport.clone();
         tokio::spawn(async move {
@@ -303,13 +296,22 @@ impl Transport {
             );
             // Replies and events written before exit stay ahead of the terminal
             // frame; pending requests may still resolve from that drained output.
-            if tokio::time::timeout(STDOUT_DRAIN_GRACE, &mut drained)
-                .await
-                .is_err()
-            {
-                stop_reading.cancel();
-                let _ = drained.await;
-            }
+            let drained = match tokio::time::timeout(STDOUT_DRAIN_GRACE, &mut drained).await {
+                Ok(result) => result,
+                Err(_) => {
+                    stop_reading.cancel();
+                    drained.await
+                }
+            };
+            let message = drained.ok().flatten().unwrap_or(message);
+            waiter.ready.send_if_modified(|ready| {
+                if ready.is_none() {
+                    *ready = Some(Err(message.clone()));
+                    true
+                } else {
+                    false
+                }
+            });
             waiter.fail(&message);
             let _ = exit_events
                 .send(json!({"type":"process_exit","error":message}))
@@ -345,10 +347,11 @@ impl Transport {
         let mut ready = self.ready.subscribe();
         let frame = tokio::time::timeout(timeout, async {
             loop {
-                if let Some(frame) = ready.borrow().clone() { return Ok::<_, anyhow::Error>(frame); }
+                if let Some(frame) = ready.borrow().clone() {
+                    return frame.map_err(anyhow::Error::msg);
+                }
                 tokio::select! {
                     _ = self.cancel.cancelled() => bail!("OMP startup cancelled"),
-                    _ = self.process.wait() => bail!("OMP exited before ready: {}", self.process.stderr_tail()),
                     result = ready.changed() => result.map_err(|_| anyhow!("OMP ready channel closed"))?,
                 }
             }
@@ -499,46 +502,20 @@ impl Transport {
 mod tests {
     use super::*;
 
-    #[test]
-    fn read_buffer_retains_small_allocations_and_releases_oversized_capacity() {
-        let mut line = Vec::with_capacity(MAX_RETAINED_LINE);
-        line.extend_from_slice(b"small frame\n");
-        let pointer = line.as_ptr();
-        clear_read_buffer(&mut line);
-        assert!(line.is_empty());
-        assert_eq!(line.capacity(), MAX_RETAINED_LINE);
-        assert_eq!(line.as_ptr(), pointer);
-        line.resize(MAX_RETAINED_LINE + 1, b' ');
-        clear_read_buffer(&mut line);
-        assert!(line.is_empty());
-        assert_eq!(line.capacity(), 0);
-    }
-
     #[tokio::test]
-    async fn legacy_large_then_small_lines_preserve_payloads_and_release_capacity() {
-        let expected = json!({"type":"message_update","text":"a€".repeat(MAX_RETAINED_LINE)});
+    async fn legacy_large_then_small_lines_preserve_payloads() {
+        let expected = json!({"type":"message_update","text":"a€".repeat(MAX_FRAME)});
         let mut input = serde_json::to_vec(&expected).unwrap();
         input.extend_from_slice(b"\n{\"type\":\"small\",\"data\":[null,42,\"ok\"]}\n");
-        let mut input = BufReader::new(input.as_slice());
+        let mut input = LineReader::new(input.as_slice());
         let mut decoder = Decoder::default();
-        let mut line = Vec::new();
-        input.read_until(b'\n', &mut line).await.unwrap();
-        assert!(line.len() > MAX_RETAINED_LINE);
-        let decoded = decoder.decode(&line).unwrap();
-        clear_read_buffer(&mut line);
-        assert_eq!(line.capacity(), 0);
-        assert_eq!(decoded, Some(expected));
-        input.read_until(b'\n', &mut line).await.unwrap();
+        assert!(input.next_line().await.unwrap());
+        assert_eq!(decoder.decode(input.line()).unwrap(), Some(expected));
+        assert!(input.next_line().await.unwrap());
         assert_eq!(
-            decoder.decode(&line).unwrap(),
+            decoder.decode(input.line()).unwrap(),
             Some(json!({"type":"small","data":[null,42,"ok"]}))
         );
-        let capacity = line.capacity();
-        let pointer = line.as_ptr();
-        clear_read_buffer(&mut line);
-        assert!(capacity <= MAX_RETAINED_LINE);
-        assert_eq!(line.capacity(), capacity);
-        assert_eq!(line.as_ptr(), pointer);
     }
 
     #[test]
@@ -715,7 +692,7 @@ mod request_tests {
             json!(-1.5),
             json!("hello €"),
             json!([null, true, {"text":"nested"}]),
-            json!({"text":"a€".repeat(MAX_RETAINED_LINE), "nested":{"values":[1,2,3]}}),
+            json!({"text":"a€".repeat(MAX_FRAME), "nested":{"values":[1,2,3]}}),
             json!({"small":"after the large legacy reply"}),
         ];
         for expected in values {
@@ -901,6 +878,23 @@ mod request_tests {
         };
         assert_eq!(tail, 64);
         assert_eq!(terminal["type"], "process_exit");
+        assert!(next(&mut events).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn truncated_stdout_preserves_accepted_rows_and_the_terminal_protocol_error() {
+        let (transport, mut events) =
+            fixture(r#"printf '%s\n' '{"type":"row","index":1}'; printf '%s' '{"type":"ready"}'"#)
+                .await;
+        let error = transport
+            .negotiate(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unterminated frame"));
+        assert_eq!(next(&mut events).await.unwrap()["index"], 1);
+        let terminal = next(&mut events).await.unwrap();
+        assert_eq!(terminal["type"], "process_exit");
+        assert_eq!(terminal["error"], error.to_string());
         assert!(next(&mut events).await.is_none());
     }
 

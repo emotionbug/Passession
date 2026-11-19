@@ -13,13 +13,15 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Weak},
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex, Weak},
+    time::{Duration, SystemTime},
 };
 use tokio::{
     io::AsyncReadExt,
-    sync::{Mutex, OnceCell},
+    sync::{Mutex, Notify, OnceCell},
+    task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 pub use transfer::FileDownload;
 
 pub struct FileService {
@@ -28,6 +30,9 @@ pub struct FileService {
     downloads: OnceCell<transfer::Downloads>,
     observers: observer::Observers,
     writes: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    retention_cancel: CancellationToken,
+    retention_wake: Arc<Notify>,
+    retention_task: StdMutex<Option<JoinHandle<()>>>,
 }
 impl FileService {
     pub fn new(app: Weak<AppState>) -> Self {
@@ -37,6 +42,9 @@ impl FileService {
             downloads: OnceCell::new(),
             observers: observer::Observers::new(),
             writes: Mutex::new(HashMap::new()),
+            retention_cancel: CancellationToken::new(),
+            retention_wake: Arc::new(Notify::new()),
+            retention_task: StdMutex::new(None),
         }
     }
     pub async fn initialize(&self) -> Result<()> {
@@ -59,23 +67,134 @@ impl FileService {
             .await;
         Ok(())
     }
-    pub async fn shutdown(&self) -> Result<()> {
-        self.observers.shutdown();
-        if let Some(transfers) = self.transfers.get() {
-            transfers.shutdown().await?;
+    pub(crate) fn start_upload_retention(&self) {
+        let mut task = self.retention_task.lock().unwrap();
+        if task.is_some() || self.retention_cancel.is_cancelled() {
+            return;
+        }
+        let app = self.app.clone();
+        let cancel = self.retention_cancel.clone();
+        let wake = self.retention_wake.clone();
+        *task = Some(tokio::spawn(async move {
+            // The first tick sweeps at startup, then daily or after a deletion.
+            let mut daily = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+            daily.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { biased;
+                    _ = cancel.cancelled() => break,
+                    _ = daily.tick() => {},
+                    _ = wake.notified() => {},
+                }
+                let Some(app) = app.upgrade() else {
+                    break;
+                };
+                if let Err(error) = app.files.sweep_uploads(&app).await {
+                    tracing::warn!(%error, "Upload retention sweep failed");
+                }
+            }
+        }));
+    }
+
+    pub(crate) fn upload_owner_deleted(&self) {
+        self.retention_wake.notify_one();
+    }
+
+    pub(crate) fn upload_references<'a>(&self, prompt: &'a Value) -> HashMap<&'a str, bool> {
+        self.transfers.get().map_or_else(HashMap::new, |transfers| {
+            transfers.referenced_uploads(prompt)
+        })
+    }
+
+    pub(crate) async fn retain_uploads(
+        &self,
+        agent: &str,
+        uploads: HashMap<&str, bool>,
+    ) -> Result<()> {
+        let transfers = self
+            .transfers
+            .get()
+            .ok_or_else(|| anyhow!("File service is not initialized"))?;
+        let app = self
+            .app
+            .upgrade()
+            .ok_or_else(|| anyhow!("Daemon is shutting down"))?;
+        let root = app.home.join("uploads");
+        for (id, explicit) in uploads {
+            let marker = transfer::upload_marker(&app.home, id);
+            let lock = self.write_lock(marker.clone()).await;
+            let _guard = lock.lock().await;
+            ensure!(!transfers.is_receiving(id), "Upload is not complete: {id}");
+            transfer::retain_upload(&root.join(id), &marker, agent, explicit).await?;
         }
         Ok(())
     }
-    pub async fn handle_binary(&self, context: &RequestContext, bytes: Bytes) -> Result<bool> {
+
+    async fn sweep_uploads(&self, app: &AppState) -> Result<()> {
+        let Some(transfers) = self.transfers.get() else {
+            return Ok(());
+        };
+        let root = app.home.join("uploads");
+        match tokio::fs::symlink_metadata(&root).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let mut entries = tokio::fs::read_dir(root).await?;
+        let protect_legacy = app.agents.has_upload_owners().await?;
+        let now = SystemTime::now();
+        while !self.retention_cancel.is_cancelled() {
+            let Some(entry) = entries.next_entry().await? else {
+                break;
+            };
+            let name = entry.file_name();
+            let Some(id) = name.to_str().filter(|id| transfer::is_upload_id(id)) else {
+                continue;
+            };
+            let marker = transfer::upload_marker(&app.home, id);
+            let lock = self.write_lock(marker.clone()).await;
+            let guard = lock.lock().await;
+            if !transfers.is_receiving(id)
+                && let Err(error) = transfer::reclaim_upload(
+                    &entry.path(),
+                    &marker,
+                    now,
+                    protect_legacy,
+                    |agent| async move { app.agents.upload_owner_exists(&agent).await },
+                )
+                .await
+            {
+                tracing::warn!(upload = id, %error, "Could not reclaim upload");
+            }
+            drop(guard);
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.observers.shutdown();
+        self.retention_cancel.cancel();
+        let retention_task = self.retention_task.lock().unwrap().take();
+        let retention = match retention_task {
+            Some(task) => task.await.map_err(anyhow::Error::from),
+            None => Ok(()),
+        };
+        if let Some(transfers) = self.transfers.get() {
+            transfers.shutdown().await?;
+        }
+        retention
+    }
+    pub fn handle_binary(&self, context: &RequestContext, bytes: Bytes) -> Result<bool> {
         ensure!(
             context.allows("workspace.write"),
             "File upload is not permitted"
         );
-        self.transfers
+        Ok(self
+            .transfers
             .get()
             .ok_or_else(|| anyhow!("File service is not initialized"))?
-            .receive(context, bytes)
-            .await
+            .receive(context, bytes))
     }
     pub async fn open_download(&self, token: &str) -> Result<Option<FileDownload>> {
         self.downloads
@@ -347,6 +466,13 @@ impl FileService {
         Ok(())
     }
 }
+
+impl Drop for FileService {
+    fn drop(&mut self) {
+        self.retention_cancel.cancel();
+    }
+}
+
 /// The source echoes the trimmed workspace cwd on failures, except the
 /// "cwd is required" case, which echoes the request value unchanged.
 fn trimmed_cwd(request: &Value) -> Value {

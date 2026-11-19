@@ -66,7 +66,7 @@ ego-tree = "0.11"
 html5ever = "0.40"
 semver = "1"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"

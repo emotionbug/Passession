@@ -410,6 +410,25 @@ fn file_upload_frames_require_source_registration_and_exact_end_length() {
     assert!(source.validate_binary(&[0x11, 1, b'u', 9], true).is_err());
 }
 
+#[tokio::test(start_paused = true)]
+async fn rejected_upload_frame_grace_is_bounded_and_source_local() {
+    let (source, _) = make_source("a", true);
+    let (other, _) = make_source("b", true);
+    source.drain_file_transfer("first");
+    let first = b"\x12\x05first";
+    assert!(source.validate_binary(first, true).is_ok());
+    assert!(other.validate_binary(first, true).is_err());
+    for i in 0..40 {
+        source.drain_file_transfer(&format!("rejected-{i}"));
+    }
+    assert!(source.validate_binary(first, true).is_err());
+    let most_recent = b"\x12\x0brejected-39";
+    assert!(source.validate_binary(most_recent, true).is_ok());
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(source.validate_binary(most_recent, true).is_err());
+    assert!(source.is_live());
+}
+
 #[tokio::test]
 async fn notification_subscription_deduplicates_per_physical_source() {
     let (source, mut output) = make_source("a", true);
@@ -497,7 +516,7 @@ async fn loopback_websocket_rejects_wrong_protocol_and_reserved_plugin_identity(
 }
 
 #[tokio::test]
-async fn upload_request_registers_ownership_before_buffered_binary_frames() {
+async fn upload_registration_drains_rejected_frames_without_blocking_other_messages() {
     use paseo_protocol::binary_frames::{
         FileBeginMetadata, FileEncoding, FileTransferFrame, encode_file_transfer_frame,
     };
@@ -510,7 +529,7 @@ async fn upload_request_registers_ownership_before_buffered_binary_frames() {
     );
     app.config.initialize().await.unwrap();
     app.files.initialize().await.unwrap();
-    let (input, inbound) = mpsc::channel(8);
+    let (input, inbound) = mpsc::channel(16);
     let (outbound, mut output) = mpsc::channel(8);
     let cancel = CancellationToken::new();
     let payload = "한글 첨부 파일\n".as_bytes();
@@ -524,6 +543,46 @@ async fn upload_request_registers_ownership_before_buffered_binary_frames() {
             })
             .to_string(),
         ))
+        .await
+        .unwrap();
+    input
+        .send(OutboundFrame::Text(
+            json!({"type":"session","message":{"type":"file.upload.request",
+                "requestId":"too-large","fileName":"oversized.txt","size":51 * 1024 * 1024,
+                "mimeType":"text/plain","modifiedAt":""}})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    for frame in [
+        FileTransferFrame::Begin {
+            request_id: "too-large",
+            metadata: FileBeginMetadata {
+                mime: "text/plain".into(),
+                size: 51 * 1024 * 1024,
+                encoding: FileEncoding::Binary,
+                modified_at: String::new(),
+                revision: None,
+                file_name: None,
+            },
+        },
+        FileTransferFrame::Chunk {
+            request_id: "too-large",
+            payload: b"already sent",
+        },
+        FileTransferFrame::End {
+            request_id: "too-large",
+        },
+    ] {
+        input
+            .send(OutboundFrame::Binary(
+                encode_file_transfer_frame(&frame).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+    }
+    input
+        .send(OutboundFrame::Text(r#"{"type":"ping"}"#.into()))
         .await
         .unwrap();
     input
@@ -574,6 +633,8 @@ async fn upload_request_registers_ownership_before_buffered_binary_frames() {
             .await
     });
     let response = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut rejected = false;
+        let mut pong = false;
         loop {
             match output
                 .recv()
@@ -582,7 +643,19 @@ async fn upload_request_registers_ownership_before_buffered_binary_frames() {
             {
                 OutboundFrame::Text(text) => {
                     let envelope: Value = serde_json::from_str(&text).unwrap();
+                    if envelope["type"] == "pong" {
+                        pong = true;
+                    }
+                    if envelope["message"]["type"] == "rpc_error" {
+                        let error = &envelope["message"]["payload"];
+                        assert_eq!(error["requestId"], "too-large");
+                        assert_eq!(error["code"], "FILE_TOO_LARGE");
+                        assert_eq!(error["error"], "oversized.txt");
+                        rejected = true;
+                    }
                     if envelope["message"]["type"] == "file.upload.response" {
+                        assert!(rejected);
+                        assert!(pong);
                         break envelope["message"]["payload"].clone();
                     }
                 }

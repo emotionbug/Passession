@@ -667,7 +667,7 @@ impl TransportService {
                         OutboundFrame::Binary(bytes) => {
                             if let Err(error) = context.validate_binary(&bytes,true) { send_close(&outbound,1008,&error.to_string()).await; break; }
                             let app = self.app.upgrade().ok_or_else(|| anyhow!("Daemon is shutting down"))?;
-                            let handled = match bytes[0] { 0x01..=0x05 => app.terminals.handle_binary(&context,&bytes).await, 0x10..=0x12 => app.files.handle_binary(&context,bytes).await, 0x30 => self.hosts.handle_binary(&context,bytes).await, _ => Ok(false) };
+                            let handled = match bytes[0] { 0x01..=0x05 => app.terminals.handle_binary(&context,&bytes).await, 0x10..=0x12 => app.files.handle_binary(&context,bytes), 0x30 => self.hosts.handle_binary(&context,bytes).await, _ => Ok(false) };
                             match handled {
                                 Ok(true) => {},
                                 Ok(false) => { send_close(&outbound,1008,"Unowned binary frame").await; break; },

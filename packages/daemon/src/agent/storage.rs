@@ -33,7 +33,7 @@ impl KeyLocks {
 /// Commit a private file in its own directory, then fsync the containing directory.
 /// Durable field changes are published only after this succeeds; activity-only
 /// stamps are explicitly cached until their bounded flush.
-pub(super) async fn atomic_json(path: &Path, value: &Value) -> Result<()> {
+pub(crate) async fn atomic_json(path: &Path, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     atomic_bytes(path, &bytes).await
 }
@@ -233,6 +233,14 @@ impl AgentStorage {
         self.records().await?;
         Ok(())
     }
+    pub(super) async fn has_records(&self) -> Result<bool> {
+        Ok(!self.records().await?.read().await.values.is_empty())
+    }
+
+    pub(super) async fn contains(&self, id: &str) -> Result<bool> {
+        Ok(self.records().await?.read().await.values.contains_key(id))
+    }
+
     pub async fn list(&self) -> Result<Vec<Value>> {
         let records = self.records().await?.read().await;
         Ok(records

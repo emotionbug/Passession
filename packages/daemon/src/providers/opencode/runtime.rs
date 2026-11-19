@@ -28,6 +28,12 @@ use paseo_client::process::{self, CommandSpec, ManagedProcess};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const LEGACY_GENERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// History responses can include many turns and embedded file contents.
+const MAX_JSON_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,10 +434,7 @@ impl Runtime {
             args.extend(["--hostname".to_owned(), "127.0.0.1".to_owned()]);
         }
         args.extend(["--port".to_owned(), legacy_port.unwrap_or(0).to_string()]);
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let client = http_client()?;
         let (process, mut stdout) = ManagedProcess::spawn(CommandSpec {
             program: program.clone(),
             args,
@@ -567,7 +570,7 @@ impl Runtime {
             generation,
             environment: BTreeMap::new(),
             process: None,
-            client: Client::builder().no_proxy().build()?,
+            client: http_client()?,
             base_url,
             password: None,
             username: "opencode".to_owned(),
@@ -601,7 +604,20 @@ impl Runtime {
         body: Option<Value>,
         cancel: CancellationToken,
     ) -> Result<Value> {
-        let mut request = self.builder(method, path, query)?;
+        // Most requests are local reads or command admission. Legacy command
+        // and summarize can keep their response open through model execution.
+        let timeout = if method == Method::POST
+            && self.generation == Generation::Legacy
+            && path
+                .strip_prefix("/session/")
+                .and_then(|route| route.split_once('/'))
+                .is_some_and(|(_, operation)| matches!(operation, "command" | "summarize"))
+        {
+            LEGACY_GENERATION_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
+        let mut request = self.builder(method, path, query)?.timeout(timeout);
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -610,12 +626,12 @@ impl Runtime {
             _ = cancel.cancelled() => bail!("OpenCode request canceled"),
             _ = self.exited.cancelled() => bail!("OpenCode helper server exited"),
             result = async {
-                let response = request.send().await?;
+                let response = request.send().await.map_err(|error| request_error(path, error))?;
                 check_response(path, &response)?;
-                if response.status() == reqwest::StatusCode::NO_CONTENT { return Ok(Value::Null); }
-                let bytes = response.bytes().await?;
-                if bytes.is_empty() { return Ok(Value::Null); }
-                serde_json::from_slice(&bytes).with_context(|| format!("OpenCode {path} returned malformed JSON"))
+                if response.status() == reqwest::StatusCode::NO_CONTENT {
+                    return Ok(Value::Null);
+                }
+                read_json_response(path, response).await
             } => result,
         }
     }
@@ -633,8 +649,10 @@ impl Runtime {
             biased;
             _ = cancel.cancelled() => bail!("OpenCode event request canceled"),
             _ = self.exited.cancelled() => bail!("OpenCode helper server exited"),
-            response = request.send() => {
-                let response = response?;
+            response = tokio::time::timeout(REQUEST_TIMEOUT, request.send()) => {
+                let response = response
+                    .with_context(|| format!("OpenCode {path} timed out waiting for event stream headers"))?
+                    .map_err(|error| request_error(path, error))?;
                 check_response(path, &response)?;
                 let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("");
                 if !content_type.split(';').next().is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream")) {
@@ -644,6 +662,70 @@ impl Runtime {
             }
         }
     }
+}
+
+fn http_client() -> Result<Client> {
+    Ok(Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()?)
+}
+
+fn request_error(path: &str, error: reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow!("OpenCode {path} timed out")
+    } else {
+        error.into()
+    }
+}
+
+async fn read_json_response(path: &str, mut response: Response) -> Result<Value> {
+    let oversized = || anyhow!("OpenCode {path} JSON response exceeds 128 MiB");
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_JSON_RESPONSE_BYTES as u64)
+    {
+        return Err(oversized());
+    }
+    let read_error = |error| request_error(path, error);
+    let parse = |bytes: &[u8]| {
+        if bytes.is_empty() {
+            Ok(Value::Null)
+        } else {
+            serde_json::from_slice(bytes)
+                .with_context(|| format!("OpenCode {path} returned malformed JSON"))
+        }
+    };
+    let Some(first) = response.chunk().await.map_err(read_error)? else {
+        return Ok(Value::Null);
+    };
+    if first.len() > MAX_JSON_RESPONSE_BYTES {
+        return Err(oversized());
+    }
+    let Some(second) = response.chunk().await.map_err(read_error)? else {
+        return parse(&first);
+    };
+    if second.len() > MAX_JSON_RESPONSE_BYTES - first.len() {
+        return Err(oversized());
+    }
+    let initial = first.len() + second.len();
+    let mut bytes = Vec::with_capacity(initial);
+    bytes.extend_from_slice(&first);
+    bytes.extend_from_slice(&second);
+    drop((first, second));
+    while let Some(chunk) = response.chunk().await.map_err(read_error)? {
+        if chunk.len() > MAX_JSON_RESPONSE_BYTES - bytes.len() {
+            return Err(oversized());
+        }
+        let len = bytes.len() + chunk.len();
+        if len > bytes.capacity() {
+            let capacity = len.max(bytes.capacity() * 2).min(MAX_JSON_RESPONSE_BYTES);
+            bytes.reserve_exact(capacity - bytes.len());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    parse(&bytes)
 }
 
 impl Drop for Runtime {
@@ -724,7 +806,9 @@ pub async fn read_sse(
             biased;
             _ = cancel.cancelled() => return Ok(()),
             _ = sender.closed() => return Ok(()),
-            next = stream.next() => next,
+            next = tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()) => {
+                next.context("OpenCode event stream was idle for 60 seconds")?
+            },
         };
         let Some(chunk) = next else {
             // Only the v2 SDK delivers a final unterminated event on EOF.
@@ -1064,5 +1148,132 @@ fn paseo_home(spec: &ProviderSpec, context: Option<&LaunchContext>) -> Result<Pa
         Ok(path)
     } else {
         Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+    };
+
+    async fn fixture() -> (tempfile::TempDir, Arc<Runtime>, TcpListener) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let runtime = Runtime::loopback(
+            Generation::V2,
+            format!("http://{}", listener.local_addr().unwrap()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        (home, runtime, listener)
+    }
+
+    async fn accept_get(listener: TcpListener) -> TcpStream {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let mut end = 0;
+        loop {
+            let count = connection.read(&mut request[end..]).await.unwrap();
+            assert_ne!(count, 0, "expected a complete GET request");
+            end += count;
+            if request[..end].ends_with(b"\r\n\r\n") {
+                assert!(request.starts_with(b"GET "));
+                return connection;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn json_request_timeout_covers_a_stalled_response_body() {
+        let (_home, runtime, listener) = fixture().await;
+        let (partial, written) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connection = accept_get(listener).await;
+            connection.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{\"",
+            ).await.unwrap();
+            partial.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let request = tokio::spawn(async move {
+            runtime
+                .request(Method::GET, "/stalled", &[], None, CancellationToken::new())
+                .await
+        });
+        written.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "OpenCode /stalled timed out");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_json_body_errors_without_a_content_length() {
+        let (_home, runtime, listener) = fixture().await;
+        let server = tokio::spawn(async move {
+            let mut connection = accept_get(listener).await;
+            connection.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            ).await.unwrap();
+            // Stream the same chunk repeatedly; there is no Content-Length
+            // hint and the client must not wait for the terminating chunk.
+            let chunk = vec![b' '; 1024 * 1024];
+            for _ in 0..=MAX_JSON_RESPONSE_BYTES / chunk.len() {
+                if connection.write_all(b"100000\r\n").await.is_err()
+                    || connection.write_all(&chunk).await.is_err()
+                    || connection.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        let error = runtime
+            .request(Method::GET, "/large", &[], None, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OpenCode /large JSON response exceeds 128 MiB"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_uses_an_idle_deadline_instead_of_a_total_request_timeout() {
+        let (_home, runtime, listener) = fixture().await;
+        let server = tokio::spawn(async move {
+            let mut connection = accept_get(listener).await;
+            connection.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"ready\"}\n\n",
+            ).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let cancel = CancellationToken::new();
+        let response = runtime
+            .events("/api/event", &[], cancel.clone())
+            .await
+            .unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let reader = tokio::spawn(read_sse(response, cancel, sender));
+        assert_eq!(receiver.recv().await.unwrap()["type"], "ready");
+        tokio::time::pause();
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        assert!(!reader.is_finished());
+        tokio::time::advance(SSE_IDLE_TIMEOUT - REQUEST_TIMEOUT).await;
+        assert!(
+            reader
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("idle for 60 seconds")
+        );
+        server.abort();
     }
 }

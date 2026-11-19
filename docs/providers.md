@@ -49,12 +49,31 @@ released on completion or cancellation. Waiting for shared serialization storage
 must remain shutdown-, cancellation- and deadline-aware. Stdin close waits behind
 already queued JSON writers; partial writes still use the termination guard.
 
-Pi/OMP stdout line storage retains at most 1 MiB between reads. This limits retained
-capacity, not accepted frame size: legacy v1 still has no frame ceiling; v2 chunk
-limits are unchanged. Correlated successful RPC replies transfer their `data`
-without cloning it; unmatched frames retain their complete payload. Base64 chunk
-decoding remains strict (including canonical padding and trailing bits); removing
-an encode-back comparison must not widen accepted input.
+Claude, Muse, Antigravity, Codex and Pi/OMP accept stdout JSONL frames up to
+64 MiB, including the terminating newline. This leaves room for encoded file
+contents and large tool or history replies. An oversized or unterminated
+frame ends the provider connection with a protocol error. The reader retains
+at most 1 MiB of line capacity between frames. OMP's v2 chunk envelope and
+64 MiB reassembly limit are unchanged. Correlated Pi/OMP RPC replies transfer
+their `data` without cloning it; unmatched frames retain their complete payload.
+Base64 chunk decoding remains strict, including canonical padding and trailing bits.
+
+Muse queues up to 256 notifications and 128 MiB of encoded notification data,
+with one staged notification in the stdout reader. If the queue fills, stdout
+pauses until the actor catches up. An outstanding control request lets the
+reader continue past the staged notification because the actor may be waiting
+for that reply. If another notification arrives and the previous one still
+cannot enter the queue, the connection fails rather than losing ordered updates
+or stalling control traffic.
+
+OpenCode's loopback HTTP connection deadline is 5 seconds. JSON requests
+have 30 seconds to finish, except legacy commands and compaction that may wait
+up to 15 minutes for model execution. The decoded JSON body is limited to
+128 MiB to accommodate history with many turns and embedded file contents.
+SSE has a 30-second header deadline and no total lifetime deadline. It
+reconnects through the existing recovery path after an idle limit of 60 seconds
+without incoming bytes; heartbeats count as activity. Its existing 16 MiB
+per-event limit still applies.
 
 ### OMP host-tool loading
 

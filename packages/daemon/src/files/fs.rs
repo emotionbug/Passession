@@ -507,6 +507,27 @@ fn decode_base64(content: &str) -> Result<Vec<u8>> {
     ))?)
 }
 pub fn write(request: &Value, home: &Path, cancel: &CancellationToken) -> Value {
+    write_with_directory_sync(request, home, cancel, sync_save_directory)
+}
+
+#[cfg(unix)]
+fn sync_save_directory(parent: &Path) -> std::io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_save_directory(_parent: &Path) -> std::io::Result<()> {
+    // Unix directory fsync does not translate to Windows directory handles.
+    // Keep std's POSIX-semantics replacement for targets open by other editors.
+    Ok(())
+}
+
+fn write_with_directory_sync(
+    request: &Value,
+    home: &Path,
+    cancel: &CancellationToken,
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Value {
     let result = (|| -> Result<Value> {
         let root = field(request, "cwd")?;
         let path = field(request, "path")?;
@@ -592,6 +613,9 @@ pub fn write(request: &Value, home: &Path, cancel: &CancellationToken) -> Value 
             let _ = fs::remove_file(&temporary);
             return Err(error.into());
         }
+        sync_directory(parent).map_err(|error| {
+            anyhow!("File was replaced, but syncing its directory failed: {error}")
+        })?;
         let final_metadata = written.metadata()?;
         Ok(
             json!({"status":"written","modifiedAt":modified(&final_metadata)?,"size":final_metadata.len(),"revision":revision(&written, &final_metadata)?}),
@@ -981,6 +1005,33 @@ mod tests {
             &CancellationToken::new(),
         );
         assert_eq!(result["status"], "conflict");
+        assert_eq!(fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[test]
+    fn save_reports_directory_sync_failure_after_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let path = cwd.join("file.md");
+        fs::write(&path, "old").unwrap();
+        let initial = version(cwd.to_str().unwrap(), "file.md", dir.path());
+        let result = write_with_directory_sync(
+            &json!({"cwd":cwd,"path":"file.md","content":"new","expectedRevision":initial["revision"]}),
+            dir.path(),
+            &CancellationToken::new(),
+            |parent| {
+                assert_eq!(parent, cwd);
+                assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+                Err(std::io::Error::other("simulated directory sync failure"))
+            },
+        );
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("simulated directory sync failure")
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), "new");
     }
     #[test]

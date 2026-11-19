@@ -43,6 +43,10 @@ $PASEO_HOME/
 ├── agents/
 │   └── {sanitized-cwd}/
 │       └── {agentId}.json               # One file per agent
+├── uploads/
+│   └── upload_{uuid}/{fileName}          # Uploaded attachment or terminal-drop bytes
+├── upload-references/
+│   └── upload_{uuid}.json                # Owning agent IDs for one upload
 ├── schedules/
 │   └── {scheduleId}.json                # One file per schedule
 ├── projects/
@@ -61,6 +65,19 @@ $PASEO_HOME/
 ```
 
 The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
+
+### Uploaded files
+
+Uploading creates a host path. Sending that path to an agent pins the upload for the life of the
+session, including while the agent is closed or archived. Permanently deleting the last owning agent
+makes the file eligible for cleanup. Files with no registered owner, including paths pasted into a
+terminal and uploads left in a draft, are eligible after 30 days. Cleanup runs in the background at
+startup, daily, and after agent deletion.
+
+Older uploads have no reliable ownership record: native providers may have retained the path as
+plain text. The daemon protects those files while any agent record or runtime remains. Once none
+remain, unclaimed legacy uploads are eligible after 30 days. To reclaim space sooner, remove only
+uploads you know no session or process still needs.
 
 ---
 

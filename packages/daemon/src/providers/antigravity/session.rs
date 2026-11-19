@@ -7,17 +7,14 @@ use std::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader, Lines},
-    sync::{mpsc, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     catalog,
     wire::{self, Error, Frame, Status, Turn},
 };
-use crate::providers::{api::*, prompt};
+use crate::providers::{api::*, jsonl::LineReader, prompt};
 use paseo_client::process::ManagedProcess;
 
 type Reply = oneshot::Sender<Result<Value>>;
@@ -266,10 +263,22 @@ impl AgentSession for Session {
 
 struct Driver {
     process: Arc<ManagedProcess>,
-    lines: Lines<BufReader<tokio::process::ChildStdout>>,
+    lines: LineReader<tokio::process::ChildStdout>,
     selection: Value,
 }
 impl Driver {
+    async fn next_frame(&mut self) -> Result<Option<Frame>> {
+        while self.lines.next_line().await.map_err(invalid_output)? {
+            let line = std::str::from_utf8(self.lines.line()).map_err(invalid_output)?;
+            if !line.trim().is_empty() {
+                let frame = wire::decode(line);
+                self.lines.clear_line();
+                return frame.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     async fn stop(self, interrupt: bool) -> Result<()> {
         if interrupt {
             self.process.interrupt(Duration::from_secs(1)).await
@@ -292,6 +301,14 @@ impl Driver {
         }
     }
 }
+
+fn invalid_output(error: impl std::fmt::Display) -> Error {
+    Error::new(
+        "INVALID_FRAME",
+        format!("Invalid Antigravity output: {error}"),
+    )
+}
+
 struct Runtime {
     spec: ProviderSpec,
     config: Value,
@@ -314,19 +331,19 @@ impl Runtime {
             enum Next {
                 Cancel,
                 Command(Option<Command>),
-                Line(std::io::Result<Option<String>>),
+                Frame(Result<Option<Frame>>),
             }
             let next = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => Next::Cancel,
                 _ = self.sink.cancellation().cancelled_owned() => Next::Cancel,
                 command = commands.recv() => Next::Command(command),
-                line = async {
+                frame = async {
                     match self.driver.as_mut() {
-                        Some(driver) => driver.lines.next_line().await,
+                        Some(driver) => driver.next_frame().await,
                         None => std::future::pending().await,
                     }
-                } => Next::Line(line),
+                } => Next::Frame(frame),
             };
             match next {
                 Next::Cancel | Next::Command(None) => break,
@@ -357,20 +374,12 @@ impl Runtime {
                     let result = self.start(prompt, options).await;
                     let _ = reply.send(result);
                 }
-                Next::Line(Ok(Some(line))) if line.trim().is_empty() => {}
-                Next::Line(Ok(Some(line))) => match wire::decode(&line) {
-                    Ok(frame) => {
-                        if self.accept(frame).await.is_err() {
-                            break;
-                        }
+                Next::Frame(Ok(Some(frame))) => {
+                    if self.accept(frame).await.is_err() {
+                        break;
                     }
-                    Err(error) => {
-                        if self.failure(error).await.is_err() {
-                            break;
-                        }
-                    }
-                },
-                Next::Line(Ok(None)) => {
+                }
+                Next::Frame(Ok(None)) => {
                     let message = if let Some(driver) = &self.driver {
                         let status = driver.process.wait().await;
                         let stderr = driver.process.stderr_tail();
@@ -395,18 +404,8 @@ impl Runtime {
                         break;
                     }
                 }
-                Next::Line(Err(error)) => {
-                    if self
-                        .failure(
-                            Error::new(
-                                "INVALID_FRAME",
-                                format!("Invalid Antigravity output: {error}"),
-                            )
-                            .into(),
-                        )
-                        .await
-                        .is_err()
-                    {
+                Next::Frame(Err(error)) => {
+                    if self.failure(error).await.is_err() {
                         break;
                     }
                 }
@@ -463,12 +462,12 @@ impl Runtime {
             .map_err(|e| Error::new("SPAWN_ERROR", e.to_string()))?;
         let mut driver = Driver {
             process,
-            lines: BufReader::new(stdout).lines(),
+            lines: LineReader::new(stdout),
             selection,
         };
         let ready = async {
             loop {
-                let Some(line) = driver.lines.next_line().await? else {
+                let Some(frame) = driver.next_frame().await? else {
                     let status = driver.process.wait().await?;
                     let stderr = driver.process.stderr_tail();
                     let message = if stderr.trim().is_empty() {
@@ -478,10 +477,7 @@ impl Runtime {
                     };
                     return Err(Error::new("PROCESS_EXIT", wire::diagnostic(&message)).into());
                 };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match wire::decode(&line)? {
+                match frame {
                     Frame::Init {
                         conversation_id, ..
                     } => return Ok(conversation_id),

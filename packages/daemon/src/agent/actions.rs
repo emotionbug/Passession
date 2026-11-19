@@ -31,6 +31,7 @@ impl AgentManager {
             .ok_or_else(|| anyhow!("Agent '{id}' not found"))?["status"]
             .clone();
         let prompt = build_prompt(&input)?;
+        self.retain_prompt_uploads(id, &prompt).await?;
         let message_id = text(&input, "messageId")
             .or_else(|| text(&input, "clientMessageId"))
             .map(str::to_owned)
@@ -214,6 +215,23 @@ impl AgentManager {
         self.settle_dispatch(&gate, &result).await;
         result
     }
+
+    async fn retain_prompt_uploads(&self, id: &str, prompt: &Value) -> Result<()> {
+        let app = self.app()?;
+        let uploads = app.files.upload_references(prompt);
+        if uploads.is_empty() {
+            return Ok(());
+        }
+        // Deletion owns the same lane and closes the provider before reclamation.
+        // Bind before notifications or adapters turn attachments into native text.
+        let lane = self.lane(id).await;
+        let _lane = lane.lock().await;
+        if !self.upload_owner_exists(id).await? {
+            bail!("Agent '{id}' not found");
+        }
+        app.files.retain_uploads(id, uploads).await
+    }
+
     async fn send_immediate_gated(
         &self,
         actor: &Value,
@@ -224,6 +242,7 @@ impl AgentManager {
         self.authorize(actor, id).await?;
         let _resident = self.keep_runtime(id).await;
         let prompt = build_prompt(&input)?;
+        self.retain_prompt_uploads(id, &prompt).await?;
         let source = if actor["kind"] == "agent" {
             let caller = required(actor, "agentId")?;
             let snapshot = self.agent_snapshot(caller).await?;
@@ -1011,6 +1030,7 @@ impl AgentManager {
     pub async fn schedule_run(&self, id: &str, prompt: Value) -> Result<Value> {
         let _resident = self.keep_runtime(id).await;
         let actor = json!({"kind":"system","source":"schedule"});
+        self.retain_prompt_uploads(id, &prompt).await?;
         let cell = self.prepare_send(id, &json!({"prompt":prompt})).await?;
         self.dispatch_prompt(
             id,
@@ -1229,6 +1249,7 @@ impl AgentManager {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
+                app.files.upload_owner_deleted();
                 let _ = self
                     .events
                     .send(Arc::new(json!({"type":"agent_deleted","agentId":id})));
@@ -1400,6 +1421,12 @@ impl AgentManager {
                     .as_ref()
                     .and_then(|result| result.get("followUpPrompt"))
                 {
+                    // The held mutation lock already fences runtime close.
+                    let app = self.app()?;
+                    let uploads = app.files.upload_references(prompt);
+                    if !uploads.is_empty() {
+                        app.files.retain_uploads(id, uploads).await?;
+                    }
                     self.dispatch_prompt_unlocked(id, &cell, &json!({"prompt":prompt}))
                         .await?;
                 }

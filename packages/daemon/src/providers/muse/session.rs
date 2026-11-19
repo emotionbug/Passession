@@ -1,7 +1,7 @@
 use super::{
     catalog,
     projection::{Projection, Questions},
-    transport::{Connection, command_id},
+    transport::{Connection, QueuedNotification, command_id},
 };
 use crate::providers::api::{
     AgentSession, EventSink, HistoryCoverage, LaunchContext, ProviderSpec, ReplayOutcome,
@@ -60,7 +60,7 @@ pub(super) type Marker = Box<dyn FnOnce(Vec<Value>, HistoryCoverage) -> Value + 
 
 struct SpawnedHost {
     host: Arc<Connection>,
-    rx: mpsc::UnboundedReceiver<Value>,
+    rx: mpsc::Receiver<QueuedNotification>,
     env: BTreeMap<String, String>,
     cwd: String,
 }
@@ -540,7 +540,7 @@ impl Session {
     }
     async fn run(
         self: Arc<Self>,
-        mut rx: mpsc::UnboundedReceiver<Value>,
+        mut rx: mpsc::Receiver<QueuedNotification>,
         mut actions: mpsc::UnboundedReceiver<Action>,
         mut projection: Projection,
         mut questions: Questions,
@@ -558,13 +558,27 @@ impl Session {
                     Some(Action::Activity)=>Ok(()),
                     Some(Action::Close(reply))=>{
                         let mut result=Ok(());
-                        while let Ok(event)=rx.try_recv(){if event["method"]!="$error"&& let Err(error)=self.notify(event,&mut projection,&mut questions).await{result=Err(error);break;}}
+                        while let Ok(event)=rx.try_recv(){
+                            result=match event.into_value(){
+                                Ok(event)=>self.notify(event,&mut projection,&mut questions).await,
+                                Err(error)=>Err(error),
+                            };
+                            if result.is_err(){break;}
+                        }
                         if result.is_ok(){result=match projection.close_children().await {Ok(events)=>self.publish(events,true).await,Err(e)=>Err(e)};}
                         let _=reply.send(result);break;
                     },
                     None=>break,
                 },
-                event=rx.recv()=>match event {Some(event)=>self.notify(event,&mut projection,&mut questions).await,None=>Err(anyhow!("Muse MSP notification stream closed"))},
+                event=async {
+                    match rx.recv().await {
+                        Some(event)=>event.into_value(),
+                        None=>Err(self.host.notification_failure().await.into()),
+                    }
+                }=>match event {
+                    Ok(event)=>self.notify(event,&mut projection,&mut questions).await,
+                    Err(error)=>Err(error),
+                },
                 // Watchdog for the parent's view and the children this run
                 // collects; unopened recovered children are never polled.
                 _=tokio::time::sleep(Duration::from_secs(120)),if self.active().is_some()=>{
@@ -620,18 +634,6 @@ impl Session {
             .as_str()
             .ok_or_else(|| anyhow!("Invalid Muse notification"))?;
         let params = &event["params"];
-        if method == "$error" {
-            return Err(self
-                .host
-                .failure()
-                .unwrap_or_else(|| {
-                    super::transport::MuseError::new(
-                        "runtime",
-                        params["message"].as_str().unwrap_or("Muse host exited"),
-                    )
-                })
-                .into());
-        }
         if !params.is_object() {
             bail!("Invalid Muse notification parameters");
         }

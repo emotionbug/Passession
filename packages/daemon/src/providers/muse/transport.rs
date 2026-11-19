@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     path::PathBuf,
     process::ExitStatus,
@@ -8,18 +9,20 @@ use std::{
 
 use anyhow::Result;
 use rand::RngCore;
-use serde::ser::{SerializeMap, Serializer};
-use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    sync::{mpsc, oneshot, watch},
+use serde::{
+    Deserialize, Deserializer,
+    ser::{SerializeMap, Serializer},
 };
+use serde_json::{Value, json, value::RawValue};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::providers::api::ProviderSpec;
+use crate::providers::{api::ProviderSpec, jsonl::LineReader};
 use paseo_client::process::{CommandSpec, ManagedProcess};
 
 const FINGERPRINT: &str = "sha256:e0e163db6ccf00dbe68402ce55d6319b3edc33c421f31e9583b587b2de8a118f";
+const NOTIFICATION_COUNT: usize = 256;
+const NOTIFICATION_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{message}")]
@@ -190,6 +193,83 @@ pub fn serve_args(options: &Value) -> Result<Vec<String>> {
 type Reply = std::result::Result<Value, MuseError>;
 type CloseResult = std::result::Result<(), MuseError>;
 
+struct Notification {
+    method: String,
+    params: Option<Box<RawValue>>,
+}
+
+impl Notification {
+    fn bytes(&self) -> u32 {
+        (self.method.capacity() + self.params.as_ref().map_or(0, |p| p.get().len())) as u32
+    }
+}
+
+pub(super) struct QueuedNotification {
+    notification: Notification,
+    _budget: OwnedSemaphorePermit,
+}
+
+impl QueuedNotification {
+    pub(super) fn into_value(self) -> Result<Value> {
+        let Notification { method, params } = self.notification;
+        let params = match params {
+            Some(params) => serde_json::from_str(params.get()).map_err(invalid_frame)?,
+            None => Value::Null,
+        };
+        Ok(Value::Object(
+            [
+                ("method".into(), Value::String(method)),
+                ("params".into(), params),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+    }
+}
+
+struct Notifications {
+    sender: mpsc::Sender<QueuedNotification>,
+    budget: Arc<Semaphore>,
+}
+
+impl Notifications {
+    fn try_send(&self, notification: Notification) -> Option<Notification> {
+        let slot = match self.sender.try_reserve() {
+            Ok(slot) => slot,
+            Err(mpsc::error::TrySendError::Full(())) => return Some(notification),
+            Err(mpsc::error::TrySendError::Closed(())) => return None,
+        };
+        let Ok(budget) = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(notification.bytes())
+        else {
+            return Some(notification);
+        };
+        slot.send(QueuedNotification {
+            notification,
+            _budget: budget,
+        });
+        None
+    }
+
+    async fn send(&self, pending: &mut Option<Notification>) {
+        let bytes = pending.as_ref().expect("notification to send").bytes();
+        let Ok(slot) = self.sender.reserve().await else {
+            pending.take();
+            return;
+        };
+        let Ok(budget) = self.budget.clone().acquire_many_owned(bytes).await else {
+            unreachable!("notification budget is never closed");
+        };
+        let notification = pending.take().expect("notification to send");
+        slot.send(QueuedNotification {
+            notification,
+            _budget: budget,
+        });
+    }
+}
+
 #[derive(Default)]
 struct State {
     sequence: u64,
@@ -202,7 +282,7 @@ struct Inner {
     process: Arc<ManagedProcess>,
     error_env: BTreeMap<String, String>,
     state: Arc<Mutex<State>>,
-    notifications: mpsc::UnboundedSender<Value>,
+    request_started: Notify,
     request_timeout: Duration,
     cancel: CancellationToken,
     close_requested: CancellationToken,
@@ -220,13 +300,13 @@ pub struct Connection {
 impl Connection {
     /// Transport controls are separate from strict Muse providerOptions. Omit
     /// providerOptions for maintenance hosts; pass {} for default session flags.
-    pub async fn spawn(
+    pub(super) async fn spawn(
         spec: &ProviderSpec,
         env: BTreeMap<String, String>,
         cwd: Option<PathBuf>,
         options: &Value,
         cancel: CancellationToken,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Value>)> {
+    ) -> Result<(Arc<Self>, mpsc::Receiver<QueuedNotification>)> {
         if cancel.is_cancelled() {
             return Err(MuseError::new("closed", "Muse host is closing").into());
         }
@@ -275,13 +355,17 @@ impl Connection {
                 ),
             )
         })?;
-        let (notifications, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(NOTIFICATION_COUNT);
+        let notifications = Notifications {
+            sender,
+            budget: Arc::new(Semaphore::new(NOTIFICATION_BYTES)),
+        };
         let (close_result, _) = watch::channel(None);
         let inner = Arc::new(Inner {
             process,
             error_env,
             state: Arc::new(Mutex::new(State::default())),
-            notifications,
+            request_started: Notify::new(),
             request_timeout: Duration::from_millis(
                 options
                     .get("timeoutMs")
@@ -298,38 +382,9 @@ impl Connection {
         });
         let reader = inner.clone();
         inner.runtime.spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                let line = tokio::select! {
-                    biased;
-                    _ = reader.reader_stop.cancelled() => break,
-                    line = lines.next_line() => line,
-                };
-                match line {
-                    Ok(Some(line)) => {
-                        let frame = serde_json::from_str::<Value>(&line).map_err(|error| {
-                            MuseError::new("invalidFrame", format!("Invalid MSP frame: {error}"))
-                        });
-                        let result = match frame {
-                            Ok(frame) => reader.receive(frame).await,
-                            Err(error) => Err(error),
-                        };
-                        if let Err(error) = result {
-                            reader.fail(error);
-                            reader.begin_close();
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        reader.fail(MuseError::new(
-                            "invalidFrame",
-                            format!("Invalid MSP frame: {error}"),
-                        ));
-                        reader.begin_close();
-                        break;
-                    }
-                }
+            if let Err(error) = reader.read_stdout(stdout, &notifications).await {
+                reader.fail(error);
+                reader.begin_close();
             }
             reader.reader_done.cancel();
         });
@@ -467,6 +522,7 @@ impl Connection {
             state.pending.insert(id, sender);
             id
         };
+        self.inner.request_started.notify_one();
         let _pending = PendingGuard {
             state: self.inner.state.clone(),
             id,
@@ -545,8 +601,18 @@ impl Connection {
         }
     }
 
-    pub fn failure(&self) -> Option<MuseError> {
-        self.inner.failure()
+    pub(super) async fn notification_failure(&self) -> MuseError {
+        // The reader drops its sender before the exit watcher publishes the
+        // process diagnostic. An explicit framing error is already recorded.
+        match self.inner.failure() {
+            Some(error) => error,
+            None => {
+                self.inner.exited.cancelled().await;
+                self.inner
+                    .failure()
+                    .expect("exit watcher records failure before signaling exit")
+            }
+        }
     }
 }
 
@@ -586,6 +652,66 @@ impl Drop for PendingGuard {
 }
 
 impl Inner {
+    async fn read_stdout(
+        &self,
+        stdout: impl tokio::io::AsyncRead + Unpin,
+        notifications: &Notifications,
+    ) -> std::result::Result<(), MuseError> {
+        let mut lines = LineReader::new(stdout);
+        let mut pending = None;
+        loop {
+            let staged = pending.is_some();
+            // Without outstanding RPCs, let the pipe backpressure the host.
+            // The actor itself can await an RPC while handling an event, so
+            // when a request is pending we must look past the staged event for
+            // the reply. A second event that cannot fit is terminal: waiting
+            // for capacity here could deadlock, and dropping it would lose
+            // ordered session state.
+            let read_control = staged
+                && !self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .is_empty();
+            let read = tokio::select! {
+                biased;
+                _ = self.reader_stop.cancelled() => return Ok(()),
+                _ = notifications.send(&mut pending), if staged => continue,
+                _ = self.request_started.notified(), if staged => continue,
+                read = lines.next_line(), if !staged || read_control => read,
+            };
+            if !read.map_err(invalid_frame)? {
+                if staged {
+                    return Err(invalid_frame(
+                        "stdout closed with a staged notification and a pending control request",
+                    ));
+                }
+                return Ok(());
+            }
+            if lines.line().iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+                return Err(invalid_frame("expected object"));
+            }
+            let frame = serde_json::from_slice(lines.line()).map_err(invalid_frame)?;
+            if let Some((method, params)) = self.receive(frame).await? {
+                if let Some(previous) = pending.take()
+                    && notifications.try_send(previous).is_some()
+                {
+                    return Err(MuseError::new(
+                        "notificationOverload",
+                        "Muse sent notifications faster than Paseo could process them; the session was closed to avoid losing updates.",
+                    ));
+                }
+                let notification = Notification {
+                    method,
+                    params: params.map(RawValue::to_owned),
+                };
+                pending = notifications.try_send(notification);
+            }
+            lines.clear_line();
+        }
+    }
+
     fn failure(&self) -> Option<MuseError> {
         self.state
             .lock()
@@ -595,21 +721,16 @@ impl Inner {
     }
 
     fn fail(&self, error: MuseError) {
-        let (pending, notify) = {
+        let pending = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.failure.is_some() {
                 return;
             }
             state.failure = Some(error.clone());
-            (std::mem::take(&mut state.pending), !state.closing)
+            std::mem::take(&mut state.pending)
         };
         for sender in pending.into_values() {
             let _ = sender.send(Err(error.clone()));
-        }
-        if notify {
-            let _ = self
-                .notifications
-                .send(json!({"method": "$error", "params": {"message": error.message}}));
         }
     }
 
@@ -664,55 +785,40 @@ impl Inner {
         }
     }
 
-    async fn receive(self: &Arc<Self>, mut frame: Value) -> std::result::Result<(), MuseError> {
-        validate_frame(&frame)?;
-        if let Some(method) = frame
-            .get("method")
-            .and_then(Value::as_str)
-            .filter(|method| !method.is_empty())
+    async fn receive<'a>(
+        &self,
+        frame: Frame<'a>,
+    ) -> std::result::Result<Option<(String, Option<&'a RawValue>)>, MuseError> {
+        frame.validate()?;
+        if let Some(Value::String(method)) = frame.method
+            && !method.is_empty()
         {
-            if let Some(id) = frame.get("id") {
-                let response = if matches!(method, "approval/request" | "userInput/request") {
-                    json!({"jsonrpc": "2.0", "id": id, "result": {}})
-                } else {
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Unsupported server request"}})
-                };
-                let _ = self.process.write_json(&response).await;
+            let Some(id) = frame.id else {
+                return Ok(Some((method, frame.params)));
+            };
+            let response = if matches!(method.as_str(), "approval/request" | "userInput/request") {
+                json!({"jsonrpc": "2.0", "id": id, "result": {}})
             } else {
-                let method = method.to_owned();
-                let params = frame
-                    .get_mut("params")
-                    .map(Value::take)
-                    .unwrap_or(Value::Null);
-                let mut notification = json!({"method": method});
-                notification["params"] = params;
-                let _ = self.notifications.send(notification);
-            }
-            return Ok(());
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Unsupported server request"}})
+            };
+            let _ = self.process.write_json(&response).await;
+            return Ok(None);
         }
-        let Some(id) = frame.get("id") else {
-            return Err(MuseError::new(
-                "invalidFrame",
-                "Invalid MSP frame: MSP response has no id",
-            ));
+        let Some(id) = frame.id else {
+            return Err(invalid_frame("MSP response has no id"));
         };
         if id.is_null() {
-            if let Some(error) = frame.get("error") {
-                self.fail(rpc_error(error, false));
-                self.begin_close();
-                return Ok(());
+            if let Some(error) = frame.error {
+                return Err(rpc_error(&error, false));
             }
-            return Err(MuseError::new(
-                "invalidFrame",
-                "Invalid MSP frame: MSP result has a null id",
-            ));
+            return Err(invalid_frame("MSP result has a null id"));
         }
         let Some(id) = id.as_u64().or_else(|| {
             let number = id.as_f64()?;
             (number >= 0.0 && number.fract() == 0.0 && number <= u64::MAX as f64)
                 .then_some(number as u64)
         }) else {
-            return Ok(());
+            return Ok(None);
         };
         let sender = self
             .state
@@ -721,64 +827,99 @@ impl Inner {
             .pending
             .remove(&id);
         if let Some(sender) = sender {
-            let result = if let Some(error) = frame.get("error") {
-                Err(rpc_error(error, true))
+            let result = if let Some(error) = frame.error {
+                Err(rpc_error(&error, true))
+            } else if let Some(result) = frame.result {
+                match serde_json::from_str(result.get()) {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        let error = invalid_frame(error);
+                        let _ = sender.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                }
             } else {
-                Ok(frame
-                    .get_mut("result")
-                    .map(Value::take)
-                    .unwrap_or(Value::Null))
+                Ok(Value::Null)
             };
             let _ = sender.send(result);
         }
-        Ok(())
+        Ok(None)
     }
 }
 
-fn validate_frame(frame: &Value) -> std::result::Result<(), MuseError> {
-    let invalid = |message| MuseError::new("invalidFrame", format!("Invalid MSP frame: {message}"));
-    let object = frame
-        .as_object()
-        .ok_or_else(|| invalid("expected object"))?;
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(invalid("jsonrpc must be 2.0"));
-    }
-    if object
-        .get("id")
-        .is_some_and(|id| !id.is_null() && !id.is_string() && !id.is_number())
-    {
-        return Err(invalid("id must be a string, number, or null"));
-    }
-    if object
-        .get("method")
-        .is_some_and(|method| !method.is_string())
-    {
-        return Err(invalid("method must be a string"));
-    }
-    if let Some(error) = object.get("error") {
-        let error = error
-            .as_object()
-            .ok_or_else(|| invalid("error must be an object"))?;
-        if !error.get("code").is_some_and(Value::is_number) {
-            return Err(invalid("error.code must be a number"));
+/// Parse control data once while leaving large notification parameters and
+/// response bodies borrowed from the input line until their consumer needs them.
+#[derive(Deserialize)]
+struct Frame<'a> {
+    #[serde(borrow)]
+    jsonrpc: Cow<'a, str>,
+    #[serde(default, deserialize_with = "present")]
+    id: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    method: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    error: Option<Value>,
+    #[serde(borrow)]
+    params: Option<&'a RawValue>,
+    #[serde(borrow)]
+    result: Option<&'a RawValue>,
+}
+
+// Missing and explicit null differ for JSON-RPC IDs and malformed fields.
+fn present<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+fn invalid_frame(error: impl std::fmt::Display) -> MuseError {
+    MuseError::new("invalidFrame", format!("Invalid MSP frame: {error}"))
+}
+
+impl Frame<'_> {
+    fn validate(&self) -> std::result::Result<(), MuseError> {
+        if self.jsonrpc != "2.0" {
+            return Err(invalid_frame("jsonrpc must be 2.0"));
         }
-        if !error.get("message").is_some_and(Value::is_string) {
-            return Err(invalid("error.message must be a string"));
+        if self
+            .id
+            .as_ref()
+            .is_some_and(|id| !id.is_null() && !id.is_string() && !id.is_number())
+        {
+            return Err(invalid_frame("id must be a string, number, or null"));
         }
-        if let Some(data) = error.get("data") {
-            let data = data
+        if self
+            .method
+            .as_ref()
+            .is_some_and(|method| !method.is_string())
+        {
+            return Err(invalid_frame("method must be a string"));
+        }
+        if let Some(error) = &self.error {
+            let error = error
                 .as_object()
-                .ok_or_else(|| invalid("error.data must be an object"))?;
-            for key in ["kind", "reason"] {
-                if data.get(key).is_some_and(|value| !value.is_string()) {
-                    return Err(invalid(
-                        "error.data.kind and error.data.reason must be strings when present",
-                    ));
+                .ok_or_else(|| invalid_frame("error must be an object"))?;
+            if !error.get("code").is_some_and(Value::is_number) {
+                return Err(invalid_frame("error.code must be a number"));
+            }
+            if !error.get("message").is_some_and(Value::is_string) {
+                return Err(invalid_frame("error.message must be a string"));
+            }
+            if let Some(data) = error.get("data") {
+                let data = data
+                    .as_object()
+                    .ok_or_else(|| invalid_frame("error.data must be an object"))?;
+                for key in ["kind", "reason"] {
+                    if data.get(key).is_some_and(|value| !value.is_string()) {
+                        return Err(invalid_frame(
+                            "error.data.kind and error.data.reason must be strings when present",
+                        ));
+                    }
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn rpc_error(error: &Value, correlated: bool) -> MuseError {
@@ -840,4 +981,136 @@ fn classify_exit(status: ExitStatus, stderr: &str) -> MuseError {
         kind,
         format!("Muse host exited ({code}). {}", &stderr[start..]),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn notification_byte_budget_backpressures_even_with_free_slots() {
+        let first = Notification {
+            method: "test".into(),
+            params: Some(RawValue::from_string(r#"{"seq":1}"#.into()).unwrap()),
+        };
+        let second = Notification {
+            method: "test".into(),
+            params: Some(RawValue::from_string(r#"{"seq":2}"#.into()).unwrap()),
+        };
+        let (sender, mut receiver) = mpsc::channel(2);
+        let budget = first.bytes().max(second.bytes()) as usize;
+        let notifications = Notifications {
+            sender,
+            budget: Arc::new(Semaphore::new(budget)),
+        };
+        assert!(notifications.try_send(first).is_none());
+        let mut staged = notifications.try_send(second);
+        assert!(staged.is_some());
+        let mut send = std::pin::pin!(notifications.send(&mut staged));
+        assert!(matches!(futures_util::poll!(&mut send), Poll::Pending));
+        assert_eq!(
+            receiver.recv().await.unwrap().into_value().unwrap()["params"]["seq"],
+            1
+        );
+        send.await;
+        assert_eq!(
+            receiver.recv().await.unwrap().into_value().unwrap()["params"]["seq"],
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    async fn saturated_host(
+        extra_notifications: usize,
+    ) -> (Arc<Connection>, mpsc::Receiver<QueuedNotification>) {
+        // No notification is consumed until after the second control request
+        // returns. One extra frame exercises the stdout reader's staged slot.
+        let script = r#"
+            read -r initialize
+            printf '{"jsonrpc":"2.0","id":1,"result":{"schema":{"fingerprint":"%s"}}}\n' "$2"
+            read -r initialized
+            i=0
+            while [ "$i" -lt "$1" ]; do
+                printf '{"jsonrpc":"2.0","method":"test","params":{"seq":%s}}\n' "$i"
+                i=$((i+1))
+            done
+            read -r request
+            printf '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}\n'
+            read -r close
+        "#;
+        let spec = ProviderSpec {
+            id: "muse".into(),
+            family: "muse".into(),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                script.into(),
+                "muse-fixture".into(),
+                (NOTIFICATION_COUNT + extra_notifications).to_string(),
+                FINGERPRINT.into(),
+            ],
+            env: BTreeMap::new(),
+            options: Value::Null,
+            defaults: json!({}),
+            runtime_settings: json!({}),
+            configured_models: vec![],
+        };
+        let (host, receiver) = Connection::spawn(
+            &spec,
+            BTreeMap::new(),
+            None,
+            &json!({"timeoutMs":5000, "startupTimeoutMs":5000}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while receiver.len() < NOTIFICATION_COUNT {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        (host, receiver)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_notification_queue_delivers_control_reply_before_consumer_drains() {
+        let (host, mut receiver) = saturated_host(1).await;
+        let reply = host.request("test", json!({})).await.unwrap();
+        assert_eq!(reply, json!({"ok":true}));
+        assert_eq!(receiver.len(), NOTIFICATION_COUNT);
+        for expected in 0..=NOTIFICATION_COUNT {
+            let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_value()
+                .unwrap();
+            assert_eq!(
+                notification["params"]["seq"].as_u64(),
+                Some(expected as u64)
+            );
+        }
+        host.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notification_overload_fails_pending_control_and_reports_terminal_error() {
+        let (host, mut receiver) = saturated_host(2).await;
+        let error = host.request("test", json!({})).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<MuseError>().unwrap().kind,
+            "notificationOverload"
+        );
+        for _ in 0..NOTIFICATION_COUNT {
+            receiver.recv().await.unwrap();
+        }
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(host.notification_failure().await.message, error.to_string());
+        host.close().await.unwrap();
+    }
 }

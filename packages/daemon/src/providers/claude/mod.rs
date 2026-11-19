@@ -25,12 +25,27 @@ use std::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
-use transport::Transport;
+use transport::{StdoutFrameError, Transport};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 fn capabilities() -> Value {
     json!({"supportsStreaming":true,"supportsSessionPersistence":true,"supportsSessionListing":true,"supportsDynamicModes":true,"supportsMcpServers":true,"supportsReasoningStream":true,"supportsToolInvocations":true,"supportsRewindConversation":true,"supportsRewindFiles":true,"supportsRewindBoth":true})
 }
+
+fn runtime_failure_events(
+    projection: &mut Projection,
+    provider: &str,
+    message: &str,
+    framing_failure: bool,
+) -> Vec<Value> {
+    let mut events = projection.runtime_failed(message);
+    if framing_failure && !events.iter().any(|event| event["type"] == "turn_failed") {
+        events.push(json!({"type":"timeline","provider":provider,
+            "item":{"type":"notification","level":"error","message":message}}));
+    }
+    events
+}
+
 fn merged_env(spec: &ProviderSpec, context: Option<&LaunchContext>) -> BTreeMap<String, String> {
     options::provider_env(spec, context.map(|context| &context.env))
 }
@@ -831,13 +846,13 @@ impl ClaudeSession {
                 match frame {
                     Ok(frame) => {
                         if let Err(error) = session.receive(&active, frame).await {
-                            session.runtime_failed(&active, error.to_string()).await;
+                            session.runtime_failed(&active, &error).await;
                             return;
                         }
                         active.finish_event();
                     }
                     Err(error) => {
-                        session.runtime_failed(&active, error.to_string()).await;
+                        session.runtime_failed(&active, &error).await;
                         return;
                     }
                 }
@@ -875,7 +890,7 @@ impl ClaudeSession {
             .is_some_and(|r| r.generation == runtime.generation)
     }
 
-    async fn runtime_failed(&self, runtime: &Transport, error: String) {
+    async fn runtime_failed(&self, runtime: &Transport, error: &anyhow::Error) {
         let mut events = {
             let mut state = self.state.lock().unwrap();
             if state
@@ -892,8 +907,14 @@ impl ClaudeSession {
             state.interrupt_pending = false;
             state.unstarted.clear();
             state.clearing_steers.clear();
-            let mut events: Vec<_> = state.permissions.drain().map(|(id,_)|json!({"type":"permission_resolved","provider":self.spec.id,"requestId":id,"resolution":{"behavior":"deny","message":error}})).collect();
-            events.extend(state.projection.runtime_failed(&error));
+            let message = error.to_string();
+            let mut events: Vec<_> = state.permissions.drain().map(|(id,_)|json!({"type":"permission_resolved","provider":self.spec.id,"requestId":id,"resolution":{"behavior":"deny","message":message}})).collect();
+            events.extend(runtime_failure_events(
+                &mut state.projection,
+                &self.spec.id,
+                &message,
+                error.is::<StdoutFrameError>(),
+            ));
             events
         };
         let _ = runtime.close().await;
@@ -1208,7 +1229,7 @@ impl AgentSession for ClaudeSession {
                 .insert(message["uuid"].as_str().unwrap().into());
         }
         if let Err(error) = runtime.process.write_json(&message).await {
-            self.runtime_failed(&runtime, error.to_string()).await;
+            self.runtime_failed(&runtime, &error).await;
             return Err(error);
         }
         let mut user = message.clone();
@@ -1828,6 +1849,27 @@ impl ClaudeSession {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_claude_reports_framing_failure_but_not_ordinary_exit() {
+        use crate::providers::jsonl::LineError;
+
+        let mut projection = Projection::new("claude");
+        assert!(
+            runtime_failure_events(
+                &mut projection,
+                "claude",
+                "Claude process output closed",
+                false
+            )
+            .is_empty()
+        );
+        let message = StdoutFrameError(LineError::Unterminated).to_string();
+        let events = runtime_failure_events(&mut projection, "claude", &message, true);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["item"]["type"], "notification");
+        assert_eq!(events[0]["item"]["message"], message);
+    }
 
     #[tokio::test]
     async fn failed_plan_mode_change_keeps_permission_pending_for_retry() -> Result<()> {

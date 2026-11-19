@@ -1,3 +1,4 @@
+use crate::providers::jsonl::{LineError, LineReader};
 use anyhow::{Result, anyhow, bail};
 use paseo_client::process::{CommandSpec, ManagedProcess};
 use serde_json::{Value, json};
@@ -6,14 +7,11 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    sync::{mpsc, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -63,11 +61,22 @@ impl RpcError {
     }
 }
 
+#[derive(Default)]
+struct Control {
+    pending: HashMap<u64, oneshot::Sender<Result<Value>>>,
+    failure: Option<CloseFailure>,
+}
+
+struct CloseFailure {
+    message: String,
+    framing: bool,
+    reported: bool,
+}
+
 pub struct Transport {
     pub process: Arc<ManagedProcess>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    control: Mutex<Control>,
     next: AtomicU64,
-    closed: AtomicBool,
     pub cancel: CancellationToken,
 }
 impl Transport {
@@ -78,26 +87,26 @@ impl Transport {
         let (process, stdout) = ManagedProcess::spawn(spec).await?;
         let this = Arc::new(Self {
             process,
-            pending: Mutex::new(HashMap::new()),
+            control: Mutex::new(Control::default()),
             next: AtomicU64::new(1),
-            closed: AtomicBool::new(false),
             cancel: cancel.child_token(),
         });
         let (sender, receiver) = mpsc::channel(4096);
         let reader = this.clone();
         tokio::spawn(async move {
-            let mut input = BufReader::new(stdout);
-            let mut line = Vec::new();
-            let failure = loop {
-                line.clear();
-                let read = tokio::select! { _ = reader.cancel.cancelled() => break "Codex app-server canceled".to_owned(), r = input.read_until(b'\n', &mut line) => r };
+            let mut input = LineReader::new(stdout);
+            let (failure, framing_failure) = loop {
+                let read = tokio::select! {
+                    _ = reader.cancel.cancelled() => break ("Codex app-server canceled".to_owned(), false),
+                    result = input.next_line() => result,
+                };
                 match read {
-                    Ok(0) => {
+                    Ok(false) => {
                         let status = tokio::select! {
-                            _=reader.cancel.cancelled()=>break "Codex app-server canceled".to_owned(),
+                            _ = reader.cancel.cancelled() => break ("Codex app-server canceled".to_owned(), false),
                             result=reader.process.wait()=>result,
                         };
-                        break match status {
+                        let failure = match status {
                             Ok(status) => format!(
                                 "Codex app-server exited with status {status}\n{}",
                                 reader.process.stderr_tail()
@@ -111,20 +120,30 @@ impl Transport {
                             .trim()
                             .to_owned(),
                         };
+                        break (failure, false);
                     }
-                    Err(error) => break format!("Codex app-server stdout: {error}"),
-                    _ => {}
+                    Err(LineError::Io(error)) => {
+                        break (format!("Codex app-server stdout: {error}"), false);
+                    }
+                    Err(error) => {
+                        break (
+                            format!("Invalid Codex app-server stdout frame: {error}"),
+                            true,
+                        );
+                    }
+                    Ok(true) => {}
                 }
-                if line.iter().all(u8::is_ascii_whitespace) {
+                if input.line().iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let message: Value = match serde_json::from_slice(&line) {
+                let message: Value = match serde_json::from_slice(input.line()) {
                     Ok(v) => v,
-                    Err(e) => break format!("Invalid Codex app-server JSON: {e}"),
+                    Err(e) => break (format!("Invalid Codex app-server JSON: {e}"), false),
                 };
+                input.clear_line();
                 if message.get("method").is_none() {
                     if let Some(id) = message["id"].as_u64() {
-                        let pending = reader.pending.lock().unwrap().remove(&id);
+                        let pending = reader.control.lock().unwrap().pending.remove(&id);
                         if let Some(pending) = pending {
                             let result = if let Some(error) = message.get("error") {
                                 Err(RpcError {
@@ -143,20 +162,47 @@ impl Transport {
                         }
                     }
                 } else if sender.try_send(message).is_err() {
-                    break "Codex event queue exceeded 4096 pending frames or its consumer closed"
-                        .to_owned();
+                    break (
+                        "Codex event queue exceeded 4096 pending frames or its consumer closed"
+                            .to_owned(),
+                        false,
+                    );
                 }
             };
-            reader.closed.store(true, Ordering::Release);
-            for (_, pending) in std::mem::take(&mut *reader.pending.lock().unwrap()) {
-                let _ = pending.send(Err(anyhow!(failure.clone())));
-            }
-            let _ = sender
-                .send(json!({"method":"paseo/transportClosed","params":{"message":failure}}))
-                .await;
+            drop(input);
+            reader.fail(failure, framing_failure);
+            drop(sender);
             let _ = reader.process.terminate(Duration::from_secs(2)).await;
         });
         Ok((this, receiver))
+    }
+
+    fn fail(&self, message: String, framing: bool) {
+        let mut control = self.control.lock().unwrap();
+        if control.failure.is_none() {
+            for (_, sender) in control.pending.drain() {
+                let _ = sender.send(Err(anyhow!("{message}")));
+            }
+            control.failure = Some(CloseFailure {
+                message,
+                framing,
+                reported: false,
+            });
+        }
+    }
+
+    /// The draining reader and reconnect can both discover the disconnect.
+    /// Preserve the original cause and publish the terminal event only once.
+    pub(super) fn take_close_event(&self) -> Option<Value> {
+        let mut control = self.control.lock().unwrap();
+        let failure = control.failure.as_mut()?;
+        if failure.reported {
+            return None;
+        }
+        failure.reported = true;
+        Some(json!({"method":"paseo/transportClosed","params":{
+            "message":failure.message,"framingFailure":failure.framing,
+        }}))
     }
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         self.request_timeout(method, params, Duration::from_secs(14 * 24 * 60 * 60))
@@ -168,20 +214,29 @@ impl Transport {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        if self.closed.load(Ordering::Acquire) {
-            bail!("Codex app-server is closed");
-        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            let mut control = self.control.lock().unwrap();
+            if let Some(failure) = &control.failure {
+                bail!("{}", failure.message);
+            }
+            control.pending.insert(id, tx);
+        }
         let result = async {
-            self.process.write_json(&json!({"id":id,"method":method,"params":params})).await?;
+            if let Err(error) = self.process.write_json(&json!({"id":id,"method":method,"params":params})).await {
+                let control = self.control.lock().unwrap();
+                return Err(match &control.failure {
+                    Some(failure) => anyhow!("{}", failure.message),
+                    None => error,
+                });
+            }
             tokio::select! {
                 _ = self.cancel.cancelled() => Err(anyhow!("Codex {method} canceled; request acceptance may be ambiguous")),
                 r = tokio::time::timeout(timeout,rx) => match r { Ok(Ok(v))=>v, Ok(Err(_))=>Err(anyhow!("Codex {method} disconnected")), Err(_)=>Err(anyhow!("Codex {method} timed out; request acceptance may be ambiguous")) }
             }
         }.await;
-        self.pending.lock().unwrap().remove(&id);
+        self.control.lock().unwrap().pending.remove(&id);
         result
     }
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -207,11 +262,8 @@ impl Transport {
         Ok(value)
     }
     pub async fn close(&self) -> Result<()> {
-        self.closed.store(true, Ordering::Release);
+        self.fail("Codex app-server is closed".to_owned(), false);
         self.cancel.cancel();
-        for (_, pending) in std::mem::take(&mut *self.pending.lock().unwrap()) {
-            let _ = pending.send(Err(anyhow!("Codex app-server is closed")));
-        }
         let shutdown = self.process.close_stdin().await;
         self.process.terminate(Duration::from_secs(2)).await?;
         shutdown
@@ -235,7 +287,7 @@ impl SessionTransport {
         self.current.lock().unwrap().clone()
     }
     pub fn is_closed(&self) -> bool {
-        self.current().closed.load(Ordering::Acquire)
+        self.current().control.lock().unwrap().failure.is_some()
     }
     pub fn is_current(&self, transport: &Arc<Transport>) -> bool {
         Arc::ptr_eq(&self.current(), transport)
@@ -265,5 +317,41 @@ impl SessionTransport {
     pub async fn close(&self) -> Result<()> {
         self.cancel.cancel();
         self.current().close().await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn codex_preserves_framing_failure_for_eof_and_reconnect() {
+        let (transport, mut receiver) = Transport::spawn(
+            CommandSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), r#"printf '%s' '{"method":"test"}'"#.into()],
+                cwd: None,
+                env: Default::default(),
+                clear_env: true,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let error = transport
+            .request("initialize", json!({}))
+            .await
+            .unwrap_err();
+        let event = transport.take_close_event().unwrap();
+        assert_eq!(event["params"]["message"], error.to_string());
+        assert_eq!(event["params"]["framingFailure"], true);
+        assert!(transport.take_close_event().is_none());
+        transport.close().await.unwrap();
     }
 }

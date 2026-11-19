@@ -242,11 +242,10 @@ impl CodexSession {
         match method.as_str() {
             "paseo/transportClosed" => {
                 let active = s.foreground.is_some() || s.native_turn.is_some();
-                if !s.closed && active {
-                    let mut event = json!({"type":"turn_failed","error":params["message"]});
-                    if let Some(turn) = &s.foreground {
-                        event["turnId"] = json!(turn);
-                    }
+                if !s.closed
+                    && let Some(event) =
+                        transport_close_event(&params, active, s.foreground.as_deref())
+                {
                     events.push(event);
                 }
                 let discarded: Vec<_> = s
@@ -905,5 +904,38 @@ fn upsert_child_item(items: &mut Vec<(String, Value)>, key: String, mut item: Va
         *existing = item;
     } else {
         items.push((key, item));
+    }
+}
+
+fn transport_close_event(params: &Value, active: bool, foreground: Option<&str>) -> Option<Value> {
+    if active {
+        let mut event = json!({"type":"turn_failed","error":params["message"]});
+        if let Some(turn) = foreground {
+            event["turnId"] = json!(turn);
+        }
+        Some(event)
+    } else if params["framingFailure"] == true {
+        Some(json!({"type":"timeline",
+            "item":{"type":"notification","level":"error","message":params["message"]}}))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_codex_reports_framing_failure_but_not_ordinary_exit() {
+        let exit = json!({"message":"Codex app-server exited"});
+        assert!(transport_close_event(&exit, false, None).is_none());
+        let framing = json!({"message":"JSONL stdout ended with an unterminated frame","framingFailure":true});
+        let idle = transport_close_event(&framing, false, None).unwrap();
+        assert_eq!(idle["item"]["type"], "notification");
+        assert_eq!(idle["item"]["message"], framing["message"]);
+        let active = transport_close_event(&framing, true, Some("turn")).unwrap();
+        assert_eq!(active["type"], "turn_failed");
+        assert_eq!(active["turnId"], "turn");
     }
 }

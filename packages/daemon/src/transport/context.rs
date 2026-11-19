@@ -17,6 +17,23 @@ pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 100 * 1024 * 1024;
 const WRITE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_PRIMING_FRAMES: usize = 4096;
+const MAX_DRAINING_UPLOADS: usize = 32;
+const UPLOAD_DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct FileTransfers {
+    active: HashSet<String>,
+    draining: VecDeque<(String, tokio::time::Instant)>,
+}
+
+impl FileTransfers {
+    fn discarding(&self, request_id: &str) -> bool {
+        let now = tokio::time::Instant::now();
+        self.draining
+            .iter()
+            .any(|(id, until)| id == request_id && *until > now)
+    }
+}
 
 #[derive(Debug)]
 pub enum OutboundFrame {
@@ -57,7 +74,7 @@ pub(crate) struct Source {
     subscriptions: Mutex<HashMap<String, Arc<SubscriptionState>>>,
     operations: Mutex<HashMap<String, CancellationToken>>,
     slots: Mutex<HashMap<u8, String>>,
-    transfers: Mutex<HashSet<String>>,
+    transfers: Mutex<FileTransfers>,
     events: Mutex<HashMap<String, (HashSet<String>, bool)>>,
     selective_subagent_timelines: AtomicBool,
 }
@@ -157,7 +174,7 @@ impl RequestContext {
             subscriptions: Mutex::new(HashMap::new()),
             operations: Mutex::new(HashMap::new()),
             slots: Mutex::new(HashMap::new()),
-            transfers: Mutex::new(HashSet::new()),
+            transfers: Mutex::new(FileTransfers::default()),
             events: Mutex::new(HashMap::new()),
             selective_subagent_timelines: AtomicBool::new(false),
         });
@@ -570,16 +587,44 @@ impl RequestContext {
         if request_id.is_empty() || request_id.len() > 255 {
             bail!("Invalid file transfer request ID");
         }
+        let mut transfers = self.source.transfers.lock().unwrap();
+        transfers.draining.retain(|(id, _)| id != request_id);
+        transfers.active.insert(request_id.to_owned());
+        Ok(())
+    }
+    pub fn release_file_transfer(&self, request_id: &str) {
         self.source
             .transfers
             .lock()
             .unwrap()
-            .insert(request_id.to_owned());
-        Ok(())
+            .active
+            .remove(request_id);
     }
-    pub fn release_file_transfer(&self, request_id: &str) {
-        self.source.transfers.lock().unwrap().remove(request_id);
+
+    // Upload clients do not wait for admission. Discard their already-buffered
+    // frames for a bounded interval instead of disconnecting the physical source.
+    pub(crate) fn drain_file_transfer(&self, request_id: &str) {
+        let mut transfers = self.source.transfers.lock().unwrap();
+        if self.source.cancel.is_cancelled() {
+            return;
+        }
+        transfers.active.remove(request_id);
+        let now = tokio::time::Instant::now();
+        transfers
+            .draining
+            .retain(|(id, until)| id != request_id && *until > now);
+        if transfers.draining.len() == MAX_DRAINING_UPLOADS {
+            transfers.draining.pop_front();
+        }
+        transfers
+            .draining
+            .push_back((request_id.to_owned(), now + UPLOAD_DRAIN_TIME));
     }
+
+    pub(crate) fn discarding_file_transfer(&self, request_id: &str) -> bool {
+        self.source.transfers.lock().unwrap().discarding(request_id)
+    }
+
     pub(crate) fn validate_binary(&self, bytes: &[u8], inbound: bool) -> Result<()> {
         if !self.is_live() || bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
             bail!("Invalid binary frame");
@@ -620,8 +665,11 @@ impl RequestContext {
                 }
                 let id = binary_request_id(bytes)
                     .ok_or_else(|| anyhow!("Invalid file transfer frame"))?;
-                if inbound && !self.source.transfers.lock().unwrap().contains(id) {
-                    bail!("File transfer is not owned by physical source");
+                if inbound {
+                    let transfers = self.source.transfers.lock().unwrap();
+                    if !transfers.active.contains(id) && !transfers.discarding(id) {
+                        bail!("File transfer is not owned by physical source");
+                    }
                 }
                 let body = 2 + bytes[1] as usize;
                 if bytes[0] == 0x12 && bytes.len() != body {
@@ -659,7 +707,7 @@ impl RequestContext {
             token.cancel();
         }
         self.source.slots.lock().unwrap().clear();
-        self.source.transfers.lock().unwrap().clear();
+        *self.source.transfers.lock().unwrap() = FileTransfers::default();
     }
     pub(crate) async fn protocol_failure(
         &self,
