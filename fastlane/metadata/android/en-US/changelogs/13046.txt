@@ -1,0 +1,14 @@
+Added
+- OMP agents: pick the OAuth account per agent.
+- OMP: /login, /logout, /queue, /bash, /fork and more commands.
+- Usage shows OMP's own logins and every Kiro account and profile.
+
+Changed
+- Model list refreshes after sign-in or account changes.
+
+Fixed
+- Failed compaction no longer shows as done.
+- Auto and Max thinking levels show correctly.
+- Warnings for a missing resumed model or MCP server.
+
+Full notes: https://github.com/emotionbug/Passession/releases
