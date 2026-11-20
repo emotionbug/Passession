@@ -4,21 +4,27 @@ mod auth;
 mod normalize;
 mod transport;
 
-use super::common::{UsageAccount, UsageRuntime, UsageScope, hash_account_key, unavailable};
+use super::{
+    UsageContext,
+    common::{UsageAccount, UsageRuntime, UsageScope, hash_account_key, unavailable},
+};
 use accounts::{DEFAULT_ACCOUNT, Target};
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
 const LOGIN_UNAVAILABLE: &str =
     "Kiro HTTP login unavailable. Run omp-kiro login, then refresh usage.";
+const LOGIN_CHANGED: &str =
+    "This Kiro HTTP login or profile changed. Refresh the usage account list.";
 const CANCELLED: &str = "The Kiro usage request was cancelled.";
 const TIMEOUT: &str = "The Kiro usage request timed out.";
 
@@ -31,6 +37,57 @@ enum Selection {
     Saved,
     /// A session on a pinned profile or API-key provider.
     Pinned(String),
+}
+
+struct EnvironmentKey {
+    credential: Result<auth::Credential, &'static str>,
+    extra_ca: Option<PathBuf>,
+}
+
+/// Credential bytes stay in the request runtime, never in a report locator.
+#[derive(Clone, Default)]
+pub(super) struct Runtime(Arc<HashMap<String, EnvironmentKey>>);
+
+impl Runtime {
+    pub(super) fn new(context: &UsageContext) -> Self {
+        let mut keys = HashMap::new();
+        let mut add = |env: &BTreeMap<String, String>| {
+            if let Some((id, credential)) = auth::environment_key(env) {
+                keys.insert(
+                    id,
+                    EnvironmentKey {
+                        credential,
+                        extra_ca: extra_ca(env),
+                    },
+                );
+            }
+        };
+        add(&context.env);
+        for session in &context.sessions {
+            if session["_runtimeUnavailable"] != true
+                && let Some(env) = session["env"].as_object()
+                && env.contains_key("KIRO_API_KEY")
+            {
+                // Only these values can affect API-key authentication and TLS.
+                let env = ["KIRO_API_KEY", "KIRO_API_REGION", "NODE_EXTRA_CA_CERTS"]
+                    .into_iter()
+                    .filter_map(|key| Some((key.to_owned(), env.get(key)?.as_str()?.to_owned())))
+                    .collect();
+                add(&env);
+            }
+        }
+        Self(Arc::new(keys))
+    }
+}
+
+fn extra_ca(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    env.get("NODE_EXTRA_CA_CERTS")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn unmeasured(detail: &str) -> Value {
+    unavailable(json!({"kind":"no_quota","detail":detail}))
 }
 
 fn scope_env(
@@ -98,24 +155,46 @@ async fn discover_env(
         _ = cancellation.cancelled() => Vec::new(),
         _ = tokio::time::sleep(Duration::from_secs(3)) => Vec::new(),
         result = tokio::task::spawn_blocking(move || {
-            let default = auth::auth_path(&env).ok()?;
-            // Named accounts live beside the default store; a saved-profile session uses only it.
+            let default_key = auth::environment_key(&env);
+            let mut rows = Vec::new();
+            let overridden = default_key.is_some();
+            let uses_environment = match &selection {
+                Selection::All | Selection::Saved => true,
+                Selection::Pinned(provider) => provider == "kiro-default-key",
+            };
+            if let Some((id, _)) = default_key.filter(|_| uses_environment) {
+                rows.push(UsageAccount {
+                    key: id.clone(),
+                    label: Some("Kiro HTTP · environment API key".into()),
+                    harness: Some("Kiro HTTP".into()),
+                    input: json!(Input::Environment { login_id: id }),
+                });
+            }
+            let Ok(default) = auth::auth_path(&env) else {
+                return rows;
+            };
             let stores = if selection == Selection::Saved {
                 vec![(DEFAULT_ACCOUNT.to_owned(), default)]
             } else {
                 accounts::stores(&default)
             };
-            Some(
-                stores
-                    .iter()
-                    .flat_map(|(name, path)| store_accounts(name, path, &selection))
-                    .collect::<Vec<_>>(),
-            )
-        }) => result.ok().flatten().unwrap_or_default(),
+            rows.extend(stores.iter().flat_map(|(name, path)| {
+                store_accounts(name, path, &selection, overridden)
+            }));
+            rows
+        }) => result.unwrap_or_default(),
     }
 }
 
-fn store_accounts(name: &str, path: &Path, selection: &Selection) -> Vec<UsageAccount> {
+fn store_accounts(
+    name: &str,
+    path: &Path,
+    selection: &Selection,
+    overridden: bool,
+) -> Vec<UsageAccount> {
+    if name == DEFAULT_ACCOUNT && overridden {
+        return Vec::new();
+    }
     let Ok(path) = path.canonicalize() else {
         return Vec::new();
     };
@@ -125,60 +204,109 @@ fn store_accounts(name: &str, path: &Path, selection: &Selection) -> Vec<UsageAc
     let Some(path) = path.to_str() else {
         return Vec::new();
     };
-    // A store with one profile keeps its plain locator, which reads the saved selection.
-    let plain = || UsageAccount {
-        key: hash_account_key(path),
-        label: Some(if name == DEFAULT_ACCOUNT {
-            format!("Kiro HTTP · {}", credential.provider)
-        } else {
-            format!("Kiro HTTP · {name} · {}", credential.provider)
+    let saved_arn = credential.profile_arn.as_deref();
+    let saved = || match saved_arn {
+        Some(arn) => Profile::Saved {
+            profile_arn: arn.to_owned(),
+        },
+        None => Profile::Unselected,
+    };
+    let make_account = |profile: Profile, profile_label: Option<&str>| UsageAccount {
+        key: profile.arn().map_or_else(
+            || hash_account_key(path),
+            |arn| hash_account_key(&format!("{path}\n{arn}")),
+        ),
+        label: Some(match (profile_label, name == DEFAULT_ACCOUNT) {
+            (Some(label), _) => format!(
+                "Kiro HTTP · {name} · {}",
+                label.replace(char::is_control, " ")
+            ),
+            (None, true) => format!("Kiro HTTP · {}", credential.provider),
+            (None, false) => format!("Kiro HTTP · {name} · {}", credential.provider),
         }),
         harness: Some("Kiro HTTP".into()),
-        input: json!({"authFile":path}),
+        input: json!(Input::Store {
+            auth_file: path.to_owned(),
+            login_id: credential.login_id.clone(),
+            profile,
+        }),
     };
-    if *selection == Selection::Saved {
-        return vec![plain()];
-    }
-    let targets = accounts::targets(name, &credential, catalog);
-    let target_account = |target: &Target| {
-        let Some(arn) = target.arn.as_deref() else {
-            return plain();
+    if credential.is_api_key() {
+        return match selection {
+            Selection::Pinned(id) if id != &format!("kiro-{name}-key") => Vec::new(),
+            _ => vec![make_account(Profile::ApiKey, None)],
         };
-        if targets.len() == 1 && credential.profile_arn.as_deref() == Some(arn) {
-            return plain();
-        }
-        UsageAccount {
-            key: hash_account_key(&format!("{path}\n{arn}")),
-            label: Some(format!(
-                "Kiro HTTP · {name} · {}",
-                target
-                    .name
-                    .as_deref()
-                    .unwrap_or(arn)
-                    .replace(char::is_control, " ")
-            )),
-            harness: Some("Kiro HTTP".into()),
-            input: json!({"authFile":path, "profileArn":arn}),
-        }
+    }
+    if *selection == Selection::Saved {
+        return vec![make_account(saved(), None)];
+    }
+    let targets = accounts::profile_targets(name, &credential, catalog);
+    let target_account = |target: &Target| {
+        let arn = target.arn.as_str();
+        let sole_saved = targets.len() == 1 && saved_arn == Some(arn);
+        let profile = if sole_saved || (*selection == Selection::All && saved_arn == Some(arn)) {
+            saved()
+        } else {
+            Profile::Listed {
+                profile_arn: arn.to_owned(),
+            }
+        };
+        make_account(
+            profile,
+            (!sole_saved).then(|| target.name.as_deref().unwrap_or(arn)),
+        )
     };
     match selection {
         Selection::Pinned(provider) => targets
             .iter()
-            .find(|target| target.provider == *provider)
+            .find(|target| target.provider.as_deref() == Some(provider))
             .map(target_account)
             .into_iter()
             .collect(),
         _ if !targets.is_empty() => targets.iter().map(target_account).collect(),
-        _ => vec![plain()],
+        _ => vec![make_account(saved(), None)],
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Input {
-    auth_file: String,
-    #[serde(default)]
-    profile_arn: Option<String>,
+#[derive(Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum Input {
+    Environment {
+        login_id: String,
+    },
+    Store {
+        auth_file: String,
+        login_id: String,
+        profile: Profile,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum Profile {
+    ApiKey,
+    Unselected,
+    Saved { profile_arn: String },
+    Listed { profile_arn: String },
+}
+
+impl Profile {
+    fn arn(&self) -> Option<&str> {
+        match self {
+            Self::ApiKey | Self::Unselected => None,
+            Self::Saved { profile_arn } | Self::Listed { profile_arn } => Some(profile_arn),
+        }
+    }
 }
 
 pub(super) async fn fetch(rt: &UsageRuntime, input: &Value) -> Result<Value> {
@@ -190,12 +318,11 @@ pub(super) async fn fetch(rt: &UsageRuntime, input: &Value) -> Result<Value> {
             ));
         }
     };
-    let path = PathBuf::from(input.auth_file);
-    if !path.is_absolute()
-        || !input
-            .profile_arn
-            .as_deref()
-            .is_none_or(auth::valid_profile_arn)
+    if let Input::Store {
+        auth_file, profile, ..
+    } = &input
+        && (!Path::new(auth_file).is_absolute()
+            || !profile.arn().is_none_or(auth::valid_profile_arn))
     {
         return Ok(transport::error(
             "Invalid Kiro authentication store locator.",
@@ -205,23 +332,61 @@ pub(super) async fn fetch(rt: &UsageRuntime, input: &Value) -> Result<Value> {
         biased;
         _ = rt.cancel.cancelled() => transport::error(CANCELLED),
         _ = tokio::time::sleep(Duration::from_secs(15)) => transport::error(TIMEOUT),
-        report = fetch_path(rt, path, input.profile_arn) => report,
+        report = fetch_credential(rt, input) => report,
     })
 }
-async fn fetch_path(rt: &UsageRuntime, path: PathBuf, profile_arn: Option<String>) -> Value {
-    let mut credential = match tokio::task::spawn_blocking(move || auth::read(&path)).await {
-        Ok(Ok(credential)) => credential,
-        _ => return transport::error(LOGIN_UNAVAILABLE),
-    };
-    if credential.disabled {
-        return unavailable(json!({
-            "kind":"no_quota",
-            "detail":"This Kiro HTTP login is disabled. Sign in again with omp-kiro login."
-        }));
+async fn fetch_credential(rt: &UsageRuntime, input: Input) -> Value {
+    match input {
+        Input::Environment { login_id } => {
+            let Some(key) = rt.kiro.0.get(&login_id) else {
+                return unmeasured(LOGIN_CHANGED);
+            };
+            let credential = match &key.credential {
+                Ok(credential) => credential,
+                Err(message) => return unmeasured(message),
+            };
+            request(rt, credential, key.extra_ca.clone(), true).await
+        }
+        Input::Store {
+            auth_file,
+            login_id,
+            profile,
+        } => {
+            let result =
+                tokio::task::spawn_blocking(move || auth::read_store(Path::new(&auth_file))).await;
+            let Ok(Ok((mut credential, catalog))) = result else {
+                return unmeasured(LOGIN_UNAVAILABLE);
+            };
+            let same_profile = match &profile {
+                Profile::ApiKey => credential.is_api_key(),
+                Profile::Unselected => !credential.is_api_key() && credential.profile_arn.is_none(),
+                Profile::Saved { profile_arn } => {
+                    !credential.is_api_key() && credential.profile_arn.as_ref() == Some(profile_arn)
+                }
+                Profile::Listed { profile_arn } => {
+                    !credential.is_api_key()
+                        && catalog.is_some_and(|profiles| {
+                            profiles.iter().any(|profile| profile.arn == *profile_arn)
+                        })
+                }
+            };
+            if !same_profile || credential.login_id != login_id {
+                return unmeasured(LOGIN_CHANGED);
+            }
+            credential.profile_arn = profile.arn().map(str::to_owned);
+            request(rt, &credential, extra_ca(&rt.env), false).await
+        }
     }
-    // A pinned profile reads that profile's quota; the store's saved selection is untouched.
-    if !credential.is_api_key() && profile_arn.is_some() {
-        credential.profile_arn = profile_arn;
+}
+
+async fn request(
+    rt: &UsageRuntime,
+    credential: &auth::Credential,
+    extra_ca: Option<PathBuf>,
+    environment: bool,
+) -> Value {
+    if credential.disabled {
+        return unmeasured("This Kiro HTTP login is disabled. Sign in again with omp-kiro login.");
     }
     if let Some(expires_at) = credential
         .expires_at
@@ -232,19 +397,25 @@ async fn fetch_path(rt: &UsageRuntime, path: PathBuf, profile_arn: Option<String
             "refreshedBy":"omp-kiro",
         }});
     }
-    let extra_ca = rt
-        .env
-        .get("NODE_EXTRA_CA_CERTS")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+    if !credential.is_api_key() && credential.profile_arn.is_none() {
+        return unmeasured("Select a Kiro HTTP profile in omp-kiro, then refresh usage.");
+    }
+    // SQLite connections are dropped before TLS setup or any HTTP await.
     let client =
         match tokio::task::spawn_blocking(move || transport::client(extra_ca.as_deref())).await {
             Ok(Ok(client)) => client,
             Ok(Err(message)) => return transport::error(message),
             Err(_) => return transport::error("The Kiro usage service could not be reached."),
         };
-    // auth::read has dropped its connection before TLS setup or any HTTP await.
-    transport::fetch(rt, client, &credential).await
+    if environment && credential.region.is_none() {
+        let Some(region) = transport::probe_api_key_region(rt, &client, credential).await else {
+            return unmeasured(
+                "Kiro API key did not resolve to one region; set KIRO_API_REGION to the key's AWS region.",
+            );
+        };
+        return transport::fetch_region(rt, client, credential, region).await;
+    }
+    transport::fetch(rt, client, credential).await
 }
 
 #[cfg(test)]
@@ -262,6 +433,7 @@ mod tests {
             endpoints: BTreeMap::new(),
             muse_providers: Vec::new(),
             omp: Default::default(),
+            kiro: Default::default(),
             plugins: None,
         }
     }
@@ -296,6 +468,14 @@ mod tests {
         discover_env(env, selection, &CancellationToken::new()).await
     }
 
+    fn saved_input(path: &Path, login_id: &str) -> Value {
+        json!(Input::Store {
+            auth_file: path.to_string_lossy().into_owned(),
+            login_id: login_id.to_owned(),
+            profile: Profile::Unselected,
+        })
+    }
+
     #[tokio::test]
     async fn source_session_auth_is_isolated_and_account_has_no_credentials() {
         let dir = tempfile::tempdir().unwrap();
@@ -316,7 +496,7 @@ mod tests {
         );
         assert_eq!(
             accounts[0].input,
-            json!({"authFile":canonical.to_str().unwrap()})
+            saved_input(&canonical, &auth::read(&canonical).unwrap().login_id)
         );
         assert!(
             !accounts[0]
@@ -391,10 +571,10 @@ mod tests {
         for input in [
             Value::Null,
             json!({}),
-            json!({"authFile":"relative"}),
-            json!({"authFile":123}),
-            json!({"authFile":"/valid","accessToken":"private-access-token"}),
-            json!({"authFile":"/valid","profileArn":"arn:aws:codewhisperer:us-east-1:1:other/X"}),
+            saved_input(Path::new("relative"), "opaque-id"),
+            json!({"kind":"store","authFile":123,"loginId":"opaque-id","profile":{"kind":"api-key"}}),
+            json!({"kind":"store","authFile":"/valid","loginId":"opaque-id","profile":{"kind":"api-key"},"accessToken":"private-access-token"}),
+            json!({"kind":"store","authFile":"/valid","loginId":"opaque-id","profile":{"kind":"listed","profileArn":"arn:aws:codewhisperer:us-east-1:1:other/X"}}),
         ] {
             let value =
                 serde_json::to_value(fetch(&runtime(Path::new("/unused")), &input).await.unwrap())
@@ -407,15 +587,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("private-auth-path.db");
         std::fs::write(&path, b"private-access-token invalid sqlite").unwrap();
-        let report = fetch(
-            &runtime(dir.path()),
-            &json!({"authFile":path.to_str().unwrap()}),
-        )
-        .await
-        .unwrap();
+        let report = fetch(&runtime(dir.path()), &saved_input(&path, "opaque-id"))
+            .await
+            .unwrap();
         assert_eq!(
             serde_json::to_value(report).unwrap(),
-            json!({"status":"error","error":LOGIN_UNAVAILABLE})
+            unmeasured(LOGIN_UNAVAILABLE)
         );
     }
 
@@ -427,9 +604,7 @@ mod tests {
         let path = dir.path().join("missing.db");
         let mut rt = runtime(dir.path());
         rt.cancel = token.clone();
-        let report = fetch(&rt, &json!({"authFile":path.to_str().unwrap()}))
-            .await
-            .unwrap();
+        let report = fetch(&rt, &saved_input(&path, "opaque-id")).await.unwrap();
         assert_eq!(
             serde_json::to_value(report).unwrap(),
             json!({"status":"error","error":CANCELLED})
@@ -503,7 +678,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.db");
-        store(&path, "github", "2099-01-01T00:00:00Z");
+        login(&path, "github", Some(PERSONAL));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut rt = runtime(dir.path());
         rt.endpoints.insert(
@@ -511,7 +686,9 @@ mod tests {
             format!("http://{}/", listener.local_addr().unwrap()),
         );
         let cancel = rt.cancel.clone();
-        let input = json!({"authFile":path.to_str().unwrap()});
+        let input = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::Saved, false)
+            .remove(0)
+            .input;
         let fetch_task = tokio::spawn(async move { fetch(&rt, &input).await.unwrap() });
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
@@ -539,10 +716,11 @@ mod tests {
         assert_eq!(report, transport::error(CANCELLED));
     }
 
-    const PERSONAL: &str = "arn:aws:codewhisperer:us-east-1:123456789012:profile/PERSONAL01";
+    pub(super) const PERSONAL: &str =
+        "arn:aws:codewhisperer:us-east-1:123456789012:profile/PERSONAL01";
     const TEAM: &str = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/Team-02";
 
-    fn login(path: &Path, provider: &str, profile_arn: Option<&str>) {
+    pub(super) fn login(path: &Path, provider: &str, profile_arn: Option<&str>) {
         store(path, provider, "2099-01-01T00:00:00Z");
         if let Some(arn) = profile_arn {
             Connection::open(path).unwrap().execute(
@@ -620,10 +798,22 @@ mod tests {
         );
         let work = work.canonicalize().unwrap();
         let work = work.to_str().unwrap();
-        assert_eq!(all[3].input, json!({"authFile":work,"profileArn":PERSONAL}));
-        assert_eq!(all[2].input, json!({"authFile":work,"profileArn":TEAM}));
+        assert_eq!(all[3].input["authFile"], work);
+        assert_eq!(
+            all[3].input["profile"],
+            json!({"kind":"listed","profileArn":PERSONAL})
+        );
+        assert_eq!(
+            all[2].input["profile"],
+            json!({"kind":"listed","profileArn":TEAM})
+        );
         assert_ne!(all[2].key, all[3].key);
-        assert_eq!(all[1].input.get("profileArn"), None);
+        assert_eq!(
+            all[1].input["profile"],
+            json!({
+                "kind":"saved","profileArn":"arn:aws:codewhisperer:us-east-1:1:profile/SOLO01"
+            })
+        );
 
         let pinned = |model: &str| UsageScope {
             provider: Some("omp".into()),
@@ -637,7 +827,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key, all[3].key);
         assert_eq!(found[0].input, all[3].input);
-        // A single-profile account keeps its plain row, so both views share one key.
+        // The single-profile account also shares an ARN-scoped key with the pinned view.
         let solo = discover_found(scope_env(&pinned("kiro-solo-solo01/auto"), BTreeMap::new)).await;
         assert_eq!(solo[0].key, all[1].key);
         assert!(
@@ -662,6 +852,7 @@ mod tests {
             "github",
             Some("arn:aws:codewhisperer:us-east-1:1:profile/SAVED"),
         );
+        catalog(&path, &[(PERSONAL, "Personal")]);
         let before = std::fs::read(&path).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut rt = runtime(dir.path());
@@ -669,7 +860,9 @@ mod tests {
             "https://management.us-east-1.kiro.dev/".into(),
             format!("http://{}/", listener.local_addr().unwrap()),
         );
-        let input = json!({"authFile":path.to_str().unwrap(),"profileArn":PERSONAL});
+        let input = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::All, false)
+            .remove(0)
+            .input;
         let fetch_task = tokio::spawn(async move { fetch(&rt, &input).await.unwrap() });
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
@@ -729,9 +922,10 @@ mod tests {
             Some("Kiro HTTP · work · api-key")
         );
         assert_eq!(
-            pinned[0].input,
-            json!({"authFile": work.canonicalize().unwrap()})
+            pinned[0].input["authFile"],
+            work.canonicalize().unwrap().to_str().unwrap()
         );
+        assert_eq!(pinned[0].input["profile"], json!({"kind":"api-key"}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         rt.endpoints.insert(
             "https://management.us-west-2.kiro.dev/".into(),
@@ -756,5 +950,203 @@ mod tests {
         scope.model = Some("kiro/auto".into());
         scope.env.insert("OMP_KIRO_TRANSPORT".into(), "http".into());
         assert!(discover(&rt, &scope).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_default_environment_key_overrides_store_and_uses_scoped_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite3");
+        login(&path, "github", Some(PERSONAL));
+        let named = dir.path().join("accounts/work.sqlite3");
+        std::fs::create_dir(named.parent().unwrap()).unwrap();
+        login(&named, "google", Some(TEAM));
+        let mut daemon_env = scoped(&path).env;
+        daemon_env.insert("KIRO_API_KEY".into(), "ksk_daemon-fixture".into());
+        daemon_env.insert("KIRO_API_REGION".into(), "us-west-2".into());
+        let mut scope = scoped(&path);
+        scope
+            .env
+            .insert("KIRO_API_KEY".into(), " ksk_session-fixture ".into());
+        scope
+            .env
+            .insert("KIRO_API_REGION".into(), "eu-west-1".into());
+        let mut rt = runtime(dir.path());
+        rt.env = daemon_env.clone();
+        rt.kiro = Runtime::new(&UsageContext {
+            env: daemon_env,
+            user_home: Some(dir.path().to_owned()),
+            provider_specs: Vec::new(),
+            enabled_provider_ids: Default::default(),
+            sessions: vec![json!({"env":scope.env})],
+            muse_providers: Vec::new(),
+            plugins: None,
+        });
+        let global = discover(&rt, &global()).await.unwrap();
+        assert_eq!(global.len(), 2);
+        assert_eq!(global[0].input["kind"], "environment");
+        assert_eq!(
+            global[1].input["authFile"],
+            named.canonicalize().unwrap().to_str().unwrap()
+        );
+        let scoped = discover(&rt, &scope).await.unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_ne!(global[0].key, scoped[0].key);
+        for (row, token, region) in [
+            (&global[0], "ksk_daemon-fixture", "us-west-2"),
+            (&scoped[0], "ksk_session-fixture", "eu-west-1"),
+        ] {
+            assert!(!row.input.to_string().contains(token));
+            let body = json!({"nextDateReset":4_000_000_000u64,"usageBreakdownList":[
+                {"resourceType":"CREDIT","currentUsage":1,"usageLimit":100}
+            ]});
+            let (endpoint, received, server) = transport::tests::fixture(200, body.to_string());
+            rt.endpoints
+                .insert(format!("https://management.{region}.kiro.dev/"), endpoint);
+            let report = fetch(&rt, &row.input).await.unwrap();
+            assert_eq!(report["status"], "available");
+            assert!(!report.to_string().contains(token));
+            let request = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(request.contains(&format!("Bearer {token}")));
+            assert!(request.contains("GetUsageLimits"));
+            assert!(!request.contains("profileArn"));
+            server.join().unwrap();
+        }
+        scope.model = Some("kiro-default-key/auto".into());
+        assert_eq!(discover(&rt, &scope).await.unwrap()[0].key, scoped[0].key);
+        scope.model = Some("kiro-default-personal01/auto".into());
+        assert!(discover(&rt, &scope).await.unwrap().is_empty());
+        scope.model = Some("kiro-work-team02/auto".into());
+        assert_eq!(discover(&rt, &scope).await.unwrap()[0].key, global[1].key);
+    }
+
+    #[tokio::test]
+    async fn source_saved_profile_key_matches_global_across_catalog_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite3");
+        login(&path, "github", Some(PERSONAL));
+        let saved = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::Saved, false).remove(0);
+        let sole = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::All, false).remove(0);
+        assert_eq!(sole.key, saved.key);
+        catalog(&path, &[(PERSONAL, "Personal"), (TEAM, "Team")]);
+        let multiple = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::All, false);
+        assert_eq!(multiple.len(), 2);
+        let personal = multiple
+            .iter()
+            .find(|row| row.input["profile"]["profileArn"] == PERSONAL)
+            .unwrap();
+        assert_eq!(personal.key, saved.key);
+        assert_eq!(personal.input, saved.input);
+    }
+
+    #[tokio::test]
+    async fn source_pinned_locators_reject_profile_kind_and_login_changes_before_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite3");
+        login(&path, "github", Some(PERSONAL));
+        let mut rt = runtime(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for region in ["us-east-1", "eu-central-1", "us-west-2"] {
+            rt.endpoints.insert(
+                format!("https://management.{region}.kiro.dev/"),
+                format!("http://{}/", listener.local_addr().unwrap()),
+            );
+        }
+        let saved = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::All, false).remove(0);
+        let db = Connection::open(&path).unwrap();
+        db.execute("UPDATE credentials SET value = json_set(value, '$.profile_arn', ?1) WHERE id = 'active'", [TEAM]).unwrap();
+        assert_eq!(
+            fetch(&rt, &saved.input).await.unwrap(),
+            unmeasured(LOGIN_CHANGED)
+        );
+        catalog(&path, &[(PERSONAL, "Personal"), (TEAM, "Team")]);
+        let listed = store_accounts(
+            DEFAULT_ACCOUNT,
+            &path,
+            &Selection::Pinned("kiro-default-personal01".into()),
+            false,
+        )
+        .remove(0);
+        db.execute("DELETE FROM credentials WHERE id = 'profiles'", [])
+            .unwrap();
+        assert_eq!(
+            fetch(&rt, &listed.input).await.unwrap(),
+            unmeasured(LOGIN_CHANGED)
+        );
+        let key = json!({"kind":"api-key","provider":"api-key","region":"us-west-2","access_token":"ksk_first-fixture"});
+        let replace = |value: &Value| {
+            db.execute(
+                "UPDATE credentials SET value = ?1 WHERE id = 'active'",
+                [value.to_string()],
+            )
+            .unwrap()
+        };
+        replace(&key);
+        assert_eq!(
+            fetch(&rt, &saved.input).await.unwrap(),
+            unmeasured(LOGIN_CHANGED)
+        );
+        let api_key = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::All, false).remove(0);
+        replace(
+            &json!({"kind":"api-key","provider":"api-key","region":"us-west-2","access_token":"ksk_replacement-fixture"}),
+        );
+        let replacement = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::All, false).remove(0);
+        assert_eq!(api_key.key, replacement.key);
+        assert_ne!(api_key.input, replacement.input);
+        assert_eq!(
+            fetch(&rt, &api_key.input).await.unwrap(),
+            unmeasured(LOGIN_CHANGED)
+        );
+        replace(
+            &json!({"kind":"social","provider":"github","profile_arn":PERSONAL,"expires_at":"2099-01-01T00:00:00Z","access_token":"different-oauth-fixture"}),
+        );
+        assert_eq!(
+            fetch(&rt, &api_key.input).await.unwrap(),
+            unmeasured(LOGIN_CHANGED)
+        );
+        assert_eq!(
+            fetch(&rt, &saved.input).await.unwrap(),
+            unmeasured(LOGIN_CHANGED)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_unselected_oauth_does_not_fetch_unpinned_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite3");
+        login(&path, "github", None);
+        let row = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::Saved, false).remove(0);
+        let rt = runtime(dir.path());
+        assert_eq!(
+            fetch(&rt, &row.input).await.unwrap(),
+            unmeasured("Select a Kiro HTTP profile in omp-kiro, then refresh usage."),
+        );
+    }
+
+    #[test]
+    fn source_pinned_provider_collisions_have_no_winner_but_keep_profile_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite3");
+        login(&path, "github", None);
+        let collision = "arn:aws:codewhisperer:us-east-1:1:profile/team_02";
+        catalog(
+            &path,
+            &[
+                (TEAM, "Team"),
+                (collision, "Other Team"),
+                (PERSONAL, "Personal"),
+                (PERSONAL, "Personal"),
+            ],
+        );
+        let rows = store_accounts(DEFAULT_ACCOUNT, &path, &Selection::All, false);
+        assert_eq!(rows.len(), 3);
+        let pinned =
+            |id: &str| store_accounts(DEFAULT_ACCOUNT, &path, &Selection::Pinned(id.into()), false);
+        assert!(pinned("kiro-default-team02").is_empty());
+        assert_eq!(pinned("kiro-default-personal01").len(), 1);
     }
 }

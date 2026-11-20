@@ -1,5 +1,6 @@
 //! omp-kiro named account stores and the OMP model providers that pin their profiles.
 use super::auth::{Credential, Profile, profile_region, valid_profile_arn};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub(super) const DEFAULT_ACCOUNT: &str = "default";
@@ -40,10 +41,10 @@ pub(super) fn stores(default: &Path) -> Vec<(String, PathBuf)> {
     stores
 }
 
-/// One account profile or an API key usable over Kiro HTTP.
+/// A profile usable for usage, with a pinned model provider only if its ID is unique.
 pub(super) struct Target {
-    pub provider: String,
-    pub arn: Option<String>,
+    pub provider: Option<String>,
+    pub arn: String,
     pub name: Option<String>,
 }
 
@@ -65,18 +66,11 @@ pub(super) fn target_provider(account: &str, arn: &str) -> Option<String> {
 }
 
 /// The listed catalog, or the saved selection when no catalog was listed yet.
-pub(super) fn targets(
+pub(super) fn profile_targets(
     account: &str,
     credential: &Credential,
     catalog: Option<Vec<Profile>>,
 ) -> Vec<Target> {
-    if credential.is_api_key() {
-        return vec![Target {
-            provider: format!("kiro-{account}-key"),
-            arn: None,
-            name: None,
-        }];
-    }
     let mut profiles = catalog.unwrap_or_else(|| {
         credential
             .profile_arn
@@ -90,19 +84,26 @@ pub(super) fn targets(
     let regions = credential.profile_regions();
     profiles.retain(|profile| profile_region(&profile.arn).is_some_and(|r| regions.contains(&r)));
     profiles.sort_unstable_by(|left, right| left.arn.cmp(&right.arn));
-    let mut targets: Vec<Target> = Vec::with_capacity(profiles.len());
-    for profile in profiles {
-        let Some(provider) = target_provider(account, &profile.arn) else {
-            continue;
-        };
-        if targets.iter().any(|target| target.provider == provider) {
-            continue;
+    profiles.dedup_by(|left, right| left.arn == right.arn);
+    let mut providers = HashMap::new();
+    let mut targets: Vec<Target> = profiles
+        .into_iter()
+        .map(|profile| {
+            let provider = target_provider(account, &profile.arn);
+            if let Some(provider) = &provider {
+                *providers.entry(provider.clone()).or_insert(0) += 1;
+            }
+            Target {
+                provider,
+                arn: profile.arn,
+                name: profile.name,
+            }
+        })
+        .collect();
+    for target in &mut targets {
+        if target.provider.as_ref().is_some_and(|id| providers[id] > 1) {
+            target.provider = None;
         }
-        targets.push(Target {
-            provider,
-            arn: Some(profile.arn),
-            name: profile.name,
-        });
     }
     targets
 }

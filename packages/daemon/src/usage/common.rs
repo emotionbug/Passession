@@ -33,6 +33,7 @@ pub(super) struct UsageRuntime {
     pub endpoints: BTreeMap<String, String>,
     pub muse_providers: Vec<std::sync::Arc<crate::providers::muse::MuseProvider>>,
     pub omp: super::omp::Runtime,
+    pub kiro: super::kiro::Runtime,
     pub plugins: Option<std::sync::Arc<crate::plugins::PluginService>>,
 }
 

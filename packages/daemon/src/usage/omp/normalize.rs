@@ -106,8 +106,10 @@ struct OAuthAccount {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Report {
     provider: String,
+    fetched_at: Option<f64>,
     limits: Vec<Limit>,
     metadata: Option<Metadata>,
 }
@@ -260,6 +262,7 @@ fn project_report(limits: Vec<Limit>, plan: Option<&str>) -> Value {
 }
 
 pub(super) struct Row {
+    pub provider: String,
     pub label: String,
     pub report: Value,
 }
@@ -270,24 +273,21 @@ fn identity_hash(provider: &str, identity: &str) -> String {
     hash_account_key(&json!([provider, "identity", identity]).to_string())
 }
 
-pub(super) fn project(
-    usage: Usage,
-    accounts: Option<Accounts>,
-    namespace: &str,
-    scope: Option<&str>,
-) -> Rows {
-    let included =
-        |provider: &str| native_provider(provider) && scope.is_none_or(|scope| scope == provider);
+pub(super) fn project(usage: Usage, accounts: Option<Accounts>, namespace: &str) -> Rows {
     let mut rows = Rows::new();
     let mut anonymous = HashMap::<String, usize>::new();
     let mut stored = HashSet::new();
-    let mut stored_anonymous = HashSet::new();
+    let mut inventory_counts = HashMap::<&str, usize>::new();
+    let mut stored_anonymous = HashMap::<&str, usize>::new();
+    let mut report_ids = HashMap::<String, HashSet<u64>>::new();
+    let mut measured_providers = HashSet::new();
     if let Some(accounts) = accounts.as_ref() {
         for account in &accounts.accounts {
+            *inventory_counts.entry(&account.provider).or_default() += 1;
             if let Some(identity) = account.identity_key.as_deref().and_then(nonempty) {
                 stored.insert(identity_hash(&account.provider, &identity.to_lowercase()));
             } else {
-                stored_anonymous.insert(account.provider.as_str());
+                *stored_anonymous.entry(&account.provider).or_default() += 1;
             }
         }
     }
@@ -312,18 +312,20 @@ pub(super) fn project(
                 label.unwrap_or_else(|| format!("Account {ordinal}")),
             )
         };
-        rows.insert(
-            key,
-            Row {
-                label: format!("OMP · {provider} · {label}"),
-                report,
-            },
-        );
+        rows.entry(key).or_insert_with(|| Row {
+            provider: provider.to_owned(),
+            label: format!("OMP · {provider} · {label}"),
+            report,
+        });
     };
+    let mut candidates = HashMap::<String, usize>::new();
+    for report in &usage.reports {
+        *candidates.entry(report.provider.clone()).or_default() += 1;
+    }
     for report in usage
         .reports
         .into_iter()
-        .filter(|row| included(&row.provider))
+        .filter(|row| native_provider(&row.provider))
     {
         let meta = report.metadata.unwrap_or_default();
         let identity = meta.identity.key(&report.provider).or_else(|| {
@@ -337,10 +339,12 @@ pub(super) fn project(
         // than counting every matching env/runtime key as a stored account.
         if meta.credential_id.is_none()
             && accounts.is_some()
-            && !identity.as_deref().map_or_else(
-                || stored_anonymous.contains(report.provider.as_str()),
-                |identity| stored.contains(&identity_hash(&report.provider, identity)),
-            )
+            && !identity
+                .as_deref()
+                .is_some_and(|identity| stored.contains(&identity_hash(&report.provider, identity)))
+            && !(stored_anonymous.get(report.provider.as_str()) == Some(&1)
+                && inventory_counts[report.provider.as_str()] == 1
+                && candidates[&report.provider] == 1)
         {
             continue;
         }
@@ -353,7 +357,20 @@ pub(super) fn project(
             .as_deref()
             .and_then(nonempty)
             .or_else(|| meta.plan_type.as_deref().and_then(nonempty));
-        let quota = project_report(report.limits, plan);
+        let mut quota = project_report(report.limits, plan);
+        if let Some(at) = report
+            .fetched_at
+            .and_then(|at| DateTime::from_timestamp_millis(at.trunc() as i64))
+        {
+            quota["fetchedAt"] = json!(at.to_rfc3339_opts(SecondsFormat::Millis, true));
+        }
+        if let Some(id) = meta.credential_id {
+            report_ids
+                .entry(report.provider.clone())
+                .or_default()
+                .insert(id);
+        }
+        measured_providers.insert(report.provider.clone());
         add(&report.provider, identity, meta.credential_id, label, quota);
     }
     for (credentials, detail) in [
@@ -365,8 +382,16 @@ pub(super) fn project(
     ] {
         for credential in credentials
             .into_iter()
-            .filter(|row| included(&row.provider))
+            .filter(|row| native_provider(&row.provider))
         {
+            if credential.id.is_some_and(|id| {
+                report_ids
+                    .get(&credential.provider)
+                    .is_some_and(|ids| ids.contains(&id))
+            }) {
+                continue;
+            }
+            measured_providers.insert(credential.provider.clone());
             let label = credential
                 .identity
                 .label()
@@ -383,11 +408,19 @@ pub(super) fn project(
     if let Some(accounts) = accounts {
         // The unscoped usage command deliberately omits providers without a
         // usage endpoint. Supplement it with the separate token-free OAuth list.
+        let mut anonymous_counts = HashMap::new();
+        for account in &accounts.accounts {
+            if account.identity_key.as_deref().and_then(nonempty).is_none() {
+                *anonymous_counts
+                    .entry(account.provider.clone())
+                    .or_insert(0) += 1;
+            }
+        }
         let mut seen = HashMap::<String, usize>::new();
         for account in accounts
             .accounts
             .into_iter()
-            .filter(|row| included(&row.provider))
+            .filter(|row| native_provider(&row.provider))
         {
             let identity = account.identity_key.as_deref().and_then(nonempty);
             let ordinal = seen.entry(account.provider.clone()).or_default();
@@ -404,11 +437,11 @@ pub(super) fn project(
                 let key = identity_hash(&account.provider, &identity.to_lowercase());
                 (key, label_base, org)
             } else {
-                if let Some(count) = anonymous
-                    .get_mut(&account.provider)
-                    .filter(|count| **count > 0)
+                // Inventory has neither an ID nor an identity key to match
+                // this row to a report or derive a stable ordinal.
+                if measured_providers.contains(&account.provider)
+                    || anonymous_counts[&account.provider] != 1
                 {
-                    *count -= 1;
                     continue;
                 }
                 (
@@ -422,6 +455,7 @@ pub(super) fn project(
             let label = label(base, account.org_name.as_deref().and_then(nonempty).or(org))
                 .unwrap_or_else(|| format!("OAuth account {ordinal}"));
             rows.entry(key).or_insert_with(|| Row {
+                provider: account.provider.clone(),
                 label: format!("OMP · {} · {label}", account.provider),
                 report: no_quota(NO_QUOTA),
             });

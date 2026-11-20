@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -12,6 +13,7 @@ use std::{
 // Deliberately not Debug/Serialize: credentials never belong in protocol errors or logs.
 pub(super) struct Credential {
     pub access_token: String,
+    pub login_id: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub profile_arn: Option<String>,
     pub provider: &'static str,
@@ -50,6 +52,62 @@ impl Credential {
             None => Some(regions[0]),
         }
     }
+}
+
+/// A process-local locator discriminator, not a token or a reusable verifier.
+fn login_id(parts: &[Option<&str>]) -> String {
+    static NONCE: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
+    let mut hash = Sha256::new();
+    hash.update(*NONCE);
+    for part in parts {
+        if let Some(part) = part {
+            hash.update([1]);
+            hash.update(part.len().to_le_bytes());
+            hash.update(part.as_bytes());
+        } else {
+            hash.update([0]);
+        }
+    }
+    hex::encode(hash.finalize())
+}
+
+fn valid_api_key(token: &str) -> bool {
+    token
+        .strip_prefix("ksk_")
+        .is_some_and(|key| !key.is_empty() && key.bytes().all(|byte| (b'!'..=b'~').contains(&byte)))
+}
+
+/// An explicitly configured (even malformed) environment key shadows the saved login.
+pub(super) fn environment_key(
+    env: &BTreeMap<String, String>,
+) -> Option<(String, Result<Credential, &'static str>)> {
+    let token = env
+        .get("KIRO_API_KEY")
+        .filter(|value| !value.is_empty())?
+        .trim();
+    let region = env.get("KIRO_API_REGION").map(String::as_str);
+    let id = login_id(&[
+        Some("environment"),
+        Some(token),
+        region,
+        env.get("NODE_EXTRA_CA_CERTS").map(String::as_str),
+    ]);
+    let credential = if !valid_api_key(token) {
+        Err("Kiro usage cannot use KIRO_API_KEY: expected an API key in ksk_… format.")
+    } else if region.is_some_and(|region| !KIRO_REGION.is_match(region)) {
+        Err("Kiro usage cannot use KIRO_API_REGION: expected a valid AWS region.")
+    } else {
+        Ok(Credential {
+            access_token: token.to_owned(),
+            login_id: id.clone(),
+            expires_at: None,
+            profile_arn: None,
+            provider: "api-key",
+            region: region.map(str::to_owned),
+            disabled: false,
+        })
+    };
+    Some((id, credential))
 }
 
 pub(super) fn auth_path(env: &BTreeMap<String, String>) -> Result<PathBuf, ()> {
@@ -183,6 +241,7 @@ fn row(db: &Connection, id: &str) -> Result<Option<String>, ()> {
     Ok(raw.flatten())
 }
 
+#[cfg(test)]
 pub(super) fn read(path: &Path) -> Result<Credential, ()> {
     let db = open(path)?;
     let raw = row(&db, "active")?.ok_or(())?;
@@ -193,8 +252,11 @@ pub(super) fn read(path: &Path) -> Result<Credential, ()> {
 /// The login and the profile catalog listed for it; an unreadable catalog counts as none.
 pub(super) fn read_store(path: &Path) -> Result<(Credential, Option<Vec<Profile>>), ()> {
     let db = open(path)?;
-    let raw = row(&db, "active")?.ok_or(())?;
-    let catalog = row(&db, "profiles").ok().flatten();
+    // A login change can update both rows; never pair snapshots from separate transactions.
+    let snapshot = db.unchecked_transaction().map_err(|_| ())?;
+    let raw = row(&snapshot, "active")?.ok_or(())?;
+    let catalog = row(&snapshot, "profiles").ok().flatten();
+    drop(snapshot);
     drop(db);
     Ok((parse(&raw)?, catalog.as_deref().and_then(parse_catalog)))
 }
@@ -258,9 +320,8 @@ fn parse(raw: &str) -> Result<Credential, ()> {
     let access_token = nonempty("access_token")?;
     let region = value["region"].as_str();
     let (expires_at, profile_arn) = if provider == "api-key" {
-        if !access_token.strip_prefix("ksk_").is_some_and(|key| {
-            !key.is_empty() && key.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
-        }) || !region.is_some_and(|region| KIRO_REGION.is_match(region))
+        if !valid_api_key(access_token)
+            || !region.is_some_and(|region| KIRO_REGION.is_match(region))
         {
             return Err(());
         }
@@ -277,8 +338,19 @@ fn parse(raw: &str) -> Result<Credential, ()> {
         };
         (Some(expires_at), profile_arn)
     };
+    // OAuth refreshes normally keep the refresh grant. An old fixture/store
+    // with no refresh grant is conservatively pinned to its current access token.
+    let grant = value["refresh_token"]
+        .as_str()
+        .filter(|token| !token.is_empty());
     Ok(Credential {
         access_token: access_token.to_owned(),
+        login_id: login_id(&[
+            Some(provider),
+            region,
+            value["client_id"].as_str(),
+            Some(grant.unwrap_or(access_token)),
+        ]),
         expires_at,
         profile_arn,
         provider,

@@ -190,10 +190,16 @@ impl AppState {
 
     async fn usage_context(&self) -> Result<UsageContext> {
         let sessions = self.agents.usage_session_snapshots().await?;
+        let providers = self.providers.entries();
         Ok(UsageContext {
             env: self.config.environment(),
             user_home: Some(self.user_home.clone()),
-            provider_specs: self.providers.specs(),
+            provider_specs: providers.iter().map(|entry| entry.spec.clone()).collect(),
+            enabled_provider_ids: providers
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.spec.id.clone())
+                .collect(),
             sessions,
             muse_providers: self.providers.muse_instances(),
             plugins: Some(self.plugins.clone()),

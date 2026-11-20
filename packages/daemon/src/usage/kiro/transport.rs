@@ -83,18 +83,18 @@ fn parse_extra_ca(bytes: &[u8]) -> Result<Vec<Certificate>, &'static str> {
     Ok(certificates)
 }
 
-enum Endpoint<'a> {
-    Service(&'a str),
+// Tests must map every region they exercise to a fixture. Production locators
+// cannot redirect a bearer token; they resolve only the fixed regional host.
+fn endpoint(rt: &UsageRuntime, region: &str) -> Option<String> {
+    let url = format!("https://management.{region}.kiro.dev/");
     #[cfg(test)]
-    Fixture(&'a str),
-}
-impl Endpoint<'_> {
-    fn url(&self) -> String {
-        match self {
-            Self::Service(region) => format!("https://management.{region}.kiro.dev/"),
-            #[cfg(test)]
-            Self::Fixture(url) => (*url).into(),
-        }
+    {
+        rt.endpoints.get(&url).cloned()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = rt;
+        Some(url)
     }
 }
 
@@ -102,28 +102,29 @@ pub(super) async fn fetch(rt: &UsageRuntime, client: Client, credential: &Creden
     let Some(region) = credential.usage_region() else {
         return error("Kiro usage does not support this account profile region.");
     };
-    // Endpoint substitutions are isolated to the test build. Account/session
-    // inputs can never redirect a production bearer token to another host.
-    #[cfg(test)]
-    {
-        let service = Endpoint::Service(region).url();
-        if let Some(target) = rt.endpoints.get(&service) {
-            return request(client, credential, Endpoint::Fixture(target)).await;
-        }
-    }
-    #[cfg(not(test))]
-    let _ = rt;
-    request(client, credential, Endpoint::Service(region)).await
+    fetch_region(rt, client, credential, region).await
 }
 
-async fn request(client: Client, credential: &Credential, endpoint: Endpoint<'_>) -> Value {
+pub(super) async fn fetch_region(
+    rt: &UsageRuntime,
+    client: Client,
+    credential: &Credential,
+    region: &str,
+) -> Value {
+    let Some(url) = endpoint(rt, region) else {
+        return error("The Kiro usage service could not be reached.");
+    };
+    request(client, credential, url).await
+}
+
+async fn request(client: Client, credential: &Credential, url: String) -> Value {
     let mut body =
         json!({"origin":"KIRO_CLI","resourceType":"AGENTIC_REQUEST","isEmailRequired":false});
     if let Some(profile) = &credential.profile_arn {
         body["profileArn"] = json!(profile);
     }
     let mut request = client
-        .post(endpoint.url())
+        .post(url)
         .bearer_auth(&credential.access_token)
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", "AmazonCodeWhispererService.GetUsageLimits")
@@ -132,7 +133,7 @@ async fn request(client: Client, credential: &Credential, endpoint: Endpoint<'_>
         request = request.header("tokentype", "API_KEY");
     }
     let response = request.json(&body).send().await;
-    let mut response = match response {
+    let response = match response {
         Ok(response) => response,
         Err(reason) => {
             return error(if reason.is_timeout() {
@@ -155,32 +156,9 @@ async fn request(client: Client, credential: &Credential, endpoint: Endpoint<'_>
     if !response.status().is_success() {
         return error("Kiro rejected the usage request.");
     }
-    if response
-        .content_length()
-        .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
-    {
-        return error(normalize::Failure::InvalidResponse.message());
-    }
-    let mut bytes = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if chunk.len() <= MAX_RESPONSE_BYTES - bytes.len() => {
-                bytes.extend_from_slice(&chunk)
-            }
-            Ok(Some(_)) => return error(normalize::Failure::InvalidResponse.message()),
-            Ok(None) => break,
-            Err(reason) => {
-                return error(if reason.is_timeout() {
-                    "The Kiro usage request timed out."
-                } else {
-                    "The Kiro usage service could not be reached."
-                });
-            }
-        }
-    }
-    let payload: Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => return error(normalize::Failure::InvalidResponse.message()),
+    let payload = match read_json_response(response).await {
+        Ok(payload) => payload,
+        Err(message) => return error(message),
     };
     match normalize::normalize(&payload, Utc::now()) {
         Ok(report) => report,
@@ -188,8 +166,73 @@ async fn request(client: Client, credential: &Credential, endpoint: Endpoint<'_>
     }
 }
 
+pub(super) async fn probe_api_key_region(
+    rt: &UsageRuntime,
+    client: &Client,
+    credential: &Credential,
+) -> Option<&'static str> {
+    let probe = |region| async move {
+        let response = client
+            .post(endpoint(rt, region)?)
+            .bearer_auth(&credential.access_token)
+            .header("tokentype", "API_KEY")
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                "KiroControlPlaneBearerService.ListAvailableModels",
+            )
+            .header("x-amzn-codewhisperer-optout", "true")
+            .timeout(Duration::from_secs(5))
+            .json(&json!({"origin":"KIRO_CLI"}))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        read_json_response(response)
+            .await
+            .ok()?
+            .is_object()
+            .then_some(region)
+    };
+    // omp-kiro accepts the key only if exactly one bootstrap region recognizes it.
+    match tokio::join!(probe("us-east-1"), probe("eu-central-1")) {
+        (Some(region), None) | (None, Some(region)) => Some(region),
+        _ => None,
+    }
+}
+
+async fn read_json_response(mut response: reqwest::Response) -> Result<Value, &'static str> {
+    let invalid = normalize::Failure::InvalidResponse.message();
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(invalid);
+    }
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= MAX_RESPONSE_BYTES - bytes.len() => {
+                bytes.extend_from_slice(&chunk)
+            }
+            Ok(Some(_)) => return Err(invalid),
+            Ok(None) => break,
+            Err(reason) => {
+                return Err(if reason.is_timeout() {
+                    "The Kiro usage request timed out."
+                } else {
+                    "The Kiro usage service could not be reached."
+                });
+            }
+        }
+    }
+    serde_json::from_slice(&bytes).map_err(|_| invalid)
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::{
         io::{Read, Write},
@@ -200,7 +243,7 @@ mod tests {
 
     // Endpoint injection is compiled only for tests; production always uses the
     // fixed regional HTTPS service, never process/session-controlled URLs.
-    fn fixture(
+    pub(in crate::usage::kiro) fn fixture(
         status: u16,
         response: String,
     ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
@@ -252,6 +295,7 @@ mod tests {
     fn credential() -> Credential {
         Credential {
             access_token: "private-access-token".into(),
+            login_id: String::new(),
             expires_at: None,
             profile_arn: Some(
                 "arn:aws:codewhisperer:eu-central-1:123456789012:profile/private-profile".into(),
@@ -271,10 +315,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_environment_api_key_probe_requires_exactly_one_matching_region() {
+        let mut key = credential();
+        key.access_token = "ksk_probe-fixture".into();
+        key.profile_arn = None;
+        key.provider = "api-key";
+        for (first_status, second_status, expected) in [
+            (403, 200, Some("eu-central-1")),
+            (200, 200, None),
+            (403, 403, None),
+        ] {
+            let mut rt = crate::usage::kiro::tests::runtime(Path::new("/unused"));
+            let mut requests = Vec::new();
+            for (region, status) in [("us-east-1", first_status), ("eu-central-1", second_status)] {
+                let (url, wire, server) = fixture(status, "{}".into());
+                rt.endpoints
+                    .insert(format!("https://management.{region}.kiro.dev/"), url);
+                requests.push((wire, server));
+            }
+            assert_eq!(
+                probe_api_key_region(&rt, &test_client(), &key).await,
+                expected
+            );
+            for (wire, server) in requests {
+                let request = wire.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+                assert!(headers.contains("KiroControlPlaneBearerService.ListAvailableModels"));
+                assert!(headers.contains("tokentype: API_KEY"));
+                assert!(headers.contains("Bearer ksk_probe-fixture"));
+                assert_eq!(
+                    serde_json::from_str::<Value>(body).unwrap(),
+                    json!({"origin":"KIRO_CLI"})
+                );
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn transport_posts_exact_usage_operation_and_normalizes_real_response() {
         let payload = json!({"nextDateReset":4_000_000_000u64,"usageBreakdownList":[{"resourceType":"CREDIT","currentUsageWithPrecision":12.5,"usageLimitWithPrecision":100.0}]}).to_string();
         let (url, received, handle) = fixture(200, payload);
-        let report = request(test_client(), &credential(), Endpoint::Fixture(&url)).await;
+        let report = request(test_client(), &credential(), url).await;
         let wire = received.recv_timeout(Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
         let (headers, body) = wire.split_once("\r\n\r\n").unwrap();
@@ -348,7 +430,7 @@ mod tests {
         for status in [401, 403, 429, 500, 302] {
             let (url, received, handle) =
                 fixture(status, "private-access-token private-account".into());
-            let report = request(test_client(), &credential(), Endpoint::Fixture(&url)).await;
+            let report = request(test_client(), &credential(), url).await;
             received.recv_timeout(Duration::from_secs(5)).unwrap();
             handle.join().unwrap();
             let value = serde_json::to_value(report).unwrap();
@@ -365,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn transport_malformed_success_and_unsupported_region_are_sanitized() {
         let (url, received, handle) = fixture(200, "private-token-not-json".into());
-        let report = request(test_client(), &credential(), Endpoint::Fixture(&url)).await;
+        let report = request(test_client(), &credential(), url).await;
         received.recv_timeout(Duration::from_secs(5)).unwrap();
         handle.join().unwrap();
         assert_eq!(
@@ -411,7 +493,8 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.db");
-        super::super::tests::store(&path, "github", "2099-01-01T00:00:00Z");
+        use super::super::tests::{PERSONAL, login};
+        login(&path, "github", Some(PERSONAL));
         let before = std::fs::read(&path).unwrap();
         let mut rt = super::super::tests::runtime(dir.path());
         let accounts = super::super::discover(&rt, &super::super::tests::scoped(&path))
@@ -466,7 +549,7 @@ mod tests {
             ),
         ] {
             let (url, received, handle) = fixture(200, payload.to_string());
-            let report = request(test_client(), &credential(), Endpoint::Fixture(&url)).await;
+            let report = request(test_client(), &credential(), url).await;
             received.recv_timeout(Duration::from_secs(5)).unwrap();
             handle.join().unwrap();
             assert_eq!(report, error(expected.message()));
@@ -487,7 +570,7 @@ mod tests {
             MAX_RESPONSE_BYTES + 1 - payload.len(),
         ));
         let (url, received, handle) = fixture(200, payload);
-        let report = request(test_client(), &credential(), Endpoint::Fixture(&url)).await;
+        let report = request(test_client(), &credential(), url).await;
         received.recv_timeout(Duration::from_secs(5)).unwrap();
         // Let Hyper observe the dropped body and close the socket while the
         // fixture finishes writing; joining here blocks this Tokio worker.

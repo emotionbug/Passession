@@ -151,12 +151,13 @@ async fn builtin_kiro_reports_expiry_without_an_external_plugin_or_auth_writes()
         env: BTreeMap::from([("OMP_KIRO_AUTH_FILE".into(), auth.to_str().unwrap().into())]),
         user_home: Some(home.path().into()),
         provider_specs: Vec::new(),
+        enabled_provider_ids: HashSet::new(),
         sessions: Vec::new(),
         muse_providers: Vec::new(),
         plugins: None,
     };
     let service = UsageService::new(home.path().into());
-    let runtime = service.runtime(&context, CancellationToken::new(), None);
+    let runtime = service.runtime(&context, CancellationToken::new(), None, true);
     let sources: Vec<_> = registered_sources(&runtime)
         .unwrap()
         .into_iter()

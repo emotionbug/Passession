@@ -35,12 +35,13 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-/// `sessions` contains `{agentId, provider, model?, env, sessionKey}`; an existing
-/// agent without a usage session is represented by `{agentId}`.
+/// `sessions` contains usage snapshots; OMP includes its launch command, cwd and family.
+/// An existing agent without a usage session is represented by `{agentId}`.
 pub struct UsageContext {
     pub env: BTreeMap<String, String>,
     pub user_home: Option<PathBuf>,
     pub provider_specs: Vec<ProviderSpec>,
+    pub enabled_provider_ids: HashSet<String>,
     pub sessions: Vec<Value>,
     pub muse_providers: Vec<Arc<crate::providers::muse::MuseProvider>>,
     pub plugins: Option<Arc<crate::plugins::PluginService>>,
@@ -50,6 +51,20 @@ struct DiscoveryContext<'a> {
     runtime: &'a UsageRuntime,
     scope: &'a UsageScope,
     agent: Option<(&'a str, &'a Value)>,
+}
+
+struct DiscoveredAccounts {
+    accounts: Vec<UsageAccount>,
+    failed_omp_launches: HashSet<String>,
+}
+
+impl From<Vec<UsageAccount>> for DiscoveredAccounts {
+    fn from(accounts: Vec<UsageAccount>) -> Self {
+        Self {
+            accounts,
+            failed_omp_launches: HashSet::new(),
+        }
+    }
 }
 
 macro_rules! sources {
@@ -73,9 +88,9 @@ macro_rules! sources {
                     _ => true,
                 }
             }
-            async fn discover(&self, rt: &UsageRuntime, scope: &UsageScope) -> Result<Vec<UsageAccount>> {
+            async fn discover(&self, rt: &UsageRuntime, scope: &UsageScope) -> Result<DiscoveredAccounts> {
                 match self {
-                    $(Self::$variant => $module::discover(rt,scope).await),+,
+                    $(Self::$variant => $module::discover(rt,scope).await.map(Into::into)),+,
                     Self::Plugin {id,..} => {
                         if !self.current(rt) { bail!("Usage source is no longer registered"); }
                         // Original AgentUsageSession.provider is the harness family ("codex"),
@@ -94,7 +109,7 @@ macro_rules! sources {
                                 }
                             }
                         }
-                        Ok(serde_json::from_value(result)?)
+                        Ok(serde_json::from_value::<Vec<UsageAccount>>(result)?.into())
                     }
                 }
             }
@@ -189,6 +204,7 @@ struct Inner {
     home: PathBuf,
     http: reqwest::Client,
     endpoints: BTreeMap<String, String>,
+    omp_batches: Arc<omp::BatchCache>,
     state: Mutex<State>,
 }
 
@@ -217,6 +233,7 @@ impl UsageService {
                 home,
                 http,
                 endpoints,
+                omp_batches: Arc::default(),
                 state: Mutex::new(State::default()),
             }),
         }
@@ -227,6 +244,7 @@ impl UsageService {
         context: &UsageContext,
         cancel: CancellationToken,
         agent_id: Option<&str>,
+        force: bool,
     ) -> UsageRuntime {
         let home = context.user_home.as_ref().unwrap_or(&self.inner.home);
         UsageRuntime {
@@ -236,7 +254,14 @@ impl UsageService {
             cancel,
             endpoints: self.inner.endpoints.clone(),
             muse_providers: context.muse_providers.clone(),
-            omp: omp::Runtime::new(context, home, agent_id),
+            omp: omp::Runtime::new(
+                context,
+                home,
+                agent_id,
+                self.inner.omp_batches.clone(),
+                force,
+            ),
+            kiro: kiro::Runtime::new(context),
             plugins: context.plugins.clone(),
         }
     }
@@ -300,7 +325,7 @@ impl UsageService {
             .get("forceRefresh")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let rt = self.runtime(context, cancel.clone(), agent_id);
+        let rt = self.runtime(context, cancel.clone(), agent_id, force);
         let sources = registered_sources(&rt)?;
         {
             let mut state = self.inner.state.lock().unwrap();
@@ -345,13 +370,8 @@ impl UsageService {
                     unavailable_sources: Vec::new(),
                 });
             }
-            let refresh_omp = force
-                && session["provider"].as_str().is_some_and(|provider| {
-                    context
-                        .provider_specs
-                        .iter()
-                        .any(|spec| spec.id == provider && spec.family == "omp")
-                });
+            let refresh_omp =
+                rt.omp.has_scoped_launch() || (force && session["providerFamily"] == "omp");
             let signature = session_signature(session);
             let cached = {
                 let state = self.inner.state.lock().unwrap();
@@ -374,7 +394,10 @@ impl UsageService {
                     .provider_specs
                     .iter()
                     .find(|spec| spec.id == provider)
-                    .map(|spec| spec.family.as_str())
+                    .map(|spec| spec.family.as_str());
+                let family = session["providerFamily"]
+                    .as_str()
+                    .or(family)
                     .unwrap_or(provider);
                 let scope = UsageScope {
                     provider: Some(family.to_owned()),
@@ -557,6 +580,14 @@ impl UsageService {
                         merged_reports(&state)
                             .into_iter()
                             .filter(|(_, known)| known.source == *source)
+                            .filter_map(|(id, mut known)| {
+                                if *source == Source::Omp {
+                                    known
+                                        .logins
+                                        .retain(|login| rt.omp.visible_global_login(&login.input));
+                                }
+                                (!known.logins.is_empty()).then_some((id, known))
+                            })
                             .collect()
                     }
                 };
@@ -610,6 +641,18 @@ impl UsageService {
         cancel: CancellationToken,
     ) -> Result<Value> {
         let key = cache_identity(&id, &known);
+        // OMP's batch cache owns refresh and single-flight semantics. The report
+        // cache must not return a different batch (including an older in-flight one).
+        if known.source == Source::Omp {
+            let fetched_at = now_iso();
+            let outcome = fetch_with_fallback(&rt, &known).await;
+            let mut state = self.inner.state.lock().unwrap();
+            let entry = report_entry(&id, &known, outcome, fetched_at, state.successful.get(&key));
+            if active_cache_keys(&state).contains(&key) {
+                remember_success(&mut state, &key, &entry);
+            }
+            return Ok(entry);
+        }
         let (mut receiver, owner) = {
             let mut state = self.inner.state.lock().unwrap();
             if !force
@@ -635,33 +678,11 @@ impl UsageService {
             tokio::spawn(async move {
                 let fetched_at = now_iso();
                 let outcome = fetch_with_fallback(&rt, &known).await;
-                let completed_at = now_iso();
-                let mut account = json!({});
-                if let Some(label) = &known.label {
-                    account["label"] = json!(label);
-                }
-                let mut entry = json!({"id":id,"sourceId":known.source.id(),"sourceLabel":known.source.label(),
-                    "account":account,"fetchedAt":fetched_at,"report":outcome.0});
-                if let Some(icon) = known.source.icon() {
-                    entry["icon"] = json!(icon);
-                }
-                if let Some(errors) = outcome.1 {
-                    entry["loginErrors"] = Value::Array(errors);
-                }
                 let mut state = inner.state.lock().unwrap();
-                let available = entry["report"]["status"] == "available";
-                if available {
-                    entry["successfulAt"] = json!(completed_at);
-                } else if let Some(previous) = state.successful.get(&key) {
-                    entry["lastSuccessful"] = previous.clone();
-                }
+                let entry =
+                    report_entry(&id, &known, outcome, fetched_at, state.successful.get(&key));
                 if known.source.current(&rt) && active_cache_keys(&state).contains(&key) {
-                    if available {
-                        state.successful.insert(
-                            key.clone(),
-                            json!({"fetchedAt":completed_at,"report":entry["report"]}),
-                        );
-                    }
+                    remember_success(&mut state, &key, &entry);
                     state
                         .cache
                         .retain(|_, cached| cached.at.elapsed() < Duration::from_secs(300));
@@ -727,6 +748,7 @@ fn now_iso() -> String {
 fn session_signature(session: &Value) -> Value {
     json!([
         session.get("provider"),
+        session.get("providerFamily"),
         session.get("model"),
         session.get("sessionKey")
     ])
@@ -812,9 +834,32 @@ async fn discover_source(
         .await
         .map_err(|_| anyhow!("Usage discovery timed out"))
         .and_then(|result| result)
-        .and_then(validate_accounts);
+        .and_then(|mut result| {
+            result.accounts = validate_accounts(result.accounts)?;
+            Ok(result)
+        });
     match discovered {
-        Ok(accounts) => {
+        Ok(DiscoveredAccounts {
+            accounts,
+            failed_omp_launches,
+        }) => {
+            let incomplete = !failed_omp_launches.is_empty();
+            let mut accounts = accounts;
+            for (id, report) in previous {
+                for login in &report.logins {
+                    if login.input["launchId"]
+                        .as_str()
+                        .is_some_and(|id| failed_omp_launches.contains(id))
+                    {
+                        accounts.push(UsageAccount {
+                            key: id.strip_prefix("omp:").expect("OMP report id").to_owned(),
+                            label: report.label.clone(),
+                            harness: Some(login.harness.clone()),
+                            input: login.input.clone(),
+                        });
+                    }
+                }
+            }
             let mut reports: Reports = Vec::new();
             for account in accounts {
                 let id = format!("{}:{}", source.id(), account.key);
@@ -842,7 +887,7 @@ async fn discover_source(
                     ));
                 }
             }
-            (reports, false)
+            (reports, incomplete)
         }
         Err(_) => {
             // Never include store contents, token-bearing request URLs, or raw errors in logs.
@@ -873,39 +918,104 @@ fn validate_accounts(accounts: Vec<UsageAccount>) -> Result<Vec<UsageAccount>> {
     }
     Ok(accounts)
 }
-async fn fetch_with_fallback(
-    rt: &UsageRuntime,
-    known: &KnownReport,
-) -> (Value, Option<Vec<Value>>) {
+async fn fetch_with_fallback(rt: &UsageRuntime, known: &KnownReport) -> FetchedReport {
     let mut attempts = FuturesOrdered::new();
     for login in &known.logins {
         attempts.push_back(async move {
-            let report = match tokio::time::timeout(
+            let (report, measured_at) = match tokio::time::timeout(
                 Duration::from_secs(20),
                 known.source.fetch(rt, &login.input),
             )
             .await
             {
-                Ok(Ok(report)) => validate_report(report)
-                    .unwrap_or_else(|error| json!({"status":"error","error":error.to_string()})),
-                Ok(Err(error)) => json!({"status":"error","error":error.to_string()}),
-                Err(_) => json!({"status":"error","error":"Usage fetch timed out"}),
+                Ok(Ok(report)) => {
+                    let measured_at = (known.source == Source::Omp)
+                        .then(|| report["fetchedAt"].as_str().map(str::to_owned))
+                        .flatten();
+                    (
+                        validate_report(report).unwrap_or_else(
+                            |error| json!({"status":"error","error":error.to_string()}),
+                        ),
+                        measured_at,
+                    )
+                }
+                Ok(Err(error)) => (json!({"status":"error","error":error.to_string()}), None),
+                Err(_) => (
+                    json!({"status":"error","error":"Usage fetch timed out"}),
+                    None,
+                ),
             };
-            (login.harness.clone(), report)
+            (login.harness.clone(), report, measured_at)
         });
     }
     let mut errors = Vec::new();
-    while let Some((harness, report)) = attempts.next().await {
+    while let Some((harness, report, measured_at)) = attempts.next().await {
         if report["status"] == "available" {
-            return (report, None);
+            return FetchedReport {
+                report,
+                measured_at,
+                login_errors: None,
+            };
         }
-        errors.push(json!({"harness":harness,"report":report}));
+        errors.push((json!({"harness":harness,"report":report}), measured_at));
     }
-    let report = errors
-        .last()
-        .map(|error| error["report"].clone())
-        .unwrap_or_else(|| json!({"status":"error","error":"Usage account has no login"}));
-    (report, Some(errors))
+    let (report, measured_at) = errors.last().map_or_else(
+        || {
+            (
+                json!({"status":"error","error":"Usage account has no login"}),
+                None,
+            )
+        },
+        |(error, measured_at)| (error["report"].clone(), measured_at.clone()),
+    );
+    FetchedReport {
+        report,
+        measured_at,
+        login_errors: Some(errors.into_iter().map(|(error, _)| error).collect()),
+    }
+}
+
+struct FetchedReport {
+    report: Value,
+    measured_at: Option<String>,
+    login_errors: Option<Vec<Value>>,
+}
+
+fn report_entry(
+    id: &str,
+    known: &KnownReport,
+    outcome: FetchedReport,
+    started_at: String,
+    previous: Option<&Value>,
+) -> Value {
+    let mut account = json!({});
+    if let Some(label) = &known.label {
+        account["label"] = json!(label);
+    }
+    let fetched_at = outcome.measured_at.as_deref().unwrap_or(&started_at);
+    let mut entry = json!({"id":id,"sourceId":known.source.id(),"sourceLabel":known.source.label(),
+        "account":account,"fetchedAt":fetched_at,"report":outcome.report});
+    if let Some(icon) = known.source.icon() {
+        entry["icon"] = json!(icon);
+    }
+    if let Some(errors) = outcome.login_errors {
+        entry["loginErrors"] = Value::Array(errors);
+    }
+    if entry["report"]["status"] == "available" {
+        entry["successfulAt"] = json!(outcome.measured_at.unwrap_or_else(now_iso));
+    } else if let Some(previous) = previous {
+        entry["lastSuccessful"] = previous.clone();
+    }
+    entry
+}
+
+fn remember_success(state: &mut State, key: &str, entry: &Value) {
+    if let Some(success) = entry.get("successfulAt") {
+        state.successful.insert(
+            key.to_owned(),
+            json!({"fetchedAt":success,"report":entry["report"]}),
+        );
+    }
 }
 fn legacy_error(report: &Value) -> Option<String> {
     match report["status"].as_str()? {
