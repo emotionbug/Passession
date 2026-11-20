@@ -263,6 +263,7 @@ impl AgentManager {
         let prepared = input["preparedAgentMessage"] == true
             && actor["kind"] == "system"
             && actor["source"] == "agent-message-delivery";
+        let operator = matches!(text(actor, "kind"), Some("owner" | "hub")) && source.is_none();
         let message_id = text(&input, "messageId")
             .or_else(|| text(&input, "clientMessageId"))
             .map(str::to_owned);
@@ -284,7 +285,7 @@ impl AgentManager {
         if gate.is_some() {
             let cell = self.prepare_send(id, &run_input).await?;
             return self
-                .dispatch_prompt_gated(id, &cell, &run_input, gate)
+                .dispatch_prompt_gated(id, &cell, &run_input, operator, gate)
                 .await;
         }
         if let Some(message_id) = message_id
@@ -305,7 +306,7 @@ impl AgentManager {
             let gate = DispatchGate::new(id, vec![message_id.to_owned()], true);
             let result = async {
                 let cell = self.prepare_send(id, &run_input).await?;
-                self.dispatch_prompt_gated(id, &cell, &run_input, Some(&gate))
+                self.dispatch_prompt_gated(id, &cell, &run_input, operator, Some(&gate))
                     .await
             }
             .await;
@@ -324,7 +325,8 @@ impl AgentManager {
             };
         }
         let cell = self.prepare_send(id, &run_input).await?;
-        self.dispatch_prompt(id, &cell, &run_input).await
+        self.dispatch_prompt_gated(id, &cell, &run_input, operator, None)
+            .await
     }
     /// Persist one attempt's outcome for every receipt it carried. A provider
     /// acknowledgement that arrives later is followed by a detached owner.
@@ -403,7 +405,7 @@ impl AgentManager {
         let cell = self.ensure_loaded(id).await?;
         let snapshot = cell.data.lock().await.snapshot.clone();
         if snapshot["title"].is_null() && snapshot["lastUserMessageAt"].is_null() {
-            let prompt = match notifications::agent_message_command(&input["prompt"]) {
+            let prompt = match notifications::single_agent_message_text(&input["prompt"]) {
                 Some(prompt) => prompt,
                 None => crate::providers::prompt::text(&input["prompt"])?,
             };
@@ -417,25 +419,18 @@ impl AgentManager {
         }
         Ok(cell)
     }
-    async fn dispatch_prompt(
-        &self,
-        id: &str,
-        cell: &Arc<AgentCell>,
-        input: &Value,
-    ) -> Result<Value> {
-        self.dispatch_prompt_gated(id, cell, input, None).await
-    }
     /// With a gate, durable receipt phases bracket the provider prompt APIs.
     async fn dispatch_prompt_gated(
         &self,
         id: &str,
         cell: &Arc<AgentCell>,
         input: &Value,
+        operator: bool,
         gate: Option<&DispatchGate>,
     ) -> Result<Value> {
         let mutation = cell.mutation.lock().await;
         let result = self
-            .dispatch_prompt_unlocked_gated(id, cell, input, gate)
+            .dispatch_prompt_unlocked_gated(id, cell, input, operator, gate)
             .await;
         drop(mutation);
         if result.as_ref().is_err_and(|error| {
@@ -447,7 +442,7 @@ impl AgentManager {
             let replacement = self.cell(id).await?;
             let _mutation = replacement.mutation.lock().await;
             return self
-                .dispatch_prompt_unlocked_gated(id, &replacement, input, gate)
+                .dispatch_prompt_unlocked_gated(id, &replacement, input, operator, gate)
                 .await;
         }
         result
@@ -458,7 +453,7 @@ impl AgentManager {
         cell: &Arc<AgentCell>,
         input: &Value,
     ) -> Result<Value> {
-        self.dispatch_prompt_unlocked_gated(id, cell, input, None)
+        self.dispatch_prompt_unlocked_gated(id, cell, input, false, None)
             .await
     }
     async fn dispatch_prompt_unlocked_gated(
@@ -466,6 +461,7 @@ impl AgentManager {
         id: &str,
         cell: &Arc<AgentCell>,
         input: &Value,
+        operator: bool,
         gate: Option<&DispatchGate>,
     ) -> Result<Value> {
         let work = self.update_admission.enter()?;
@@ -477,6 +473,25 @@ impl AgentManager {
             .clone()
             .ok_or_else(|| anyhow!("Agent has no managed session"))?;
         let prompt = &input["prompt"];
+        // Agent messages retain their source envelope, so native slash parsers
+        // see a message rather than a command. Other automated paths cannot send
+        // bare provider commands either.
+        if !operator {
+            let is_slash = |text: &str| {
+                text.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
+                    .starts_with('/')
+            };
+            let slash = if let Some(text) = prompt.as_str() {
+                is_slash(text)
+            } else {
+                is_slash(&crate::providers::prompt::text(prompt)?)
+            };
+            if slash {
+                return Err(PromptDeliveryError::not_delivered(
+                    "Provider slash commands require direct operator input",
+                ));
+            }
+        }
         let mut options = input.get("runOptions").cloned().unwrap_or(json!({}));
         for key in ["clientMessageId", "outputSchema", "spokenInput"] {
             if let Some(value) = input.get(key) {
@@ -497,14 +512,18 @@ impl AgentManager {
         if let Some(mode) = text(input, "sessionMode") {
             self.change_mode(cell, session.as_ref(), mode).await?;
         }
-        let command = notifications::agent_message_command(prompt).map(Value::String);
-        if let Some(run) = session
-            .clone()
-            .prepare_out_of_band(command.as_ref().unwrap_or(prompt))
-        {
+        if operator && let Some(run) = session.clone().prepare_out_of_band(prompt) {
             self.drain_events(cell).await?;
-            self.record_submitted(id, cell, prompt, client_id.as_deref(), None, false)
-                .await?;
+            let command = crate::providers::prompt::text(prompt)?;
+            self.apply_event(
+                id,
+                cell,
+                json!({"type":"timeline","provider":session.provider(),"item":{
+                    "type":"notification","level":"info","message":command,"clientMessageId":client_id
+                }}),
+                false,
+            )
+            .await?;
             let sink = cell.sink.clone();
             let cancel = cell.cancel.clone();
             let provider = session.provider().to_owned();
@@ -520,8 +539,8 @@ impl AgentManager {
                 };
                 if let Err(error) = result {
                     let event = json!({"type":"timeline","provider":provider,"item":{
-                        "type":"assistant_message",
-                        "text":format!("[System Error] Out-of-band command failed: {error}")
+                        "type":"notification","level":"error",
+                        "message":format!("Out-of-band command failed: {error}")
                     }});
                     if let Err(report_error) = sink.emit(event).await {
                         tracing::error!(error=%error,report_error=%report_error,"Failed to report out-of-band command failure");
@@ -1032,10 +1051,12 @@ impl AgentManager {
         let actor = json!({"kind":"system","source":"schedule"});
         self.retain_prompt_uploads(id, &prompt).await?;
         let cell = self.prepare_send(id, &json!({"prompt":prompt})).await?;
-        self.dispatch_prompt(
+        self.dispatch_prompt_gated(
             id,
             &cell,
             &json!({"prompt":prompt,"requireIdle":true,"activeTurnBehavior":"interrupt"}),
+            false,
+            None,
         )
         .await?;
         let mut result = self

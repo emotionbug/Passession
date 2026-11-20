@@ -180,10 +180,12 @@ fn creation_reads_require_an_enabled_ready_entry() {
 }
 
 #[tokio::test]
-async fn omp_native_controls_registry_publishes_live_workspace_models() {
+async fn omp_live_workspace_catalogs_survive_other_workspaces_and_probes() {
     use crate::providers::{api::ProviderSpec, pi_omp::JsonlProvider, registry::ProviderEntry};
     let root = tempfile::tempdir().unwrap();
     let cwd = root.path();
+    let other = cwd.join("other");
+    std::fs::create_dir(&other).unwrap();
     let service = super::CatalogService::new(std::sync::Weak::new());
     let spec = ProviderSpec {
         id: "alias-omp".into(),
@@ -244,6 +246,29 @@ async fn omp_native_controls_registry_publishes_live_workspace_models() {
         updated["models"],
     );
     service
+        .omp_catalog_changed(
+            "alias-omp",
+            &other,
+            vec![json!({"id":"kiro-other/auto","label":"Account B"})],
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .catalog("alias-omp", Some(&other), true)
+            .await
+            .unwrap()["models"][0]["label"],
+        "Account B",
+    );
+    assert_eq!(
+        service.catalog("alias-omp", Some(cwd), true).await.unwrap()["models"],
+        updated["models"],
+    );
+    service.refresh(Some(cwd), None).await.unwrap();
+    assert_eq!(
+        service.catalog("alias-omp", Some(cwd), true).await.unwrap()["models"],
+        updated["models"],
+    );
+    service
         .omp_catalog_changed("alias-omp", cwd, Vec::new())
         .unwrap();
     let updated = service
@@ -252,5 +277,12 @@ async fn omp_native_controls_registry_publishes_live_workspace_models() {
         .unwrap();
     assert_eq!(updated["models"].as_array().unwrap().len(), 1);
     assert_eq!(updated["models"][0]["id"], "local/test");
+    assert_eq!(
+        service
+            .catalog("alias-omp", Some(&other), true)
+            .await
+            .unwrap()["models"][0]["label"],
+        "Account B",
+    );
     service.shutdown().await;
 }

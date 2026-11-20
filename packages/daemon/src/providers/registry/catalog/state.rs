@@ -87,6 +87,7 @@ impl Catalog {
 
 pub(super) struct Target {
     pub bindings: HashMap<String, Binding>,
+    pub live: HashMap<String, Arc<SnapshotRecord>>,
     pub snapshot: Snapshot,
 }
 
@@ -121,6 +122,7 @@ impl Cache {
                 cwd.to_owned(),
                 Target {
                     bindings: HashMap::new(),
+                    live: HashMap::new(),
                     snapshot: Snapshot {
                         cwd: cwd.to_owned(),
                         records,
@@ -159,14 +161,18 @@ impl Cache {
                 .order
                 .iter()
                 .map(|provider| {
-                    let binding = target.bindings.get(provider);
-                    binding
-                        .and_then(|binding| binding.failure.as_ref())
+                    target
+                        .live
+                        .get(provider)
                         .or_else(|| {
-                            binding
-                                .and_then(|binding| binding.key.as_ref())
-                                .and_then(|key| self.catalogs.get(key)?.get(provider))
-                                .and_then(|catalog| catalog.result.as_ref())
+                            let binding = target.bindings.get(provider)?;
+                            binding.failure.as_ref().or_else(|| {
+                                self.catalogs
+                                    .get(binding.key.as_ref()?)?
+                                    .get(provider)?
+                                    .result
+                                    .as_ref()
+                            })
                         })
                         .unwrap_or(&self.providers[provider].initial)
                         .clone()

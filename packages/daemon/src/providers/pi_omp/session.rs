@@ -10,7 +10,7 @@ use crate::providers::api::{
     AgentSession, EventSink, HistoryCoverage, LaunchContext, PromptAck, PromptAckFuture,
     PromptDeliveryError, ProviderSpec, RewindTarget, UnloadReadiness,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
@@ -105,8 +105,10 @@ struct Inner {
     manual_compaction: AtomicBool,
     compaction_started: AtomicBool,
     login_active: AtomicBool,
+    bash_active: AtomicBool,
     usage_key: String,
     usage_env: Value,
+    usage_command: Vec<String>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -141,6 +143,24 @@ impl Inner {
             .clone()
             .ok_or_else(|| anyhow!("History session has no live runtime"))
     }
+
+    fn require_no_login(&self) -> Result<()> {
+        ensure!(
+            !self.login_active.load(Ordering::Acquire),
+            "Wait for OMP login to finish before starting another session operation"
+        );
+        Ok(())
+    }
+
+    async fn lock_operation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        // OMP serializes login ahead of ordinary RPCs. Do not queue a native
+        // operation while holding a manager lock that the login response needs.
+        self.require_no_login()?;
+        let gate = self.operation.lock().await;
+        self.require_no_login()?;
+        Ok(gate)
+    }
+
     async fn refresh(&self) -> Result<Value> {
         let state = self.runtime()?.request(json!({"type":"get_state"})).await?;
         let mut data = self.state.lock().unwrap();
@@ -191,7 +211,7 @@ impl Inner {
         Ok(())
     }
     async fn out_of_band_message(&self, text: String) -> Result<()> {
-        self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"assistant_message","text":text}})).await
+        self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"notification","level":"info","message":text}})).await
     }
     async fn warn(&self, message: String) -> Result<()> {
         self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"notification","level":"warning","message":message}})).await
@@ -1233,12 +1253,14 @@ impl Session {
         } else {
             None
         };
-        let assets = if omp && !history_only {
-            Some(launch::omp_assets()?)
-        } else if !history_only {
-            Some(launch::pi_assets(&spec, &config, &context, probes).await?)
-        } else {
+        let assets = if history_only {
             None
+        } else if omp {
+            launch::allows_omp_account_bridge(&spec)
+                .then(launch::omp_assets)
+                .transpose()?
+        } else {
+            Some(launch::pi_assets(&spec, &config, &context, probes).await?)
         };
         let supports_mcp = omp || assets.as_ref().is_some_and(|a| a.mcp);
         let launch_command = if history_only {
@@ -1268,7 +1290,11 @@ impl Session {
             .map(|p| p["metadata"]["bridgedTools"].clone())
             .unwrap_or(Value::Null);
         mapper.set_bridged_tools(&bridged_tools);
-        let usage_env = json!(launch::external_env(&spec, &context));
+        let usage_env = launch_command.as_ref().map(|command| &command.env);
+        let usage_command = usage_env
+            .map(|env| launch::command_prefix(&spec, env))
+            .unwrap_or_default();
+        let usage_env = json!(usage_env);
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 config: config.clone(),
@@ -1319,8 +1345,10 @@ impl Session {
             manual_compaction: AtomicBool::new(false),
             compaction_started: AtomicBool::new(false),
             login_active: AtomicBool::new(false),
+            bash_active: AtomicBool::new(false),
             usage_key: uuid::Uuid::new_v4().to_string(),
             usage_env,
+            usage_command,
         });
         if let Some(command) = launch_command {
             let (runtime, receiver) = Transport::spawn(
@@ -1479,7 +1507,11 @@ impl Session {
                 "OMP history session cannot start a turn",
             ));
         }
-        let _gate = self.inner.operation.lock().await;
+        let _gate = self
+            .inner
+            .lock_operation()
+            .await
+            .map_err(|error| PromptDeliveryError::not_delivered(error.to_string()))?;
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(PromptDeliveryError::not_delivered(
                 "Provider session is closed",
@@ -1696,7 +1728,7 @@ impl AgentSession for Session {
             return None;
         }
         let state = self.inner.state.lock().unwrap();
-        let mut usage = json!({"provider":self.inner.spec.id,"cwd":state.config["cwd"],"env":self.inner.usage_env,"sessionKey":self.inner.usage_key});
+        let mut usage = json!({"provider":self.inner.spec.id,"providerFamily":self.inner.spec.family,"cwd":state.config["cwd"],"env":self.inner.usage_env,"command":self.inner.usage_command,"sessionKey":self.inner.usage_key});
         if let Some(model) = catalog::model_id(&state.native["model"]) {
             usage["model"] = json!(model);
         }
@@ -1709,6 +1741,11 @@ impl AgentSession for Session {
         let Ok(_operation) = self.inner.operation.try_lock() else {
             return UnloadReadiness::Busy;
         };
+        if self.inner.login_active.load(Ordering::Acquire)
+            || self.inner.bash_active.load(Ordering::Acquire)
+        {
+            return UnloadReadiness::Busy;
+        }
         let Ok(runtime) = self.inner.runtime() else {
             return UnloadReadiness::Unknown;
         };
@@ -2009,7 +2046,7 @@ impl AgentSession for Session {
         if !matches!(mode, "full" | "write" | "ask") {
             bail!("Invalid OMP mode '{mode}'");
         }
-        let _gate = self.inner.operation.lock().await;
+        let _gate = self.inner.lock_operation().await?;
         {
             let state = self.inner.state.lock().unwrap();
             if state.mode.as_deref() == Some(mode) {
@@ -2018,9 +2055,10 @@ impl AgentSession for Session {
             if state.active.is_some()
                 || state.native["isStreaming"] == true
                 || state.native["isCompacting"] == true
+                || self.inner.bash_active.load(Ordering::Acquire)
             {
                 return Ok(Some(
-                    json!({"type":"warning","message":"Change approval mode once the current turn ends"}),
+                    json!({"type":"warning","message":"Change approval mode once the current turn or OMP control ends"}),
                 ));
             }
         }
@@ -2146,7 +2184,7 @@ impl AgentSession for Session {
             .or_else(|| model.split_once(':'))
             .filter(|(p, i)| !p.is_empty() && !i.is_empty())
             .ok_or_else(|| anyhow!("Model id must include a provider: {model}"))?;
-        let _gate = self.inner.operation.lock().await;
+        let _gate = self.inner.lock_operation().await?;
         let result = self
             .inner
             .runtime()?
@@ -2165,6 +2203,7 @@ impl AgentSession for Session {
         let level = option
             .filter(|s| launch::valid_thinking(s, self.inner.spec.family == "omp"))
             .unwrap_or("medium");
+        let _gate = self.inner.lock_operation().await?;
         self.inner
             .runtime()?
             .request(json!({"type":"set_thinking_level","level":level}))
@@ -2186,6 +2225,7 @@ impl AgentSession for Session {
         if !self.inner.state.lock().unwrap().native["fastModeEnabled"].is_boolean() {
             bail!("OMP fast mode is unavailable");
         }
+        let _gate = self.inner.lock_operation().await?;
         let result = self
             .inner
             .runtime()?
@@ -2205,7 +2245,7 @@ impl AgentSession for Session {
         if target != RewindTarget::Conversation {
             bail!("Provider does not support file rewind");
         }
-        let _gate = self.inner.operation.lock().await;
+        let _gate = self.inner.lock_operation().await?;
         let id = id.trim();
         {
             let state = self.inner.state.lock().unwrap();

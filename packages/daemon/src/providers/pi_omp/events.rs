@@ -543,7 +543,7 @@ impl Mapper {
                         lines.push(String::new());
                         lines.push(instructions.into());
                     }
-                    out.push(self.timeline(json!({"type":"assistant_message","text":lines.join("\n")})));
+                    out.push(self.timeline(json!({"type":"assistant_message","text":lines.join("\n"),"daemonOwned":true})));
                 }
                 else if frame["method"] == "cancel" {
                     if let Some(id) = self.permissions.cancel(frame) {
@@ -1467,7 +1467,7 @@ mod native_turn_tests {
         );
     }
     #[test]
-    fn omp_auto_and_max_thinking_and_failed_auto_compaction_reach_the_app() {
+    fn omp_auto_and_max_thinking_and_auto_compaction_outcomes_reach_the_app() {
         let mut omp = Mapper::new("omp", "omp");
         for level in ["auto", "max"] {
             let events = omp.map(&json!({"type":"thinking_level_changed","level":level}));
@@ -1490,6 +1490,12 @@ mod native_turn_tests {
         assert_eq!(
             status(json!({"type":"auto_compaction_end","aborted":true,"willRetry":false})),
             "failed"
+        );
+        assert_eq!(
+            status(
+                json!({"type":"auto_compaction_end","skipped":true,"aborted":false,"errorMessage":"falling back to full context"})
+            ),
+            "completed"
         );
         assert_eq!(
             status(

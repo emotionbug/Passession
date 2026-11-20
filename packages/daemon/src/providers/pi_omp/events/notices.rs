@@ -153,8 +153,8 @@ pub fn runtime(event: &Value) -> Option<Value> {
             Some(json!({"type":"notification","level":event["level"],"message":event["message"]}))
         }
         "auto_compaction_start" | "auto_compaction_end" => {
-            // An aborted or failed run must not read as a finished compaction.
-            let failed = t.ends_with("end")
+            // A skipped fallback can carry an explanation without having failed.
+            let failed = event["skipped"] != true
                 && (event["aborted"] == true || event["errorMessage"].is_string());
             let status = if t.ends_with("start") {
                 "loading"

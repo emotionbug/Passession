@@ -33,6 +33,26 @@ pub fn external_env(spec: &ProviderSpec, context: &LaunchContext) -> BTreeMap<St
     }
     env
 }
+
+pub(super) fn command_prefix(spec: &ProviderSpec, env: &BTreeMap<String, String>) -> Vec<String> {
+    if !spec.command.is_empty() {
+        return spec.command.clone();
+    }
+    let omp = spec.family == "omp";
+    let program = env
+        .get(if omp { "OMP_COMMAND" } else { "PI_COMMAND" })
+        .or_else(|| (!omp).then(|| env.get("PI_ACP_PI_COMMAND")).flatten())
+        .unwrap_or(&spec.family);
+    vec![program.clone()]
+}
+
+pub(super) fn allows_omp_account_bridge(spec: &ProviderSpec) -> bool {
+    !spec.command.iter().skip(1).any(|arg| {
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        matches!(flag, "--trusted-extension" | "--no-extensions" | "--no-ui")
+    })
+}
+
 pub fn command(
     spec: &ProviderSpec,
     config: &Value,
@@ -44,23 +64,9 @@ pub fn command(
         &spec.family,
         config.get("providerOptions").unwrap_or(&spec.options),
     )?;
-    let mut argv = spec.command.clone();
-    let omp = spec.family == "omp";
     let env = external_env(spec, context);
-    if argv.is_empty() {
-        argv.push(
-            env.get(if omp { "OMP_COMMAND" } else { "PI_COMMAND" })
-                .cloned()
-                .or_else(|| {
-                    if omp {
-                        None
-                    } else {
-                        env.get("PI_ACP_PI_COMMAND").cloned()
-                    }
-                })
-                .unwrap_or_else(|| spec.family.clone()),
-        );
-    }
+    let omp = spec.family == "omp";
+    let mut argv = command_prefix(spec, &env);
     if !argv
         .iter()
         .any(|arg| arg == "--mode" || arg.starts_with("--mode="))

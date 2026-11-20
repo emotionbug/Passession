@@ -7,7 +7,7 @@ mod push;
 use crate::state::AppState;
 use anyhow::{Context, Result, bail};
 pub use delivery::{AgentMessageDelivery, MessageReceipt};
-pub use envelope::{agent_message_command, prepare_agent_message, project_agent_messages};
+pub use envelope::{prepare_agent_message, project_agent_messages, single_agent_message_text};
 use observation::{Observation, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

@@ -2,7 +2,7 @@
 const command = "__PASEO_ACCOUNT_COMMAND__";
 
 export default function paseoOmp(pi) {
-  pi.registerCommand(command, {
+  const accountCommand = {
     description: "Passession internal OAuth account control",
     async handler(args, ctx) {
       const { requestId, provider, sessionId, credentialId } = JSON.parse(
@@ -55,5 +55,10 @@ export default function paseoOmp(pi) {
         fail("OMP could not read or change this session's OAuth account.");
       }
     },
+  };
+  // The RPC runner binds the real UI (or a no-op context for headless hosts)
+  // before session_start. Do not advertise a command that cannot reply.
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.hasUI) pi.registerCommand(command, accountCommand);
   });
 }

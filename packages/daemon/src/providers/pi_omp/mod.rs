@@ -8,6 +8,8 @@ mod host_tools;
 mod launch;
 mod prompt;
 mod session;
+#[cfg(all(test, unix))]
+pub(crate) use session::omp_controls::tests::fixture_provider_spec;
 mod transport;
 
 use crate::providers::api::{

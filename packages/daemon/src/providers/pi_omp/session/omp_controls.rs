@@ -227,7 +227,7 @@ impl Inner {
     }
 
     pub(super) async fn set_oauth_account(&self, value: &Value) -> Result<()> {
-        let _gate = self.operation.lock().await;
+        let _gate = self.lock_operation().await?;
         let native = self.refresh().await?;
         self.require_idle(&native, "changing accounts")?;
         {
@@ -307,7 +307,9 @@ impl Inner {
     pub(super) fn schedule_control_refresh(self: &Arc<Self>, generation: u64, models: bool) {
         let inner = self.clone();
         tokio::spawn(async move {
-            let _gate = inner.operation.lock().await;
+            let Ok(_gate) = inner.lock_operation().await else {
+                return;
+            };
             if inner.generation.load(Ordering::Acquire) != generation
                 || inner.closed.load(Ordering::Acquire)
                 || inner.state.lock().unwrap().native["sessionId"].is_null()
@@ -323,7 +325,16 @@ impl Inner {
         });
     }
 
+    fn require_no_long_control(&self) -> Result<()> {
+        ensure!(
+            !self.login_active.load(Ordering::Acquire) && !self.bash_active.load(Ordering::Acquire),
+            "Wait for the current OMP login or shell command to end"
+        );
+        Ok(())
+    }
+
     fn require_idle(&self, native: &Value, action: &str) -> Result<()> {
+        self.require_no_long_control()?;
         ensure!(
             self.state.lock().unwrap().active.is_none()
                 && native["isStreaming"] != true
@@ -340,11 +351,22 @@ impl Inner {
     }
 }
 
+/// The runtime must not be reconfigured or reaped while one of these controls
+/// awaits the operator. Unlike the operation gate, this does not block responses.
+struct LongControl<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for LongControl<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl Session {
     pub(super) async fn command(&self, name: &str, args: &str) -> Result<()> {
         if let Some(reason) = identity_block(name, args) {
             bail!("{reason}");
         }
+        self.inner.require_no_login()?;
         let runtime = self.inner.runtime()?;
         let usage = || {
             let hint = COMMANDS
@@ -394,22 +416,22 @@ impl Session {
                 output
             }
             ("login", [provider]) => {
-                let _gate = self.inner.operation.lock().await;
+                let gate = self.inner.lock_operation().await?;
+                self.inner.require_no_long_control()?;
                 let native = self.inner.refresh().await?;
                 self.inner.require_idle(&native, "logging in")?;
-                {
-                    struct Login<'a>(&'a std::sync::atomic::AtomicBool);
-                    impl Drop for Login<'_> {
-                        fn drop(&mut self) {
-                            self.0.store(false, Ordering::Release);
-                        }
-                    }
-                    self.inner.login_active.store(true, Ordering::Release);
-                    let _login = Login(&self.inner.login_active);
-                    runtime
-                        .request_with_timeout(json!({"type":"login","providerId":provider}), None)
-                        .await?;
-                }
+                self.inner.login_active.store(true, Ordering::Release);
+                let _login = LongControl(&self.inner.login_active);
+                self.inner
+                    .runtime()?
+                    .request_admitted(
+                        json!({"type":"login","providerId":provider}),
+                        None,
+                        Some(gate),
+                    )
+                    .await?;
+                let _gate = self.inner.operation.lock().await;
+                drop(_login);
                 self.inner
                     .after_authentication()
                     .await
@@ -417,7 +439,7 @@ impl Session {
                 format!("Signed in to OMP provider {provider}.")
             }
             ("logout", [] | [_] | [_, _]) => {
-                let _gate = self.inner.operation.lock().await;
+                let _gate = self.inner.lock_operation().await?;
                 let native = self.inner.refresh().await?;
                 let provider = words
                     .first()
@@ -469,7 +491,7 @@ impl Session {
                 }
             }
             ("queue", _) => {
-                let _gate = self.inner.operation.lock().await;
+                let _gate = self.inner.lock_operation().await?;
                 queue_command(&self.inner, &runtime, words).await?
             }
             ("retry-stop", []) => {
@@ -490,7 +512,7 @@ impl Session {
                 }
             }
             ("autoretry", ["on" | "off"]) => {
-                let _gate = self.inner.operation.lock().await;
+                let _gate = self.inner.lock_operation().await?;
                 let enabled = words[0] == "on";
                 runtime
                     .request(json!({"type":"set_auto_retry","enabled":enabled}))
@@ -539,9 +561,14 @@ impl Session {
                 format!("Cancelled OMP subagent {id}.")
             }
             ("bash", [_, ..]) => {
-                let _gate = self.inner.operation.lock().await;
-                let (_, result) = runtime
-                    .request_with_timeout(json!({"type":"bash","command":args}), None)
+                let gate = self.inner.lock_operation().await?;
+                self.inner.require_no_long_control()?;
+                self.inner.bash_active.store(true, Ordering::Release);
+                let _bash = LongControl(&self.inner.bash_active);
+                let (_, result) = self
+                    .inner
+                    .runtime()?
+                    .request_admitted(json!({"type":"bash","command":args}), None, Some(gate))
                     .await?;
                 let status = if result["cancelled"] == true {
                     "canceled"
@@ -552,15 +579,22 @@ impl Session {
                 };
                 return self.inner.emit(json!({"type":"timeline","provider":self.inner.spec.id,"item":{
                     "type":"tool_call","callId":format!("omp-bash-{}",uuid::Uuid::new_v4()),"name":"bash","status":status,
+                    "daemonOwned":true,
                     "detail":{"type":"shell","command":args,"output":result["output"],"exitCode":result["exitCode"]},"error":null
                 }})).await;
             }
             ("bash-stop", []) => {
-                runtime.request(json!({"type":"abort_bash"})).await?;
+                let gate = self.inner.lock_operation().await?;
+                let timeout =
+                    launch::timeout(&self.inner.spec, &self.inner.state.lock().unwrap().config);
+                self.inner
+                    .runtime()?
+                    .request_admitted(json!({"type":"abort_bash"}), Some(timeout), Some(gate))
+                    .await?;
                 "OMP shell stop requested.".into()
             }
             ("next-model" | "next-thinking", []) => {
-                let _gate = self.inner.operation.lock().await;
+                let _gate = self.inner.lock_operation().await?;
                 let native = self.inner.refresh().await?;
                 self.inner
                     .require_idle(&native, "cycling models or thinking levels")?;
@@ -611,7 +645,7 @@ impl Session {
     }
 
     async fn native_handoff(&self, runtime: &Transport, instructions: &str) -> Result<()> {
-        let _gate = self.inner.operation.lock().await;
+        let _gate = self.inner.lock_operation().await?;
         let before = self.inner.refresh().await?;
         self.inner.state.lock().unwrap().live = true;
         let mut command = json!({"type":"handoff"});
@@ -641,7 +675,7 @@ impl Session {
     }
 
     async fn edit_todo(&self, runtime: &Transport, args: &str) -> Result<String> {
-        let _gate = self.inner.operation.lock().await;
+        let _gate = self.inner.lock_operation().await?;
         let mut native = self.inner.refresh().await?;
         let mut phases = native["todoPhases"].take();
         let phases_list = phases
@@ -701,7 +735,7 @@ impl Session {
     }
 
     async fn native_fork(&self, entry: Option<&str>) -> Result<()> {
-        let _gate = self.inner.operation.lock().await;
+        let _gate = self.inner.lock_operation().await?;
         let source = self.inner.refresh().await?;
         self.inner
             .require_idle(&source, "forking the conversation")?;
@@ -912,4 +946,4 @@ async fn queue_command(inner: &Inner, runtime: &Transport, words: &[&str]) -> Re
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;

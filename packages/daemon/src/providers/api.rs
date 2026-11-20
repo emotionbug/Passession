@@ -6,9 +6,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Local native transcript identity without reading its body. Unix change time
-/// catches same-length rewrites even when an editor restores modification time.
-/// Other platforms stay on replay until an equally strong file identity exists.
+/// Local native transcript identity without reading its body. Include filesystem
+/// change time to catch same-length writes whose modification time was restored.
+/// Platforms without this identity stay on replay.
 pub(crate) async fn native_file_revision(path: &std::path::Path) -> Option<Value> {
     #[cfg(unix)]
     {
@@ -25,10 +25,85 @@ pub(crate) async fn native_file_revision(path: &std::path::Path) -> Option<Value
             "changed":[metadata.ctime(), metadata.ctime_nsec()]
         }))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::{
+            fs::OpenOptions,
+            os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileBasicInfo, FileIdInfo,
+            GetFileInformationByHandleEx,
+        };
+
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let path = std::fs::canonicalize(path).ok()?;
+            let file = OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(&path).ok()?;
+            let metadata = file.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let mut identity = FILE_ID_INFO::default();
+            let mut times = FILE_BASIC_INFO::default();
+            // The handle stays open, and both output buffers match their API layouts.
+            let read = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileIdInfo,
+                    std::ptr::from_mut(&mut identity).cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                ) != 0 && GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileBasicInfo,
+                    std::ptr::from_mut(&mut times).cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                ) != 0
+            };
+            if !read {
+                return None;
+            }
+            Some(serde_json::json!({
+                "path":path, "device":identity.VolumeSerialNumber,
+                "inode":identity.FileId.Identifier, "length":metadata.len(),
+                "created":times.CreationTime, "modified":times.LastWriteTime, "changed":times.ChangeTime,
+            }))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         None
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod file_revision_tests {
+    use super::native_file_revision;
+
+    #[tokio::test]
+    async fn native_file_revision_tracks_transcript_changes_and_replacement() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("session.jsonl");
+        assert!(native_file_revision(root.path()).await.is_none());
+        assert!(native_file_revision(&path).await.is_none());
+        tokio::fs::write(&path, b"one").await?;
+        let original = native_file_revision(&path).await.unwrap();
+        assert_eq!(native_file_revision(&path).await.unwrap(), original);
+        tokio::fs::write(&path, b"longer").await?;
+        let changed = native_file_revision(&path).await.unwrap();
+        assert_ne!(changed, original);
+        tokio::fs::rename(&path, root.path().join("previous.jsonl")).await?;
+        tokio::fs::write(&path, b"longer").await?;
+        let replacement = native_file_revision(&path).await.unwrap();
+        assert_ne!(replacement["inode"], changed["inode"]);
+        assert_eq!(replacement["length"], changed["length"]);
+        assert_eq!(replacement["path"], changed["path"]);
+        Ok(())
     }
 }
 

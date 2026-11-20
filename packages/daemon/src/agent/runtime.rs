@@ -472,14 +472,14 @@ impl AgentManager {
         result
     }
     pub(super) async fn import_session(&self, input: Value) -> Result<Value> {
+        let config = json!({"provider":input["provider"],"cwd":input["cwd"]});
+        self.import_session_with_config(input, config).await
+    }
+
+    async fn import_session_with_config(&self, input: Value, config: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let app = self.app()?;
-        let config = self
-            .normalize_config(
-                json!({"provider":input["provider"],"cwd":input["cwd"]}),
-                true,
-            )
-            .await?;
+        let config = self.normalize_config(config, true).await?;
         let factory = app.providers.get(required(&config, "provider")?)?;
         let timestamp = now();
         let snapshot = json!({"id":id,"provider":config["provider"],"cwd":config["cwd"],"config":config,"createdAt":timestamp,"updatedAt":timestamp,"lastUserMessageAt":null,"workspaceId":input["workspaceId"],"labels":input.get("labels").cloned().unwrap_or(json!({})),"internal":false,"title":null,"archivedAt":null,"requiresAttention":false,"attentionReason":null,"attentionTimestamp":null});
@@ -935,8 +935,9 @@ impl AgentManager {
     fn detached_import(
         manager: Arc<AgentManager>,
         input: Value,
+        config: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> {
-        Box::pin(async move { manager.import_session(input).await })
+        Box::pin(async move { manager.import_session_with_config(input, config).await })
     }
     /// Opens a provider's native fork file as a new agent. The import starts
     /// another provider runtime, so it runs in the background instead of holding
@@ -963,8 +964,12 @@ impl AgentManager {
             "labels": if snapshot["labels"].is_object() { snapshot["labels"].clone() } else { json!({}) },
             "providerHandleId": file,
         });
-        let import = Self::detached_import(app.agents.clone(), input);
+        let manager = app.agents.clone();
         tokio::spawn(async move {
+            let import = async {
+                let config = native_fork_config(&snapshot)?;
+                Self::detached_import(manager, input, config).await
+            };
             let (level, message) = match import.await {
                 Ok(created) => (
                     "info",
@@ -1853,12 +1858,338 @@ pub(super) fn transition_attention(
     Some(reason)
 }
 
+fn native_fork_config(snapshot: &Value) -> Result<Value> {
+    let source = &snapshot["config"];
+    let mode = text(snapshot, "currentModeId")
+        .or_else(|| text(source, "modeId"))
+        .context("Cannot fork without the source agent's effective approval mode")?;
+    let mut config = json!({"provider":snapshot["provider"],"cwd":snapshot["cwd"],"modeId":mode});
+    for key in ["model", "thinkingOptionId"] {
+        if let Some(value) = text(&snapshot["runtimeInfo"], key).or_else(|| text(source, key)) {
+            config[key] = json!(value);
+        }
+    }
+    for key in [
+        "featureValues",
+        "providerOptions",
+        "systemPrompt",
+        "mcpServers",
+        "toolPolicy",
+    ] {
+        if let Some(value) = source.get(key) {
+            config[key] = value.clone();
+        }
+    }
+    Ok(config)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::providers::api::{AgentProvider, LaunchContext, ProviderSpec};
     use crate::providers::pi_omp::JsonlProvider;
     use crate::transport::{OutboundFrame, RequestContext};
+
+    #[cfg(unix)]
+    async fn omp_control_fixture() -> Result<(tempfile::TempDir, Arc<AppState>, String)> {
+        use crate::providers::pi_omp::fixture_provider_spec;
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("daemon");
+        let fixture = fixture_provider_spec(root.path());
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe()?);
+        app.config
+            .initialize_with_overrides(&json!({"listen":"127.0.0.1:0"}))
+            .await?;
+        app.transport.prepare().await?;
+        app.agents
+            .storage
+            .get_or_init(|| async { AgentStorage::new(home.clone()) })
+            .await;
+        app.agents
+            .receipts
+            .get_or_init(|| async { super::super::receipts::MessageReceipts::new(home) })
+            .await;
+        app.providers.apply_config(&json!({"providerOverrides":{
+            (fixture.id.as_str()): {"extends":"omp","label":"Fixture OMP","enabled":true,"command":fixture.command,"env":fixture.env}
+        }}), &json!({})).await?;
+        let workspace = app.projects.resolve_workspace(root.path()).await?;
+        let native = root.path().join("source.jsonl");
+        tokio::fs::write(&native, format!("{}\n{}\n",
+            json!({"type":"session","version":3,"id":"source","cwd":root.path(),"timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"message","id":"question","parentId":null,"message":{"role":"user","content":"previous question"}})
+        )).await?;
+        let imported = app
+            .agents
+            .import_session_with_config(
+                json!({"provider":fixture.id,"cwd":root.path(),"providerHandleId":native,"workspaceId":workspace["workspaceId"]}),
+                json!({"provider":fixture.id,"cwd":root.path(),"modeId":"ask","model":"kiro/one"}),
+            )
+            .await?;
+        let id = required(&imported, "id")?.to_owned();
+        Ok((root, app, id))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn omp_operator_queue_submission_and_reply_survive_reload() -> Result<()> {
+        let (root, app, id) = omp_control_fixture().await?;
+        let manager = &app.agents;
+        let mut events = manager.subscribe_events();
+        let sent = manager
+            .send_immediate(
+                &json!({"kind":"owner"}),
+                &id,
+                json!({
+                    "prompt":"/queue", "clientMessageId":"queue-control",
+                }),
+            )
+            .await?;
+        assert_eq!(sent["disposition"], "out_of_band");
+        let wait = async {
+            loop {
+                let event = events.recv().await?;
+                if event["agentId"] == id
+                    && event["event"]["item"]["message"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("OMP queue ("))
+                {
+                    anyhow::ensure!(event["event"]["item"]["type"] == "notification");
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait).await??;
+        // Force authoritative replay; merely retaining the old projection must fail.
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(root.path().join("source.jsonl"))
+            .await?;
+        file.write_all(format!("{}\n", json!({
+            "type":"message","id":"answer","parentId":"question",
+            "message":{"role":"assistant","responseId":"answer","content":[{"type":"text","text":"new from native history"}]}
+        })).as_bytes()).await?;
+        drop(file);
+        let reloaded = manager.reload(&id, json!({}), true).await?;
+        assert_eq!(reloaded["historySync"]["status"], "complete");
+        let cell = manager.cell(&id).await?;
+        let notices = cell
+            .read_timeline(|timeline| {
+                Ok(timeline
+                    .all_rows()?
+                    .into_iter()
+                    .map(|row| row["item"].clone())
+                    .collect::<Vec<_>>())
+            })
+            .await?;
+        assert!(
+            notices
+                .iter()
+                .any(|item| item["clientMessageId"] == "queue-control"
+                    && item["message"] == "/queue")
+        );
+        assert!(notices.iter().any(|item| {
+            item["message"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("OMP queue ("))
+        }));
+        assert!(
+            notices
+                .iter()
+                .any(|item| item["text"] == "new from native history")
+        );
+        manager.close_cell(&id, &cell).await?;
+        app.providers.catalogs.shutdown().await;
+        app.transport.shutdown().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn omp_agent_slash_payload_is_delivered_with_sender_provenance() -> Result<()> {
+        let (_root, app, id) = omp_control_fixture().await?;
+        let manager = &app.agents;
+        let caller = "00000000-0000-4000-8000-000000000064";
+        // The sender only needs a managed identity; no provider or event owner
+        // is needed for this send.
+        manager
+            .make_cell(
+                caller,
+                json!({
+                    "id":caller,"provider":"mock","internal":true,"config":{}
+                }),
+                true,
+            )
+            .await?;
+        let mut events = manager.subscribe_events();
+        manager
+            .send(
+                &json!({"kind":"agent","agentId":caller}),
+                &id,
+                json!({
+                    "prompt":"/queue", "messageId":"queued-slash", "notifyOnFinish":false,
+                }),
+            )
+            .await?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager
+                .message_delivery
+                .wait_for_dispatch(&id, CancellationToken::new()),
+        )
+        .await
+        .context("Waiting for queued dispatch")?
+        .context("Delivering the queued agent prompt")?;
+        let wait = async {
+            let mut reached_native = false;
+            loop {
+                let event = events.recv().await?;
+                if event["agentId"] != id {
+                    continue;
+                }
+                if event["event"]["type"] == "turn_failed" {
+                    bail!(
+                        "Fixture rejected the agent prompt: {}",
+                        event["event"]["error"]
+                    );
+                }
+                if event["event"]["item"]["message"] == "Native fixture received the agent envelope"
+                {
+                    reached_native = true;
+                }
+                if event["event"]["type"] == "turn_completed" {
+                    anyhow::ensure!(
+                        reached_native,
+                        "The native fixture never saw the source envelope"
+                    );
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(7), wait)
+            .await
+            .context("The native OMP fixture did not complete the agent message turn")??;
+        let cell = manager.cell(&id).await?;
+        let items = manager.timeline_items(&id).await?;
+        assert!(
+            items
+                .iter()
+                .any(|item| item["agentMessage"]["text"] == "/queue"
+                    && item["agentMessage"]["sender"]["id"] == caller)
+        );
+        assert!(!items.iter().any(|item| {
+            item["message"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("OMP queue ("))
+        }));
+        manager.message_delivery.shutdown().await?;
+        manager.close_cell(&id, &cell).await?;
+        app.providers.catalogs.shutdown().await;
+        app.transport.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn omp_native_fork_inherits_effective_mode_and_missing_descriptor_settings() -> Result<()> {
+        let mut snapshot = json!({
+            "provider":"omp","cwd":"/work","currentModeId":"ask",
+            "runtimeInfo":{"model":"effective/model","thinkingOptionId":"high"},
+            "config":{"modeId":"full","model":"old/model","thinkingOptionId":"low",
+                "featureValues":{"fast_mode":true},"providerOptions":{"smolModel":"some/model"},
+                "title":"source only","internal":true}
+        });
+        let inherited = native_fork_config(&snapshot)?;
+        assert_eq!(
+            inherited,
+            json!({
+                "provider":"omp","cwd":"/work","modeId":"ask",
+                "model":"effective/model","thinkingOptionId":"high",
+                "featureValues":{"fast_mode":true},"providerOptions":{"smolModel":"some/model"}
+            })
+        );
+        snapshot["currentModeId"] = Value::Null;
+        snapshot["config"]["modeId"] = json!("write");
+        assert_eq!(native_fork_config(&snapshot)?["modeId"], "write");
+        snapshot["config"]["modeId"] = Value::Null;
+        assert!(native_fork_config(&snapshot).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn omp_native_fork_opens_with_inherited_restrictions() -> Result<()> {
+        let (root, app, id) = omp_control_fixture().await?;
+        let manager = &app.agents;
+        let source = manager.cell(&id).await?;
+        manager
+            .update_snapshot(&source, |snapshot| {
+                // Force effective mode/thinking to differ from stale saved settings.
+                assert_eq!(snapshot["currentModeId"], "ask");
+                snapshot["config"]["modeId"] = json!("full");
+                snapshot["config"]["thinkingOptionId"] = json!("high");
+                snapshot["config"]["featureValues"]["fast_mode"] = json!(true);
+                Ok(())
+            })
+            .await?;
+        let file = root.path().join("imported-fork.jsonl");
+        // Minimal valid native descriptor: it does not restore mode, model, thinking or features.
+        tokio::fs::write(
+            &file,
+            format!(
+                "{}\n",
+                json!({
+                    "type":"session","version":3,"id":"imported-fork","cwd":root.path(),
+                    "timestamp":"2026-01-01T00:00:00.000Z"
+                })
+            ),
+        )
+        .await?;
+        let mut events = manager.subscribe_events();
+        source
+            .sink
+            .emit(json!({"type":"omp_fork_ready","provider":"configured-omp","sessionFile":file}))
+            .await?;
+        let wait = async {
+            loop {
+                let event = events.recv().await?;
+                if event["agentId"] == id
+                    && let Some(message) = event["event"]["item"]["message"].as_str()
+                {
+                    if message.starts_with("Forked this conversation") {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    if message.starts_with("Could not open the fork") {
+                        bail!("{message}");
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait).await??;
+        let child = manager
+            .list_snapshots()
+            .await?
+            .into_iter()
+            .find(|snapshot| snapshot["persistence"]["sessionId"] == "imported-fork")
+            .context("fork was not imported as a managed agent")?;
+        assert_eq!(child["currentModeId"], "ask");
+        assert_eq!(child["runtimeInfo"]["model"], "kiro/one");
+        assert_eq!(child["runtimeInfo"]["thinkingOptionId"], "low");
+        assert!(
+            child["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|feature| { feature["id"] == "fast_mode" && feature["value"] == true })
+        );
+        let child_id = required(&child, "id")?;
+        manager
+            .close_cell(child_id, &manager.cell(child_id).await?)
+            .await?;
+        manager.close_cell(&id, &source).await?;
+        app.providers.catalogs.shutdown().await;
+        app.transport.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn provider_environment_selects_private_home_before_session_overrides() {

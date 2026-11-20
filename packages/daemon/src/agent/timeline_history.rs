@@ -119,7 +119,7 @@ impl Timeline {
         self.native_revision = revision;
     }
     /// Non-destructive refresh requires unique, ordered matches for conversation
-    /// rows. Complete provider history may omit daemon notifications: retain those
+    /// rows. Complete provider history can omit daemon-owned rows: retain those
     /// beside the next matched row rather than dropping them or refusing recovery.
     /// `previous` is streamed once; stored rows are decoded one at a time.
     pub(in crate::agent) fn reconcile_history(
@@ -221,7 +221,8 @@ impl Timeline {
                 }
                 None if allow_removal => {}
                 None if coverage == HistoryCoverage::Complete
-                    && row["item"]["type"] == "notification" =>
+                    && (row["item"]["type"] == "notification"
+                        || row["item"]["daemonOwned"] == true) =>
                 {
                     edits.execute(
                         "INSERT INTO notices(position, row_json) VALUES (NULL, ?1)",

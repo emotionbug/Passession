@@ -378,8 +378,19 @@ impl Transport {
     }
     pub async fn request_with_timeout(
         &self,
+        command: Value,
+        timeout: Option<Duration>,
+    ) -> Result<(String, Value)> {
+        self.request_admitted(command, timeout, None).await
+    }
+
+    /// Release the caller's admission gate after the complete frame is written,
+    /// before waiting for a command that itself may need operator input.
+    pub(super) async fn request_admitted(
+        &self,
         mut command: Value,
         timeout: Option<Duration>,
+        admission: Option<tokio::sync::MutexGuard<'_, ()>>,
     ) -> Result<(String, Value)> {
         let started = Instant::now();
         let id = format!("req_{}", self.sequence.fetch_add(1, Ordering::Relaxed));
@@ -414,11 +425,17 @@ impl Transport {
             id: &id,
         };
         let result = async {
-            self.send_with_deadline(&command, deadline).await.map_err(|error| {
-                let attempted = error.downcast_ref::<WriteError>()
-                    .is_none_or(|error| error.attempted);
-                request_failure(&id, error, attempted)
-            })?;
+            let write_deadline = deadline.or_else(|| {
+                admission.as_ref().and_then(|_| started.checked_add(self.timeout))
+            });
+            self.send_with_deadline(&command, write_deadline)
+                .await
+                .map_err(|error| {
+                    let attempted = error.downcast_ref::<WriteError>()
+                        .is_none_or(|error| error.attempted);
+                    request_failure(&id, error, attempted)
+                })?;
+            drop(admission);
             let result = tokio::select! {
                 biased;
                 result = receiver => result.unwrap_or_else(|_| Err(anyhow!("JSONL request channel closed"))),

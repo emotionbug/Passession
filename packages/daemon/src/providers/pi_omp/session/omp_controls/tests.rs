@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::{
     collections::BTreeMap,
     io::{self, BufRead},
+    path::Path,
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -20,6 +21,15 @@ fn fake_native_omp() {
     let args = std::env::var("PASEO_FAKE_OMP_ARGS").unwrap();
     let arg = |flag| args.lines().skip_while(|part| *part != flag).nth(1);
     let secondary = arg("--session").is_some();
+    if args.lines().any(|arg| {
+        matches!(arg, "--no-ui" | "--no-extensions" | "--trusted-extension")
+            || arg.starts_with("--trusted-extension=")
+    }) {
+        assert!(
+            arg("--extension").is_none(),
+            "must not inject the account extension"
+        );
+    }
     let bridge = arg("--extension")
         .and_then(|path| {
             let source = std::fs::read_to_string(path).unwrap();
@@ -33,6 +43,15 @@ fn fake_native_omp() {
     let mut file = root.join("source.jsonl");
     let mut provider = "kiro";
     let mut level = "low";
+    let mut fast = false;
+    if let Some(path) = arg("--session").filter(|path| path.ends_with("imported-fork.jsonl")) {
+        assert_eq!(arg("--approval-mode"), Some("always-ask"));
+        assert_eq!(arg("--thinking"), Some("low"));
+        native_id = "imported-fork";
+        file = path.into();
+        provider = "initial";
+        level = arg("--thinking").unwrap();
+    }
     let mut account = Some(22);
     let mut signed_out = false;
     let mut models_changed = false;
@@ -83,22 +102,38 @@ fn fake_native_omp() {
                 } else {
                     json!(["other", "promote me"])
                 };
-                respond(
-                    &q,
-                    json!({"sessionId":native_id,"sessionFile":file,"model":{"provider":provider,"id":"one","reasoning":true},"isSettled":true,"isStreaming":false,"isCompacting":false,"thinkingLevel":level,
-                    "steeringMode":"all","followUpMode":"one-at-a-time","queuedMessages":{"steering":steering,"followUp":follow_up,"liveSteered":1},"todoPhases":todo_phases}),
-                );
+                let mut state = json!({"sessionId":native_id,"sessionFile":file,"model":{"provider":provider,"id":"one","reasoning":true},"isSettled":true,"isStreaming":false,"isCompacting":false,"thinkingLevel":level,
+                    "steeringMode":"all","followUpMode":"one-at-a-time","queuedMessages":{"steering":steering,"followUp":follow_up,"liveSteered":1},"todoPhases":todo_phases});
+                if native_id == "imported-fork" {
+                    state["fastModeEnabled"] = json!(fast);
+                    state["fastModeActive"] = json!(fast);
+                }
+                respond(&q, state);
             }
             "set_event_filter" => respond(&q, json!({"messageUpdates":"delta"})),
             "get_available_commands" => respond(&q, json!({"commands":command_list()})),
             "get_available_models" => {
                 let mut models = vec![json!({"provider":provider,"id":"one","name":"One"})];
+                if native_id == "imported-fork" {
+                    models.push(json!({"provider":"kiro","id":"one","name":"Inherited"}));
+                }
                 if models_changed {
                     models.push(
                         json!({"provider":"kiro-work-team","id":"two","name":"Pinned model"}),
                     );
                 }
                 respond(&q, json!({"models":models}));
+            }
+            "set_model" if native_id == "imported-fork" => {
+                assert_eq!(q["provider"], "kiro");
+                assert_eq!(q["modelId"], "one");
+                provider = "kiro";
+                respond(&q, Value::Null);
+            }
+            "set_fast_mode" if native_id == "imported-fork" => {
+                assert_eq!(q["enabled"], true);
+                fast = true;
+                respond(&q, json!({"enabled":fast,"active":fast}));
             }
             "get_login_providers" => respond(
                 &q,
@@ -138,6 +173,41 @@ fn fake_native_omp() {
                 signed_out = true;
                 models_changed = false;
                 respond(&q, json!({}));
+            }
+            "prompt"
+                if q["message"] == "prompt during shell"
+                    || q["message"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("<paseo-system ")) =>
+            {
+                let message = q["message"].as_str().unwrap();
+                if message == "prompt during shell" {
+                    assert!(bash.is_some(), "shell must still be awaiting a stop");
+                } else {
+                    assert!(message.contains("source-agent-id="));
+                    assert!(message.contains("/queue"));
+                    println!(
+                        "{}",
+                        notice(
+                            "provenance",
+                            "Native fixture received the agent envelope".into()
+                        )
+                    );
+                }
+                respond(&q, json!({"agentInvoked":true}));
+                println!("{}", json!({"type":"agent_start"}));
+                println!(
+                    "{}",
+                    json!({"type":"message_end","message":{"role":"user","content":message,"id":"fake-user"}})
+                );
+                println!(
+                    "{}",
+                    json!({"type":"agent_end","messages":[{"role":"assistant","content":[],"stopReason":"stop"}]})
+                );
+                println!(
+                    "{}",
+                    json!({"type":"prompt_result","id":q["id"],"agentInvoked":true})
+                );
             }
             "prompt" => {
                 let (name, args) = slash(q["message"].as_str().unwrap()).unwrap();
@@ -291,8 +361,33 @@ fn fake_native_omp() {
     }
 }
 
+pub(crate) fn fixture_provider_spec(root: &Path) -> ProviderSpec {
+    let path = root.to_str().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    ProviderSpec {
+        id: "configured-omp".into(),
+        family: "omp".into(),
+        command: vec!["sh".into(), "-c".into(), "export PASEO_FAKE_OMP_ARGS=\"$(printf '%s\\n' \"$@\")\"; exec \"$PASEO_FAKE_OMP_EXE\" \"$PASEO_FAKE_OMP_FILTER\" --nocapture --ignored".into(), "fake-omp".into()],
+        env: BTreeMap::from([
+            ("HOME".into(), path.into()),
+            ("PI_CODING_AGENT_DIR".into(), path.into()),
+            ("PASEO_FAKE_OMP_ROOT".into(), path.into()),
+            ("PASEO_FAKE_OMP_EXE".into(), exe.to_str().unwrap().into()),
+            ("PASEO_FAKE_OMP_FILTER".into(), FIXTURE_FILTER.into()),
+        ]),
+        options: json!({"rpcTimeoutMs":3000}), defaults: json!({}), runtime_settings: json!({}), configured_models: Vec::new(),
+    }
+}
+
 async fn open_fixture(
     hide_accounts: bool,
+) -> (tempfile::TempDir, Arc<Session>, mpsc::Receiver<Value>) {
+    open_fixture_with_args(hide_accounts, &[]).await
+}
+
+async fn open_fixture_with_args(
+    hide_accounts: bool,
+    args: &[&str],
 ) -> (tempfile::TempDir, Arc<Session>, mpsc::Receiver<Value>) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().to_str().unwrap();
@@ -302,26 +397,34 @@ async fn open_fixture(
     let cancel = CancellationToken::new();
     let (sink, events) = EventSink::channel(128, cancel.clone());
     let exe = std::env::current_exe().unwrap();
-    let mut env = BTreeMap::from([
-        ("HOME".into(), path.into()),
-        ("PI_CODING_AGENT_DIR".into(), path.into()),
-        ("PASEO_FAKE_OMP_ROOT".into(), path.into()),
-        ("PASEO_FAKE_OMP_EXE".into(), exe.to_str().unwrap().into()),
-        ("PASEO_FAKE_OMP_FILTER".into(), FIXTURE_FILTER.into()),
-    ]);
+    let mut spec = fixture_provider_spec(root.path());
+    spec.command
+        .extend(args.iter().map(|arg| (*arg).to_owned()));
     if hide_accounts {
-        env.insert("PASEO_FAKE_OMP_NO_ACCOUNTS".into(), "1".into());
+        spec.env
+            .insert("PASEO_FAKE_OMP_NO_ACCOUNTS".into(), "1".into());
     }
     let session = Session::open(
-        ProviderSpec {
-            id: "configured-omp".into(), family: "omp".into(),
-            command: vec!["sh".into(), "-c".into(), "export PASEO_FAKE_OMP_ARGS=\"$(printf '%s\\n' \"$@\")\"; exec \"$PASEO_FAKE_OMP_EXE\" \"$PASEO_FAKE_OMP_FILTER\" --nocapture --ignored".into(), "fake-omp".into()],
-            env, options: json!({"rpcTimeoutMs":3000}), defaults: json!({}), runtime_settings: json!({}), configured_models: Vec::new(),
-        },
+        spec,
         json!({"cwd":path}),
-        LaunchContext { agent_id: "source-agent".into(), home: root.path().into(), executable: exe, env: BTreeMap::new(), mcp_servers: json!({}), tool_catalog: json!([]), tool_manifest: json!([]), tool_executor: None, cancel },
-        None, json!({}), sink, &launch::CommandProbes::default(),
-    ).await.unwrap();
+        LaunchContext {
+            agent_id: "source-agent".into(),
+            home: root.path().into(),
+            executable: exe,
+            env: BTreeMap::new(),
+            mcp_servers: json!({}),
+            tool_catalog: json!([]),
+            tool_manifest: json!([]),
+            tool_executor: None,
+            cancel,
+        },
+        None,
+        json!({}),
+        sink,
+        &launch::CommandProbes::default(),
+    )
+    .await
+    .unwrap();
     (root, session, events)
 }
 
@@ -373,10 +476,10 @@ async fn omp_native_controls_account_pin_auto_and_unsupported_runtime() {
             .iter()
             .all(|c| !c["name"].as_str().unwrap().starts_with("paseo-account-"))
     );
-    assert_eq!(
-        session.usage_session().unwrap()["provider"],
-        "configured-omp"
-    );
+    let usage = session.usage_session().unwrap();
+    assert_eq!(usage["provider"], "configured-omp");
+    assert_eq!(usage["providerFamily"], "omp");
+    assert_eq!(usage["command"], json!(session.inner.spec.command));
     assert_eq!(
         until(&mut events, |e| e["type"] == "thread_started").await["sessionId"],
         "source"
@@ -397,11 +500,61 @@ async fn omp_native_controls_account_pin_auto_and_unsupported_runtime() {
 }
 
 #[tokio::test]
+async fn omp_account_bridge_skips_trusted_and_disabled_extension_launches() {
+    for flags in [
+        &["--trusted-extension", "/private/trusted.mjs"][..],
+        &["--trusted-extension=/private/trusted.mjs"][..],
+        &["--no-extensions"][..],
+        &["--no-ui"][..],
+    ] {
+        let (_root, session, _events) =
+            tokio::time::timeout(Duration::from_secs(5), open_fixture_with_args(false, flags))
+                .await
+                .expect("must not wait for an extension UI result");
+        assert!(session.features().is_empty());
+        assert!(session.inner.assets.lock().unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(5), oob(&session, "/next-thinking"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.features().is_empty());
+        assert!(
+            !session
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .account_command_available
+        );
+        session.close().await.unwrap();
+    }
+    let (_root, session, _events) =
+        tokio::time::timeout(Duration::from_secs(5), open_fixture(true))
+            .await
+            .expect("a runtime that does not advertise the UI bridge must not be probed");
+    assert!(session.inner.assets.lock().unwrap().is_some());
+    assert!(
+        !session
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .account_command_available
+    );
+    tokio::time::timeout(Duration::from_secs(5), oob(&session, "/next-thinking"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session.features().is_empty());
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn omp_native_controls_login_dialog_logout_and_catalog_refresh() {
     let (_root, session, mut events) = open_fixture(false).await;
     oob(&session, "/login").await.unwrap();
     assert!(
-        until(&mut events, |e| e["item"]["type"] == "assistant_message").await["item"]["text"]
+        until(&mut events, |e| e["item"]["type"] == "notification").await["item"]["message"]
             .as_str()
             .unwrap()
             .contains("kiro — Kiro")
@@ -428,6 +581,20 @@ async fn omp_native_controls_login_dialog_logout_and_catalog_refresh() {
     );
     let prompt = until(&mut events, |e| e["type"] == "permission_requested").await;
     assert_eq!(prompt["request"]["id"], "paste");
+    let rejection = tokio::time::timeout(
+        Duration::from_secs(2),
+        session.start_turn(json!("not while logging in"), json!({})),
+    )
+    .await
+    .expect("a competing prompt must not block the login response")
+    .unwrap_err();
+    assert!(rejection.to_string().contains("Wait for OMP login"));
+    let rejection =
+        tokio::time::timeout(Duration::from_secs(2), session.set_model(Some("kiro/one")))
+            .await
+            .expect("a competing model change must not block the login response")
+            .unwrap_err();
+    assert!(rejection.to_string().contains("Wait for OMP login"));
     session
         .respond_to_permission(
             "paste",
@@ -442,13 +609,13 @@ async fn omp_native_controls_login_dialog_logout_and_catalog_refresh() {
     assert_eq!(update["models"][1]["id"], "kiro-work-team/two");
     oob(&session, "/logout").await.unwrap();
     let account = until(&mut events, |e| {
-        e["item"]["text"]
+        e["item"]["message"]
             .as_str()
             .is_some_and(|s| s.contains("OMP credentials for kiro"))
     })
     .await;
     assert!(
-        account["item"]["text"]
+        account["item"]["message"]
             .as_str()
             .unwrap()
             .contains("#22: Second account")
@@ -470,7 +637,7 @@ async fn omp_native_controls_queue_never_edits_ambiguous_or_claimed_entries() {
     let (_root, session, mut events) = open_fixture(false).await;
     oob(&session, "/queue").await.unwrap();
     assert!(
-        until(&mut events, |e| e["item"]["type"] == "assistant_message").await["item"]["text"]
+        until(&mut events, |e| e["item"]["type"] == "notification").await["item"]["message"]
             .as_str()
             .unwrap()
             .contains("1. [steering, already delivering] claimed")
@@ -523,13 +690,13 @@ async fn omp_native_controls_retry_subagents_and_cancelled_shell_row() {
         .unwrap();
     oob(&session, "/subagent-cancel child-42").await.unwrap();
     let subagents = until(&mut events, |e| {
-        e["item"]["text"]
+        e["item"]["message"]
             .as_str()
             .is_some_and(|s| s.starts_with("OMP subagents:"))
     })
     .await;
     assert!(
-        subagents["item"]["text"]
+        subagents["item"]["message"]
             .as_str()
             .unwrap()
             .contains("child-42 — Scout (running)")
@@ -541,6 +708,26 @@ async fn omp_native_controls_retry_subagents_and_cancelled_shell_row() {
             .unwrap(),
     );
     until(&mut events, |e| e["item"]["message"] == "Shell started").await;
+    let mutation = tokio::sync::Mutex::new(());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        // The manager holds this lane while admitting a prompt. The shell's
+        // response cannot be required for admission, since stop also uses it.
+        let _mutation = mutation.lock().await;
+        let prompt = session
+            .start_turn(json!("prompt during shell"), json!({}))
+            .await
+            .unwrap();
+        let acknowledgement = session
+            .native_acknowledgement(prompt["turnId"].as_str().unwrap())
+            .unwrap();
+        assert!(matches!(
+            acknowledgement.await,
+            crate::providers::api::PromptAck::Accepted(_)
+        ));
+    })
+    .await
+    .expect("shell is still running and must not hold the operation gate");
+    let _mutation = mutation.lock().await;
     oob(&session, "/bash-stop").await.unwrap();
     bash.await.unwrap().unwrap();
     let shell = until(&mut events, |e| e["item"]["detail"]["type"] == "shell").await;
@@ -632,13 +819,13 @@ async fn omp_native_controls_kiro_commands_refresh_models_and_keep_native_todo_e
     );
     oob(&session, "/todo edit").await.unwrap();
     let list = until(&mut events, |e| {
-        e["item"]["text"]
+        e["item"]["message"]
             .as_str()
             .is_some_and(|s| s.starts_with("OMP todos"))
     })
     .await;
     assert!(
-        list["item"]["text"]
+        list["item"]["message"]
             .as_str()
             .unwrap()
             .contains("1.1 [pending] Default: check fixture")

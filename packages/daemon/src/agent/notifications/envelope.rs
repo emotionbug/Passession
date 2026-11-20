@@ -251,7 +251,7 @@ pub fn project_agent_messages(item: &Value) -> Vec<Value> {
     }).collect()
 }
 
-pub fn agent_message_command(prompt: &Value) -> Option<String> {
+pub fn single_agent_message_text(prompt: &Value) -> Option<String> {
     let mut messages = parse_many(prompt.as_str()?)?;
     if messages.len() != 1 || messages[0].source.is_none() {
         return None;
