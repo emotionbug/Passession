@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.45 - 2026-11-20
+
 ### Added
 
 - Screen readers: Android TalkBack and iOS VoiceOver can read and activate labeled controls, move through session lists, and focus the message field. The app builds this information only while a screen reader is on. It has not yet been tried on a phone with TalkBack or VoiceOver.

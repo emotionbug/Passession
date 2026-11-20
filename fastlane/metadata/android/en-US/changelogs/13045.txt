@@ -1,0 +1,14 @@
+Added
+- TalkBack can read and activate labeled controls.
+
+Changed
+- Less background reconnecting; faster retry on reopen or network change.
+- Push registration retries; Settings says when a build has no push.
+- Faster terminal search, Markdown preview and large diffs.
+- Scrollbars fade after scrolling; lists stop at the edge.
+
+Fixed
+- Dropped file paths keep every character.
+- Pairing links reopen after closing the dialog.
+
+Full notes: https://github.com/emotionbug/Passession/releases
