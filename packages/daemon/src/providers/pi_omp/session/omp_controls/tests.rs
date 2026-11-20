@@ -228,13 +228,14 @@ fn fake_native_omp() {
                         _ => json!([]),
                     };
                     let result = json!({"requestId":payload["requestId"],"result":{"explicit":account,"accounts":accounts}});
-                    println!(
-                        "{}",
-                        notice("bridge", format!("PASEO_COMMAND_RESULT {result}"))
-                    );
+                    // A command's own output precedes the reply that ends it.
                     println!(
                         "{}",
                         json!({"type":"command_output","text":"internal extension output"})
+                    );
+                    println!(
+                        "{}",
+                        notice("bridge", format!("PASEO_COMMAND_RESULT {result}"))
                     );
                 } else {
                     match (name, args) {

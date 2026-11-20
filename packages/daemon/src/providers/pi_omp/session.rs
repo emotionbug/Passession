@@ -419,6 +419,15 @@ impl Inner {
         {
             return Ok(());
         }
+        // Output of an internal bridge command never belongs to the conversation. The
+        // command runs under the operation gate while idle, and its reply closes the
+        // window when the reader reaches it, so the order of frames decides, not timing.
+        if self.spec.family == "omp"
+            && frame["type"] == "command_output"
+            && !self.state.lock().unwrap().extension_results.is_empty()
+        {
+            return Ok(());
+        }
         if self.spec.family == "omp" {
             let router = self.host_tools.lock().unwrap().clone();
             if let Some(router) = router
