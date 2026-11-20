@@ -821,16 +821,16 @@ pub(super) async fn stream_omp(
         reader.read_exact(&mut bytes).await?;
         let entry = record(&String::from_utf8_lossy(&bytes))
             .ok_or_else(|| anyhow!("OMP history entry changed during replay"))?;
-        if entry["message"]["role"] == "toolResult" {
-            if let (Some(id), Some(timestamp)) = (
+        if entry["message"]["role"] == "toolResult"
+            && let (Some(id), Some(timestamp)) = (
                 entry["message"]["toolCallId"].as_str(),
                 replay_timestamp(&entry["timestamp"]),
-            ) {
-                finished.insert(id.to_owned(), timestamp);
-            }
-            if entry["message"]["toolName"] == "todo" {
-                todo = todo_message(&entry["message"]);
-            }
+            )
+        {
+            finished.insert(id.to_owned(), timestamp);
+        }
+        if let Some(phases) = todo_entry_phases(&entry) {
+            todo = todo_from_phases(phases);
         }
         let (events, message) = replay_entry(&mut mapper, "omp", provider, &entry);
         if let Some(message) = message {
@@ -1384,17 +1384,23 @@ fn subagent_title(title: &str, model: Option<&str>) -> String {
     }
 }
 
-pub fn todo_state(entries: &[Value]) -> Option<Value> {
-    let message = entries
-        .iter()
-        .rev()
-        .find(|e| e["message"]["role"] == "toolResult" && e["message"]["toolName"] == "todo")?
-        .get("message")?;
-    todo_message(message)
+fn todo_state(entries: &[Value]) -> Option<Value> {
+    todo_from_phases(entries.iter().rev().find_map(todo_entry_phases)?)
 }
 
-fn todo_message(message: &Value) -> Option<Value> {
-    let phases = message["details"]["phases"].as_array()?;
+fn todo_entry_phases(entry: &Value) -> Option<&Value> {
+    if entry["type"] == "custom" && entry["customType"] == "user_todo_edit" {
+        return Some(&entry["data"]["phases"]);
+    }
+    let message = &entry["message"];
+    if message["role"] == "toolResult" && message["toolName"] == "todo" {
+        return Some(&message["details"]["phases"]);
+    }
+    None
+}
+
+pub(super) fn todo_from_phases(phases: &Value) -> Option<Value> {
+    let phases = phases.as_array()?;
     let mut tasks = Vec::new();
     for phase in phases {
         phase["name"].as_str()?;
@@ -1638,6 +1644,20 @@ mod tests {
                     "content":text("queued"),"details":{"async":true,"results":[],"progress":progress}}}),
             delivery,
         ])
+    }
+
+    #[test]
+    fn omp_native_controls_todo_replay_prefers_the_latest_user_edit() {
+        let phases = |content: &str| json!([{"name":"Work","tasks":[{"content":content,"status":"in_progress"}]}]);
+        let mut entries = vec![
+            json!({"type":"message","message":{"role":"toolResult","toolName":"todo","details":{"phases":phases("before")}}}),
+            json!({"type":"custom","customType":"user_todo_edit","data":{"phases":phases("after")}}),
+        ];
+        let todo = todo_state(&entries).unwrap();
+        assert_eq!(todo["items"][0]["text"], "after");
+        assert_eq!(todo["items"][0]["status"], "in_progress");
+        entries.push(json!({"type":"custom","customType":"user_todo_edit","data":{"phases":[]}}));
+        assert!(todo_state(&entries).is_none());
     }
 
     #[tokio::test]

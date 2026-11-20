@@ -908,6 +908,86 @@ impl AgentManager {
             tracing::warn!(agent_id=id, error=%error, "Unable to publish message correction recovery notice");
         }
     }
+    async fn apply_catalog_change(&self, id: &str, cell: &Arc<AgentCell>, event: &Value) {
+        let snapshot = cell.data.lock().await.snapshot.clone();
+        let (Some(provider), Some(cwd), Some(models), true) = (
+            snapshot["provider"].as_str(),
+            snapshot["cwd"].as_str(),
+            event["models"].as_array(),
+            event["provider"] == snapshot["provider"],
+        ) else {
+            tracing::warn!(agent_id = id, "Ignoring an invalid catalog change event");
+            return;
+        };
+        let Ok(app) = self.app() else {
+            return;
+        };
+        if let Err(error) = app
+            .providers
+            .omp_catalog_changed(provider, std::path::Path::new(cwd), models.clone())
+            .await
+        {
+            tracing::warn!(agent_id = id, error = %error, "Unable to refresh the provider catalog");
+        }
+    }
+    /// Type-erased import. Importing applies the new agent's events, a path that can
+    /// reach `import_native_fork` again, so the future cannot be a nested opaque type.
+    fn detached_import(
+        manager: Arc<AgentManager>,
+        input: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> {
+        Box::pin(async move { manager.import_session(input).await })
+    }
+    /// Opens a provider's native fork file as a new agent. The import starts
+    /// another provider runtime, so it runs in the background instead of holding
+    /// this agent's event order; its outcome is reported in this agent's timeline.
+    async fn import_native_fork(&self, id: &str, cell: &Arc<AgentCell>, event: &Value) {
+        let snapshot = cell.data.lock().await.snapshot.clone();
+        let file = event["sessionFile"]
+            .as_str()
+            .filter(|file| std::path::Path::new(file).is_absolute());
+        // Only the agent's own provider may announce a fork of its session.
+        let (Some(file), true) = (file, event["provider"] == snapshot["provider"]) else {
+            tracing::warn!(agent_id = id, "Ignoring an invalid native fork event");
+            return;
+        };
+        let Ok(app) = self.app() else {
+            return;
+        };
+        let sink = cell.sink.clone();
+        let source = id.to_owned();
+        let input = json!({
+            "provider": snapshot["provider"],
+            "cwd": snapshot["cwd"],
+            "workspaceId": snapshot["workspaceId"],
+            "labels": if snapshot["labels"].is_object() { snapshot["labels"].clone() } else { json!({}) },
+            "providerHandleId": file,
+        });
+        let import = Self::detached_import(app.agents.clone(), input);
+        tokio::spawn(async move {
+            let (level, message) = match import.await {
+                Ok(created) => (
+                    "info",
+                    format!(
+                        "Forked this conversation into a new agent ({}).",
+                        created["title"]
+                            .as_str()
+                            .or(created["id"].as_str())
+                            .unwrap_or("untitled")
+                    ),
+                ),
+                Err(error) => (
+                    "error",
+                    format!("Could not open the fork as a new agent: {error}"),
+                ),
+            };
+            let notice = json!({"type":"timeline","provider":snapshot["provider"],
+                "item":{"type":"notification","level":level,"message":message}});
+            if let Err(error) = sink.emit(notice).await {
+                tracing::warn!(agent_id = source, error = %error, "Unable to report a native fork");
+            }
+        });
+    }
     pub(super) async fn apply_event(
         &self,
         id: &str,
@@ -926,6 +1006,22 @@ impl AgentManager {
             return Ok(());
         }
         cell.activity.touch();
+        if event["type"] == "omp_catalog_changed" {
+            // A live runtime registered or removed model providers (login, logout,
+            // omp-kiro accounts); the shared catalog follows without a restart.
+            if !from_history {
+                self.apply_catalog_change(id, cell, &event).await;
+            }
+            return Ok(());
+        }
+        if event["type"] == "omp_fork_ready" {
+            // A provider-native fork becomes a new agent; it is never part of this
+            // agent's history or wire stream.
+            if !from_history {
+                self.import_native_fork(id, cell, &event).await;
+            }
+            return Ok(());
+        }
         if event["type"] == "timeline" {
             event["item"] = timeline::limit_item_content(event["item"].take());
         }
@@ -1135,6 +1231,22 @@ impl AgentManager {
             }
             "model_changed" => {
                 snapshot["runtimeInfo"] = event["runtimeInfo"].clone();
+                // Top-level `model` and `thinkingOptionId` report that the configured
+                // values changed (cycled or not restorable), not just runtime details.
+                if event["model"].is_string() {
+                    snapshot["config"]["model"] = event["model"].clone();
+                }
+                match event.get("thinkingOptionId") {
+                    Some(Value::Null) => {
+                        object(&mut snapshot["config"]).remove("thinkingOptionId");
+                    }
+                    Some(level) => snapshot["config"]["thinkingOptionId"] = level.clone(),
+                    None => {}
+                }
+                // A model change can change which feature pickers apply (e.g. accounts).
+                if event["runtimeInfo"]["features"].is_array() {
+                    snapshot["features"] = event["runtimeInfo"]["features"].clone();
+                }
                 if let Some(mode) = event["runtimeInfo"].get("modeId") {
                     snapshot["currentModeId"] = mode.clone();
                     if !mode.is_null() {

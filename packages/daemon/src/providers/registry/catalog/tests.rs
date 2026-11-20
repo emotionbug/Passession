@@ -178,3 +178,79 @@ fn creation_reads_require_an_enabled_ready_entry() {
     let ready = json!({"provider":"codex","enabled":true,"status":"ready","modes":[]});
     assert_eq!(require_ready("codex", ready.clone()).unwrap(), ready);
 }
+
+#[tokio::test]
+async fn omp_native_controls_registry_publishes_live_workspace_models() {
+    use crate::providers::{api::ProviderSpec, pi_omp::JsonlProvider, registry::ProviderEntry};
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path();
+    let service = super::CatalogService::new(std::sync::Weak::new());
+    let spec = ProviderSpec {
+        id: "alias-omp".into(),
+        family: "omp".into(),
+        command: vec!["false".into()],
+        env: Default::default(),
+        options: json!({}),
+        defaults: json!({}),
+        runtime_settings: json!({}),
+        configured_models: Vec::new(),
+    };
+    let entry = Arc::new(ProviderEntry {
+        definition: Arc::new(json!({"label":"OMP","defaultModeId":"write"})),
+        client: Arc::new(JsonlProvider::new(spec.clone())),
+        spec,
+        enabled: true,
+        source: "custom",
+        profile_models: Vec::new(),
+        additional_models: vec![json!({"id":"local/test","label":"Local"})],
+        profile_models_are_additive: true,
+        identity: json!({}),
+    });
+    {
+        let mut cache = service.inner.cache.lock().unwrap();
+        cache.order.push("alias-omp".into());
+        cache.providers.insert(
+            "alias-omp".into(),
+            Arc::new(super::state::ProviderState {
+                initial: super::state::initial(&entry),
+                entry,
+                limit: Arc::new(tokio::sync::Semaphore::new(1)),
+                cancel: service.inner.cancel.child_token(),
+                replacement_models: None,
+            }),
+        );
+    }
+    service
+        .omp_catalog_changed(
+            "alias-omp",
+            cwd,
+            vec![
+                json!({"id":"kiro-work-team/auto","label":"Account A"}),
+                json!({"id":"kiro-work-team/auto","label":"Duplicate"}),
+            ],
+        )
+        .unwrap();
+    let updated = service
+        .catalog("alias-omp", Some(cwd), false)
+        .await
+        .unwrap();
+    assert_eq!(updated["status"], "ready");
+    assert_eq!(updated["defaultModeId"], "write");
+    assert_eq!(updated["models"][0]["label"], "Account A");
+    assert_eq!(updated["models"][1]["id"], "local/test");
+    assert_eq!(updated["models"].as_array().unwrap().len(), 2);
+    assert_ne!(
+        service.catalog("alias-omp", None, false).await.unwrap()["models"],
+        updated["models"],
+    );
+    service
+        .omp_catalog_changed("alias-omp", cwd, Vec::new())
+        .unwrap();
+    let updated = service
+        .catalog("alias-omp", Some(cwd), false)
+        .await
+        .unwrap();
+    assert_eq!(updated["models"].as_array().unwrap().len(), 1);
+    assert_eq!(updated["models"][0]["id"], "local/test");
+    service.shutdown().await;
+}

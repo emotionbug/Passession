@@ -435,10 +435,53 @@ Custom OMP profiles should extend `omp`. They inherit the OMP adapter's `rpc-ui`
 
 `options.sessionDir` is used only for importing sessions that were started outside Paseo. If `command` or XDG env vars move OMP's state directory, set `options.sessionDir` to the resulting OMP JSONL session directory; launching and resuming still go through the configured command. OMP waits 20 seconds for its initial `ready` frame and 60 seconds for later control-plane RPCs by default. `options.rpcTimeoutMs` overrides both deadlines.
 
-OMP account usage follows the selected model's native provider and session
-credential store. `anthropic/...` uses the Claude account source and
-`openai-codex/...` uses the Codex subscription source. `openai/...` API-key models
-do not borrow a ChatGPT subscription's quota.
+OMP account usage comes from OMP itself. The daemon runs the configured OMP
+command with `usage --json` (12 s limit) and `usage accounts --json` (4 s limit)
+and lists every OMP login as `OMP · <provider> · <account>`, with its plan,
+windows, resets and balances. An agent's usage is narrowed to its current model's
+provider and runs with that agent's OMP environment. A login that OMP disabled
+(for example an expired grant) is shown as needing a new sign-in. OMP's account
+inventory lists only OAuth logins, so an API key for a provider without a usage
+endpoint has no row. Passession no longer reads OMP's credential database
+directly; Claude and Codex rows come only from those tools' own logins.
+`openai/...` API-key models never borrow a ChatGPT subscription's quota.
+
+##### Accounts and controls in OMP agents
+
+When OMP has stored OAuth logins for the current model's provider (for example
+two Anthropic accounts, or several logins of OMP's own `kiro` provider), the
+agent's feature menu shows an **Account** picker. Picking an
+account pins this agent's OMP session to it; **Automatic** releases the pin and
+lets OMP's own account ranking choose again. The pin never affects other agents,
+and it can only change between turns. Passession loads a small bundled OMP
+extension for this; OMP versions without the needed account API simply show no
+picker.
+
+Signing in or out inside an agent, and omp-kiro account or profile changes
+(`/kiro-accounts`, `/kiro-profile`, `/kiro-profiles`, `/kiro-model`), refresh the
+model list for that workspace without a restart, so newly registered providers
+such as omp-kiro's `kiro-<account>-<profile id>` appear in the model picker.
+
+OMP agents also accept these commands:
+
+| Command | What it does |
+| --- | --- |
+| `/login [provider]` | Without a provider, lists the providers OMP can sign in to; with one, runs OMP's sign-in. Links and questions appear as dialogs. Sign-in steps that OMP does not support over RPC still need OMP's own terminal. |
+| `/logout [provider] [account number]` | Lists stored OMP credentials or removes one. |
+| `/queue`, `/queue remove <n>`, `/queue promote <n>`, `/queue mode <steering\|follow-up> <all\|one>` | Shows OMP's own queue of steering and follow-up messages and changes it. OMP finds queued messages by their text, so a change is refused when two queued messages are identical or the message is already being delivered. |
+| `/retry-stop`, `/autoretry [on\|off]` | Stops a pending automatic retry, or shows and sets automatic retry for this session. |
+| `/subagents`, `/subagent-steer <id> <message>`, `/subagent-cancel <id>` | Lists OMP's native subagents, sends one guidance, or cancels one. |
+| `/bash <command>`, `/bash-stop` | Runs a shell command through OMP; the output is shown as a shell row and added to OMP's context. `/bash-stop` cancels it. |
+| `/next-model`, `/next-thinking` | Moves to OMP's next model or thinking level. |
+| `/todo edit <phase.task> <new text>` | Renames a task in OMP's todo list, keeping its status and notes. OMP's other `/todo` actions work as before. |
+| `/fork` | Copies the conversation into a new Passession agent that continues from OMP's own fork. This agent is not changed. The session must be saved to a file first. |
+| `/handoff [instructions]` | Hands off with an OMP summary. If OMP moves the conversation to a new session file, the agent follows it. |
+
+OMP commands that would replace or delete the session behind an agent
+(`/fresh`, `/resume`, `/new`, `/delete`, `/branch`, `/rewind`, `/tree`, and
+`/session` actions other than `info` and `pin`) are refused with a message;
+open or import another Passession agent instead. `/switch` only changes the
+model, so it stays available.
 
 #### Kiro through OMP
 
@@ -493,6 +536,17 @@ account, split into one row per profile when an account has several (for example
 account profile; a `kiro-http/...` agent still reports the default account's
 saved profile. Reading a profile's usage never changes the store's saved
 selection.
+
+omp-kiro 0.7.0 adds `ksk_…` API keys and AWS GovCloud Identity Center profiles.
+Usage for a saved API key uses the key's region and sends `tokentype: API_KEY`;
+an API-key account pinned in OMP is `kiro-<account>-key/<model>`. GovCloud
+profiles (`arn:aws-us-gov:…`, `us-gov-west-1`, `us-gov-east-1`) are read from
+their regional endpoint. A login that omp-kiro marked as disabled after a failed
+token refresh is shown as needing a new sign-in and is never sent to Kiro. Usage
+requests opt out of Kiro content sharing.
+
+OMP's own `kiro/...` provider (OMP 18.22.2 and later) keeps its logins inside
+OMP; their credits appear in the OMP rows above, not in the `Kiro HTTP` rows.
 
 
 #### Other Pi-compatible forks

@@ -33,6 +33,8 @@ pub struct Router {
     catalog: history::Catalog,
     history: history::History,
     clients: Vec<Arc<McpConnection>>,
+    /// One user-facing line per configured MCP server left out of this session.
+    unavailable: Vec<String>,
     pending: Mutex<HashMap<String, CancellationToken>>,
     closed: AtomicBool,
     cancel: CancellationToken,
@@ -82,12 +84,12 @@ impl Router {
                     Ok(Ok(client)) => client,
                     Ok(Err(error)) => {
                         tracing::warn!(%server,%error,"OMP MCP server unavailable");
-                        return None;
+                        return Err((server, "could not connect"));
                     }
                     Err(_) => {
                         cancel.cancel();
                         tracing::warn!(%server,"OMP MCP server connection timed out");
-                        return None;
+                        return Err((server, "did not connect within 10 s"));
                     }
                 };
                 let listed = tokio::time::timeout(
@@ -96,20 +98,28 @@ impl Router {
                 )
                 .await;
                 match listed {
-                    Ok(Ok(tools)) => Some((server, client, tools)),
+                    Ok(Ok(tools)) => Ok((server, client, tools)),
                     _ => {
                         let _ = client.close().await;
                         tracing::warn!(%server,"OMP MCP server tool listing failed");
-                        None
+                        Err((server, "connected but could not list its tools"))
                     }
                 }
             });
         }
         let mut tools = HashMap::new();
         let mut clients = Vec::new();
+        let mut unavailable = Vec::new();
         while let Some(connection) = connections.next().await {
-            let Some((server, client, listed)) = connection else {
-                continue;
+            let (server, client, listed) = match connection {
+                Ok(connected) => connected,
+                Err((server, reason)) => {
+                    // Details stay in the log: MCP errors can echo configured secrets.
+                    unavailable.push(format!(
+                        "MCP server {server} {reason}, so its tools are not available in this session."
+                    ));
+                    continue;
+                }
             };
             for tool in listed {
                 let Some(name) = tool["name"].as_str() else {
@@ -172,6 +182,7 @@ impl Router {
             catalog,
             history,
             clients,
+            unavailable,
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             cancel,
@@ -189,6 +200,9 @@ impl Router {
             return Err(error);
         }
         Ok(router)
+    }
+    pub fn unavailable_servers(&self) -> &[String] {
+        &self.unavailable
     }
     pub fn identities(&self) -> Value {
         json!(
@@ -782,6 +796,7 @@ mod tests {
             catalog: history::Catalog::default(),
             history: history::History::load(home.path(), Vec::new()).await,
             clients: Vec::new(),
+            unavailable: Vec::new(),
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             cancel,

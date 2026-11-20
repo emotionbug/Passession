@@ -29,6 +29,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(super) mod omp_controls;
+
 struct State {
     config: Value,
     native: Value,
@@ -41,6 +43,13 @@ struct State {
     commands: Option<Vec<Value>>,
     extension_results: HashMap<String, oneshot::Sender<Result<Value>>>,
     features: Arc<[Value]>,
+    account: Option<(String, Value)>,
+    account_command_available: bool,
+    models: Option<Vec<Value>>,
+    auto_retry: Option<bool>,
+    refresh_after_prompt: bool,
+    login_responses: HashSet<String>,
+    shown_queue: Option<Value>,
     dead: bool,
     prompt_id: Option<String>,
     prompt_results: HashMap<String, Value>,
@@ -57,6 +66,24 @@ struct State {
     /// Pi's persisted session file and live leaf from the latest entry capture.
     /// None when the runtime did not prove both (unpersisted or older Pi).
     native_leaf: Option<(String, Value)>,
+}
+
+impl State {
+    fn update_features(&mut self) {
+        let mut features = catalog::features(&self.native);
+        if let Some((provider, feature)) = &self.account
+            && self.native["model"]["provider"] == provider.as_str()
+        {
+            features.push(feature.clone());
+        }
+        if self.features.as_ref() != features.as_slice() {
+            self.features = features.into();
+        }
+    }
+
+    fn info(&self, provider: &str) -> Value {
+        json!({"provider":provider,"sessionId":self.native["sessionId"],"model":catalog::model_id(&self.native["model"]).or_else(||self.config["model"].as_str().map(str::to_owned)),"thinkingOptionId":self.native["thinkingLevel"],"modeId":self.mode,"features":self.features.as_ref()})
+    }
 }
 struct Inner {
     spec: ProviderSpec,
@@ -77,6 +104,7 @@ struct Inner {
     operation: tokio::sync::Mutex<()>,
     manual_compaction: AtomicBool,
     compaction_started: AtomicBool,
+    login_active: AtomicBool,
     usage_key: String,
     usage_env: Value,
 }
@@ -116,11 +144,11 @@ impl Inner {
     async fn refresh(&self) -> Result<Value> {
         let state = self.runtime()?.request(json!({"type":"get_state"})).await?;
         let mut data = self.state.lock().unwrap();
-        let features = catalog::features(&state);
-        if data.features.as_ref() != features.as_slice() {
-            data.features = features.into();
+        if data.native["sessionId"] != state["sessionId"] {
+            data.account = None;
         }
         data.native = state.clone();
+        data.update_features();
         Ok(state)
     }
     async fn emit(&self, event: Value) -> Result<()> {
@@ -164,6 +192,9 @@ impl Inner {
     }
     async fn out_of_band_message(&self, text: String) -> Result<()> {
         self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"assistant_message","text":text}})).await
+    }
+    async fn warn(&self, message: String) -> Result<()> {
+        self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"notification","level":"warning","message":message}})).await
     }
     async fn accept_events(&self, events: Vec<Value>) -> Result<()> {
         for event in events {
@@ -232,7 +263,12 @@ impl Inner {
                     state.settling = false;
                     state.mapper.map(&frame)
                 };
+                let refresh_controls =
+                    std::mem::take(&mut self.state.lock().unwrap().refresh_after_prompt);
                 let _ = self.accept_events(events).await;
+                if refresh_controls {
+                    self.schedule_control_refresh(generation, true);
+                }
                 self.poll_usage(turn).await;
                 return;
             }
@@ -266,7 +302,12 @@ impl Inner {
                 }
                 state.mapper.map(&frame)
             };
+            let refresh_controls =
+                std::mem::take(&mut inner.state.lock().unwrap().refresh_after_prompt);
             let _ = inner.accept_events(events).await;
+            if refresh_controls {
+                inner.schedule_control_refresh(inner.generation.load(Ordering::Acquire), true);
+            }
             inner.poll_usage(turn).await;
         });
     }
@@ -454,7 +495,11 @@ impl Inner {
         if frame["type"] == "available_commands_update"
             && let Some(commands) = frame["commands"].as_array()
         {
-            self.state.lock().unwrap().commands = Some(catalog::commands(commands, true));
+            self.record_omp_commands(commands);
+            self.schedule_control_refresh(generation, true);
+        }
+        if frame["type"] == "config_update" && self.spec.family == "omp" {
+            self.schedule_control_refresh(generation, false);
         }
         if frame["type"] == "process_exit" {
             {
@@ -554,6 +599,18 @@ impl Inner {
                 state.omp_child_start_epoch = state.omp_child_start_epoch.wrapping_add(1);
             }
             let events = state.mapper.map(&frame);
+            if self.login_active.load(Ordering::Acquire)
+                && frame["type"] == "extension_ui_request"
+                && frame["method"] == "input"
+            {
+                for event in &events {
+                    if event["type"] == "permission_requested"
+                        && let Some(id) = event["request"]["id"].as_str()
+                    {
+                        state.login_responses.insert(id.to_owned());
+                    }
+                }
+            }
             (
                 events,
                 state.mapper.drain_responses(),
@@ -798,8 +855,15 @@ impl Inner {
             )
         };
         config["modeId"] = json!(mode);
+        let command = launch::command(
+            &self.spec,
+            &config,
+            &self.context,
+            path.as_deref(),
+            self.assets.lock().unwrap().as_ref(),
+        )?;
         let (next, mut receiver) = Transport::spawn(
-            launch::command(&self.spec, &config, &self.context, path.as_deref(), None)?,
+            command,
             launch::timeout(&self.spec, &config),
             self.context.cancel.child_token(),
         )
@@ -817,7 +881,7 @@ impl Inner {
         let initialized = async {
             next.negotiate(launch::ready_timeout(&self.spec, &config))
                 .await?;
-            let state = initialized_state(&next, &config, true, true).await?;
+            let (state, notice) = initialized_state(&next, &config, true, true).await?;
             configure_message_updates(&next).await?;
             let env = launch::external_env(&self.spec, &self.context);
             let router = Router::register(
@@ -828,7 +892,7 @@ impl Inner {
                 &config,
             )
             .await?;
-            Ok::<_, anyhow::Error>((state, router))
+            Ok::<_, anyhow::Error>((state, notice, router))
         }
         .await;
         done.cancel();
@@ -839,7 +903,7 @@ impl Inner {
                 return Err(error.into());
             }
         };
-        let (state, router) = match initialized {
+        let (state, notice, router) = match initialized {
             Ok(value) => value,
             Err(error) => {
                 next.close().await.ok();
@@ -854,6 +918,7 @@ impl Inner {
         }
         let session_id = state["sessionId"].clone();
         let identities = router.identities();
+        let unavailable = router.unavailable_servers().to_vec();
         let old_tools = self.host_tools.lock().unwrap().replace(router);
         let previous = self.runtime.lock().unwrap().replace(next.clone());
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -863,8 +928,14 @@ impl Inner {
             let ended_children = data.mapper.close_work();
             data.config = config;
             data.mode = Some(mode.into());
-            data.features = catalog::features(&state).into();
             data.native = state;
+            data.account = None;
+            data.account_command_available = false;
+            data.auto_retry = None;
+            data.refresh_after_prompt = false;
+            data.shown_queue = None;
+            data.login_responses.clear();
+            data.update_features();
             data.dead = false;
             data.prompt_id = None;
             data.prompt_results.clear();
@@ -881,9 +952,16 @@ impl Inner {
             previous.close().await.ok();
         }
         self.accept_events(ended_children).await?;
+        if let Some(notice) = notice {
+            self.warn(notice).await?;
+        }
+        for message in unavailable {
+            self.warn(message).await?;
+        }
         drop(frames);
         self.attach(receiver, generation);
         subscribe(&next).await;
+        self.discover_account_bridge().await;
         if session_id != previous_id {
             self.emit(
                 json!({"type":"thread_started","provider":self.spec.id,"sessionId":session_id}),
@@ -997,12 +1075,15 @@ async fn omp_subagent_roster(runtime: &Transport) -> Option<Vec<String>> {
         })
         .collect()
 }
+/// The runtime's state, plus a user-facing notice when the session's saved
+/// model could not be restored and OMP kept a different one.
 async fn initialized_state(
     runtime: &Transport,
     config: &Value,
     resume: bool,
     omp: bool,
-) -> Result<Value> {
+) -> Result<(Value, Option<String>)> {
+    let mut notice = None;
     let mut state = runtime.request(json!({"type":"get_state"})).await?;
     if resume
         && let Some((provider, id)) = config["model"]
@@ -1024,9 +1105,11 @@ async fn initialized_state(
                 .await?;
             state = runtime.request(json!({"type":"get_state"})).await?;
         } else {
-            tracing::warn!(
-                "Requested resume model unavailable; preserving provider's resolved model"
-            );
+            let current = catalog::model_id(&state["model"])
+                .unwrap_or_else(|| "the provider's default model".into());
+            notice = Some(format!(
+                "The saved model {provider}/{id} is not available now, so this session continues with {current}."
+            ));
         }
     }
     if omp
@@ -1040,7 +1123,7 @@ async fn initialized_state(
         state["fastModeEnabled"] = result["enabled"].clone();
         state["fastModeActive"] = result["active"].clone();
     }
-    Ok(state)
+    Ok((state, notice))
 }
 impl Session {
     /// Whether this is `parent`'s session with a runtime that can still publish
@@ -1150,7 +1233,9 @@ impl Session {
         } else {
             None
         };
-        let assets = if !omp && !history_only {
+        let assets = if omp && !history_only {
+            Some(launch::omp_assets()?)
+        } else if !history_only {
             Some(launch::pi_assets(&spec, &config, &context, probes).await?)
         } else {
             None
@@ -1197,6 +1282,13 @@ impl Session {
                 commands: None,
                 extension_results: HashMap::new(),
                 features: Arc::from([]),
+                account: None,
+                account_command_available: false,
+                models: None,
+                auto_retry: None,
+                refresh_after_prompt: false,
+                login_responses: HashSet::new(),
+                shown_queue: None,
                 dead: false,
                 prompt_id: None,
                 prompt_results: HashMap::new(),
@@ -1226,6 +1318,7 @@ impl Session {
             operation: tokio::sync::Mutex::new(()),
             manual_compaction: AtomicBool::new(false),
             compaction_started: AtomicBool::new(false),
+            login_active: AtomicBool::new(false),
             usage_key: uuid::Uuid::new_v4().to_string(),
             usage_env,
         });
@@ -1242,7 +1335,7 @@ impl Session {
             inner.attach(receiver, 1);
             let initialize=async {
                 if omp{runtime.negotiate(launch::ready_timeout(&inner.spec,&config)).await?;}
-                let native=initialized_state(&runtime,&config,persistence.is_some(),omp).await?;
+                let (native,notice)=initialized_state(&runtime,&config,persistence.is_some(),omp).await?;
                 {
                     let mut state = inner.state.lock().unwrap();
                     if let Some(model) = catalog::model_id(&native["model"]) {
@@ -1251,18 +1344,23 @@ impl Session {
                     if native["thinkingLevel"].is_string() {
                         state.config["thinkingOptionId"] = native["thinkingLevel"].clone();
                     }
-                    state.features = catalog::features(&native).into();
                     state.native = native;
+                    state.update_features();
                 }
+                // Shown once the thread exists, after the provider has settled its state.
+                let mut warnings:Vec<String>=notice.into_iter().collect();
                 if omp {
                     configure_message_updates(&runtime).await?;
                     let cwd=config["cwd"].as_str().ok_or_else(||anyhow!("OMP requires cwd"))?;
                     let env=launch::external_env(&inner.spec,&inner.context);
                     let router=Router::register(runtime.clone(),&inner.context,Path::new(cwd),&env,&config).await?;
                     let identities=router.identities();
+                    let unavailable=router.unavailable_servers().to_vec();
                     {let mut state=inner.state.lock().unwrap();state.bridged_tools=identities.clone();state.mapper.set_bridged_tools(&identities);}
                     *inner.host_tools.lock().unwrap()=Some(router);
+                    warnings.extend(unavailable);
                     subscribe(&runtime).await;
+                    inner.discover_account_bridge().await;
                     if path.is_some()
                         && let Some(active_ids) = omp_subagent_roster(&runtime).await
                     {
@@ -1287,6 +1385,16 @@ impl Session {
                 }
                 let session_id=inner.state.lock().unwrap().native["sessionId"].clone();
                 inner.emit(json!({"type":"thread_started","provider":inner.spec.id,"sessionId":session_id})).await?;
+                if omp && let Some(wanted) = config["model"].as_str() {
+                    let event = {
+                        let state = inner.state.lock().unwrap();
+                        state.config["model"].as_str()
+                            .filter(|reported| *reported != wanted)
+                            .map(|model| json!({"type":"model_changed","provider":inner.spec.id,"model":model,"runtimeInfo":state.info(&inner.spec.id)}))
+                    };
+                    if let Some(event) = event { inner.emit(event).await?; }
+                }
+                for message in warnings{inner.warn(message).await?;}
                 Ok::<_,anyhow::Error>(())
             }.await;
             if let Err(error) = initialize {
@@ -1390,6 +1498,15 @@ impl Session {
         let model = self.inner.state.lock().unwrap().native["model"].clone();
         let mut command = super::prompt::convert(&prompt, &model)
             .map_err(|error| PromptDeliveryError::not_delivered(error.to_string()))?;
+        if self.inner.spec.family == "omp"
+            && let Some((name, args)) = command["message"].as_str().and_then(omp_controls::slash)
+            && let Some(reason) = omp_controls::identity_block(name, args).or_else(|| {
+                name.eq_ignore_ascii_case("handoff")
+                    .then_some("Use /handoff as a standalone Passession command.")
+            })
+        {
+            return Err(PromptDeliveryError::not_delivered(reason));
+        }
         command["type"] = json!("prompt");
         if let Some(behavior) = behavior {
             command["streamingBehavior"] = json!(behavior);
@@ -1402,6 +1519,11 @@ impl Session {
             state.active = Some(turn.clone());
             state.prompt_id = None;
             state.prompt_results.clear();
+            state.refresh_after_prompt = self.inner.spec.family == "omp"
+                && command["message"]
+                    .as_str()
+                    .and_then(omp_controls::slash)
+                    .is_some_and(|(name, args)| omp_controls::refresh_after_command(name, args));
             state.prompt_epoch += 1;
             state.turn_started = false;
             state.turn_has_user = false;
@@ -1574,7 +1696,7 @@ impl AgentSession for Session {
             return None;
         }
         let state = self.inner.state.lock().unwrap();
-        let mut usage = json!({"provider":self.inner.spec.family,"env":self.inner.usage_env,"sessionKey":self.inner.usage_key});
+        let mut usage = json!({"provider":self.inner.spec.id,"cwd":state.config["cwd"],"env":self.inner.usage_env,"sessionKey":self.inner.usage_key});
         if let Some(model) = catalog::model_id(&state.native["model"]) {
             usage["model"] = json!(model);
         }
@@ -1829,9 +1951,7 @@ impl AgentSession for Session {
                     sink.emit(event).await?;
                 }
             }
-            if let Some(todo) = history::todo_state(&[
-                json!({"message":{"role":"toolResult","toolName":"todo","details":{"phases":phases}}}),
-            ]) {
+            if let Some(todo) = history::todo_from_phases(&phases) {
                 sink.emit(json!({"type":"timeline","provider":self.provider(),"item":todo}))
                     .await?;
             }
@@ -1871,10 +1991,7 @@ impl AgentSession for Session {
         if !self.history_only {
             self.inner.refresh().await?;
         }
-        let state = self.inner.state.lock().unwrap();
-        Ok(
-            json!({"provider":self.provider(),"sessionId":state.native["sessionId"],"model":catalog::model_id(&state.native["model"]).or_else(||state.config["model"].as_str().map(str::to_owned)),"thinkingOptionId":state.native["thinkingLevel"],"modeId":state.mode,"features":catalog::features(&state.native)}),
-        )
+        Ok(self.inner.state.lock().unwrap().info(self.provider()))
     }
     async fn available_modes(&self) -> Result<Vec<Value>> {
         Ok(catalog::modes(self.inner.spec.family == "omp"))
@@ -1914,10 +2031,14 @@ impl AgentSession for Session {
         if self.history_only {
             bail!("OMP history session cannot answer permissions");
         }
-        let (frame, extra) = {
+        let (frame, extra, sensitive) = {
             let mut state = self.inner.state.lock().unwrap();
             let frame = state.mapper.permission_response(id, &response)?;
-            (frame, state.mapper.drain_responses())
+            (
+                frame,
+                state.mapper.drain_responses(),
+                state.login_responses.contains(id),
+            )
         };
         let runtime = self.inner.runtime()?;
         if !frame.is_null() {
@@ -1926,8 +2047,17 @@ impl AgentSession for Session {
         for frame in extra {
             runtime.send(&frame).await?;
         }
-        let turn = self.inner.state.lock().unwrap().active.clone();
-        let mut event = json!({"type":"permission_resolved","provider":self.provider(),"requestId":id,"resolution":response});
+        let turn = {
+            let mut state = self.inner.state.lock().unwrap();
+            state.login_responses.remove(id);
+            state.active.clone()
+        };
+        let resolution = if sensitive {
+            json!({"behavior":if matches!(response["behavior"].as_str(), Some("deny" | "cancel")){"deny"}else{"allow"}})
+        } else {
+            response
+        };
+        let mut event = json!({"type":"permission_resolved","provider":self.provider(),"requestId":id,"resolution":resolution});
         if let Some(turn) = turn {
             event["turnId"] = json!(turn);
         }
@@ -2016,14 +2146,19 @@ impl AgentSession for Session {
             .or_else(|| model.split_once(':'))
             .filter(|(p, i)| !p.is_empty() && !i.is_empty())
             .ok_or_else(|| anyhow!("Model id must include a provider: {model}"))?;
+        let _gate = self.inner.operation.lock().await;
         let result = self
             .inner
             .runtime()?
             .request(json!({"type":"set_model","provider":provider,"modelId":id}))
             .await?;
-        self.inner.refresh().await?;
-        self.inner.state.lock().unwrap().config["model"] =
-            json!(catalog::model_id(&result).unwrap_or_else(|| model.into()));
+        if self.inner.spec.family == "omp" {
+            self.inner.refresh_control_state().await?;
+        } else {
+            self.inner.refresh().await?;
+            self.inner.state.lock().unwrap().config["model"] =
+                json!(catalog::model_id(&result).unwrap_or_else(|| model.into()));
+        }
         Ok(())
     }
     async fn set_thinking_option(&self, option: Option<&str>) -> Result<Option<Value>> {
@@ -2039,6 +2174,9 @@ impl AgentSession for Session {
         Ok(None)
     }
     async fn set_feature(&self, feature: &str, value: Value) -> Result<()> {
+        if self.inner.spec.family == "omp" && feature == "oauth_account" {
+            return self.inner.set_oauth_account(&value).await;
+        }
         if self.inner.spec.family != "omp" || feature != "fast_mode" {
             bail!("Unknown provider feature: {feature}");
         }
@@ -2060,7 +2198,7 @@ impl AgentSession for Session {
             state.config["featureValues"] = json!({});
         }
         state.config["featureValues"]["fast_mode"] = result["enabled"].clone();
-        state.features = catalog::features(&state.native).into();
+        state.update_features();
         Ok(())
     }
     async fn rewind(&self, target: RewindTarget, id: &str) -> Result<()> {
@@ -2131,20 +2269,27 @@ impl AgentSession for Session {
         self: Arc<Self>,
         prompt: &Value,
     ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
-        let text = prompt.as_str()?.trim().strip_prefix('/')?;
+        let text = prompt.as_str()?;
+        let (name, args) = if self.inner.spec.family == "omp" {
+            omp_controls::slash(text)?
+        } else {
+            let text = text.trim().strip_prefix('/')?;
+            let (name, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+            (name, args.trim())
+        };
         enum Command {
             Compact,
             AutoCompact,
-            Handoff,
+            OmpControl,
             Prompt(&'static str),
         }
-        let (name, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
         let name = name.to_lowercase();
-        let args = args.trim();
         let command = match name.as_str() {
             "compact" => Command::Compact,
             "autocompact" => Command::AutoCompact,
-            "handoff" if self.inner.spec.family == "omp" => Command::Handoff,
+            name if self.inner.spec.family == "omp" && omp_controls::is_control(name, args) => {
+                Command::OmpControl
+            }
             "steer" | "follow-up" if self.inner.spec.family == "omp" && !args.is_empty() => {
                 Command::Prompt(if name == "steer" { "steer" } else { "followUp" })
             }
@@ -2177,11 +2322,18 @@ impl AgentSession for Session {
                         .runtime()?
                         .request_with_timeout(command, None)
                         .await;
+                    // OMP always shows its own loading marker; pi only after compaction_start.
+                    // Either way a failed request must settle the marker as failed, not done.
                     if omp
                         || (result.is_err()
                             && self.inner.compaction_started.swap(false, Ordering::AcqRel))
                     {
-                        self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":"completed","trigger":"manual"}})).await?;
+                        let status = if result.is_ok() {
+                            "completed"
+                        } else {
+                            "failed"
+                        };
+                        self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":status,"trigger":"manual"}})).await?;
                     }
                     if let Err(error) = result {
                         self.inner
@@ -2239,20 +2391,7 @@ impl AgentSession for Session {
                         }
                     }
                 }
-                Command::Handoff => {
-                    self.inner.state.lock().unwrap().live = true;
-                    let mut command = json!({"type":"handoff"});
-                    if !args.is_empty() {
-                        command["customInstructions"] = json!(args);
-                    }
-                    if let Err(error) = self.inner.runtime()?.request(command).await {
-                        self.inner
-                            .out_of_band_message(format!(
-                                "[Error] Failed to hand off turn: {error}"
-                            ))
-                            .await?;
-                    }
-                }
+                Command::OmpControl => self.command(&name, &args).await?,
                 Command::Prompt(behavior) => {
                     if self.inner.state.lock().unwrap().active.is_none() {
                         self.prompt(json!(args), json!({}), Some(behavior)).await?;
@@ -2260,7 +2399,7 @@ impl AgentSession for Session {
                         self.inner
                             .runtime()?
                             .request(
-                                json!({"type":"prompt","message":args,"streamingBehavior":behavior}),
+                                json!({"type":if behavior=="steer"{"steer"}else{"follow_up"},"message":args}),
                             )
                             .await?;
                     }

@@ -149,6 +149,14 @@ impl ProviderRegistry {
     pub async fn catalog(&self, provider: &str, cwd: Option<&Path>, wait: bool) -> Result<Value> {
         self.catalogs.catalog(provider, cwd, wait).await
     }
+    pub(crate) async fn omp_catalog_changed(
+        &self,
+        provider: &str,
+        cwd: &Path,
+        models: Vec<Value>,
+    ) -> Result<()> {
+        self.catalogs.omp_catalog_changed(provider, cwd, models)
+    }
     pub async fn list(&self, cwd: Option<&Path>, wait: bool) -> Result<Vec<Value>> {
         self.catalogs.list(cwd, wait).await
     }

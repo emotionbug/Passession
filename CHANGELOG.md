@@ -5,6 +5,23 @@
 ### Added
 
 - Kiro usage covers several accounts. With omp-kiro 0.6.0 signed in to more than one account (`omp-kiro login --account <name>`), the usage report lists each account, with one row per Kiro profile when an account has several. An agent on a pinned `kiro-<account>-<profile id>/…` model reports exactly that account and profile, and reading it never changes the account's saved profile.
+- OMP account usage: the usage report lists every login OMP itself stores (for example Anthropic, OpenAI Codex and OMP's own `kiro/…` provider) as `OMP · <provider> · <account>`, with plan, windows, resets and balances. The daemon gets them from the configured OMP command (`usage --json`, 12 s limit; `usage accounts --json`, 4 s limit). An agent's usage is narrowed to its current model's provider. Logins that OMP disabled are shown as needing a new sign-in.
+- Kiro usage supports omp-kiro 0.7.0: saved `ksk_…` API keys (sent with `tokentype: API_KEY`, pinned as `kiro-<account>-key/…`), AWS GovCloud Identity Center profiles, and logins that omp-kiro disabled after a failed refresh. Those are shown as needing a new sign-in and are never sent to Kiro. Usage requests opt out of Kiro content sharing.
+- OMP agents have an **Account** picker when OMP stores OAuth logins for the current model's provider (including OMP's own `kiro` provider). It pins that agent's OMP session to one login; **Automatic** hands the choice back to OMP. Other agents are not affected.
+- OMP agents refresh the workspace model list after `/login`, `/logout` and omp-kiro account or profile commands, so newly registered providers appear in the model picker without a restart.
+- New OMP commands: `/login`, `/logout`, `/queue` (show, remove, promote, mode), `/retry-stop`, `/autoretry`, `/subagents`, `/subagent-steer`, `/subagent-cancel`, `/bash`, `/bash-stop`, `/next-model`, `/next-thinking`, `/todo edit` and `/fork`. `/fork` opens a separate agent from OMP's own fork and leaves the current agent unchanged.
+
+### Changed
+
+- `/handoff` in OMP agents follows OMP to a new session file when OMP moves the conversation. OMP commands that would replace or delete the session behind an agent (`/fresh`, `/resume`, `/new`, `/delete`, `/branch`, `/rewind`, `/tree` and destructive `/session` actions) are refused with a message.
+- Usage no longer reads OMP's credential database directly. OMP's Anthropic and Codex logins now appear as OMP rows instead of Claude and Codex rows, and the Claude and Codex rows show only those tools' own logins.
+
+### Fixed
+
+- OMP: when OMP switches thinking to Auto or Max, the app now shows it. Before, those two levels were ignored and the app kept showing the previous level.
+- OMP: a compaction that fails or is aborted, started by `/compact` or automatically, is now shown as "Context compaction failed". Before, it was first shown as compacted.
+- OMP: when a resumed session's saved model is no longer available, the session shows a warning that names the model it continues with. Before, it switched silently.
+- OMP: an MCP server that cannot connect or list its tools for an OMP session now shows a warning that its tools are missing from that session. Before, the tools were left out silently. The warning does not include the server's error text, which can contain configured secrets.
 
 ## 0.13.45 - 2026-11-20
 

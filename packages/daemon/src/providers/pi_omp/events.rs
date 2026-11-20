@@ -499,7 +499,7 @@ impl Mapper {
             }
             "agent_start"=>{self.started=true;out.extend(self.take_no_turn_rows());if let Some(id)=frame["sessionId"].as_str(){out.push(json!({"type":"thread_started","provider":self.provider,"sessionId":id}));}},
             "turn_start"=>{if self.suppress_next_start{self.suppress_next_start=false;}else if self.family=="omp"||!self.turn_started{out.push(self.event("turn_started"));}self.started=true;self.turn_started=true;out.extend(self.take_no_turn_rows());},
-            "thinking_level_changed"=>{if let Some(level)=frame["level"].as_str().filter(|s|matches!(*s,"off"|"minimal"|"low"|"medium"|"high"|"xhigh")){out.push(json!({"type":"thinking_option_changed","provider":self.provider,"thinkingOptionId":level}));}},
+            "thinking_level_changed"=>{if let Some(level)=frame["level"].as_str().filter(|s|matches!(*s,"off"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max")||(self.family=="omp"&&*s=="auto")){out.push(json!({"type":"thinking_option_changed","provider":self.provider,"thinkingOptionId":level}));}},
             "message_start"=>{if frame["message"]["role"]=="assistant"{if self.family=="omp"{self.omp_streams.start(frame);}else{self.assistant=first(&[&frame["message"]["responseId"]]).map(str::to_owned);self.stream_text.clear();self.stream_thinking.clear();}}},
             "message_update"=>{
                 if frame.get("message").is_some_and(|m|!m.is_null()&&m["role"]!="assistant"){return out;}
@@ -1464,6 +1464,38 @@ mod native_turn_tests {
             mapper
                 .map(&json!({"type":"agent_end","messages":[]}))
                 .is_empty()
+        );
+    }
+    #[test]
+    fn omp_auto_and_max_thinking_and_failed_auto_compaction_reach_the_app() {
+        let mut omp = Mapper::new("omp", "omp");
+        for level in ["auto", "max"] {
+            let events = omp.map(&json!({"type":"thinking_level_changed","level":level}));
+            assert_eq!(events[0]["thinkingOptionId"], level);
+        }
+        // Pi has no automatic level.
+        assert!(
+            Mapper::new("pi", "pi")
+                .map(&json!({"type":"thinking_level_changed","level":"auto"}))
+                .is_empty()
+        );
+        let status =
+            |frame: Value| Mapper::new("omp", "omp").map(&frame)[0]["item"]["status"].clone();
+        assert_eq!(
+            status(
+                json!({"type":"auto_compaction_end","aborted":false,"willRetry":false,"errorMessage":"summary failed"})
+            ),
+            "failed"
+        );
+        assert_eq!(
+            status(json!({"type":"auto_compaction_end","aborted":true,"willRetry":false})),
+            "failed"
+        );
+        assert_eq!(
+            status(
+                json!({"type":"auto_compaction_end","aborted":false,"willRetry":false,"result":{"tokensBefore":9000}})
+            ),
+            "completed"
         );
     }
 }

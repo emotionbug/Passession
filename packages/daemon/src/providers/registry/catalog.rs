@@ -225,6 +225,100 @@ impl CatalogService {
         }
     }
 
+    pub(super) fn omp_catalog_changed(
+        &self,
+        provider: &str,
+        cwd: &Path,
+        models: Vec<Value>,
+    ) -> Result<()> {
+        let cwd = refresh::target(Some(cwd))?;
+        let targets = {
+            let mut cache = self.inner.cache.lock().unwrap();
+            let Some(state) = cache.providers.get(provider).cloned().filter(|state| {
+                state.entry.enabled && state.entry.spec.family == "omp" && !cache.stopped
+            }) else {
+                return Ok(());
+            };
+            let models = match &state.replacement_models {
+                Some(replacement) => replacement
+                    .as_ref()
+                    .map_err(|error| anyhow!("{error}"))?
+                    .clone(),
+                None => {
+                    let entry = &state.entry;
+                    let profiles = client::resolve_configured_models(
+                        provider,
+                        entry.client.as_ref(),
+                        &entry.profile_models,
+                    )?;
+                    let additions = client::resolve_configured_models(
+                        provider,
+                        entry.client.as_ref(),
+                        &entry.additional_models,
+                    )?;
+                    client::merge_models(
+                        provider,
+                        &profiles,
+                        &additions,
+                        models,
+                        entry.profile_models_are_additive,
+                    )
+                }
+            };
+            let key = crate::json::stringify(&json!(["target", cwd]))?;
+            let mut entry = state.initial.entry.clone();
+            refresh::ready(
+                &mut entry,
+                provider,
+                Value::Array(models),
+                json!(crate::providers::pi_omp::omp_modes(true)),
+            );
+            let result = state::identify(entry);
+            // A probe can never supersede a later observation from the live
+            // process. Other workspaces' model availability still uses probes.
+            for catalogs in cache.catalogs.values_mut() {
+                if let Some(catalog) = catalogs.get_mut(provider) {
+                    if let Some(load) = catalog.load.take() {
+                        load.cancel.cancel();
+                    }
+                    catalog.stale = true;
+                }
+            }
+            let catalog = cache
+                .catalogs
+                .entry(key.clone())
+                .or_default()
+                .entry(provider.to_owned())
+                .or_default();
+            catalog.result = Some(result);
+            catalog.stale = false;
+            let id = cache.next_id();
+            let (_, done) = watch::channel(true);
+            cache.target(&cwd).bindings.insert(
+                provider.to_owned(),
+                Binding {
+                    id,
+                    key: Some(key),
+                    failure: None,
+                    force: false,
+                    done,
+                },
+            );
+            cache.target(GLOBAL);
+            self.publish(&mut cache, std::slice::from_ref(&cwd));
+            cache
+                .target_order
+                .iter()
+                .filter(|target| **target != cwd)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for target in targets {
+            self.begin_load(&target, provider, false);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn catalog(
         &self,
         provider: &str,

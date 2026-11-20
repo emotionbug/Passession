@@ -342,3 +342,44 @@ async fn omp_message_reconcile_admitted_commit_survives_waiter_cancellation() {
     cell.data.lock().await.snapshot["internal"] = json!(true);
     manager.close_cell(id, &cell).await.unwrap();
 }
+
+#[tokio::test]
+async fn model_changes_apply_reported_configuration_and_foreign_forks_are_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let app = AppState::new(
+        root.path().join("home"),
+        root.path().into(),
+        std::env::current_exe().unwrap(),
+    );
+    let manager = &app.agents;
+    let id = "00000000-0000-4000-8000-000000000092";
+    let cell = staged_cell(&app, id).await;
+    manager.release_event_stage(&cell).await.unwrap();
+    let features = json!([{"type":"select","id":"oauth_account","label":"Account","value":"auto",
+        "options":[{"id":"auto","label":"Automatic"}]}]);
+    emit(&cell, vec![
+        json!({"type":"model_changed","provider":"mock","model":"kiro/auto","thinkingOptionId":"max",
+            "runtimeInfo":{"model":"kiro/auto","features":features}}),
+        json!({"type":"omp_fork_ready","provider":"another","sessionFile":"/tmp/fork.jsonl"}),
+    ])
+    .await;
+    manager.drain_events(&cell).await.unwrap();
+    let snapshot = cell.data.lock().await.snapshot.clone();
+    assert_eq!(snapshot["config"]["model"], "kiro/auto");
+    assert_eq!(snapshot["config"]["thinkingOptionId"], "max");
+    assert_eq!(snapshot["features"], features);
+    // A fork announced by another provider never opens an agent.
+    assert_eq!(manager.agents.read().await.len(), 1);
+    // Runtime-only details leave the configured thinking level alone.
+    emit(
+        &cell,
+        vec![json!({"type":"model_changed","provider":"mock","runtimeInfo":{"model":"kiro/auto"}})],
+    )
+    .await;
+    manager.drain_events(&cell).await.unwrap();
+    assert_eq!(
+        cell.data.lock().await.snapshot["config"]["thinkingOptionId"],
+        "max"
+    );
+    manager.close_cell(id, &cell).await.unwrap();
+}

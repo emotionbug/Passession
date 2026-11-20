@@ -163,6 +163,9 @@ fn curate_projected<'a>(
                 &mut entries,
                 format!("[Error] {}", str_field(item, "message")),
             ),
+            "compaction" if item["status"] == "failed" => {
+                push(&mut entries, "[Compaction failed]".into())
+            }
             "compaction" => push(&mut entries, "[Compacted]".into()),
             _ => {}
         }

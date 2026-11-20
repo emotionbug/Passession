@@ -162,14 +162,27 @@ pub fn commands(native: &[Value], omp: bool) -> Vec<Value> {
         json!({"name":"autocompact","description":"Toggle automatic context compaction","argumentHint":"[on|off|toggle]","kind":"command"}),
     ];
     if omp {
-        result.extend([json!({"name":"handoff","description":"Hand off from planning to implementation","argumentHint":"[instructions]","kind":"command"}),json!({"name":"steer","description":"Steer the active OMP turn","argumentHint":"<message>","kind":"command"}),json!({"name":"follow-up","description":"Queue a follow-up message for OMP","argumentHint":"<message>","kind":"command"})]);
+        result.extend([json!({"name":"steer","description":"Steer the active OMP turn","argumentHint":"<message>","kind":"command"}),json!({"name":"follow-up","description":"Queue a follow-up message for OMP","argumentHint":"<message>","kind":"command"})]);
+        result.extend(super::session::omp_controls::COMMANDS.iter().map(|(name, description, hint)| {
+            json!({"name":name,"description":description,"argumentHint":hint,"kind":"command"})
+        }));
     }
     for command in native {
         let Some(name) = command["name"].as_str() else {
             continue;
         };
+        if omp
+            && (super::session::omp_controls::identity_block(name, "").is_some()
+                || super::session::omp_controls::COMMANDS
+                    .iter()
+                    .any(|(command, _, _)| *command == name))
+        {
+            continue;
+        }
         let existing = result.iter().position(|v| v["name"] == name);
-        let hint = if omp {
+        let hint = if omp && name == "todo" {
+            Some("[edit [phase.task new text]|append|start|done|drop|rm|help]")
+        } else if omp {
             command.pointer("/input/hint").and_then(Value::as_str)
         } else {
             None

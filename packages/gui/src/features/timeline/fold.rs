@@ -353,8 +353,10 @@ impl TimelineFold {
                     self.users.insert(id, self.entries.len());
                 }
             }
-            "compaction" if get(item, "status") == "completed" => {
-                // A completion settles the pending compaction marker.
+            "compaction"
+                if matches!(get(item, "status").as_str(), Some("completed" | "failed")) =>
+            {
+                // A completion or failure settles the pending compaction marker.
                 let pending = self.entries.iter().position(|entry| {
                     let existing = get(entry, "item");
                     get(existing, "type") == "compaction" && get(existing, "status") == "loading"
@@ -363,7 +365,7 @@ impl TimelineFold {
                     let previous = self.entries[index].clone();
                     let existing = get(&previous, "item");
                     let mut m = map(existing).clone();
-                    m.insert("status".into(), json!("completed"));
+                    m.insert("status".into(), get(item, "status").clone());
                     let trigger = if get(item, "trigger").is_null() {
                         get(existing, "trigger").clone()
                     } else {

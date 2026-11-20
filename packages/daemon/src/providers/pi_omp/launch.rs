@@ -15,6 +15,7 @@ pub type CommandProbes = Memo<Arc<[Value]>>;
 pub struct Assets {
     pub directory: tempfile::TempDir,
     pub mcp: bool,
+    pub account_command: Option<String>,
 }
 pub fn external_env(spec: &ProviderSpec, context: &LaunchContext) -> BTreeMap<String, String> {
     let mut env = std::env::vars().collect::<BTreeMap<_, _>>();
@@ -136,6 +137,22 @@ pub fn command(
         )),
         env,
         clear_env: true,
+    })
+}
+
+pub fn omp_assets() -> Result<Assets> {
+    let directory = tempfile::Builder::new()
+        .prefix("paseo-omp-extension-")
+        .tempdir()?;
+    let account_command = format!("paseo-account-{}", uuid::Uuid::new_v4().simple());
+    std::fs::write(
+        directory.path().join("paseo-integration.mjs"),
+        include_str!("omp-integration.mjs").replace("__PASEO_ACCOUNT_COMMAND__", &account_command),
+    )?;
+    Ok(Assets {
+        directory,
+        mcp: false,
+        account_command: Some(account_command),
     })
 }
 pub fn valid_thinking(level: &str, omp: bool) -> bool {
@@ -368,6 +385,7 @@ pub async fn pi_assets(
     Ok(Assets {
         directory,
         mcp: supported,
+        account_command: None,
     })
 }
 fn pi_server(server: &Value, adapter: bool) -> Value {

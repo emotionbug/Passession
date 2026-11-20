@@ -17,6 +17,7 @@ use crate::providers::api::{
 use crate::providers::registry::catalog::refresh_activity;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+pub(super) use catalog::modes as omp_modes;
 use paseo_client::process::{self, CommandSpec};
 use serde_json::{Value, json};
 use session::Session;

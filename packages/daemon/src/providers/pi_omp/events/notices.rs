@@ -153,7 +153,17 @@ pub fn runtime(event: &Value) -> Option<Value> {
             Some(json!({"type":"notification","level":event["level"],"message":event["message"]}))
         }
         "auto_compaction_start" | "auto_compaction_end" => {
-            let mut item = json!({"type":"compaction","status":if t.ends_with("start"){"loading"}else{"completed"},"trigger":"auto"});
+            // An aborted or failed run must not read as a finished compaction.
+            let failed = t.ends_with("end")
+                && (event["aborted"] == true || event["errorMessage"].is_string());
+            let status = if t.ends_with("start") {
+                "loading"
+            } else if failed {
+                "failed"
+            } else {
+                "completed"
+            };
+            let mut item = json!({"type":"compaction","status":status,"trigger":"auto"});
             if event["result"]["tokensBefore"].is_number() {
                 item["preTokens"] = event["result"]["tokensBefore"].clone();
             }

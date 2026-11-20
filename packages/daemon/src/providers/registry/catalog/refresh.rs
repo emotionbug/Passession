@@ -117,25 +117,16 @@ pub(super) async fn discover(
             if let Some(default_mode) = catalog.shift_remove("defaultModeId") {
                 entry["defaultModeId"] = default_mode;
             }
-            entry["status"] = json!("ready");
-            let mut seen = std::collections::HashSet::new();
-            let Value::Array(mut models) = catalog
-                .shift_remove("models")
-                .expect("assembled catalog has models")
-            else {
-                unreachable!()
-            };
-            let original_count = models.len();
-            models.retain(|model| seen.insert(model["id"].clone()));
-            if models.len() != original_count {
-                tracing::warn!(provider = %state.entry.spec.id, discarded_rows = original_count - models.len(), "Provider catalog contains repeated model IDs; retaining the first definition");
-            }
-            entry["models"] = Value::Array(models);
-            entry["modes"] = catalog
-                .shift_remove("modes")
-                .expect("assembled catalog has modes");
-            entry["fetchedAt"] =
-                json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            ready(
+                &mut entry,
+                &state.entry.spec.id,
+                catalog
+                    .shift_remove("models")
+                    .expect("assembled catalog has models"),
+                catalog
+                    .shift_remove("modes")
+                    .expect("assembled catalog has modes"),
+            );
         }
         Err(error) => {
             // toErrorMessage: an empty message reports "Unknown error".
@@ -149,6 +140,21 @@ pub(super) async fn discover(
         }
     }
     identify(entry)
+}
+
+pub(super) fn ready(entry: &mut Value, provider: &str, mut models: Value, modes: Value) {
+    let rows = models.as_array_mut().expect("catalog has a model array");
+    let mut seen = std::collections::HashSet::new();
+    let original_count = rows.len();
+    rows.retain(|model| seen.insert(model["id"].clone()));
+    if rows.len() != original_count {
+        tracing::warn!(%provider, discarded_rows = original_count - rows.len(), "Provider catalog contains repeated model IDs; retaining the first definition");
+    }
+    entry["status"] = json!("ready");
+    entry["models"] = models;
+    entry["modes"] = modes;
+    entry["fetchedAt"] =
+        json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 }
 
 async fn assemble(

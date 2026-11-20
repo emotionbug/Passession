@@ -167,8 +167,10 @@ pub fn overview_summary(summary: &OverviewSummary) -> String {
 
 /// message-compaction-label.ts getCompactionMarkerLabel.
 pub fn compaction_label(status: &str, trigger: Option<&str>, pre_tokens: Option<f64>) -> String {
-    if status == "loading" {
-        return t("message.compaction.loading");
+    match status {
+        "loading" => return t("message.compaction.loading"),
+        "failed" => return t("message.compaction.failed"),
+        _ => {}
     }
     match trigger {
         Some("auto") => t("message.compaction.auto"),
