@@ -1,9 +1,8 @@
 //! omp-kiro named account stores and the OMP model providers that pin their profiles.
-use super::auth::{Credential, Profile};
+use super::auth::{Credential, Profile, profile_region, valid_profile_arn};
 use std::path::{Path, PathBuf};
 
 pub(super) const DEFAULT_ACCOUNT: &str = "default";
-const HTTP_REGIONS: [&str; 2] = ["us-east-1", "eu-central-1"];
 
 /// 1–32 lowercase letters, digits or inner hyphens; `http` and `cli` name the unpinned providers.
 fn valid_name(name: &str) -> bool {
@@ -41,20 +40,20 @@ pub(super) fn stores(default: &Path) -> Vec<(String, PathBuf)> {
     stores
 }
 
-/// One account profile usable over Kiro HTTP.
+/// One account profile or an API key usable over Kiro HTTP.
 pub(super) struct Target {
     pub provider: String,
-    pub arn: String,
+    pub arn: Option<String>,
     pub name: Option<String>,
 }
 
 /// `kiro-<account>-<profile id>`: the ARN's final segment reduced to lowercase
 /// ASCII letters and digits, exactly as omp-kiro names the provider.
 pub(super) fn target_provider(account: &str, arn: &str) -> Option<String> {
-    let (_, id) = arn.rsplit_once(":profile/")?;
-    if id.contains(':') {
+    if !valid_profile_arn(arn) {
         return None;
     }
+    let (_, id) = arn.rsplit_once(":profile/")?;
     let mut provider = format!("kiro-{account}-");
     let prefix = provider.len();
     provider.extend(
@@ -71,6 +70,13 @@ pub(super) fn targets(
     credential: &Credential,
     catalog: Option<Vec<Profile>>,
 ) -> Vec<Target> {
+    if credential.is_api_key() {
+        return vec![Target {
+            provider: format!("kiro-{account}-key"),
+            arn: None,
+            name: None,
+        }];
+    }
     let mut profiles = catalog.unwrap_or_else(|| {
         credential
             .profile_arn
@@ -81,13 +87,8 @@ pub(super) fn targets(
             })
             .collect()
     });
-    profiles.retain(|profile| {
-        profile
-            .arn
-            .split(':')
-            .nth(3)
-            .is_some_and(|region| HTTP_REGIONS.contains(&region))
-    });
+    let regions = credential.profile_regions();
+    profiles.retain(|profile| profile_region(&profile.arn).is_some_and(|r| regions.contains(&r)));
     profiles.sort_unstable_by(|left, right| left.arn.cmp(&right.arn));
     let mut targets: Vec<Target> = Vec::with_capacity(profiles.len());
     for profile in profiles {
@@ -99,7 +100,7 @@ pub(super) fn targets(
         }
         targets.push(Target {
             provider,
-            arn: profile.arn,
+            arn: Some(profile.arn),
             name: profile.name,
         });
     }
@@ -124,6 +125,14 @@ mod tests {
             )
             .as_deref(),
             Some("kiro-a-b-team02")
+        );
+        assert_eq!(
+            target_provider(
+                "work",
+                "arn:aws-us-gov:codewhisperer:us-gov-east-1:123456789012:profile/Gov-Team"
+            )
+            .as_deref(),
+            Some("kiro-work-govteam")
         );
         for arn in [
             "arn:aws:codewhisperer:us-east-1:1:profile/--",

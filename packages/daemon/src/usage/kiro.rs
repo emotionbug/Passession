@@ -4,7 +4,7 @@ mod auth;
 mod normalize;
 mod transport;
 
-use super::common::{UsageAccount, UsageRuntime, UsageScope, hash_account_key};
+use super::common::{UsageAccount, UsageRuntime, UsageScope, hash_account_key, unavailable};
 use accounts::{DEFAULT_ACCOUNT, Target};
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
@@ -29,7 +29,7 @@ enum Selection {
     All,
     /// A `kiro-http/…` session: the default account's saved profile.
     Saved,
-    /// A session on a pinned `kiro-<account>-<profile id>/…` model.
+    /// A session on a pinned profile or API-key provider.
     Pinned(String),
 }
 
@@ -37,30 +37,32 @@ fn scope_env(
     scope: &UsageScope,
     global: impl FnOnce() -> BTreeMap<String, String>,
 ) -> Option<(BTreeMap<String, String>, Selection)> {
-    if scope.provider.is_none() {
-        return Some((global(), Selection::All));
+    match scope.provider.as_deref() {
+        None => return Some((global(), Selection::All)),
+        Some("omp" | "kiro-http") => {}
+        _ => return None,
     }
-    let pinned = scope
+    let model_provider = scope
         .model
         .as_deref()
         .and_then(|model| model.split_once('/'))
-        .map(|(provider, _)| provider)
-        .filter(|provider| {
-            provider.starts_with("kiro-") && !matches!(*provider, "kiro-http" | "kiro-cli")
-        });
+        .map(|(provider, _)| provider);
+    if matches!(model_provider, Some("kiro" | "kiro-cli")) {
+        return None;
+    }
+    let pinned =
+        model_provider.filter(|provider| provider.starts_with("kiro-") && *provider != "kiro-http");
     if let Some(provider) = pinned {
         return Some((scope.env.clone(), Selection::Pinned(provider.to_owned())));
     }
     // Preserve OMP HTTP markers, without claiming CLI/non-HTTP sessions.
     if scope.provider.as_deref() == Some("kiro-http")
-        || scope
-            .env
-            .get("OMP_KIRO_TRANSPORT")
-            .is_some_and(|v| v == "http")
-        || scope
-            .model
-            .as_deref()
-            .is_some_and(|v| v.starts_with("kiro-http/"))
+        || (model_provider.is_none()
+            && scope
+                .env
+                .get("OMP_KIRO_TRANSPORT")
+                .is_some_and(|v| v == "http"))
+        || model_provider == Some("kiro-http")
     {
         Some((scope.env.clone(), Selection::Saved))
     } else {
@@ -138,33 +140,35 @@ fn store_accounts(name: &str, path: &Path, selection: &Selection) -> Vec<UsageAc
         return vec![plain()];
     }
     let targets = accounts::targets(name, &credential, catalog);
-    let profile = |target: &Target| UsageAccount {
-        key: hash_account_key(&format!("{path}\n{}", target.arn)),
-        label: Some(format!(
-            "Kiro HTTP · {name} · {}",
-            target
-                .name
-                .as_deref()
-                .unwrap_or(&target.arn)
-                .replace(char::is_control, " ")
-        )),
-        harness: Some("Kiro HTTP".into()),
-        input: json!({"authFile":path, "profileArn":target.arn}),
+    let target_account = |target: &Target| {
+        let Some(arn) = target.arn.as_deref() else {
+            return plain();
+        };
+        if targets.len() == 1 && credential.profile_arn.as_deref() == Some(arn) {
+            return plain();
+        }
+        UsageAccount {
+            key: hash_account_key(&format!("{path}\n{arn}")),
+            label: Some(format!(
+                "Kiro HTTP · {name} · {}",
+                target
+                    .name
+                    .as_deref()
+                    .unwrap_or(arn)
+                    .replace(char::is_control, " ")
+            )),
+            harness: Some("Kiro HTTP".into()),
+            input: json!({"authFile":path, "profileArn":arn}),
+        }
     };
     match selection {
         Selection::Pinned(provider) => targets
             .iter()
             .find(|target| target.provider == *provider)
-            .map(|target| {
-                if targets.len() > 1 {
-                    profile(target)
-                } else {
-                    plain()
-                }
-            })
+            .map(target_account)
             .into_iter()
             .collect(),
-        _ if targets.len() > 1 => targets.iter().map(profile).collect(),
+        _ if !targets.is_empty() => targets.iter().map(target_account).collect(),
         _ => vec![plain()],
     }
 }
@@ -209,13 +213,22 @@ async fn fetch_path(rt: &UsageRuntime, path: PathBuf, profile_arn: Option<String
         Ok(Ok(credential)) => credential,
         _ => return transport::error(LOGIN_UNAVAILABLE),
     };
+    if credential.disabled {
+        return unavailable(json!({
+            "kind":"no_quota",
+            "detail":"This Kiro HTTP login is disabled. Sign in again with omp-kiro login."
+        }));
+    }
     // A pinned profile reads that profile's quota; the store's saved selection is untouched.
-    if profile_arn.is_some() {
+    if !credential.is_api_key() && profile_arn.is_some() {
         credential.profile_arn = profile_arn;
     }
-    if credential.expires_at <= Utc::now() {
+    if let Some(expires_at) = credential
+        .expires_at
+        .filter(|expires_at| *expires_at <= Utc::now())
+    {
         return json!({"status":"unavailable", "problem":{
-            "kind":"expired", "expiresAt":credential.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "kind":"expired", "expiresAt":expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             "refreshedBy":"omp-kiro",
         }});
     }
@@ -248,6 +261,7 @@ mod tests {
             cancel: CancellationToken::new(),
             endpoints: BTreeMap::new(),
             muse_providers: Vec::new(),
+            omp: Default::default(),
             plugins: None,
         }
     }
@@ -678,5 +692,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn source_pins_named_api_keys_and_keeps_disabled_keys_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("accounts/work.sqlite3");
+        std::fs::create_dir(work.parent().unwrap()).unwrap();
+        store(&work, "github", "2099-01-01T00:00:00Z");
+        let db = Connection::open(&work).unwrap();
+        db.execute(
+            "UPDATE credentials SET value = ?1 WHERE id = 'active'",
+            [json!({
+                "kind":"api-key","provider":"api-key","access_token":"ksk_test-key",
+                "region":"us-west-2", "disabled":"private-reason"
+            })
+            .to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO credentials VALUES ('refresh_lease', '{\"owner\":\"fixture\",\"expiresAt\":0}')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let mut rt = runtime(dir.path());
+        rt.env = scoped(&dir.path().join("auth.sqlite3")).env;
+        let mut scope = scoped(&dir.path().join("auth.sqlite3"));
+        scope.model = Some("kiro-work-key/auto".into());
+        let pinned = discover(&rt, &scope).await.unwrap();
+        assert_eq!(pinned.len(), 1);
+        let global = discover(&rt, &global()).await.unwrap();
+        assert_eq!(global[0].key, pinned[0].key);
+        assert_eq!(
+            global[0].label.as_deref(),
+            Some("Kiro HTTP · work · api-key")
+        );
+        assert_eq!(
+            pinned[0].input,
+            json!({"authFile": work.canonicalize().unwrap()})
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        rt.endpoints.insert(
+            "https://management.us-west-2.kiro.dev/".into(),
+            format!("http://{}/", listener.local_addr().unwrap()),
+        );
+        let report = fetch(&rt, &pinned[0].input).await.unwrap();
+        let report = crate::usage::validate_report(report).unwrap();
+        assert_eq!(report["status"], "unavailable");
+        assert!(
+            report["problem"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Sign in again")
+        );
+        assert!(!report.to_string().contains("private-reason"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+
+        scope.model = Some("kiro/auto".into());
+        scope.env.insert("OMP_KIRO_TRANSPORT".into(), "http".into());
+        assert!(discover(&rt, &scope).await.unwrap().is_empty());
     }
 }

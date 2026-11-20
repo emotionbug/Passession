@@ -177,23 +177,18 @@ pub(super) async fn discover(rt: &UsageRuntime, scope: &UsageScope) -> Result<Ve
                 return Ok(Vec::new());
             }
             vec![claude_route(rt, &home, env).await]
-        } else if scope
-            .model
-            .as_deref()
-            .is_some_and(|s| s.starts_with("anthropic/"))
+        } else if provider == "pi"
+            && scope
+                .model
+                .as_deref()
+                .is_some_and(|s| s.starts_with("anthropic/"))
         {
-            match provider {
-                "pi" => vec![pi()],
-                "omp" => stores::discover_omp(&home, env, "anthropic").await?,
-                _ => Vec::new(),
-            }
+            vec![pi()]
         } else {
             Vec::new()
         }
     } else {
-        let mut routes = vec![claude_route(rt, &home, env).await, pi()];
-        routes.extend(stores::discover_omp(&home, env, "anthropic").await?);
-        routes
+        vec![claude_route(rt, &home, env).await, pi()]
     };
     let mut accounts = Vec::new();
     for route in routes {

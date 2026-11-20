@@ -32,6 +32,7 @@ pub(super) struct UsageRuntime {
     /// Explicit endpoint substitution permits isolated HTTP fixtures without live accounts.
     pub endpoints: BTreeMap<String, String>,
     pub muse_providers: Vec<std::sync::Arc<crate::providers::muse::MuseProvider>>,
+    pub omp: super::omp::Runtime,
     pub plugins: Option<std::sync::Arc<crate::plugins::PluginService>>,
 }
 

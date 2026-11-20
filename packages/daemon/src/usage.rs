@@ -9,6 +9,7 @@ mod kimi;
 mod kiro;
 mod minimax;
 mod muse;
+mod omp;
 mod opencode_go;
 mod report;
 mod zai;
@@ -52,7 +53,7 @@ struct DiscoveryContext<'a> {
 }
 
 macro_rules! sources {
-    ($( $variant:ident => ($module:ident, $id:literal, $label:literal, $icon:literal) ),+ $(,)?) => {
+    ($( $variant:ident => ($module:ident, $id:literal, $label:literal $(,$icon:literal)? ) ),+ $(,)?) => {
         #[derive(Clone, PartialEq, Eq, Hash)]
         enum Source {
             $( $variant ),+,
@@ -62,7 +63,7 @@ macro_rules! sources {
             const ALL: &'static [Self] = &[$( Self::$variant ),+];
             fn id(&self) -> &str { match self { $(Self::$variant => $id),+, Self::Plugin {id,..} => id } }
             fn label(&self) -> &str { match self { $(Self::$variant => $label),+, Self::Plugin {label,..} => label } }
-            fn icon(&self) -> Option<&str> { match self { $(Self::$variant => Some(include_str!($icon))),+, Self::Plugin {icon,..} => icon.as_deref() } }
+            fn icon(&self) -> Option<&str> { match self { $(Self::$variant => sources!(@icon $($icon)?)),+, Self::Plugin {icon,..} => icon.as_deref() } }
             fn generation(&self) -> Option<&str> { match self { Self::Plugin {generation,..} => Some(generation), _ => None } }
             fn current(&self, rt:&UsageRuntime) -> bool {
                 match self {
@@ -108,7 +109,9 @@ macro_rules! sources {
                 }
             }
         }
-    }
+    };
+    (@icon $icon:literal) => { Some(include_str!($icon)) };
+    (@icon) => { None };
 }
 sources! {
     Claude => (claude,"claude","Claude","../../../plugins/claude-usage-source/icon.svg"),
@@ -120,6 +123,7 @@ sources! {
     Kiro => (kiro,"kiro","Kiro HTTP","../../../plugins/kiro-usage-source/icon.svg"),
     MiniMax => (minimax,"minimax","MiniMax","../../../plugins/minimax-usage-source/icon.svg"),
     Muse => (muse,"muse","Muse Code","../../../plugins/muse-provider/icon.svg"),
+    Omp => (omp,"omp","OMP"),
     OpenCodeGo => (opencode_go,"opencode-go","OpenCode Go","../../../plugins/opencode-go-usage-source/icon.svg"),
     Zai => (zai,"zai","Z.ai","../../../plugins/zai-usage-source/icon.svg"),
 }
@@ -218,17 +222,21 @@ impl UsageService {
         }
     }
 
-    fn runtime(&self, context: &UsageContext, cancel: CancellationToken) -> UsageRuntime {
+    fn runtime(
+        &self,
+        context: &UsageContext,
+        cancel: CancellationToken,
+        agent_id: Option<&str>,
+    ) -> UsageRuntime {
+        let home = context.user_home.as_ref().unwrap_or(&self.inner.home);
         UsageRuntime {
-            home: context
-                .user_home
-                .clone()
-                .unwrap_or_else(|| self.inner.home.clone()),
+            home: home.clone(),
             env: context.env.clone(),
             http: self.inner.http.clone(),
             cancel,
             endpoints: self.inner.endpoints.clone(),
             muse_providers: context.muse_providers.clone(),
+            omp: omp::Runtime::new(context, home, agent_id),
             plugins: context.plugins.clone(),
         }
     }
@@ -292,7 +300,7 @@ impl UsageService {
             .get("forceRefresh")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let rt = self.runtime(context, cancel.clone());
+        let rt = self.runtime(context, cancel.clone(), agent_id);
         let sources = registered_sources(&rt)?;
         {
             let mut state = self.inner.state.lock().unwrap();
@@ -337,6 +345,13 @@ impl UsageService {
                     unavailable_sources: Vec::new(),
                 });
             }
+            let refresh_omp = force
+                && session["provider"].as_str().is_some_and(|provider| {
+                    context
+                        .provider_specs
+                        .iter()
+                        .any(|spec| spec.id == provider && spec.family == "omp")
+                });
             let signature = session_signature(session);
             let cached = {
                 let state = self.inner.state.lock().unwrap();
@@ -344,7 +359,10 @@ impl UsageService {
                     .by_agent
                     .iter()
                     .find(|(id, mapping)| {
-                        id == agent_id && mapping.signature == signature && mapping.complete
+                        id == agent_id
+                            && mapping.signature == signature
+                            && mapping.complete
+                            && !refresh_omp
                     })
                     .map(|(_, mapping)| mapping.reports.clone())
             };

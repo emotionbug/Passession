@@ -156,7 +156,7 @@ async fn builtin_kiro_reports_expiry_without_an_external_plugin_or_auth_writes()
         plugins: None,
     };
     let service = UsageService::new(home.path().into());
-    let runtime = service.runtime(&context, CancellationToken::new());
+    let runtime = service.runtime(&context, CancellationToken::new(), None);
     let sources: Vec<_> = registered_sources(&runtime)
         .unwrap()
         .into_iter()

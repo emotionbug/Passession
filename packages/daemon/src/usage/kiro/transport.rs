@@ -99,15 +99,9 @@ impl Endpoint<'_> {
 }
 
 pub(super) async fn fetch(rt: &UsageRuntime, client: Client, credential: &Credential) -> Value {
-    let region = credential
-        .profile_arn
-        .as_deref()
-        .and_then(|arn| arn.split(':').nth(3))
-        .filter(|v| !v.is_empty())
-        .unwrap_or("us-east-1");
-    if !matches!(region, "us-east-1" | "eu-central-1") {
+    let Some(region) = credential.usage_region() else {
         return error("Kiro usage does not support this account profile region.");
-    }
+    };
     // Endpoint substitutions are isolated to the test build. Account/session
     // inputs can never redirect a production bearer token to another host.
     #[cfg(test)]
@@ -128,14 +122,16 @@ async fn request(client: Client, credential: &Credential, endpoint: Endpoint<'_>
     if let Some(profile) = &credential.profile_arn {
         body["profileArn"] = json!(profile);
     }
-    let response = client
+    let mut request = client
         .post(endpoint.url())
         .bearer_auth(&credential.access_token)
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", "AmazonCodeWhispererService.GetUsageLimits")
-        .json(&body)
-        .send()
-        .await;
+        .header("x-amzn-codewhisperer-optout", "true");
+    if credential.is_api_key() {
+        request = request.header("tokentype", "API_KEY");
+    }
+    let response = request.json(&body).send().await;
     let mut response = match response {
         Ok(response) => response,
         Err(reason) => {
@@ -256,13 +252,13 @@ mod tests {
     fn credential() -> Credential {
         Credential {
             access_token: "private-access-token".into(),
-            expires_at: chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            expires_at: None,
             profile_arn: Some(
-                "arn:aws:codewhisperer:eu-central-1:private-account:profile/private-profile".into(),
+                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/private-profile".into(),
             ),
             provider: "github",
+            region: None,
+            disabled: false,
         }
     }
     fn test_client() -> Client {
@@ -287,6 +283,8 @@ mod tests {
         assert!(headers.contains("authorization: bearer private-access-token"));
         assert!(headers.contains("content-type: application/x-amz-json-1.0"));
         assert!(headers.contains("x-amz-target: amazoncodewhispererservice.getusagelimits"));
+        assert!(headers.contains("x-amzn-codewhisperer-optout: true"));
+        assert!(!headers.contains("tokentype:"));
         assert_eq!(
             serde_json::from_str::<Value>(body).unwrap(),
             json!({"origin":"KIRO_CLI","resourceType":"AGENTIC_REQUEST","isEmailRequired":false,"profileArn":credential().profile_arn})
@@ -294,6 +292,55 @@ mod tests {
         let result = serde_json::to_value(report).unwrap();
         assert_eq!(result["balances"][0]["used"], 12.5);
         assert!(!result.to_string().contains("private-"));
+    }
+
+    #[tokio::test]
+    async fn transport_routes_api_keys_and_govcloud_to_their_management_regions() {
+        let gov_profile =
+            "arn:aws-us-gov:codewhisperer:us-gov-east-1:123456789012:profile/Gov-Team";
+        for (credential, region) in [
+            (
+                Credential {
+                    access_token: "ksk_fixture-key".into(),
+                    profile_arn: None,
+                    provider: "api-key",
+                    region: Some("us-west-2".into()),
+                    ..credential()
+                },
+                "us-west-2",
+            ),
+            (
+                Credential {
+                    profile_arn: Some(gov_profile.into()),
+                    provider: "identity-center",
+                    region: Some("us-gov-west-1".into()),
+                    ..credential()
+                },
+                "us-gov-east-1",
+            ),
+        ] {
+            assert_eq!(credential.usage_region(), Some(region));
+            let mut rt = super::super::tests::runtime(Path::new("/unused"));
+            let (url, received, handle) = fixture(403, "private server details".into());
+            rt.endpoints
+                .insert(format!("https://management.{region}.kiro.dev/"), url);
+            let report = fetch(&rt, test_client(), &credential).await;
+            let wire = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            handle.join().unwrap();
+            let (headers, body) = wire.split_once("\r\n\r\n").unwrap();
+            let headers = headers.to_ascii_lowercase();
+            assert_eq!(report["problem"]["status"], 403);
+            assert!(headers.contains("x-amzn-codewhisperer-optout: true"));
+            let body: Value = serde_json::from_str(body).unwrap();
+            if credential.is_api_key() {
+                assert!(headers.contains("authorization: bearer ksk_fixture-key"));
+                assert!(headers.contains("tokentype: api_key"));
+                assert!(body.get("profileArn").is_none());
+            } else {
+                assert!(!headers.contains("tokentype:"));
+                assert_eq!(body["profileArn"], gov_profile);
+            }
+        }
     }
 
     #[tokio::test]

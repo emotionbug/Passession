@@ -1,18 +1,55 @@
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::Duration,
 };
 
 // Deliberately not Debug/Serialize: credentials never belong in protocol errors or logs.
 pub(super) struct Credential {
     pub access_token: String,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
     pub profile_arn: Option<String>,
     pub provider: &'static str,
+    pub region: Option<String>,
+    pub disabled: bool,
+}
+
+impl Credential {
+    pub(super) fn is_api_key(&self) -> bool {
+        self.provider == "api-key"
+    }
+
+    pub(super) fn profile_regions(&self) -> [&'static str; 2] {
+        if self.provider == "identity-center"
+            && self
+                .region
+                .as_deref()
+                .is_some_and(|region| region.starts_with("us-gov-"))
+        {
+            ["us-gov-west-1", "us-gov-east-1"]
+        } else {
+            ["us-east-1", "eu-central-1"]
+        }
+    }
+
+    pub(super) fn usage_region(&self) -> Option<&str> {
+        if self.is_api_key() {
+            return self
+                .region
+                .as_deref()
+                .filter(|region| KIRO_REGION.is_match(region));
+        }
+        let regions = self.profile_regions();
+        match self.profile_arn.as_deref() {
+            Some(arn) => profile_region(arn).filter(|region| regions.contains(region)),
+            None => Some(regions[0]),
+        }
+    }
 }
 
 pub(super) fn auth_path(env: &BTreeMap<String, String>) -> Result<PathBuf, ()> {
@@ -182,16 +219,24 @@ fn parse_catalog(raw: &str) -> Option<Vec<Profile>> {
         .collect()
 }
 
-/// `arn:aws:codewhisperer:<region>:<account>:profile/<id>`, as omp-kiro accepts it.
+const KIRO_REGION_PATTERN: &str = r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+";
+static KIRO_REGION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"\A{KIRO_REGION_PATTERN}\z")).unwrap());
+static PROFILE_ARN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"\Aarn:(aws|aws-us-gov):codewhisperer:({KIRO_REGION_PATTERN}):[0-9]+:profile/[A-Za-z0-9_-]+\z"
+    ))
+    .unwrap()
+});
+
+pub(super) fn profile_region(arn: &str) -> Option<&str> {
+    let capture = PROFILE_ARN.captures(arn)?;
+    let region = capture.get(2)?.as_str();
+    ((&capture[1] == "aws-us-gov") == region.starts_with("us-gov-")).then_some(region)
+}
+
 pub(super) fn valid_profile_arn(arn: &str) -> bool {
-    let mut parts = arn.split(':');
-    matches!(
-        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
-        (Some("arn"), Some("aws"), Some("codewhisperer"), Some(region), Some(account), Some(resource), None)
-            if !region.is_empty()
-                && !account.is_empty()
-                && resource.strip_prefix("profile/").is_some_and(|id| !id.is_empty())
-    )
+    profile_region(arn).is_some()
 }
 
 fn parse(raw: &str) -> Result<Credential, ()> {
@@ -201,6 +246,7 @@ fn parse(raw: &str) -> Result<Credential, ()> {
         (Some("social"), Some("github")) => "github",
         (Some("oidc"), Some("builder-id")) => "builder-id",
         (Some("oidc"), Some("identity-center")) => "identity-center",
+        (Some("api-key"), Some("api-key")) => "api-key",
         _ => return Err(()),
     };
     let nonempty = |key: &str| value[key].as_str().filter(|s| !s.is_empty()).ok_or(());
@@ -209,21 +255,35 @@ fn parse(raw: &str) -> Result<Credential, ()> {
             nonempty(key)?;
         }
     }
-    let access_token = nonempty("access_token")?.to_owned();
-    let expires_at = DateTime::parse_from_rfc3339(nonempty("expires_at")?)
-        .map_err(|_| ())?
-        .with_timezone(&Utc);
-    let profile_arn = match value.get("profile_arn") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) if value.is_empty() => None,
-        Some(Value::String(value)) => Some(value.clone()),
-        _ => return Err(()),
+    let access_token = nonempty("access_token")?;
+    let region = value["region"].as_str();
+    let (expires_at, profile_arn) = if provider == "api-key" {
+        if !access_token.strip_prefix("ksk_").is_some_and(|key| {
+            !key.is_empty() && key.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
+        }) || !region.is_some_and(|region| KIRO_REGION.is_match(region))
+        {
+            return Err(());
+        }
+        (None, None)
+    } else {
+        let expires_at = DateTime::parse_from_rfc3339(nonempty("expires_at")?)
+            .map_err(|_| ())?
+            .with_timezone(&Utc);
+        let profile_arn = match value.get("profile_arn") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if value.is_empty() => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => return Err(()),
+        };
+        (Some(expires_at), profile_arn)
     };
     Ok(Credential {
-        access_token,
+        access_token: access_token.to_owned(),
         expires_at,
         profile_arn,
         provider,
+        region: region.map(str::to_owned),
+        disabled: !value["disabled"].is_null(),
     })
 }
 
@@ -343,12 +403,12 @@ mod tests {
                 "expires_at":"2099-01-01T01:00:00+01:00",
                 "client_id":"private-client","client_secret":"private-secret",
                 "region":"eu-central-1",
-                "profile_arn":"arn:aws:codewhisperer:eu-central-1:private-account:profile/private",
+                "profile_arn":"arn:aws:codewhisperer:eu-central-1:123456789012:profile/private",
             });
             let credential = parse(&value.to_string()).unwrap();
             assert_eq!(credential.provider, provider);
             assert_eq!(
-                credential.expires_at.to_rfc3339(),
+                credential.expires_at.unwrap().to_rfc3339(),
                 "2099-01-01T00:00:00+00:00"
             );
             assert_eq!(
@@ -356,5 +416,30 @@ mod tests {
                 value["profile_arn"].as_str()
             );
         }
+    }
+
+    #[test]
+    fn auth_validates_govcloud_partitions_and_uses_api_key_region_without_expiry() {
+        let gov = "arn:aws-us-gov:codewhisperer:us-gov-east-1:123456789012:profile/Gov-Team";
+        assert!(valid_profile_arn(gov));
+        assert!(!valid_profile_arn(&gov.replacen("aws-us-gov", "aws", 1)));
+        assert!(!valid_profile_arn(&gov.replacen(
+            "us-gov-east-1",
+            "us-east-1",
+            1
+        )));
+        assert!(!valid_profile_arn(&gov.replacen(
+            "123456789012",
+            "not-an-account",
+            1
+        )));
+        let key = parse(r#"{"kind":"api-key","provider":"api-key","access_token":"ksk_fixture","region":"us-west-2"}"#).unwrap();
+        assert!(key.is_api_key());
+        assert_eq!(key.expires_at, None);
+        assert_eq!(key.profile_arn, None);
+        assert_eq!(key.usage_region(), Some("us-west-2"));
+        let oidc = parse(r#"{"kind":"oidc","provider":"identity-center","client_id":"fixture","client_secret":"fixture","access_token":"fixture","region":"us-gov-east-1","expires_at":"2099-01-01T00:00:00Z"}"#).unwrap();
+        assert_eq!(oidc.usage_region(), Some("us-gov-west-1"));
+        assert_eq!(oidc.profile_regions(), ["us-gov-west-1", "us-gov-east-1"]);
     }
 }

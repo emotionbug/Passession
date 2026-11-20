@@ -23,32 +23,12 @@ pub(in crate::usage) enum Route {
     Pi {
         path: String,
     },
-    Omp {
-        path: String,
-        #[serde(rename = "credentialId", deserialize_with = "integer_id")]
-        credential_id: i64,
-    },
     Keychain {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         service: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
     },
-}
-
-fn integer_id<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<i64, D::Error> {
-    let value = Value::deserialize(deserializer)?;
-    if let Some(id) = value.as_i64() {
-        return Ok(id);
-    }
-    match value.as_f64() {
-        Some(id) if id.is_finite() && id.fract() == 0.0 && id > 0.0 && id < i64::MAX as f64 => {
-            Ok(id as i64)
-        }
-        _ => Err(serde::de::Error::custom("Invalid credential ID")),
-    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -70,10 +50,6 @@ impl Route {
             Self::Claude { path } => claude && !path.is_empty(),
             Self::Codex { path } | Self::Opencode { path } => !claude && !path.is_empty(),
             Self::Pi { path } => !path.is_empty(),
-            Self::Omp {
-                path,
-                credential_id,
-            } => !path.is_empty() && *credential_id > 0,
             Self::Keychain { .. } => claude,
         };
         ensure!(valid, "Invalid usage credential route");
@@ -93,7 +69,6 @@ impl Route {
             Self::Codex { .. } => "codex",
             Self::Opencode { .. } => "opencode",
             Self::Pi { .. } => "pi",
-            Self::Omp { .. } => "omp",
             Self::Keychain { .. } => "keychain",
         }
     }
@@ -103,7 +78,6 @@ impl Route {
             Self::Codex { .. } => "Codex",
             Self::Opencode { .. } => "OpenCode",
             Self::Pi { .. } => "Pi",
-            Self::Omp { .. } => "OMP",
         }
     }
 }
@@ -176,43 +150,6 @@ pub(in crate::usage) fn pi_path(home: &Path, env: &BTreeMap<String, String>) -> 
             .join("auth.json"),
     }
 }
-fn omp_path(home: &Path, env: &BTreeMap<String, String>) -> PathBuf {
-    let profile = env
-        .get("OMP_PROFILE")
-        .or_else(|| env.get("PI_PROFILE"))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("default");
-    let base = join(home, nonempty(env, "PI_CONFIG_DIR").unwrap_or(".omp"));
-    let root = if profile == "default" {
-        base
-    } else {
-        join(&base.join("profiles"), profile)
-    };
-    let default = root.join("agent");
-    let agent = if profile == "default" {
-        nonempty(env, "PI_CODING_AGENT_DIR")
-            .map(resolve)
-            .unwrap_or_else(|| default.clone())
-    } else {
-        default.clone()
-    };
-    if cfg!(any(target_os = "linux", target_os = "macos"))
-        && agent == default
-        && let Some(xdg) = nonempty(env, "XDG_DATA_HOME")
-    {
-        let base = join(Path::new(xdg), "omp");
-        let root = if profile == "default" {
-            base
-        } else {
-            join(&base.join("profiles"), profile)
-        };
-        if root.exists() {
-            return root.join("agent.db");
-        }
-    }
-    agent.join("agent.db")
-}
 
 pub(in crate::usage) struct OAuth {
     pub access: String,
@@ -242,68 +179,8 @@ fn oauth(value: &Value) -> Result<OAuth> {
         expires,
     })
 }
-fn omp_rows(path: &Path, provider: &str) -> Vec<(i64, OAuth)> {
-    let read = || -> Result<Vec<(i64, OAuth)>> {
-        let db = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        let mut statement = db.prepare("SELECT id, data FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' AND disabled_cause IS NULL ORDER BY id")?;
-        let rows = statement.query_map([provider], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            let Ok((id, data)) = row else { continue };
-            if id <= 0 {
-                continue;
-            }
-            if let Ok(value) = serde_json::from_str::<Value>(&data)
-                && let Ok(auth) = oauth(&value)
-            {
-                result.push((id, auth));
-            }
-        }
-        Ok(result)
-    };
-    read().unwrap_or_default()
-}
-pub(in crate::usage) async fn discover_omp(
-    home: &Path,
-    env: &BTreeMap<String, String>,
-    provider: &'static str,
-) -> Result<Vec<Route>> {
-    let path = omp_path(home, env);
-    tokio::task::spawn_blocking(move || {
-        omp_rows(&path, provider)
-            .into_iter()
-            .map(|(credential_id, _)| Route::Omp {
-                path: path.to_string_lossy().into_owned(),
-                credential_id,
-            })
-            .collect()
-    })
-    .await
-    .map_err(Into::into)
-}
 pub(in crate::usage) async fn read_harness(route: &Route, provider: &'static str) -> Option<OAuth> {
     match route {
-        Route::Omp {
-            path,
-            credential_id,
-        } => {
-            let path = PathBuf::from(path);
-            let id = *credential_id;
-            tokio::task::spawn_blocking(move || {
-                omp_rows(&path, provider)
-                    .into_iter()
-                    .find(|(candidate, _)| *candidate == id)
-                    .map(|(_, auth)| auth)
-            })
-            .await
-            .ok()
-            .flatten()
-        }
         Route::Pi { path } | Route::Opencode { path } => {
             let json = read_json(path).await?;
             let key = if matches!(route, Route::Opencode { .. }) {
@@ -432,7 +309,7 @@ pub(in crate::usage) async fn response_text(
 mod tests {
     use super::*;
     #[test]
-    fn routes_reject_credentials_and_preserve_source_hash_order() {
+    fn routes_reject_credential_fields() {
         assert!(Route::parse(&serde_json::json!({"accessToken":"secret"}), true).is_err());
         assert!(
             Route::parse(
@@ -441,62 +318,11 @@ mod tests {
             )
             .is_err()
         );
-        let route = Route::Omp {
-            path: "/auth".into(),
-            credential_id: 3,
-        };
-        assert_eq!(
-            serde_json::to_string(&route).unwrap(),
-            r#"{"store":"omp","path":"/auth","credentialId":3}"#
-        );
     }
     #[test]
-    fn pi_expands_tilde_but_omp_uses_resolved_override() {
+    fn pi_expands_tilde_for_agent_dir_override() {
         let home = Path::new("/fixture");
         let env = BTreeMap::from([("PI_CODING_AGENT_DIR".into(), "~/work".into())]);
         assert_eq!(pi_path(home, &env), Path::new("/fixture/work/auth.json"));
-        assert_eq!(omp_path(home, &env), resolve("~/work").join("agent.db"));
-    }
-    #[tokio::test]
-    async fn omp_rotations_and_disabling_are_reread_without_writes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("agent.db");
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT, credential_type TEXT, data TEXT, disabled_cause TEXT)").unwrap();
-        db.execute(
-            "INSERT INTO auth_credentials VALUES (1, 'anthropic', 'oauth', ?1, NULL)",
-            [r#"{"access":"first","expires":0}"#],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO auth_credentials VALUES (2, 'openai-codex', 'oauth', ?1, NULL)",
-            [r#"{"access":"other"}"#],
-        )
-        .unwrap();
-        let route = Route::Omp {
-            path: path.to_string_lossy().into_owned(),
-            credential_id: 1,
-        };
-        let before = std::fs::read(&path).unwrap();
-        let auth = read_harness(&route, "anthropic").await.unwrap();
-        assert_eq!(auth.access, "first");
-        assert_eq!(auth.expires, Some(0.0));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        db.execute(
-            "UPDATE auth_credentials SET data = ?1 WHERE id = 1",
-            [r#"{"access":"rotated"}"#],
-        )
-        .unwrap();
-        assert_eq!(
-            read_harness(&route, "anthropic").await.unwrap().access,
-            "rotated"
-        );
-        db.execute(
-            "UPDATE auth_credentials SET disabled_cause = 'revoked' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        assert!(read_harness(&route, "anthropic").await.is_none());
-        assert_eq!(omp_rows(&path, "openai-codex").len(), 1);
     }
 }
