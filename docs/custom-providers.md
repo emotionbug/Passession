@@ -475,6 +475,25 @@ credentials, purchase credits or change billing. See the OMP extension's
 [authentication guide](https://github.com/emotionbug/omp-kiro#credential-storage-and-migration)
 for login and custom-store alignment.
 
+##### Several Kiro accounts
+
+omp-kiro 0.6.0 can stay signed in to several accounts at once
+(`omp-kiro login --account work`). Each named account is a separate store in
+`accounts/<name>.sqlite3` beside the default store. Once a named account exists,
+or one account has several Kiro profiles, OMP lists every account profile as its
+own model provider, `kiro-<account>-<profile id>/<model>`, with models named
+`Kiro · <account> · <profile> · <model>`. Pick one in the **OMP** model picker to
+pin an agent to that account and profile; agents on different accounts run side
+by side, and an agent profile can keep the choice. A custom `kiro-omp-http`
+profile with a fixed `models` list shows only the models it lists.
+
+Usage follows the same stores. The daemon-wide report has one row per signed-in
+account, split into one row per profile when an account has several (for example
+`Kiro HTTP · work · Personal`). An agent on a pinned model reports exactly that
+account profile; a `kiro-http/...` agent still reports the default account's
+saved profile. Reading a profile's usage never changes the store's saved
+selection.
+
 
 #### Other Pi-compatible forks
 

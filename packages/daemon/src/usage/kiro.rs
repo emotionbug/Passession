@@ -1,14 +1,20 @@
-//! Read-only built-in usage for OMP's managed Kiro HTTP authentication store.
+//! Read-only built-in usage for OMP's managed Kiro HTTP authentication stores.
+mod accounts;
 mod auth;
 mod normalize;
 mod transport;
 
 use super::common::{UsageAccount, UsageRuntime, UsageScope, hash_account_key};
+use accounts::{DEFAULT_ACCOUNT, Target};
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 const LOGIN_UNAVAILABLE: &str =
@@ -16,12 +22,34 @@ const LOGIN_UNAVAILABLE: &str =
 const CANCELLED: &str = "The Kiro usage request was cancelled.";
 const TIMEOUT: &str = "The Kiro usage request timed out.";
 
+/// Which account profiles a usage scope covers.
+#[derive(Debug, PartialEq)]
+enum Selection {
+    /// Daemon-wide: every signed-in account, one row per profile when it has several.
+    All,
+    /// A `kiro-http/…` session: the default account's saved profile.
+    Saved,
+    /// A session on a pinned `kiro-<account>-<profile id>/…` model.
+    Pinned(String),
+}
+
 fn scope_env(
     scope: &UsageScope,
     global: impl FnOnce() -> BTreeMap<String, String>,
-) -> Option<BTreeMap<String, String>> {
+) -> Option<(BTreeMap<String, String>, Selection)> {
     if scope.provider.is_none() {
-        return Some(global());
+        return Some((global(), Selection::All));
+    }
+    let pinned = scope
+        .model
+        .as_deref()
+        .and_then(|model| model.split_once('/'))
+        .map(|(provider, _)| provider)
+        .filter(|provider| {
+            provider.starts_with("kiro-") && !matches!(*provider, "kiro-http" | "kiro-cli")
+        });
+    if let Some(provider) = pinned {
+        return Some((scope.env.clone(), Selection::Pinned(provider.to_owned())));
     }
     // Preserve OMP HTTP markers, without claiming CLI/non-HTTP sessions.
     if scope.provider.as_deref() == Some("kiro-http")
@@ -34,14 +62,14 @@ fn scope_env(
             .as_deref()
             .is_some_and(|v| v.starts_with("kiro-http/"))
     {
-        Some(scope.env.clone())
+        Some((scope.env.clone(), Selection::Saved))
     } else {
         None
     }
 }
 
 pub(super) async fn discover(rt: &UsageRuntime, scope: &UsageScope) -> Result<Vec<UsageAccount>> {
-    let Some(env) = scope_env(scope, || {
+    let Some((env, selection)) = scope_env(scope, || {
         let mut env = rt.env.clone();
         if !env
             .get("HOME")
@@ -53,10 +81,11 @@ pub(super) async fn discover(rt: &UsageRuntime, scope: &UsageScope) -> Result<Ve
     }) else {
         return Ok(Vec::new());
     };
-    Ok(discover_env(env, &rt.cancel).await)
+    Ok(discover_env(env, selection, &rt.cancel).await)
 }
 async fn discover_env(
     env: BTreeMap<String, String>,
+    selection: Selection,
     cancellation: &CancellationToken,
 ) -> Vec<UsageAccount> {
     if cancellation.is_cancelled() {
@@ -67,16 +96,76 @@ async fn discover_env(
         _ = cancellation.cancelled() => Vec::new(),
         _ = tokio::time::sleep(Duration::from_secs(3)) => Vec::new(),
         result = tokio::task::spawn_blocking(move || {
-            let path = auth::auth_path(&env).ok()?.canonicalize().ok()?;
-            let credential = auth::read(&path).ok()?;
-            let path = path.to_str()?;
-            Some(UsageAccount {
-                key: hash_account_key(path),
-                label: Some(format!("Kiro HTTP · {}", credential.provider)),
-                harness: Some("Kiro HTTP".into()),
-                input: json!({"authFile":path}),
+            let default = auth::auth_path(&env).ok()?;
+            // Named accounts live beside the default store; a saved-profile session uses only it.
+            let stores = if selection == Selection::Saved {
+                vec![(DEFAULT_ACCOUNT.to_owned(), default)]
+            } else {
+                accounts::stores(&default)
+            };
+            Some(
+                stores
+                    .iter()
+                    .flat_map(|(name, path)| store_accounts(name, path, &selection))
+                    .collect::<Vec<_>>(),
+            )
+        }) => result.ok().flatten().unwrap_or_default(),
+    }
+}
+
+fn store_accounts(name: &str, path: &Path, selection: &Selection) -> Vec<UsageAccount> {
+    let Ok(path) = path.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok((credential, catalog)) = auth::read_store(&path) else {
+        return Vec::new();
+    };
+    let Some(path) = path.to_str() else {
+        return Vec::new();
+    };
+    // A store with one profile keeps its plain locator, which reads the saved selection.
+    let plain = || UsageAccount {
+        key: hash_account_key(path),
+        label: Some(if name == DEFAULT_ACCOUNT {
+            format!("Kiro HTTP · {}", credential.provider)
+        } else {
+            format!("Kiro HTTP · {name} · {}", credential.provider)
+        }),
+        harness: Some("Kiro HTTP".into()),
+        input: json!({"authFile":path}),
+    };
+    if *selection == Selection::Saved {
+        return vec![plain()];
+    }
+    let targets = accounts::targets(name, &credential, catalog);
+    let profile = |target: &Target| UsageAccount {
+        key: hash_account_key(&format!("{path}\n{}", target.arn)),
+        label: Some(format!(
+            "Kiro HTTP · {name} · {}",
+            target
+                .name
+                .as_deref()
+                .unwrap_or(&target.arn)
+                .replace(char::is_control, " ")
+        )),
+        harness: Some("Kiro HTTP".into()),
+        input: json!({"authFile":path, "profileArn":target.arn}),
+    };
+    match selection {
+        Selection::Pinned(provider) => targets
+            .iter()
+            .find(|target| target.provider == *provider)
+            .map(|target| {
+                if targets.len() > 1 {
+                    profile(target)
+                } else {
+                    plain()
+                }
             })
-        }) => result.ok().flatten().into_iter().collect(),
+            .into_iter()
+            .collect(),
+        _ if targets.len() > 1 => targets.iter().map(profile).collect(),
+        _ => vec![plain()],
     }
 }
 
@@ -84,6 +173,8 @@ async fn discover_env(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Input {
     auth_file: String,
+    #[serde(default)]
+    profile_arn: Option<String>,
 }
 
 pub(super) async fn fetch(rt: &UsageRuntime, input: &Value) -> Result<Value> {
@@ -96,7 +187,12 @@ pub(super) async fn fetch(rt: &UsageRuntime, input: &Value) -> Result<Value> {
         }
     };
     let path = PathBuf::from(input.auth_file);
-    if !path.is_absolute() {
+    if !path.is_absolute()
+        || !input
+            .profile_arn
+            .as_deref()
+            .is_none_or(auth::valid_profile_arn)
+    {
         return Ok(transport::error(
             "Invalid Kiro authentication store locator.",
         ));
@@ -105,14 +201,18 @@ pub(super) async fn fetch(rt: &UsageRuntime, input: &Value) -> Result<Value> {
         biased;
         _ = rt.cancel.cancelled() => transport::error(CANCELLED),
         _ = tokio::time::sleep(Duration::from_secs(15)) => transport::error(TIMEOUT),
-        report = fetch_path(rt, path) => report,
+        report = fetch_path(rt, path, input.profile_arn) => report,
     })
 }
-async fn fetch_path(rt: &UsageRuntime, path: PathBuf) -> Value {
-    let credential = match tokio::task::spawn_blocking(move || auth::read(&path)).await {
+async fn fetch_path(rt: &UsageRuntime, path: PathBuf, profile_arn: Option<String>) -> Value {
+    let mut credential = match tokio::task::spawn_blocking(move || auth::read(&path)).await {
         Ok(Ok(credential)) => credential,
         _ => return transport::error(LOGIN_UNAVAILABLE),
     };
+    // A pinned profile reads that profile's quota; the store's saved selection is untouched.
+    if profile_arn.is_some() {
+        credential.profile_arn = profile_arn;
+    }
     if credential.expires_at <= Utc::now() {
         return json!({"status":"unavailable", "problem":{
             "kind":"expired", "expiresAt":credential.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -175,6 +275,12 @@ mod tests {
             env: BTreeMap::from([("OMP_KIRO_AUTH_FILE".into(), path.to_str().unwrap().into())]),
         }
     }
+    async fn discover_found(
+        found: Option<(BTreeMap<String, String>, Selection)>,
+    ) -> Vec<UsageAccount> {
+        let (env, selection) = found.unwrap();
+        discover_env(env, selection, &CancellationToken::new()).await
+    }
 
     #[tokio::test]
     async fn source_session_auth_is_isolated_and_account_has_no_credentials() {
@@ -183,11 +289,10 @@ mod tests {
         let session = dir.path().join("session.db");
         store(&daemon, "google", "2099-01-01T00:00:00Z");
         store(&session, "github", "2099-01-01T00:00:00Z");
-        let env = scope_env(&scoped(&session), || {
+        let accounts = discover_found(scope_env(&scoped(&session), || {
             panic!("session must not inspect daemon environment")
-        })
-        .unwrap();
-        let accounts = discover_env(env, &CancellationToken::new()).await;
+        }))
+        .await;
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].label.as_deref(), Some("Kiro HTTP · github"));
         let canonical = session.canonicalize().unwrap();
@@ -205,18 +310,18 @@ mod tests {
                 .to_string()
                 .contains("private-access-token")
         );
-        let global = scope_env(&global(), || {
+        let accounts = discover_found(scope_env(&global(), || {
             BTreeMap::from([("OMP_KIRO_AUTH_FILE".into(), daemon.to_str().unwrap().into())])
-        })
-        .unwrap();
-        let accounts = discover_env(global, &CancellationToken::new()).await;
+        }))
+        .await;
         assert_eq!(accounts[0].label.as_deref(), Some("Kiro HTTP · google"));
         let missing = dir.path().join("missing.db");
-        let env = scope_env(&scoped(&missing), || panic!("no daemon fallback")).unwrap();
         assert!(
-            discover_env(env, &CancellationToken::new())
-                .await
-                .is_empty()
+            discover_found(scope_env(&scoped(&missing), || panic!(
+                "no daemon fallback"
+            )))
+            .await
+            .is_empty()
         );
         assert!(!missing.exists());
     }
@@ -254,8 +359,7 @@ mod tests {
         let path = dir.path().join("auth.db");
         store(&path, "github", "2000-01-01T00:00:00Z");
         let before = std::fs::read(&path).unwrap();
-        let env = scope_env(&scoped(&path), BTreeMap::new).unwrap();
-        let accounts = discover_env(env, &CancellationToken::new()).await;
+        let accounts = discover_found(scope_env(&scoped(&path), BTreeMap::new)).await;
         assert_eq!(accounts.len(), 1);
         let result = fetch(&runtime(dir.path()), &accounts[0].input)
             .await
@@ -276,6 +380,7 @@ mod tests {
             json!({"authFile":"relative"}),
             json!({"authFile":123}),
             json!({"authFile":"/valid","accessToken":"private-access-token"}),
+            json!({"authFile":"/valid","profileArn":"arn:aws:codewhisperer:us-east-1:1:other/X"}),
         ] {
             let value =
                 serde_json::to_value(fetch(&runtime(Path::new("/unused")), &input).await.unwrap())
@@ -316,7 +421,11 @@ mod tests {
             json!({"status":"error","error":CANCELLED})
         );
         assert!(!path.exists());
-        assert!(discover_env(BTreeMap::new(), &token).await.is_empty());
+        assert!(
+            discover_env(BTreeMap::new(), Selection::All, &token)
+                .await
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -327,16 +436,8 @@ mod tests {
         let alias = dir.path().join("alias.db");
         store(&path, "github", "2099-01-01T00:00:00Z");
         std::os::unix::fs::symlink(&path, &alias).unwrap();
-        let first = discover_env(
-            scope_env(&scoped(&path), BTreeMap::new).unwrap(),
-            &CancellationToken::new(),
-        )
-        .await;
-        let second = discover_env(
-            scope_env(&scoped(&alias), BTreeMap::new).unwrap(),
-            &CancellationToken::new(),
-        )
-        .await;
+        let first = discover_found(scope_env(&scoped(&path), BTreeMap::new)).await;
+        let second = discover_found(scope_env(&scoped(&alias), BTreeMap::new)).await;
         assert_eq!(first[0].key, second[0].key);
         assert_eq!(first[0].input, second[0].input);
     }
@@ -422,5 +523,160 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report, transport::error(CANCELLED));
+    }
+
+    const PERSONAL: &str = "arn:aws:codewhisperer:us-east-1:123456789012:profile/PERSONAL01";
+    const TEAM: &str = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/Team-02";
+
+    fn login(path: &Path, provider: &str, profile_arn: Option<&str>) {
+        store(path, provider, "2099-01-01T00:00:00Z");
+        if let Some(arn) = profile_arn {
+            Connection::open(path).unwrap().execute(
+                "UPDATE credentials SET value = json_set(value, '$.profile_arn', ?1) WHERE id = 'active'",
+                [arn],
+            ).unwrap();
+        }
+    }
+    fn catalog(path: &Path, profiles: &[(&str, &str)]) {
+        let profiles: Vec<Value> = profiles
+            .iter()
+            .map(|(arn, name)| json!({"arn":arn,"name":name}))
+            .collect();
+        Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO credentials VALUES ('profiles', ?1)",
+                [
+                    json!({"version":1,"fetchedAt":"2026-11-20T00:00:00.000Z","profiles":profiles})
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_lists_named_accounts_and_scopes_pinned_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join("auth.sqlite3");
+        let accounts = dir.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        login(
+            &default,
+            "google",
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/DEFAULT01"),
+        );
+        let work = accounts.join("work.sqlite3");
+        login(&work, "github", None);
+        catalog(
+            &work,
+            &[
+                (PERSONAL, "Personal"),
+                (TEAM, "Team\nEU"),
+                (
+                    "arn:aws:codewhisperer:ap-northeast-1:1:profile/TOKYO",
+                    "Unsupported region",
+                ),
+            ],
+        );
+        login(
+            &accounts.join("solo.sqlite3"),
+            "google",
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/SOLO01"),
+        );
+        for ignored in ["http.sqlite3", "Bad.sqlite3", "default.sqlite3"] {
+            login(&accounts.join(ignored), "google", None);
+        }
+        let env = BTreeMap::from([(
+            "OMP_KIRO_AUTH_FILE".into(),
+            default.to_str().unwrap().into(),
+        )]);
+        let all = discover_found(scope_env(&global(), || env.clone())).await;
+        let labels: Vec<_> = all
+            .iter()
+            .map(|account| account.label.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Kiro HTTP · google",
+                "Kiro HTTP · solo · google",
+                "Kiro HTTP · work · Team EU",
+                "Kiro HTTP · work · Personal",
+            ]
+        );
+        let work = work.canonicalize().unwrap();
+        let work = work.to_str().unwrap();
+        assert_eq!(all[3].input, json!({"authFile":work,"profileArn":PERSONAL}));
+        assert_eq!(all[2].input, json!({"authFile":work,"profileArn":TEAM}));
+        assert_ne!(all[2].key, all[3].key);
+        assert_eq!(all[1].input.get("profileArn"), None);
+
+        let pinned = |model: &str| UsageScope {
+            provider: Some("omp".into()),
+            model: Some(model.into()),
+            env: env.clone(),
+        };
+        let found = discover_found(scope_env(&pinned("kiro-work-personal01/auto"), || {
+            panic!("pinned sessions use their own environment")
+        }))
+        .await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, all[3].key);
+        assert_eq!(found[0].input, all[3].input);
+        // A single-profile account keeps its plain row, so both views share one key.
+        let solo = discover_found(scope_env(&pinned("kiro-solo-solo01/auto"), BTreeMap::new)).await;
+        assert_eq!(solo[0].key, all[1].key);
+        assert!(
+            discover_found(scope_env(&pinned("kiro-work-missing/auto"), BTreeMap::new))
+                .await
+                .is_empty()
+        );
+        assert!(scope_env(&pinned("kiro-cli/auto"), || panic!("no global fallback")).is_none());
+        // kiro-http keeps reading only the default account's saved selection.
+        let saved = discover_found(scope_env(&pinned("kiro-http/auto"), BTreeMap::new)).await;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].key, all[0].key);
+    }
+
+    #[tokio::test]
+    async fn source_profile_locator_requests_that_profile_without_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.db");
+        login(
+            &path,
+            "github",
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/SAVED"),
+        );
+        let before = std::fs::read(&path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut rt = runtime(dir.path());
+        rt.endpoints.insert(
+            "https://management.us-east-1.kiro.dev/".into(),
+            format!("http://{}/", listener.local_addr().unwrap()),
+        );
+        let input = json!({"authFile":path.to_str().unwrap(),"profileArn":PERSONAL});
+        let fetch_task = tokio::spawn(async move { fetch(&rt, &input).await.unwrap() });
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        while !String::from_utf8_lossy(&bytes).contains(PERSONAL) {
+            let mut buffer = [0; 4096];
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0, "the request ended without the pinned profile");
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        assert!(!String::from_utf8_lossy(&bytes).contains("profile/SAVED"));
+        socket
+            .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), fetch_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

@@ -117,7 +117,13 @@ fn os_home() -> Option<PathBuf> {
     None
 }
 
-pub(super) fn read(path: &Path) -> Result<Credential, ()> {
+/// One profile from the non-secret catalog omp-kiro saves when it lists profiles.
+pub(super) struct Profile {
+    pub arn: String,
+    pub name: Option<String>,
+}
+
+fn open(path: &Path) -> Result<Connection, ()> {
     if !path.is_absolute() {
         return Err(());
     }
@@ -127,15 +133,65 @@ pub(super) fn read(path: &Path) -> Result<Credential, ()> {
     )
     .map_err(|_| ())?;
     db.busy_timeout(Duration::from_secs(1)).map_err(|_| ())?;
-    // Bound the record before copying it out of SQLite. No schema, pragmas that
-    // mutate storage, refresh calls, or writable connection are ever used.
+    Ok(db)
+}
+
+// Bound each record before copying it out of SQLite. No schema, pragmas that
+// mutate storage, refresh calls, or writable connection are ever used.
+fn row(db: &Connection, id: &str) -> Result<Option<String>, ()> {
     let raw: Option<Option<String>> = db.query_row(
         "SELECT CASE WHEN length(value) <= 1048576 THEN value ELSE NULL END FROM credentials WHERE id = ?1",
-        ["active"], |row| row.get(0),
+        [id], |row| row.get(0),
     ).optional().map_err(|_| ())?;
-    let raw = raw.flatten().ok_or(())?;
+    Ok(raw.flatten())
+}
+
+pub(super) fn read(path: &Path) -> Result<Credential, ()> {
+    let db = open(path)?;
+    let raw = row(&db, "active")?.ok_or(())?;
     drop(db);
     parse(&raw)
+}
+
+/// The login and the profile catalog listed for it; an unreadable catalog counts as none.
+pub(super) fn read_store(path: &Path) -> Result<(Credential, Option<Vec<Profile>>), ()> {
+    let db = open(path)?;
+    let raw = row(&db, "active")?.ok_or(())?;
+    let catalog = row(&db, "profiles").ok().flatten();
+    drop(db);
+    Ok((parse(&raw)?, catalog.as_deref().and_then(parse_catalog)))
+}
+
+fn parse_catalog(raw: &str) -> Option<Vec<Profile>> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    if value["version"] != 1 {
+        return None;
+    }
+    value["profiles"]
+        .as_array()?
+        .iter()
+        .map(|profile| {
+            Some(Profile {
+                arn: profile["arn"]
+                    .as_str()
+                    .filter(|arn| valid_profile_arn(arn))?
+                    .to_owned(),
+                name: Some(profile["name"].as_str()?.to_owned()),
+            })
+        })
+        .collect()
+}
+
+/// `arn:aws:codewhisperer:<region>:<account>:profile/<id>`, as omp-kiro accepts it.
+pub(super) fn valid_profile_arn(arn: &str) -> bool {
+    let mut parts = arn.split(':');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("arn"), Some("aws"), Some("codewhisperer"), Some(region), Some(account), Some(resource), None)
+            if !region.is_empty()
+                && !account.is_empty()
+                && resource.strip_prefix("profile/").is_some_and(|id| !id.is_empty())
+    )
 }
 
 fn parse(raw: &str) -> Result<Credential, ()> {

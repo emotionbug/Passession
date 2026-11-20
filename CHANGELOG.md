@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Kiro usage covers several accounts. With omp-kiro 0.6.0 signed in to more than one account (`omp-kiro login --account <name>`), the usage report lists each account, with one row per Kiro profile when an account has several. An agent on a pinned `kiro-<account>-<profile id>/…` model reports exactly that account and profile, and reading it never changes the account's saved profile.
+
 ## 0.13.45 - 2026-11-20
 
 ### Added
