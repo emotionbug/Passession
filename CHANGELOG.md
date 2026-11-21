@@ -8,6 +8,8 @@
 - OMP: `/compact` with nothing to compact shows "Context compaction skipped" and OMP's reason, such as "Nothing to compact (session too small)", instead of "Context compaction failed" and an error. An automatic compaction that OMP skips is also shown as skipped instead of as compacted. Compaction markers now come from OMP's own start and end events, so compactions that OMP starts itself are shown too.
 - OMP 19: imported, forked and replayed OMP sessions no longer show "[model_usage] Unsupported history record" rows. OMP 19 writes a `model_usage` record for each side request, such as a handoff summary. History also follows OMP's saved active branch (`activeLeafId`), so a side request that finished on an older branch no longer makes the replay show that older branch.
 - Errors from slash commands that the daemon runs for a provider (such as OMP's `/handoff` or `/fork`) now include their cause, for example "Failed to hand off the OMP conversation: Cannot hand off while a response is in progress".
+- OMP: tool approvals in the "Always Ask" and "Write Approval" modes work again. OMP offers "Approve", "Approve <tool> for this session" and "Deny", and Passession only recognized a prompt with exactly "Approve" and "Deny". It showed a generic question instead of the tool approval card, and allowing it from the CLI or the agent tools denied the tool. The approval card now shows OMP's choices, including approving the tool for the rest of the session. Approvals for any tool show as a tool card.
+- Stopping or restarting the daemon no longer adds a "[System Error]" row, such as "JSONL process exited: Ok(0)" on OMP agents, to open agents. The daemon stops their provider processes itself, so the exit is not an error.
 
 ## 0.13.46 - 2026-11-21
 

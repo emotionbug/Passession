@@ -1197,7 +1197,11 @@ impl AgentManager {
                     if let Some(usage) = event.get("usage") {
                         merge(&mut snapshot["lastUsage"], usage);
                     }
-                    if kind == "turn_failed" {
+                    // A provider the daemon itself stopped (shutdown or close) did not fail.
+                    let stopped = session_ended
+                        && (cell.cancel.is_cancelled()
+                            || self.app().is_ok_and(|app| app.cancel.is_cancelled()));
+                    if kind == "turn_failed" && !stopped {
                         snapshot["lastError"] = event["error"].clone();
                         // appendSystemErrorTimelineMessage: the failure is an assistant row,
                         // skipped when it repeats the latest item.
@@ -1217,7 +1221,7 @@ impl AgentManager {
                                 row,
                             ));
                         }
-                    } else {
+                    } else if kind != "turn_failed" {
                         object(&mut snapshot).remove("lastError");
                     }
                 }
@@ -2394,6 +2398,53 @@ pub(super) mod tests {
         assert_eq!(cell.data.lock().await.snapshot["activeTurnId"], Value::Null);
         manager.close_cell(id, &cell).await.unwrap();
         assert!(manager.cell(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_exit_during_daemon_shutdown_is_not_a_system_error() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let app = AppState::new(
+            home.clone(),
+            root.path().into(),
+            std::env::current_exe().unwrap(),
+        );
+        let manager = &app.agents;
+        manager
+            .storage
+            .get_or_init(|| async { AgentStorage::new(home.clone()) })
+            .await;
+        let id = "00000000-0000-4000-8000-000000000014";
+        let cell = staged_cell(&app, id).await;
+        {
+            let mut data = cell.data.lock().await;
+            data.snapshot["internal"] = json!(false);
+            data.snapshot["cwd"] = json!(root.path());
+            data.snapshot["createdAt"] = json!(now());
+        }
+        cell.sink
+            .emit(json!({
+                "type":"timeline","provider":"mock","turnId":"live-turn",
+                "item":{"type":"assistant_message","text":"last output","messageId":"last"}
+            }))
+            .await
+            .unwrap();
+        // Shutdown cancels every provider first, so their exits arrive afterwards.
+        app.cancel.cancel();
+        cell.sink
+            .emit(json!({
+                "type":"turn_failed","provider":"mock","turnId":"live-turn",
+                "sessionEnded":true,"error":"JSONL process exited: Ok(0)"
+            }))
+            .await
+            .unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        manager.release_event_stage(&cell).await.unwrap();
+        let snapshot = manager.agent_snapshot(id).await.unwrap().unwrap();
+        assert!(snapshot["lastError"].is_null(), "{}", snapshot["lastError"]);
+        let rows = cell.timeline.lock().unwrap().rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["item"]["text"], "last output");
     }
 
     #[tokio::test]
