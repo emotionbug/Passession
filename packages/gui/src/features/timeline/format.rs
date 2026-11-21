@@ -170,11 +170,13 @@ pub fn compaction_label(status: &str, trigger: Option<&str>, pre_tokens: Option<
     match status {
         "loading" => return t("message.compaction.loading"),
         "failed" => return t("message.compaction.failed"),
+        "skipped" => return t("message.compaction.skipped"),
         _ => {}
     }
     match trigger {
         Some("auto") => t("message.compaction.auto"),
         Some("manual") => t("message.compaction.manual"),
+        Some("handoff") => t("message.compaction.handoff"),
         _ => match pre_tokens {
             Some(tokens) if tokens != 0.0 => ta(
                 "message.compaction.withTokens",

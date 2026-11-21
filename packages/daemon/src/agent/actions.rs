@@ -540,7 +540,7 @@ impl AgentManager {
                 if let Err(error) = result {
                     let event = json!({"type":"timeline","provider":provider,"item":{
                         "type":"notification","level":"error",
-                        "message":format!("Out-of-band command failed: {error}")
+                        "message":format!("Out-of-band command failed: {error:#}")
                     }});
                     if let Err(report_error) = sink.emit(event).await {
                         tracing::error!(error=%error,report_error=%report_error,"Failed to report out-of-band command failure");

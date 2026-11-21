@@ -104,6 +104,9 @@ struct Inner {
     operation: tokio::sync::Mutex<()>,
     manual_compaction: AtomicBool,
     compaction_started: AtomicBool,
+    /// Manual compactions OMP has reported as ended; its end event precedes the
+    /// RPC reply but reaches the mapper on the frame task.
+    compaction_ends: watch::Sender<u64>,
     login_active: AtomicBool,
     bash_active: AtomicBool,
     usage_key: String,
@@ -161,6 +164,18 @@ impl Inner {
         Ok(gate)
     }
 
+    fn compaction_end_count(&self) -> u64 {
+        *self.compaction_ends.borrow()
+    }
+    /// Whether OMP reported a manual compaction outcome after `seen`. OMP emits the
+    /// end event before its RPC reply, but replies bypass the frame task, so a
+    /// failed request waits briefly for the event before reporting on its own.
+    async fn native_compaction_settled(&self, seen: u64) -> bool {
+        let mut ends = self.compaction_ends.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), ends.wait_for(|ends| *ends > seen))
+            .await
+            .is_ok_and(|result| result.is_ok())
+    }
     async fn refresh(&self) -> Result<Value> {
         let state = self.runtime()?.request(json!({"type":"get_state"})).await?;
         let mut data = self.state.lock().unwrap();
@@ -418,6 +433,9 @@ impl Inner {
             || self.closed.load(Ordering::Acquire)
         {
             return Ok(());
+        }
+        if self.spec.family == "omp" && frame["type"] == "manual_compaction_end" {
+            self.compaction_ends.send_modify(|ends| *ends += 1);
         }
         // Output of an internal bridge command never belongs to the conversation. The
         // command runs under the operation gate while idle, and its reply closes the
@@ -1353,6 +1371,7 @@ impl Session {
             operation: tokio::sync::Mutex::new(()),
             manual_compaction: AtomicBool::new(false),
             compaction_started: AtomicBool::new(false),
+            compaction_ends: watch::channel(0).0,
             login_active: AtomicBool::new(false),
             bash_active: AtomicBool::new(false),
             usage_key: uuid::Uuid::new_v4().to_string(),
@@ -2359,9 +2378,7 @@ impl AgentSession for Session {
                         .compaction_started
                         .store(false, Ordering::Release);
                     let omp = self.inner.spec.family == "omp";
-                    if omp {
-                        self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":"loading","trigger":"manual"}})).await?;
-                    }
+                    let seen = self.inner.compaction_end_count();
                     let mut command = json!({"type":"compact"});
                     if !args.is_empty() {
                         command["customInstructions"] = json!(args);
@@ -2371,25 +2388,24 @@ impl AgentSession for Session {
                         .runtime()?
                         .request_with_timeout(command, None)
                         .await;
-                    // OMP always shows its own loading marker; pi only after compaction_start.
-                    // Either way a failed request must settle the marker as failed, not done.
-                    if omp
-                        || (result.is_err()
-                            && self.inner.compaction_started.swap(false, Ordering::AcqRel))
+                    // OMP reports its own start and outcome (manual_compaction_*). Pi
+                    // reports only compaction_start, so a failed pi request settles
+                    // the marker here as failed, not done.
+                    if !omp
+                        && result.is_err()
+                        && self.inner.compaction_started.swap(false, Ordering::AcqRel)
                     {
-                        let status = if result.is_ok() {
-                            "completed"
-                        } else {
-                            "failed"
-                        };
-                        self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":status,"trigger":"manual"}})).await?;
+                        self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":"failed","trigger":"manual"}})).await?;
                     }
                     if let Err(error) = result {
-                        self.inner
-                            .out_of_band_message(format!(
-                                "[Error] Failed to compact context: {error}"
-                            ))
-                            .await?;
+                        // Once OMP started compacting, its outcome already carries the reason.
+                        if !(omp && self.inner.native_compaction_settled(seen).await) {
+                            self.inner
+                                .out_of_band_message(format!(
+                                    "[Error] Failed to compact context: {error}"
+                                ))
+                                .await?;
+                        }
                     } else if omp {
                         self.inner.poll_usage(None).await;
                     }

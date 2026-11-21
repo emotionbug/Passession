@@ -806,8 +806,11 @@ fn timeline(value: &mut Value) -> Result<()> {
             ("id", Id),
             ("revertToken?", Json),
             ("type", String),
-            ("status", Enum(&["loading", "completed", "failed"])),
-            ("trigger?", Enum(&["auto", "manual"])),
+            (
+                "status",
+                Enum(&["loading", "completed", "failed", "skipped"]),
+            ),
+            ("trigger?", Enum(&["auto", "manual", "handoff"])),
             ("preTokens?", Number),
         ],
         "plugin" => &[

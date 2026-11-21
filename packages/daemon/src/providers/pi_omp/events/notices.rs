@@ -152,23 +152,6 @@ pub fn runtime(event: &Value) -> Option<Value> {
         {
             Some(json!({"type":"notification","level":event["level"],"message":event["message"]}))
         }
-        "auto_compaction_start" | "auto_compaction_end" => {
-            // A skipped fallback can carry an explanation without having failed.
-            let failed = event["skipped"] != true
-                && (event["aborted"] == true || event["errorMessage"].is_string());
-            let status = if t.ends_with("start") {
-                "loading"
-            } else if failed {
-                "failed"
-            } else {
-                "completed"
-            };
-            let mut item = json!({"type":"compaction","status":status,"trigger":"auto"});
-            if event["result"]["tokensBefore"].is_number() {
-                item["preTokens"] = event["result"]["tokensBefore"].clone();
-            }
-            Some(item)
-        }
         "goal_updated" => {
             let goal = event
                 .get("goal")

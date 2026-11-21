@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- OMP 19: `/handoff` now shows a "Context handed off" marker. OMP 19 hands off by compacting the conversation in place, and before this the agent showed nothing when it worked. When it fails, the agent shows OMP's reason, such as "Handoff generation produced an invalid document", instead of a generic error.
+- OMP: `/compact` with nothing to compact shows "Context compaction skipped" and OMP's reason, such as "Nothing to compact (session too small)", instead of "Context compaction failed" and an error. An automatic compaction that OMP skips is also shown as skipped instead of as compacted. Compaction markers now come from OMP's own start and end events, so compactions that OMP starts itself are shown too.
+- OMP 19: imported, forked and replayed OMP sessions no longer show "[model_usage] Unsupported history record" rows. OMP 19 writes a `model_usage` record for each side request, such as a handoff summary. History also follows OMP's saved active branch (`activeLeafId`), so a side request that finished on an older branch no longer makes the replay show that older branch.
+- Errors from slash commands that the daemon runs for a provider (such as OMP's `/handoff` or `/fork`) now include their cause, for example "Failed to hand off the OMP conversation: Cannot hand off while a response is in progress".
+
 ## 0.13.46 - 2026-11-21
 
 ### Added

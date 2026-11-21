@@ -648,13 +648,15 @@ impl Session {
         let _gate = self.inner.lock_operation().await?;
         let before = self.inner.refresh().await?;
         self.inner.state.lock().unwrap().live = true;
+        let seen = self.inner.compaction_end_count();
         let mut command = json!({"type":"handoff"});
         if !instructions.is_empty() {
             command["customInstructions"] = json!(instructions);
         }
         let result = runtime.request_with_timeout(command, None).await;
-        // 18.22.1 may adopt a new native transcript; newer builds compact in
-        // place. get_state, not savedPath, describes the current live owner.
+        // 18.22.1 may adopt a new native transcript; 19 hands off by compacting in
+        // place and reports it as a manual compaction. get_state, not savedPath,
+        // describes the current live owner.
         let after = self.inner.refresh().await;
         if let Ok(after) = &after
             && (after["sessionId"] != before["sessionId"]
@@ -669,7 +671,12 @@ impl Session {
             }
             self.inner.emit(json!({"type":"thread_started","provider":self.inner.spec.id,"sessionId":after["sessionId"]})).await?;
         }
-        result.context("Failed to hand off the OMP conversation")?;
+        if let Err(error) = result {
+            // A compacting handoff already showed its outcome with OMP's reason.
+            if !self.inner.native_compaction_settled(seen).await {
+                bail!("Failed to hand off the OMP conversation: {error}");
+            }
+        }
         let after = after.context("OMP handed off, but the new session state could not be read")?;
         self.inner.publish_control_state(&after).await
     }

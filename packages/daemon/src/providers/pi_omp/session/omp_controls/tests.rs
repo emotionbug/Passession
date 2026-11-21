@@ -272,7 +272,31 @@ fn fake_native_omp() {
                 );
             }
             "handoff" => match q["customInstructions"].as_str() {
-                Some("in place") => respond(&q, json!({})),
+                Some("in place") => {
+                    // OMP 19: a handoff is a manual compaction in place.
+                    println!(
+                        "{}",
+                        json!({"type":"manual_compaction_start","mode":"handoff"})
+                    );
+                    println!(
+                        "{}",
+                        json!({"type":"manual_compaction_end","aborted":false,"result":{"tokensBefore":42000}})
+                    );
+                    respond(&q, json!({}));
+                }
+                Some("invalid") => {
+                    println!(
+                        "{}",
+                        json!({"type":"manual_compaction_start","mode":"handoff"})
+                    );
+                    println!(
+                        "{}",
+                        json!({"type":"manual_compaction_end","aborted":false,
+                        "errorMessage":"Handoff generation produced an invalid document"})
+                    );
+                    error(&q, "Handoff generation produced an invalid document");
+                }
+                Some("busy") => error(&q, "Cannot hand off while a response is in progress"),
                 Some("legacy") => {
                     native_id = "replacement";
                     file = root.join("replacement.jsonl");
@@ -281,6 +305,15 @@ fn fake_native_omp() {
                 }
                 _ => panic!("unexpected handoff request: {q}"),
             },
+            "compact" => {
+                println!("{}", json!({"type":"manual_compaction_start"}));
+                println!(
+                    "{}",
+                    json!({"type":"manual_compaction_end","aborted":false,"skipped":true,
+                    "errorMessage":"Nothing to compact (session too small)"})
+                );
+                error(&q, "Nothing to compact (session too small)");
+            }
             "set_todos" => {
                 todo_phases = q["phases"].clone();
                 assert_eq!(todo_phases[0]["tasks"][0]["notes"], json!(["preserve"]));
@@ -872,6 +905,42 @@ async fn omp_native_controls_handoff_keeps_working_and_adopts_replacement_identi
     let (root, session, mut events) = open_fixture(false).await;
     until(&mut events, |e| e["type"] == "thread_started").await;
     oob(&session, "/handoff in place").await.unwrap();
+    let marker = until(&mut events, |e| {
+        e["item"]["type"] == "compaction" && e["item"]["status"] == "completed"
+    })
+    .await;
+    assert_eq!(marker["item"]["trigger"], "handoff");
+    // OMP already showed a failed compacting handoff with its reason: no second error.
+    oob(&session, "/handoff invalid").await.unwrap();
+    let reason = until(&mut events, |e| e["item"]["level"] == "error").await;
+    assert_eq!(
+        reason["item"]["message"],
+        "Compaction failed: Handoff generation produced an invalid document"
+    );
+    // A refusal before compacting keeps OMP's reason in the command error.
+    let refused = oob(&session, "/handoff busy").await.unwrap_err();
+    assert_eq!(
+        format!("{refused:#}"),
+        "Failed to hand off the OMP conversation: Cannot hand off while a response is in progress"
+    );
+    // A skipped /compact is not an error.
+    oob(&session, "/compact").await.unwrap();
+    let skipped = until(&mut events, |e| e["item"]["status"] == "skipped").await;
+    assert_eq!(skipped["item"]["trigger"], "manual");
+    let note = until(&mut events, |e| e["item"]["type"] == "notification").await;
+    assert_eq!(note["item"]["level"], "info");
+    assert_eq!(
+        note["item"]["message"],
+        "Nothing to compact (session too small)"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Ok(event) = events.try_recv() {
+        let text = event["item"]["text"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains("Failed to compact"),
+            "duplicate error: {event}"
+        );
+    }
     assert_eq!(session.native_id().as_deref(), Some("source"));
     oob(&session, "/handoff legacy").await.unwrap();
     let thread = until(&mut events, |e| e["type"] == "thread_started").await;

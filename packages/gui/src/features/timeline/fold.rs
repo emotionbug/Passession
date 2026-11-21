@@ -354,9 +354,12 @@ impl TimelineFold {
                 }
             }
             "compaction"
-                if matches!(get(item, "status").as_str(), Some("completed" | "failed")) =>
+                if matches!(
+                    get(item, "status").as_str(),
+                    Some("completed" | "failed" | "skipped")
+                ) =>
             {
-                // A completion or failure settles the pending compaction marker.
+                // Any outcome settles the pending compaction marker.
                 let pending = self.entries.iter().position(|entry| {
                     let existing = get(entry, "item");
                     get(existing, "type") == "compaction" && get(existing, "status") == "loading"

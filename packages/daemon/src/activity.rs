@@ -166,6 +166,12 @@ fn curate_projected<'a>(
             "compaction" if item["status"] == "failed" => {
                 push(&mut entries, "[Compaction failed]".into())
             }
+            "compaction" if item["status"] == "skipped" => {
+                push(&mut entries, "[Compaction skipped]".into())
+            }
+            "compaction" if item["trigger"] == "handoff" => {
+                push(&mut entries, "[Handed off]".into())
+            }
             "compaction" => push(&mut entries, "[Compacted]".into()),
             _ => {}
         }

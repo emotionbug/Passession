@@ -124,6 +124,8 @@ pub struct Mapper {
     /// live child event and the child's file record carry alike, never by a
     /// counter that depends on where reading started.
     native_ids: bool,
+    /// Trigger of the manual compaction OMP started last: its end event omits the mode.
+    manual_compaction: &'static str,
 }
 impl Mapper {
     pub fn new(family: &str, provider: &str) -> Self {
@@ -155,6 +157,7 @@ impl Mapper {
             card_updates: HashMap::new(),
             suppress_next_start: false,
             native_ids: false,
+            manual_compaction: "manual",
         }
     }
     /// For child transcripts, read live or from their file.
@@ -476,14 +479,75 @@ impl Mapper {
         }
         out
     }
+    /// OMP compaction markers. Manual ones (`/compact`, a compacting `/handoff`)
+    /// also show OMP's reason when they fail or have nothing to compact.
+    fn compaction(&mut self, event: &Value) -> Option<Vec<Value>> {
+        let kind = string(&event["type"]);
+        let (manual, start) = match kind {
+            "manual_compaction_start" => (true, true),
+            "manual_compaction_end" => (true, false),
+            "auto_compaction_start" => (false, true),
+            "auto_compaction_end" => (false, false),
+            _ => return None,
+        };
+        if manual && start {
+            self.manual_compaction = if event["mode"] == "handoff" {
+                "handoff"
+            } else {
+                "manual"
+            };
+        }
+        let trigger = if manual {
+            self.manual_compaction
+        } else {
+            "auto"
+        };
+        let reason = event["errorMessage"]
+            .as_str()
+            .filter(|reason| !reason.is_empty());
+        // A skip is benign (nothing to compact, or a fallback to the next method),
+        // even when OMP explains it.
+        let status = if start {
+            "loading"
+        } else if event["skipped"] == true {
+            "skipped"
+        } else if event["aborted"] == true || reason.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        let mut item = json!({"type":"compaction","status":status,"trigger":trigger});
+        if event["result"]["tokensBefore"].is_number() {
+            item["preTokens"] = event["result"]["tokensBefore"].clone();
+        }
+        let mut items = vec![item];
+        if manual && let Some(reason) = reason {
+            items.push(match status {
+                "skipped" => json!({"type":"notification","level":"info","message":reason}),
+                _ if event["aborted"] == true => {
+                    json!({"type":"notification","level":"warning","message":format!("Compaction stopped: {reason}")})
+                }
+                _ => json!({"type":"notification","level":"error","message":format!("Compaction failed: {reason}")}),
+            });
+        }
+        Some(items)
+    }
     pub fn map(&mut self, frame: &Value) -> Vec<Value> {
         let mut out = Vec::new();
         let kind = string(&frame["type"]);
-        if self.family == "omp"
-            && let Some(item) = notices::runtime(frame)
-        {
-            out.push(json!({"type":"timeline","provider":self.provider,"item":item}));
-            return out;
+        if self.family == "omp" {
+            if let Some(items) = self.compaction(frame) {
+                out.extend(
+                    items.into_iter().map(
+                        |item| json!({"type":"timeline","provider":self.provider,"item":item}),
+                    ),
+                );
+                return out;
+            }
+            if let Some(item) = notices::runtime(frame) {
+                out.push(json!({"type":"timeline","provider":self.provider,"item":item}));
+                return out;
+            }
         }
         match kind{
             "command_output" if self.turn.is_some()=>{
@@ -1495,13 +1559,74 @@ mod native_turn_tests {
             status(
                 json!({"type":"auto_compaction_end","skipped":true,"aborted":false,"errorMessage":"falling back to full context"})
             ),
-            "completed"
+            "skipped"
         );
         assert_eq!(
             status(
                 json!({"type":"auto_compaction_end","aborted":false,"willRetry":false,"result":{"tokensBefore":9000}})
             ),
             "completed"
+        );
+    }
+    #[test]
+    fn omp_manual_and_handoff_compactions_show_their_outcome_and_reason() {
+        let mut omp = Mapper::new("omp", "omp");
+        let items = |events: Vec<Value>| -> Vec<Value> {
+            events
+                .into_iter()
+                .map(|event| event["item"].clone())
+                .collect()
+        };
+        let start = items(omp.map(&json!({"type":"manual_compaction_start","mode":"handoff"})));
+        assert_eq!(
+            start,
+            [json!({"type":"compaction","status":"loading","trigger":"handoff"})]
+        );
+        // The end event omits the mode; the marker keeps the handoff trigger.
+        let done = items(
+            omp.map(&json!({"type":"manual_compaction_end","aborted":false,
+            "result":{"tokensBefore":42000}})),
+        );
+        assert_eq!(
+            done,
+            [
+                json!({"type":"compaction","status":"completed","trigger":"handoff","preTokens":42000})
+            ]
+        );
+        omp.map(&json!({"type":"manual_compaction_start"}));
+        let skipped = items(omp.map(
+            &json!({"type":"manual_compaction_end","aborted":false,"skipped":true,
+            "errorMessage":"Nothing to compact (session too small)"}),
+        ));
+        assert_eq!(skipped[0]["status"], "skipped");
+        assert_eq!(skipped[0]["trigger"], "manual");
+        assert_eq!(
+            skipped[1],
+            json!({"type":"notification","level":"info","message":"Nothing to compact (session too small)"})
+        );
+        omp.map(&json!({"type":"manual_compaction_start","mode":"handoff"}));
+        let failed = items(
+            omp.map(&json!({"type":"manual_compaction_end","aborted":false,
+            "errorMessage":"Handoff generation produced an invalid document"})),
+        );
+        assert_eq!(failed[0]["status"], "failed");
+        assert_eq!(failed[1]["level"], "error");
+        assert_eq!(
+            failed[1]["message"],
+            "Compaction failed: Handoff generation produced an invalid document"
+        );
+        // Auto compaction explains nothing extra; pi frames are untouched.
+        assert_eq!(
+            omp.map(
+                &json!({"type":"auto_compaction_end","skipped":true,"errorMessage":"fallback"})
+            )
+            .len(),
+            1
+        );
+        assert!(
+            Mapper::new("pi", "pi")
+                .map(&json!({"type":"manual_compaction_start"}))
+                .is_empty()
         );
     }
 }

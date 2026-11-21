@@ -485,7 +485,7 @@ does not block other prompts, `/bash-stop` or permission answers.
 | `/next-model`, `/next-thinking` | Moves to OMP's next model or thinking level. |
 | `/todo edit <phase.task> <new text>` | Renames a task in OMP's todo list, keeping its status and notes. OMP's other `/todo` actions work as before. |
 | `/fork` | Copies the conversation into a new Passession agent that continues from OMP's own fork, with this agent's approval mode, model, thinking level and features. This agent is not changed. The session must be saved to a file first. Works on Linux, macOS and Windows. |
-| `/handoff [instructions]` | Hands off with an OMP summary. If OMP moves the conversation to a new session file, the agent follows it. |
+| `/handoff [instructions]` | Hands off with an OMP summary. OMP 19 replaces the conversation's context with the handoff summary in place; the agent shows it as a "Context handed off" marker, or OMP's reason if it fails. OMP 18 moves the conversation to a new session file, and the agent follows it. |
 
 OMP commands that would replace or delete the session behind an agent
 (`/fresh`, `/resume`, `/new`, `/delete`, `/branch`, `/rewind`, `/tree`, and
