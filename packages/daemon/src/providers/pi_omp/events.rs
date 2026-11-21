@@ -1427,6 +1427,69 @@ mod tests {
     }
 
     #[test]
+    fn omp_approval_offers_session_and_grant_choices_and_any_tool() {
+        let mut mapper = Mapper::new("omp", "omp");
+        // OMP's always-ask prompt adds a session-wide choice.
+        let events = mapper.map(
+            &json!({"type":"extension_ui_request","id":"w","method":"select",
+            "title":"Allow tool: write\nPath: created.txt\nContent:\ncreated by e2e\n",
+            "options":["Approve","Approve write for this session","Deny"]}),
+        );
+        let request = &events[0]["request"];
+        assert_eq!(request["kind"], "tool");
+        assert_eq!(request["detail"]["filePath"], "created.txt");
+        let labels: Vec<_> = request["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["label"].clone())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                json!("Deny"),
+                json!("Approve"),
+                json!("Approve write for this session")
+            ]
+        );
+        assert_eq!(
+            mapper
+                .permission_response(
+                    "w",
+                    &json!({"behavior":"allow","selectedActionId":"approve_session"})
+                )
+                .unwrap()["value"],
+            "Approve write for this session"
+        );
+        // A bare allow approves this call only; grants keep OMP's labels; any tool is a tool card.
+        let events = mapper.map(&json!({"type":"extension_ui_request","id":"g","method":"select",
+            "title":"Allow tool: grep\nPattern: todo","options":["Approve File","Always Approve File","Approve Once","Deny"]}));
+        assert_eq!(events[0]["request"]["kind"], "tool");
+        assert_eq!(events[0]["request"]["detail"]["type"], "plain_text");
+        assert_eq!(
+            mapper
+                .permission_response("g", &json!({"behavior":"allow"}))
+                .unwrap()["value"],
+            "Approve Once"
+        );
+        let events = mapper.map(&json!({"type":"extension_ui_request","id":"d","method":"select",
+            "title":"Allow tool: bash\nCommand: ls","options":["Approve","Approve bash for this session","Deny"]}));
+        assert_eq!(events[0]["request"]["detail"]["command"], "ls");
+        assert_eq!(
+            mapper
+                .permission_response("d", &json!({"behavior":"deny"}))
+                .unwrap()["value"],
+            "Deny"
+        );
+        // Other selects that merely start with Approve stay questions.
+        let events = mapper.map(
+            &json!({"type":"extension_ui_request","id":"r","method":"select",
+            "title":"Review plan","options":["Approve","Revise","Abort"]}),
+        );
+        assert_ne!(events[0]["request"]["kind"], "tool");
+    }
+
+    #[test]
     fn omp_multi_answer_handles_commas_and_custom_editor() {
         let mut mapper = Mapper::new("omp", "omp");
         mapper.map(&json!({"type":"tool_execution_start","toolCallId":"ask","toolName":"ask","args":{"questions":[{"question":"Pick","multi":true,"options":[{"label":"A, B"},{"label":"C"}]}]}}));

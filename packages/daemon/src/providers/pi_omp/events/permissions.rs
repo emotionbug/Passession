@@ -332,7 +332,17 @@ impl Permissions {
             return Ok(Value::Null);
         }
         if req["metadata"]["toolApproval"] == "omp_rpc_ui_tool_approval" {
-            return Ok(frame(id, json!({"value":if allow{"Approve"}else{"Deny"}})));
+            // The chosen action names one of OMP's own approval labels.
+            let value = if allow {
+                response["selectedActionId"]
+                    .as_str()
+                    .and_then(|action| req["metadata"]["approveValues"][action].as_str())
+                    .or_else(|| req["metadata"]["approveValue"].as_str())
+                    .unwrap_or("Approve")
+            } else {
+                "Deny"
+            };
+            return Ok(frame(id, json!({ "value": value })));
         }
         if req["metadata"]["combinedAskUser"] == "ask_user_select_optional_comment" {
             let Some(selected) = answers["Response"].as_str().filter(|_| allow) else {
@@ -468,8 +478,28 @@ fn generic(event: &Value, provider: &str, label: &str) -> Option<Value> {
         json!({"id":event["id"],"provider":provider,"name":format!("{label} {method}"),"kind":"question","title":title,"input":{"questions":[q]},"metadata":{"extensionUiMethod":method,"answerHeader":"Response"}}),
     )
 }
+/// OMP's tool approval select (`approvalChoiceLabels`): optional per-file or
+/// per-directory grants, "Approve" (or "Approve Once" beside grants), an
+/// optional "Approve <subject> for this session", then "Deny".
 fn approval(e: &Value, provider: &str) -> Option<Value> {
-    if e["method"] != "select" || e["options"] != json!(["Approve", "Deny"]) {
+    if e["method"] != "select" {
+        return None;
+    }
+    let options: Vec<&str> = array(&e["options"])
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let (&"Deny", choices) = options.split_last()? else {
+        return None;
+    };
+    let once = *choices
+        .iter()
+        .find(|choice| matches!(**choice, "Approve" | "Approve Once"))?;
+    if options.len() != array(&e["options"]).len()
+        || !choices
+            .iter()
+            .all(|choice| choice.starts_with("Approve") || choice.starts_with("Always Approve"))
+    {
         return None;
     }
     let title = e["title"].as_str()?;
@@ -521,10 +551,32 @@ fn approval(e: &Value, provider: &str) -> Option<Value> {
                 format!("Path: {path}"),
             )
         }
-        _ => return None,
+        _ => {
+            let summary = body.lines().map(str::trim).find(|line| !line.is_empty());
+            (
+                json!({}),
+                json!({"type":"plain_text","label":name,"text":body.trim()}),
+                summary.unwrap_or_default().to_owned(),
+            )
+        }
     };
+    // Deny, this call only, then OMP's wider approvals in its own order.
+    let mut actions = vec![
+        json!({"id":"deny","label":"Deny","behavior":"deny","variant":"danger","intent":"dismiss"}),
+        json!({"id":"approve","label":once,"behavior":"allow","variant":"primary"}),
+    ];
+    let mut values = serde_json::Map::from_iter([("approve".to_owned(), json!(once))]);
+    for (index, choice) in choices.iter().filter(|choice| **choice != once).enumerate() {
+        let id = if choice.ends_with(" for this session") {
+            "approve_session".to_owned()
+        } else {
+            format!("approve_grant_{index}")
+        };
+        actions.push(json!({"id":id,"label":choice,"behavior":"allow","variant":"secondary"}));
+        values.insert(id, json!(choice));
+    }
     Some(
-        json!({"id":e["id"],"provider":provider,"name":name,"kind":"tool","title":format!("Allow tool: {name}"),"description":description,"detail":detail,"actions":[{"id":"deny","label":"Deny","behavior":"deny","variant":"danger","intent":"dismiss"},{"id":"approve","label":"Approve","behavior":"allow","variant":"primary"}],"metadata":{"extensionUiMethod":"select","toolApproval":"omp_rpc_ui_tool_approval","toolName":name,"toolArgs":args,"approveValue":"Approve","denyValue":"Deny"}}),
+        json!({"id":e["id"],"provider":provider,"name":name,"kind":"tool","title":format!("Allow tool: {name}"),"description":description,"detail":detail,"actions":actions,"metadata":{"extensionUiMethod":"select","toolApproval":"omp_rpc_ui_tool_approval","toolName":name,"toolArgs":args,"approveValue":once,"approveValues":values,"denyValue":"Deny"}}),
     )
 }
 fn valid_rpiv(args: &Value) -> bool {
