@@ -570,33 +570,46 @@ fn title_preamble(entry: &Value) -> bool {
         && entry.get("message").is_none()
 }
 
+/// An absent key selects the entry itself; an explicit null clears the leaf.
+fn captured_active_leaf(entry: &Value) -> Option<Option<&str>> {
+    match entry.get("activeLeafId")? {
+        Value::Null => Some(None),
+        Value::String(id) => Some(Some(id)),
+        _ => None,
+    }
+}
+
 /// Both readers select the same last-wins ID graph, including damaged branches.
 fn active_chain<'a>(
     len: usize,
-    entry: impl Fn(usize) -> (&'a str, Option<&'a str>),
+    entry: impl Fn(usize) -> (&'a str, Option<&'a str>, Option<Option<&'a str>>),
     active_entry_id: Option<&str>,
     mut complete: bool,
 ) -> (Vec<usize>, bool) {
     let by_id: HashMap<_, _> = (0..len).map(|i| (entry(i).0, i)).collect();
     complete &= by_id.len() == len;
-    if let Some(id) = active_entry_id.filter(|id| !id.is_empty())
-        && !by_id.contains_key(id)
-    {
-        return (Vec::new(), false);
-    }
-    let parents: HashSet<_> = (0..len)
-        .filter_map(|i| entry(i).1)
-        .filter(|id| !id.is_empty())
-        .collect();
-    let mut current = active_entry_id
-        .filter(|id| !id.is_empty())
-        .and_then(|id| by_id.get(id).copied())
-        .or_else(|| (0..len).rfind(|&i| !parents.contains(entry(i).0)))
-        .or_else(|| len.checked_sub(1));
+    let mut current = if let Some(id) = active_entry_id.filter(|id| !id.is_empty()) {
+        let Some(&index) = by_id.get(id) else {
+            return (Vec::new(), false);
+        };
+        Some(index)
+    } else {
+        len.checked_sub(1).and_then(|last| match entry(last).2 {
+            None => Some(last),
+            Some(None) => None,
+            Some(Some(leaf)) => by_id.get(leaf).copied().or_else(|| {
+                // A rewrite can remove the leaf captured by a late append.
+                (0..last).rev().find_map(|i| {
+                    let (id, _, captured_leaf) = entry(i);
+                    (captured_leaf.unwrap_or(Some(id)) == Some(id)).then(|| by_id[id])
+                })
+            }),
+        })
+    };
     let mut seen = HashSet::new();
     let mut chain = Vec::new();
     while let Some(index) = current {
-        let (id, parent) = entry(index);
+        let (id, parent, _) = entry(index);
         if id.is_empty() || !seen.insert(id) {
             complete = false;
             break;
@@ -638,6 +651,7 @@ async fn active_entries_with_coverage(
             (
                 entries[i]["id"].as_str().unwrap_or(""),
                 entries[i]["parentId"].as_str(),
+                captured_active_leaf(&entries[i]),
             )
         },
         active_entry_id,
@@ -673,6 +687,9 @@ fn fallback_message(role: &str, value: &Value) -> Value {
 }
 
 fn entry_message(family: &str, entry: &Value) -> Option<Value> {
+    if entry["type"] == "model_usage" {
+        return None;
+    }
     if let Some(role) = entry["message"]["role"].as_str() {
         let message = &entry["message"];
         if matches!(
@@ -748,6 +765,7 @@ fn entry_message(family: &str, entry: &Value) -> Option<Value> {
 struct EntryLocation {
     id: String,
     parent: Option<String>,
+    captured_leaf: Option<Option<String>>,
     offset: u64,
     length: usize,
 }
@@ -788,6 +806,7 @@ pub(super) async fn stream_omp(
                 Some(entry) if entry["id"].is_string() => locations.push(EntryLocation {
                     id: entry["id"].as_str().unwrap().to_owned(),
                     parent: entry["parentId"].as_str().map(str::to_owned),
+                    captured_leaf: captured_active_leaf(&entry).map(|leaf| leaf.map(str::to_owned)),
                     offset,
                     length,
                 }),
@@ -798,7 +817,14 @@ pub(super) async fn stream_omp(
     }
     let (chain, complete) = active_chain(
         locations.len(),
-        |i| (locations[i].id.as_str(), locations[i].parent.as_deref()),
+        |i| {
+            let location = &locations[i];
+            (
+                location.id.as_str(),
+                location.parent.as_deref(),
+                location.captured_leaf.as_ref().map(|leaf| leaf.as_deref()),
+            )
+        },
         active_entry_id,
         complete,
     );
@@ -1590,6 +1616,165 @@ mod tests {
 
     fn lines(entries: &[Value]) -> String {
         entries.iter().map(|entry| format!("{entry}\n")).collect()
+    }
+
+    fn branched_session() -> [Value; 4] {
+        [
+            json!({"type":"session","id":"session","cwd":"/work","timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":text("prompt")}}),
+            json!({"type":"message","id":"old","parentId":"root","message":{"role":"assistant","content":text("old answer")}}),
+            json!({"type":"message","id":"new","parentId":"root","message":{"role":"assistant","content":text("new answer")}}),
+        ]
+    }
+
+    fn usage_entry(id: &str, parent: &str, captured_leaf: Option<Value>) -> Value {
+        let mut entry = json!({"type":"model_usage","id":id,"parentId":parent,
+            "timestamp":"2026-01-01T00:00:01.000Z","runtime":{"version":"19.0.1"},
+            "purpose":"recap","api":"anthropic-messages","provider":"anthropic","model":"claude",
+            "usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,
+                "cost":{"input":0.01,"output":0.01,"cacheRead":0,"cacheWrite":0,"total":0.02}}});
+        if let Some(leaf) = captured_leaf {
+            entry["activeLeafId"] = leaf;
+        }
+        entry
+    }
+
+    async fn assert_replayed_branch(
+        family: &str,
+        entries: &[Value],
+        explicit_leaf: Option<&str>,
+        expected_leaf: Option<&str>,
+        expected_texts: &[&str],
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        fs::write(&path, lines(entries)).await.unwrap();
+        let history = load_with_metadata(family, family, &path, explicit_leaf, &Value::Null)
+            .await
+            .unwrap();
+        assert!(history.complete);
+        assert_eq!(
+            history.descriptor["activeBranchEntryId"],
+            json!(expected_leaf)
+        );
+        let texts: Vec<_> = history
+            .timeline
+            .iter()
+            .map(|item| item["text"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(texts, expected_texts);
+
+        if family == "omp" {
+            let (sink, mut receiver) =
+                EventSink::channel(1, tokio_util::sync::CancellationToken::new());
+            let collect = async move {
+                let mut events = Vec::new();
+                while let Some(event) = receiver.recv().await {
+                    events.push(event);
+                }
+                events
+            };
+            let (result, events) = tokio::join!(
+                stream_omp(family, &path, explicit_leaf, &Value::Null, sink),
+                collect,
+            );
+            assert_eq!(result.unwrap(), (HistoryCoverage::Complete, true));
+            assert_eq!(events, history.events);
+        }
+    }
+
+    #[tokio::test]
+    async fn omp_replay_preserves_captured_branch_after_late_model_usage() {
+        let [header, root, old, new] = branched_session();
+        let entries = [
+            header,
+            root,
+            old,
+            new,
+            usage_entry("late", "old", Some(json!("new"))),
+        ];
+        assert_replayed_branch(
+            "omp",
+            &entries,
+            None,
+            Some("new"),
+            &["prompt", "new answer"],
+        )
+        .await;
+        assert_replayed_branch(
+            "omp",
+            &entries,
+            Some("old"),
+            Some("old"),
+            &["prompt", "old answer"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn omp_replay_falls_back_to_last_self_selected_entry() {
+        let [header, root, old, mut new] = branched_session();
+        new["activeLeafId"] = json!("new");
+        let entries = [
+            header,
+            root,
+            old,
+            new,
+            usage_entry("late", "old", Some(json!("new"))),
+            usage_entry("latest", "old", Some(json!("missing"))),
+        ];
+        assert_replayed_branch(
+            "omp",
+            &entries,
+            None,
+            Some("new"),
+            &["prompt", "new answer"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn omp_replay_respects_cleared_leaf() {
+        let [header, root, old, new] = branched_session();
+        let entries = [
+            header,
+            root,
+            old,
+            new,
+            usage_entry("late", "old", Some(Value::Null)),
+        ];
+        assert_replayed_branch("omp", &entries, None, None, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn omp_replay_skips_in_line_model_usage_rows_without_breaking_the_chain() {
+        let [header, root, _, mut new] = branched_session();
+        new["parentId"] = json!("inline");
+        let entries = [
+            header,
+            root,
+            usage_entry("inline", "root", None),
+            new,
+            usage_entry("leaf", "new", None),
+        ];
+        assert_replayed_branch(
+            "omp",
+            &entries,
+            None,
+            Some("leaf"),
+            &["prompt", "new answer"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_history_without_active_leaf_uses_last_entry() {
+        let [header, root, old, new] = branched_session();
+        // Even if the file is out of parent order, the last entry selects itself.
+        let entries = [header, old, new, root];
+        for family in ["pi", "omp"] {
+            assert_replayed_branch(family, &entries, None, Some("root"), &["prompt"]).await;
+        }
     }
 
     /// An OMP session whose `task` tool spawned `children`, each with an agent name.
