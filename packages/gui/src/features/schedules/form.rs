@@ -826,8 +826,11 @@ impl WaScheduleEditor {
             .empty(empty)
     }
 
-    fn open_select(&self, cx: &mut Cx, token: &str, request: SelectRequest) {
-        self.view.wa_select(id!(select)).open(cx, token, request);
+    /// Pickers drop down from the field that opened them (a sheet on compact windows).
+    fn open_select(&self, cx: &mut Cx, token: &str, request: SelectRequest, field: Rect) {
+        self.view
+            .wa_select(id!(select))
+            .open_at(cx, token, request, field);
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, ctx: &mut UiContext) {
@@ -885,6 +888,7 @@ impl WaScheduleEditor {
                 SelectRequest::new(l("Host"), options)
                     .selected(self.server_id.as_deref())
                     .empty(l("No hosts found")),
+                view.wa_button(id!(host)).rect(cx),
             );
         }
         if view.wa_button(id!(project)).clicked(actions) && self.server_id.is_some() {
@@ -905,14 +909,20 @@ impl WaScheduleEditor {
                 .selected(selected.as_deref())
                 .searchable(l("Search projects..."))
                 .empty(l("No projects found"));
-            self.open_select(cx, "project", request);
+            self.open_select(
+                cx,
+                "project",
+                request,
+                view.wa_button(id!(project)).rect(cx),
+            );
         }
         if view.wa_button(id!(model)).clicked(actions) && self.server_id.is_some() {
             // `refetchIfStale` on open.
             if !self.catalog_loading && (self.catalog_error.is_some() || self.entries.is_empty()) {
                 self.load_catalog(ctx);
             }
-            self.open_select(cx, "model", self.model_request(ctx));
+            let field = view.wa_button(id!(model)).rect(cx);
+            self.open_select(cx, "model", self.model_request(ctx), field);
         }
         if view.wa_button(id!(thinking)).clicked(actions) {
             let extra = t("agentControls.thinking.extraHigh");
@@ -933,7 +943,12 @@ impl WaScheduleEditor {
             if options.len() > 6 {
                 request = request.searchable("");
             }
-            self.open_select(cx, "thinking", request);
+            self.open_select(
+                cx,
+                "thinking",
+                request,
+                view.wa_button(id!(thinking)).rect(cx),
+            );
         }
         if view.wa_button(id!(mode)).clicked(actions) && !self.mode_options().is_empty() {
             let options: Vec<SelectOption> = self
@@ -947,7 +962,7 @@ impl WaScheduleEditor {
             if options.len() > 6 {
                 request = request.searchable("");
             }
-            self.open_select(cx, "mode", request);
+            self.open_select(cx, "mode", request, view.wa_button(id!(mode)).rect(cx));
         }
         if view.wa_button(id!(cadence_preset)).clicked(actions) {
             let options = model::CADENCE_PRESETS
@@ -962,6 +977,7 @@ impl WaScheduleEditor {
                 cx,
                 "cadence",
                 SelectRequest::new(l("Cadence"), options).selected(preset),
+                view.wa_button(id!(cadence_preset)).rect(cx),
             );
         }
         if let Some((token, value)) = view.wa_select(id!(select)).picked(actions) {

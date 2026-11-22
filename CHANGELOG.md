@@ -13,6 +13,9 @@
 
 - When the window is too narrow for the sidebar, the conversation and the Explorer together (under about 710px, such as half of a 1366px laptop screen), the sidebar steps aside while the Explorer is open instead of squeezing all three. The sidebar button brings it back by closing the Explorer, and widening the window shows both again.
 - A tab whose label would be cut to a letter or two shows only its icon, with the full title in its tooltip, and its room goes to the other tabs. The Explorer's default width no longer shows "Fi…" and "Gi…" next to an open Commit tab.
+- On desktop, the New session pickers (project, host, What to launch, model, mode, thinking and provider options), the schedule form's pickers, the Schedules host filter and a schedule's actions menu open as a dropdown under the field you clicked, like a native select, instead of a dialog in the middle of the window. A dropdown opens above its field when there is more room there, closes with one Escape or a click outside, and closes when the window is resized. Phone-sized windows keep the titled bottom sheet.
+- In a window shorter than about 640px, the sidebar's New session, History, Search and Schedules rows fold into one row (New session with icons beside it, or only icons in a narrow sidebar), so the session list keeps about 100px more room.
+- In a sidebar narrower than 260px, sessions are indented one step less and show their age in the subtitle ("mock · Idle · 1d") instead of beside the title, so titles keep more of the row.
 
 ### Fixed
 

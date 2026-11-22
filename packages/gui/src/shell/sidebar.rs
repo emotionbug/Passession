@@ -1058,6 +1058,23 @@ pub fn nav_order(preferences: &Value) -> Vec<&'static str> {
     order
 }
 
+/// Below this sidebar height (a desktop window under ~640px tall) the nav rows fold into one row
+/// so the session list keeps its room.
+const SHORT_SIDEBAR: f64 = 600.0;
+
+/// Below this sidebar width, sessions sit one step less indented (under the project's folder
+/// glyph rather than its name) so their titles keep room.
+const NARROW_SIDEBAR: f64 = 260.0;
+
+fn nav_item(id: &str) -> (&'static str, String) {
+    match id {
+        "new-workspace" => ("plus", tr("sessionNavigation.newSession")),
+        "history" => ("history", tr("sidebar.sections.sessions")),
+        "search" => ("search", tr("sidebar.sections.search")),
+        _ => ("calendar-clock", tr("sidebar.sections.schedules")),
+    }
+}
+
 /// Sidebar column: nav rows, section header + search, session tree, footer.
 fn draw_header(
     shell: &mut PaseoShell,
@@ -1089,46 +1106,64 @@ fn draw_header(
     if !order.is_empty() || compact {
         y += 8.0;
         let mut ui = make_ui(shell);
-        for (index, id) in order.iter().enumerate() {
-            let (icon, label) = match *id {
-                "new-workspace" => ("plus", tr("sessionNavigation.newSession")),
-                "history" => ("history", tr("sidebar.sections.sessions")),
-                "search" => ("search", tr("sidebar.sections.search")),
-                _ => ("calendar-clock", tr("sidebar.sections.schedules")),
-            };
-            let row_w = if compact && index == 0 {
-                r.size.x - 48.0
+        if !compact && r.size.y < SHORT_SIDEBAR {
+            // Short window: the first row keeps its label and the rest become icons beside
+            // it; a sidebar too narrow for the label shows every item as an icon.
+            const ICON: f64 = 32.0;
+            let icons_w = (order.len() - 1) as f64 * (ICON + 2.0) + 6.0;
+            let labelled = r.size.x - icons_w >= 140.0;
+            let (mut x, icons) = if labelled {
+                let (icon, label) = nav_item(order[0]);
+                let row = rect(r.pos.x, y, r.size.x - icons_w, nav_h);
+                header_row(&mut ui, cx, row, &format!("nav:{}", order[0]), icon, &label);
+                (r.pos.x + r.size.x - icons_w, &order[1..])
             } else {
-                r.size.x
+                (r.pos.x + 8.0, &order[..])
             };
-            header_row(
-                &mut ui,
-                cx,
-                rect(r.pos.x, y, row_w, nav_h),
-                &format!("nav:{id}"),
-                icon,
-                &label,
-            );
-            if compact && index == 0 {
-                let close = rect(
-                    r.pos.x + r.size.x - 40.0,
-                    y + (nav_h - 32.0) * 0.5,
-                    32.0,
-                    32.0,
-                );
-                ui.icon_button(
-                    cx,
-                    close,
-                    "nav:close",
-                    "x",
-                    16.0,
-                    16.0,
-                    &tr("sidebar.actions.closeSidebar"),
-                );
-                // Phone: a 44px square at the row's trailing edge.
-                ui.hit(rect(r.pos.x + r.size.x - 44.0, y, 44.0, nav_h), "nav:close");
+            for id in icons {
+                let (icon, label) = nav_item(id);
+                let button = rect(x, y + (nav_h - ICON) * 0.5, ICON, ICON);
+                ui.icon_button(cx, button, &format!("nav:{id}"), icon, 16.0, 6.0, &label);
+                x += ICON + 2.0;
             }
             y += nav_h + 2.0;
+        } else {
+            for (index, id) in order.iter().enumerate() {
+                let (icon, label) = nav_item(id);
+                let row_w = if compact && index == 0 {
+                    r.size.x - 48.0
+                } else {
+                    r.size.x
+                };
+                header_row(
+                    &mut ui,
+                    cx,
+                    rect(r.pos.x, y, row_w, nav_h),
+                    &format!("nav:{id}"),
+                    icon,
+                    &label,
+                );
+                if compact && index == 0 {
+                    let close = rect(
+                        r.pos.x + r.size.x - 40.0,
+                        y + (nav_h - 32.0) * 0.5,
+                        32.0,
+                        32.0,
+                    );
+                    ui.icon_button(
+                        cx,
+                        close,
+                        "nav:close",
+                        "x",
+                        16.0,
+                        16.0,
+                        &tr("sidebar.actions.closeSidebar"),
+                    );
+                    // Phone: a 44px square at the row's trailing edge.
+                    ui.hit(rect(r.pos.x + r.size.x - 44.0, y, 44.0, nav_h), "nav:close");
+                }
+                y += nav_h + 2.0;
+            }
         }
         y += 4.0;
         ui.painter.hline(cx, r.pos.x, y, r.size.x, p.border);
@@ -1420,6 +1455,7 @@ fn draw_tree(
     let session_h = session_metrics.height(0.0, 7.0, 14.0);
     let button_h = theme::control_height(ControlSize::Sm);
     let mut any = false;
+    let session_x = if w < NARROW_SIDEBAR { 28.0 } else { 48.0 };
     // Position in the session-switch order (Ctrl+1–9), counted like `navigation_sessions`.
     let mut nav_index = 0usize;
     for host_group in &tree.hosts {
@@ -1683,7 +1719,7 @@ fn draw_tree(
                 let agent = session.agent();
                 let index = nav_index;
                 nav_index += 1;
-                let row = rect(x0 + 48.0, y, w - 56.0, session_h);
+                let row = rect(x0 + session_x, y, w - session_x - 8.0, session_h);
                 y += row.size.y;
                 // Skip layout outside the retained strip, not at the transient viewport edge.
                 if row.pos.y + row.size.y <= band.pos.y || row.pos.y >= band.pos.y + band.size.y {
@@ -1707,10 +1743,14 @@ fn draw_tree(
                     title.to_string()
                 };
                 let hint = hints && index < 9;
-                let trailing = if hint {
+                let age =
+                    compact_time_ago(j::text_or(agent, "updatedAt", j::text(agent, "createdAt")));
+                // A narrow sidebar moves the age into the subtitle so the title keeps the row.
+                let age_inline = w < NARROW_SIDEBAR;
+                let trailing = if hint || age_inline {
                     String::new()
                 } else {
-                    compact_time_ago(j::text_or(agent, "updatedAt", j::text(agent, "createdAt")))
+                    age.clone()
                 };
                 let trailing_w = if hovered {
                     32.0
@@ -1757,16 +1797,16 @@ fn draw_tree(
                 );
                 ui.text(cx, slots.title, title_spec, &title);
                 let sub = ui.spec(Font::Regular, 12.0, p.muted);
-                ui.text(
-                    cx,
-                    slots.subtitle,
-                    sub,
-                    &format!(
-                        "{} · {}",
-                        j::text(agent, "provider"),
-                        agent_status_label(agent, bucket)
-                    ),
+                let mut subtitle = format!(
+                    "{} · {}",
+                    j::text(agent, "provider"),
+                    agent_status_label(agent, bucket)
                 );
+                if age_inline && !age.is_empty() {
+                    subtitle.push_str(" · ");
+                    subtitle.push_str(&age);
+                }
+                ui.text(cx, slots.subtitle, sub, &subtitle);
                 ui.control(
                     cx,
                     row,
@@ -1796,7 +1836,7 @@ fn draw_tree(
                 }
             }
             for terminal in terms {
-                let row = rect(x0 + 48.0, y, w - 56.0, session_h);
+                let row = rect(x0 + session_x, y, w - session_x - 8.0, session_h);
                 y += row.size.y;
                 if row.pos.y + row.size.y <= band.pos.y || row.pos.y >= band.pos.y + band.size.y {
                     continue;

@@ -401,7 +401,7 @@ impl SchedulesPanel {
             .open(cx, &hosts, schedule);
     }
 
-    fn open_kebab(&mut self, cx: &mut Cx, ctx: &UiContext, schedule: &Value) {
+    fn open_kebab(&mut self, cx: &mut Cx, ctx: &UiContext, schedule: &Value, anchor: Rect) {
         let state = self.state(ctx, schedule);
         let product = model::product_name(schedule);
         let lower = model::product_name_lower(schedule);
@@ -478,10 +478,11 @@ impl SchedulesPanel {
                 .enabled(can_manage && !busy.contains("delete")),
         );
         let title = lf("{product} actions", &[("product", product)]);
-        self.view.wa_select(id!(select)).open(
+        self.view.wa_select(id!(select)).open_at(
             cx,
             &format!("row:{}", row_key(schedule)),
             SelectRequest::new(title, options),
+            anchor,
         );
     }
 
@@ -515,11 +516,12 @@ impl SchedulesPanel {
             options.extend(host::hosts(&ctx.state).iter().map(|h| {
                 SelectOption::new(h.id(), h.display_label()).leading(Leading::Status(h.status()))
             }));
-            view.wa_select(id!(select)).open(
+            view.wa_select(id!(select)).open_at(
                 cx,
                 "host-filter",
                 SelectRequest::new(l("Filter by host"), options)
                     .selected(Some(&self.selected_host)),
+                view.wa_button(id!(host_filter)).rect(cx),
             );
         }
         if view.wa_schedule_editor(id!(editor)).saved(actions) {
@@ -528,7 +530,8 @@ impl SchedulesPanel {
         let rows = view.wa_repeat(id!(rows));
         if let Some(index) = clicked_in(&rows, id!(kebab), actions) {
             if let Some(schedule) = self.visible_rows.get(index).cloned() {
-                self.open_kebab(cx, ctx, &schedule);
+                let anchor = rows.items()[index].wa_button(id!(kebab)).rect(cx);
+                self.open_kebab(cx, ctx, &schedule, anchor);
             }
         } else if let Some(index) = rows
             .items()

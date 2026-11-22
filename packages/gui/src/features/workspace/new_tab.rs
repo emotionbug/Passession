@@ -2040,13 +2040,21 @@ impl WaNewTabView {
             .empty(empty)
     }
 
-    fn pick_models(&mut self, cx: &mut Cx) {
-        self.view
-            .wa_select(id!(select))
-            .open(cx, "model", self.model_request());
+    /// Pickers drop down from the field that opened them on wide layouts; without a field
+    /// (a choice inside the compact controls sheet) they open as a sheet.
+    fn open_picker(&self, cx: &mut Cx, token: &str, request: SelectRequest, anchor: Option<Rect>) {
+        let select = self.view.wa_select(id!(select));
+        match anchor.filter(|anchor| anchor.size.x > 0.0) {
+            Some(anchor) => select.open_at(cx, token, request, anchor),
+            None => select.open(cx, token, request),
+        }
     }
 
-    fn pick_mode(&mut self, cx: &mut Cx) {
+    fn pick_models(&mut self, cx: &mut Cx, anchor: Option<Rect>) {
+        self.open_picker(cx, "model", self.model_request(), anchor);
+    }
+
+    fn pick_mode(&mut self, cx: &mut Cx, anchor: Option<Rect>) {
         let modes = self
             .entry()
             .map(|e| array_of(e, "modes").to_vec())
@@ -2055,15 +2063,16 @@ impl WaNewTabView {
             .iter()
             .map(|m| SelectOption::new(str_of(m, "id"), controls_model::format_agent_mode_label(m)))
             .collect();
-        self.view.wa_select(id!(select)).open(
+        self.open_picker(
             cx,
             "mode",
             SelectRequest::new(l("Select mode"), options)
                 .selected(Some(str_of(&self.config, "modeId"))),
+            anchor,
         );
     }
 
-    fn pick_thinking(&mut self, cx: &mut Cx) {
+    fn pick_thinking(&mut self, cx: &mut Cx, anchor: Option<Rect>) {
         let options_list = self
             .current_model()
             .map(|m| array_of(&m, "thinkingOptions").to_vec())
@@ -2078,16 +2087,23 @@ impl WaNewTabView {
                 )
             })
             .collect();
-        self.view.wa_select(id!(select)).open(
+        self.open_picker(
             cx,
             "thinking",
             SelectRequest::new(l("Select thinking"), options)
                 .selected(Some(str_of(&self.config, "thinkingOptionId"))),
+            anchor,
         );
     }
 
     /// A toggle feature flips at once; a select feature opens its options.
-    fn pick_feature(&mut self, cx: &mut Cx, ctx: &mut UiContext, feature: &Value) {
+    fn pick_feature(
+        &mut self,
+        cx: &mut Cx,
+        ctx: &mut UiContext,
+        feature: &Value,
+        anchor: Option<Rect>,
+    ) {
         let id = str_of(feature, "id").to_owned();
         if str_of(feature, "type") == "toggle" {
             let current = model::feature_value(&self.config, feature) == &Value::Bool(true);
@@ -2102,10 +2118,11 @@ impl WaNewTabView {
                 .as_str()
                 .map(str::to_owned);
             let title = str_or(feature, "label", &id).to_owned();
-            self.view.wa_select(id!(select)).open(
+            self.open_picker(
                 cx,
                 &format!("feature:{id}"),
                 SelectRequest::new(title, options).selected(selected.as_deref()),
+                anchor,
             );
         }
         self.presentation_dirty = true;
@@ -2450,7 +2467,8 @@ impl WaNewTabView {
             options.push(SelectOption::new("\u{0}add-host", l("Add host")).glyph("plus"));
             let request = SelectRequest::new(t("newWorkspace.fields.host"), options)
                 .selected(Some(&self.target.host_id));
-            view.wa_select(id!(select)).open(cx, "host", request);
+            let anchor = view.wa_trigger(id!(host_field)).rect(cx);
+            self.open_picker(cx, "host", request, Some(anchor));
         }
         if view.wa_trigger(id!(launch_field)).clicked(actions) && !pending_intent && !self.busy {
             // `LaunchControl`: Chat and the blank Terminal. Terminal profiles and their Manage
@@ -2463,7 +2481,8 @@ impl WaNewTabView {
             let selected = if self.terminal() { "terminal" } else { "chat" };
             let request = SelectRequest::new(t("newWorkspace.launch.title"), options)
                 .selected(Some(selected));
-            view.wa_select(id!(select)).open(cx, "launch", request);
+            let anchor = view.wa_trigger(id!(launch_field)).rect(cx);
+            self.open_picker(cx, "launch", request, Some(anchor));
         }
         // Composer toolbar.
         if view.wa_button(id!(attach)).clicked(actions) && self.connected && !locked {
@@ -2508,26 +2527,30 @@ impl WaNewTabView {
             }));
         }
         if view.surface(id!(model_trigger)).clicked(actions) && !locked {
+            let anchor = view.widget(id!(model_trigger)).area().rect(cx);
             // Compact hides the thinking, mode and feature buttons: the trigger lists them.
             match self.compact.then(|| self.controls_request()).flatten() {
                 Some(request) => view.wa_select(id!(select)).open(cx, "controls", request),
-                None => self.pick_models(cx),
+                None => self.pick_models(cx, Some(anchor)),
             }
         }
         if view.wa_button(id!(mode)).clicked(actions) && !locked {
-            self.pick_mode(cx);
+            let anchor = view.wa_button(id!(mode)).rect(cx);
+            self.pick_mode(cx, Some(anchor));
         }
         if view.wa_button(id!(thinking)).clicked(actions) && !locked {
-            self.pick_thinking(cx);
+            let anchor = view.wa_button(id!(thinking)).rect(cx);
+            self.pick_thinking(cx, Some(anchor));
         }
         let features = view.wa_repeat(id!(features));
-        if let Some(index) = features
-            .items()
+        let items = features.items();
+        if let Some(index) = items
             .iter()
             .position(|item| item.as_wa_button().clicked(actions))
             && let Some(feature) = self.visible_features().get(index).cloned()
         {
-            self.pick_feature(cx, ctx, &feature);
+            let anchor = items[index].as_wa_button().rect(cx);
+            self.pick_feature(cx, ctx, &feature, Some(anchor));
         }
         let images = view.wa_repeat(id!(images));
         if let Some(index) = images
@@ -2568,11 +2591,13 @@ impl WaNewTabView {
                     SelectOption::new(*id, t(key)).glyph(glyph)
                 })
                 .collect();
-            view.wa_select(id!(select)).open(
+            let anchor = view.wa_button(id!(source)).rect(cx);
+            self.open_picker(
                 cx,
                 "source",
                 SelectRequest::new(t("newWorkspace.addProject.source"), options)
                     .selected(Some(&self.source)),
+                Some(anchor),
             );
         }
         if view.wa_button(id!(browse)).clicked(actions) {
@@ -2664,9 +2689,8 @@ impl WaNewTabView {
             .selected(Some(self.path.trim()))
             .searchable(l("Search projects"))
             .empty(l("No projects available."));
-        self.view
-            .wa_select(id!(select))
-            .open(cx, "project", request);
+        let anchor = self.root().wa_trigger(id!(project_field)).rect(cx);
+        self.open_picker(cx, "project", request, Some(anchor));
     }
 
     fn open_browser(&mut self, cx: &mut Cx, compact: bool) {
@@ -2827,9 +2851,9 @@ impl WaNewTabView {
                 self.change_config(ctx, next);
             }
             "controls" => match value.as_str() {
-                "model" => self.pick_models(cx),
-                "thinking" => self.pick_thinking(cx),
-                "mode" => self.pick_mode(cx),
+                "model" => self.pick_models(cx, None),
+                "thinking" => self.pick_thinking(cx, None),
+                "mode" => self.pick_mode(cx, None),
                 other => {
                     let id = other.strip_prefix("feature:").unwrap_or_default();
                     if let Some(feature) = self
@@ -2837,7 +2861,7 @@ impl WaNewTabView {
                         .into_iter()
                         .find(|f| str_of(f, "id") == id)
                     {
-                        self.pick_feature(cx, ctx, &feature);
+                        self.pick_feature(cx, ctx, &feature, None);
                     }
                 }
             },

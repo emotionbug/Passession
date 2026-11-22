@@ -217,6 +217,9 @@ pub struct WaSelect {
     open: bool,
     #[rust]
     pending_focus: bool,
+    /// Opened from a field: a dropdown on wide layouts.
+    #[rust]
+    anchored: bool,
 }
 
 impl WaSelect {
@@ -227,13 +230,18 @@ impl WaSelect {
         self.view
             .widget(id!(search_wrap))
             .set_visible(cx, request.searchable);
-        let rows = request.options.len()
-            + request
-                .options
-                .iter()
-                .filter(|o| o.separator_before)
-                .count();
-        let height = (rows.max(1) as f64 * 40.0).min(360.0);
+        // Rows are a label line (33px at the default text size) plus a description line, so a
+        // short list ends at its last option instead of leaving a blank band.
+        let scale = crate::theme::current_typography().ui_size(14.0) / 14.0;
+        let height = request
+            .options
+            .iter()
+            .map(|o| {
+                let row = if o.description.is_empty() { 36.0 } else { 52.0 };
+                row * scale + if o.separator_before { 9.0 } else { 0.0 }
+            })
+            .sum::<f64>()
+            .clamp(40.0, 360.0);
         self.view
             .portal_list(id!(list))
             .apply_over(cx, live! { height: (height) });
@@ -411,6 +419,15 @@ impl Widget for WaSelect {
         self.view
             .widget(id!(sheet.header.title))
             .set_text(cx, &self.request.title);
+        // A dropdown is its own title: the field it hangs from names it. Compact windows
+        // present the same picker as a titled sheet.
+        let dialog = !self.anchored
+            || scope
+                .data
+                .get::<crate::common::UiContext>()
+                .is_none_or(|ui| ui.compact);
+        self.view.widget(id!(sheet.header)).set_visible(cx, dialog);
+        self.view.widget(id!(sheet.rule)).set_visible(cx, dialog);
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -516,8 +533,29 @@ impl Widget for WaSelect {
 }
 
 impl WaSelectRef {
-    /// Opens the picker for `request`; `token` comes back with the answer.
+    /// Opens the picker for `request` as a dialog; `token` comes back with the answer.
     pub fn open(&self, cx: &mut Cx, token: &str, request: SelectRequest) {
+        self.present(cx, token, request, None);
+    }
+
+    /// Opens the picker as a dropdown from its field (`anchor`, window coordinates) on wide
+    /// layouts, like a native select; compact windows keep the sheet.
+    pub fn open_at(&self, cx: &mut Cx, token: &str, request: SelectRequest, anchor: Rect) {
+        let width = if request.searchable {
+            420.0
+        } else {
+            anchor.size.x.max(260.0)
+        };
+        self.present(cx, token, request, Some((anchor, width)));
+    }
+
+    fn present(
+        &self,
+        cx: &mut Cx,
+        token: &str,
+        request: SelectRequest,
+        anchor: Option<(Rect, f64)>,
+    ) {
         let Some(mut inner) = self.borrow_mut() else {
             return;
         };
@@ -528,7 +566,10 @@ impl WaSelectRef {
         inner.apply_request(cx, request);
         inner.open = true;
         inner.pending_focus = true;
-        inner.view.wa_modal(id!(modal)).open(cx);
+        inner.anchored = anchor.is_some();
+        let modal = inner.view.wa_modal(id!(modal));
+        modal.set_anchor(anchor);
+        modal.open(cx);
         inner.view.redraw(cx);
     }
 

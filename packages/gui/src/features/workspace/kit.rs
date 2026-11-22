@@ -237,7 +237,7 @@ live_design! {
             title = <WaMedium> { margin: { top: 6. } }
             close = <WaIconButton> { icon: "x", radius: 8., width: 32., height: 32. }
         }
-        <WaSheetRule> {}
+        rule = <WaSheetRule> {}
     }
 }
 
@@ -2096,6 +2096,18 @@ pub struct WaModal {
     /// A text field inside the content holds key focus: Escape ends its edit first.
     #[rust]
     field_focus: bool,
+    /// On wide layouts, a picker opened from a field drops down from that field (window
+    /// coordinates, and the dropdown's width) instead of a centred dialog.
+    #[rust]
+    anchor: Option<(Rect, f64)>,
+    /// The last draw placed this modal as a dropdown (the event scope may lack the layout).
+    #[rust]
+    dropped: bool,
+    /// The window size the dropdown was first placed in; a resize leaves its field elsewhere.
+    #[rust]
+    dropped_size: Option<DVec2>,
+    #[rust]
+    dropped_stale: bool,
 }
 
 impl LiveHook for WaModal {
@@ -2125,6 +2137,17 @@ impl Widget for WaModal {
         if !self.opened {
             return;
         }
+        // A dropdown hangs from its field: once the window resizes the field has moved, so the
+        // dropdown closes like a native menu (on the next frame its draw asked for).
+        if self.dropped_stale {
+            cx.widget_action(
+                self.content.widget_uid(),
+                &scope.path,
+                ModalAction::Dismissed,
+            );
+            self.close(cx);
+            return;
+        }
         let area = self.draw_bg.area();
         if !modal_is_top(self.widget_uid(), self.window_id.as_deref()) {
             cx.sweep_unlock(area);
@@ -2140,9 +2163,9 @@ impl Widget for WaModal {
                     .borrow_mut()
                     .claim_escape(self.window_id.as_deref(), event)
             }) {
-                if self.field_focus {
+                if self.field_focus && !self.dropped {
                     // The focused field gets this Escape (cancelling its edit); the next
-                    // one dismisses the modal.
+                    // one dismisses the modal. A dropdown's filter closes with the dropdown.
                     self.field_focus = false;
                     self.content.handle_event(cx, event, scope);
                     cx.set_key_focus(Area::Empty);
@@ -2207,8 +2230,25 @@ impl Widget for WaModal {
                     bottom: insets.bottom_occlusion() + 12.0,
                 };
             }
+            self.dropped = self.opened && self.dropdown(scope).is_some();
+            if self.dropped {
+                let size = cx.current_pass_size();
+                match self.dropped_size {
+                    None => self.dropped_size = Some(size),
+                    Some(placed) if placed != size && !self.dropped_stale => {
+                        self.dropped_stale = true;
+                        cx.new_next_frame();
+                    }
+                    Some(_) => {}
+                }
+            }
+            if self.dropped {
+                // A dropdown is placed at its field; the dialog's centring would move it.
+                layout.align = Align::default();
+                layout.padding = Padding::default();
+            }
             self.draw_bg.begin(cx, self.walk, self.layout);
-            if self.opened {
+            if self.opened && !self.dropped {
                 let _ = self
                     .bg_view
                     .draw_walk(cx, scope, Walk::size(Size::Fill, Size::Fill));
@@ -2234,10 +2274,21 @@ impl Widget for WaModal {
                 }
                 let insets = crate::shell::platform::safe_insets();
                 let size = cx.current_pass_size();
-                let available = dvec2(
+                let dropdown = self.dropdown(scope);
+                let mut available = dvec2(
                     (size.x - insets.left - insets.right - 24.0).max(0.0),
                     (size.y - insets.top - insets.bottom_occlusion() - 24.0).max(0.0),
                 );
+                let bounds = Rect {
+                    pos: dvec2(insets.left + 12.0, insets.top + 12.0),
+                    size: available,
+                };
+                let frame = dropdown.map(|(anchor, width)| {
+                    dropdown_frame(anchor, width, self.sheet_height, bounds)
+                });
+                if let Some((_, room)) = frame {
+                    available.y = room;
+                }
                 if let Size::Fixed(height) = body.walk(cx).height {
                     // A select can author a new preferred height when its options change.
                     if self
@@ -2256,15 +2307,21 @@ impl Widget for WaModal {
                     }
                     self.applied_body_height = Some(constrained);
                 }
-                content_walk.width = Size::Fixed(preferred.min(available.x).max(0.0));
-                content_walk.height = Size::Fixed(
-                    if self.sheet_height > 0.0 {
-                        self.sheet_height.min(available.y)
-                    } else {
-                        available.y
-                    }
-                    .max(0.0),
-                );
+                if let Some((frame, _)) = frame {
+                    content_walk.width = Size::Fixed(frame.size.x);
+                    content_walk.height = Size::Fixed(frame.size.y);
+                    content_walk.abs_pos = Some(frame.pos);
+                } else {
+                    content_walk.width = Size::Fixed(preferred.min(available.x).max(0.0));
+                    content_walk.height = Size::Fixed(
+                        if self.sheet_height > 0.0 {
+                            self.sheet_height.min(available.y)
+                        } else {
+                            available.y
+                        }
+                        .max(0.0),
+                    );
+                }
             }
             self.content.draw_walk(cx, scope, content_walk)?;
             if !sheet.is_empty() {
@@ -2303,6 +2360,13 @@ impl Widget for WaModal {
 }
 
 impl WaModal {
+    /// The dropdown placement for this draw: only wide layouts drop down from a field; compact
+    /// windows keep the bottom-sheet dialog.
+    fn dropdown(&self, scope: &mut Scope) -> Option<(Rect, f64)> {
+        let compact = scope.data.get::<UiContext>().is_none_or(|ui| ui.compact);
+        self.anchor.filter(|_| !compact)
+    }
+
     fn sync_window(&mut self, scope: &mut Scope) {
         let Some(ui) = scope.data.get::<UiContext>() else {
             return;
@@ -2360,6 +2424,8 @@ impl WaModal {
 
     pub fn open(&mut self, cx: &mut Cx) {
         self.opened = true;
+        self.dropped_size = None;
+        self.dropped_stale = false;
         let uid = self.widget_uid();
         MODAL_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
@@ -2396,6 +2462,48 @@ impl Drop for WaModal {
         let uid = self.widget_uid();
         let _ = MODAL_STACK.try_with(|stack| stack.borrow_mut().remove(uid));
     }
+}
+
+/// Frame of a dropdown `width` wide whose sheet measures `natural` (0 until measured), hanging
+/// from `anchor` inside `bounds`, plus the height it may grow to. It opens below its field unless
+/// the room there is short and there is more above, and lines up with the field's nearer edge.
+fn dropdown_frame(anchor: Rect, width: f64, natural: f64, bounds: Rect) -> (Rect, f64) {
+    const GAP: f64 = 4.0;
+    let below = bounds.pos.y + bounds.size.y - (anchor.pos.y + anchor.size.y + GAP);
+    let over = anchor.pos.y - GAP - bounds.pos.y;
+    let wanted = if natural > 0.0 {
+        natural.min(240.0)
+    } else {
+        240.0
+    };
+    let above = below < wanted && over > below;
+    let room = if above { over } else { below }.max(0.0);
+    let height = if natural > 0.0 {
+        natural.min(room)
+    } else {
+        room
+    };
+    let width = width.min(bounds.size.x).max(0.0);
+    let right_half = anchor.pos.x + anchor.size.x / 2.0 > bounds.pos.x + bounds.size.x / 2.0;
+    let x = if right_half {
+        anchor.pos.x + anchor.size.x - width
+    } else {
+        anchor.pos.x
+    };
+    let x = x.clamp(
+        bounds.pos.x,
+        (bounds.pos.x + bounds.size.x - width).max(bounds.pos.x),
+    );
+    let y = if above {
+        anchor.pos.y - GAP - height
+    } else {
+        anchor.pos.y + anchor.size.y + GAP
+    };
+    let frame = Rect {
+        pos: dvec2(x, y),
+        size: dvec2(width, height),
+    };
+    (frame, room)
 }
 
 struct ModalEntry {
@@ -2472,6 +2580,14 @@ impl WaModalRef {
     pub fn open(&self, cx: &mut Cx) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.open(cx);
+        }
+    }
+
+    /// Drop down from `anchor` (window coordinates) at `width` on wide layouts; `None` keeps the
+    /// centred dialog.
+    pub fn set_anchor(&self, anchor: Option<(Rect, f64)>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.anchor = anchor;
         }
     }
 
@@ -2624,6 +2740,30 @@ mod modal_input_tests {
             })
         ));
         assert!(stack.claim_escape(Some("main"), &escape(4.0, false)));
+    }
+
+    #[test]
+    fn a_dropdown_hangs_from_its_field_and_stays_on_screen() {
+        let rect = |x, y, w, h| Rect {
+            pos: dvec2(x, y),
+            size: dvec2(w, h),
+        };
+        let bounds = rect(12.0, 12.0, 1416.0, 876.0);
+        // Below a left field, lined up with its left edge, at its measured height.
+        let (frame, room) = dropdown_frame(rect(490.0, 388.0, 60.0, 28.0), 420.0, 230.0, bounds);
+        assert_eq!(frame, rect(490.0, 420.0, 420.0, 230.0));
+        assert_eq!(room, 468.0);
+        // A field in the right half lines up with its right edge.
+        let (frame, _) = dropdown_frame(rect(1190.0, 388.0, 86.0, 28.0), 260.0, 80.0, bounds);
+        assert_eq!(frame.pos.x, 1016.0);
+        // Short room below and more above: it opens upward, ending just above the field.
+        let (frame, room) = dropdown_frame(rect(500.0, 760.0, 120.0, 30.0), 420.0, 300.0, bounds);
+        assert_eq!(room, 744.0);
+        assert_eq!(frame.pos.y + frame.size.y, 756.0);
+        // Narrow windows clamp the dropdown inside the margins.
+        let narrow = rect(12.0, 12.0, 300.0, 600.0);
+        let (frame, _) = dropdown_frame(rect(250.0, 50.0, 40.0, 28.0), 420.0, 120.0, narrow);
+        assert_eq!((frame.pos.x, frame.size.x), (12.0, 300.0));
     }
 
     #[test]
