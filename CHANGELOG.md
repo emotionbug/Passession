@@ -2,8 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Claude: permission cards offer Claude's own "don't ask again" choices next to Allow and Deny, such as "Allow all edits for this session", "Always allow Bash(npm test) in this project" and "Allow access to <folder> for this session". Before this, the card offered only Allow and Deny.
+- Codex: command and file-change approval cards offer "Allow this command for this session" (or "Allow changes to these files for this session"), and "Always allow commands starting with `…`" when Codex proposes a rule.
+- Claude: while Claude retries a failed API request (for example when the API is overloaded or the key is rejected), the agent shows a "Claude API retry 2/10" row with the error and the wait time. Before this, the agent showed nothing for the minutes Claude spent retrying.
+- `paseo permit allow` and `paseo permit deny` accept `--action <id>` to pick one of a request's own choices, and `paseo permit ls --json` lists each request's choices.
+
 ### Fixed
 
+- Claude: an API error that ends a turn, such as "Invalid API key", now fails the turn and shows it as an error. Before this, the turn showed the error text as a normal reply and was reported as completed.
+- Claude: approving a plan now shows the mode Claude switched to (Accept Edits, or the mode the agent used before planning). Before this, the agent kept showing Plan Mode. Mode changes that Claude reports itself are also shown.
 - OMP 19: `/handoff` now shows a "Context handed off" marker. OMP 19 hands off by compacting the conversation in place, and before this the agent showed nothing when it worked. When it fails, the agent shows OMP's reason, such as "Handoff generation produced an invalid document", instead of a generic error.
 - OMP: `/compact` with nothing to compact shows "Context compaction skipped" and OMP's reason, such as "Nothing to compact (session too small)", instead of "Context compaction failed" and an error. An automatic compaction that OMP skips is also shown as skipped instead of as compacted. Compaction markers now come from OMP's own start and end events, so compactions that OMP starts itself are shown too.
 - OMP 19: imported, forked and replayed OMP sessions no longer show "[model_usage] Unsupported history record" rows. OMP 19 writes a `model_usage` record for each side request, such as a handoff summary. History also follows OMP's saved active branch (`activeLeafId`), so a side request that finished on an older branch no longer makes the replay show that older branch.

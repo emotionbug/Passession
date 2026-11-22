@@ -33,12 +33,14 @@ pub fn commands() -> Vec<Command> {
                     .arg(positional("agent", true))
                     .arg(positional("request", false))
                     .arg(switch("all", "all"))
-                    .arg(option("input", "input")),
+                    .arg(option("input", "input"))
+                    .arg(option("action", "action")),
                 Command::new("deny")
                     .arg(positional("agent", true))
                     .arg(positional("request", false))
                     .arg(switch("all", "all"))
                     .arg(option("message", "message"))
+                    .arg(option("action", "action"))
                     .arg(switch("interrupt", "interrupt")),
             ]),
         Command::new("usage")
@@ -197,7 +199,7 @@ async fn permit(
             false,
         )
         .await?;
-        let rows:Vec<Value>=agents.iter().flat_map(|agent|array(&agent["pendingPermissions"]).iter().map(move|p|json!({"id":p["id"],"agentId":agent["id"],"agentShortId":short(text(agent,"id")),"name":p["name"],"description":p["description"].as_str().unwrap_or("-")}))).collect();
+        let rows:Vec<Value>=agents.iter().flat_map(|agent|array(&agent["pendingPermissions"]).iter().map(move|p|json!({"id":p["id"],"agentId":agent["id"],"agentShortId":short(text(agent,"id")),"name":p["name"],"description":p["description"].as_str().unwrap_or("-"),"actions":array(&p["actions"]).iter().map(|a|json!({"id":a["id"],"label":a["label"],"behavior":a["behavior"]})).collect::<Vec<_>>()}))).collect();
         return permission_output(rows, false, context);
     }
     if command != "allow" && command != "deny" {
@@ -211,6 +213,10 @@ async fn permit(
         ));
     }
     let mut response = json!({"behavior":command});
+    // One of the request's own choices, such as "allow for this session" (see `permit ls --json`).
+    if let Some(action) = string(m, "action") {
+        response["selectedActionId"] = json!(action);
+    }
     if command == "allow" {
         if let Some(input) = string(m, "input") {
             response["updatedInput"] = serde_json::from_str(input)
