@@ -739,3 +739,30 @@ fn subagent_restored_roster_ends_abandoned_children_without_regressing_history()
             .is_empty()
     );
 }
+
+#[test]
+fn codex_moderation_replaces_persisted_child_message_and_invalidates_its_epoch() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut store = SubagentStore::default();
+    let before = message(&mut store, root, "parent", "child", 1);
+    let sibling = message(&mut store, root, "parent", "sibling", 1);
+    store.release_parent("parent");
+    let notice = json!({"type":"notification","messageId":"child-1","level":"warning",
+        "message":"Codex blocked this response.","metadata":{"codexModeration":true}});
+    let correction = json!({"type":"codex_moderation","reason":"codex_moderation",
+        "id":"child","messageId":"child-1","item":notice});
+    let after = store
+        .apply_persisted(root, "parent", "codex", &correction)
+        .unwrap();
+    assert_eq!(after["type"], "timeline");
+    assert_ne!(after["epoch"], before["epoch"]);
+    assert_eq!(after["row"]["item"], notice);
+    store.release_parent("parent");
+    let saved = page(&mut store, root, "parent", "child", json!({"limit":0}));
+    assert_eq!(saved["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(saved["rows"][0]["item"], notice);
+    let untouched = page(&mut store, root, "parent", "sibling", json!({"limit":0}));
+    assert_eq!(untouched["epoch"], sibling["epoch"]);
+    assert_eq!(untouched["rows"][0]["item"], sibling["row"]["item"]);
+}

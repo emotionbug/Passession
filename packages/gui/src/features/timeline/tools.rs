@@ -1107,6 +1107,13 @@ pub fn build_tool_call_presentation(
     if summary.as_deref() == Some("") {
         summary = None;
     }
+    if matches!(status.as_str(), "running" | "executing")
+        && let Some(progress) = get(metadata, "progressMessage")
+            .as_str()
+            .and_then(to_summary_text)
+    {
+        summary = Some(progress);
+    }
     let loading_details = is_pending_tool_call_detail(&detail, &status, error);
     let has_details = non_empty_error(error) || has_meaningful_tool_call_detail(&detail);
     let plan_outcome = if get(&raw_detail, "type") != "plan" {
@@ -1655,6 +1662,26 @@ mod eval_tests {
             assert_eq!(presentation.display_name, "Eval");
             assert_eq!(presentation.summary, None);
         }
+    }
+}
+
+#[test]
+fn tool_progress_only_overrides_running_summary() {
+    for status in ["running", "executing", "completed", "failed", "canceled"] {
+        let error = (status == "failed").then_some("tool failed");
+        let item = json!({"type":"tool_call","name":"remoteTool","status":status,
+            "error":error,
+            "detail":{"type":"plain_text","label":"Normal title","text":"Actual result"},
+            "metadata":{"progressMessage":"Working \n now"}});
+        let display = build_tool_call_presentation(&item, None, None);
+        let summary = if matches!(status, "running" | "executing") {
+            "Working now"
+        } else {
+            "Normal title"
+        };
+        assert_eq!(display.summary.as_deref(), Some(summary));
+        assert_eq!(display.detail["text"], "Actual result");
+        assert_eq!(display.error_text.as_deref(), error);
     }
 }
 

@@ -96,6 +96,13 @@ fn same_content(left: &Value, right: &Value) -> bool {
     }
 }
 
+fn moderated_message_id(item: &Value) -> Option<&str> {
+    (item["type"] == "notification" && item["metadata"]["codexModeration"] == true)
+        .then(|| item["messageId"].as_str())
+        .flatten()
+        .filter(|id| !id.is_empty())
+}
+
 impl Timeline {
     pub(in crate::agent) fn native_revision(&self) -> Option<&Value> {
         self.native_revision.as_ref()
@@ -146,8 +153,12 @@ impl Timeline {
              CREATE INDEX notice_position ON notices(position, ordinal);",
         )?;
         let mut candidates: HashMap<String, Option<usize>> = HashMap::new();
+        let mut moderated = HashMap::<String, usize>::new();
         let mut index = 0;
         self.scan(&[], |row| {
+            if let Some(id) = moderated_message_id(&row["item"]) {
+                moderated.entry(id.to_owned()).or_insert(index);
+            }
             for key in keys(&row) {
                 candidates
                     .entry(key)
@@ -165,6 +176,26 @@ impl Timeline {
         let mut previous_index = None;
         let mut accepted = true;
         previous.scan(&[], |row| {
+            let item = &row["item"];
+            if let Some(id) = moderated_message_id(item)
+                && candidates.contains_key(&format!("message:assistant_message:{id}"))
+            {
+                // A replay lacking the directive cannot resurrect text Codex
+                // already withdrew for this exact provider message.
+                accepted = false;
+                return Ok(false);
+            }
+            let redaction = if item["type"] == "assistant_message" {
+                item["messageId"]
+                    .as_str()
+                    .and_then(|id| moderated.get(id).copied())
+            } else {
+                None
+            };
+            if redaction.is_some_and(|index| used.contains(&index)) {
+                // Later interleaved chunks of the same withdrawn message.
+                return Ok(true);
+            }
             let mut resolved = HashSet::new();
             for key in keys(&row) {
                 if let Some(index) = candidates.get(&key).copied().flatten() {
@@ -177,7 +208,8 @@ impl Timeline {
                     }
                 }
             }
-            let matched = (resolved.len() == 1).then(|| *resolved.iter().next().unwrap());
+            let matched =
+                redaction.or_else(|| (resolved.len() == 1).then(|| *resolved.iter().next().unwrap()));
             if !allow_removal
                 && matched.is_some_and(|index| previous_index.is_some_and(|old| index <= old))
             {
@@ -185,6 +217,7 @@ impl Timeline {
                 return Ok(false);
             }
             if !allow_removal
+                && redaction.is_none()
                 && let Some(index) = matched
                 && let Some(text) = row["item"]["text"].as_str().filter(|text| !text.is_empty())
                 && !self.history_row(index)?["item"]["text"]

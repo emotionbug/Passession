@@ -303,6 +303,24 @@ pub(super) async fn handle(
             )
             .await?;
         }
+        "agent.provider_tasks.stop.request" => {
+            if !context.allows("workspace.write") {
+                bail!("Stopping a provider task requires workspace.write");
+            }
+            if id.is_empty() || !message["requestId"].is_string() {
+                bail!("Stopping a provider task requires an agentId and requestId");
+            }
+            let result = match message["taskToken"].as_str().and_then(|token| token.parse().ok()) {
+                Some(token) => manager.stop_provider_task(context.principal(), id, token).await,
+                None => Err(anyhow!("Invalid task token")),
+            };
+            reply(
+                context,
+                "agent.provider_tasks.stop.response",
+                correlated(message, json!({"agentId":id,"error":result.err().map(|error|error.to_string())})),
+            )
+            .await?;
+        }
         "agent.fork_context.request" => {
             let mut payload = match manager.fork_context(id, message).await {
                 Ok(mut value) => {

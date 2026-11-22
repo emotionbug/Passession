@@ -2303,7 +2303,7 @@ impl Widget for WaModal {
                     size: available,
                 };
                 let frame = dropdown.map(|(anchor, width)| {
-                    dropdown_frame(anchor, width, self.sheet_height, bounds)
+                    overlay::dropdown_frame(anchor, width, self.sheet_height, bounds)
                 });
                 if let Some((_, room)) = frame {
                     available.y = room;
@@ -2481,48 +2481,6 @@ impl Drop for WaModal {
         let uid = self.widget_uid();
         let _ = MODAL_STACK.try_with(|stack| stack.borrow_mut().remove(uid));
     }
-}
-
-/// Frame of a dropdown `width` wide whose sheet measures `natural` (0 until measured), hanging
-/// from `anchor` inside `bounds`, plus the height it may grow to. It opens below its field unless
-/// the room there is short and there is more above, and lines up with the field's nearer edge.
-fn dropdown_frame(anchor: Rect, width: f64, natural: f64, bounds: Rect) -> (Rect, f64) {
-    const GAP: f64 = 4.0;
-    let below = bounds.pos.y + bounds.size.y - (anchor.pos.y + anchor.size.y + GAP);
-    let over = anchor.pos.y - GAP - bounds.pos.y;
-    let wanted = if natural > 0.0 {
-        natural.min(240.0)
-    } else {
-        240.0
-    };
-    let above = below < wanted && over > below;
-    let room = if above { over } else { below }.max(0.0);
-    let height = if natural > 0.0 {
-        natural.min(room)
-    } else {
-        room
-    };
-    let width = width.min(bounds.size.x).max(0.0);
-    let right_half = anchor.pos.x + anchor.size.x / 2.0 > bounds.pos.x + bounds.size.x / 2.0;
-    let x = if right_half {
-        anchor.pos.x + anchor.size.x - width
-    } else {
-        anchor.pos.x
-    };
-    let x = x.clamp(
-        bounds.pos.x,
-        (bounds.pos.x + bounds.size.x - width).max(bounds.pos.x),
-    );
-    let y = if above {
-        anchor.pos.y - GAP - height
-    } else {
-        anchor.pos.y + anchor.size.y + GAP
-    };
-    let frame = Rect {
-        pos: dvec2(x, y),
-        size: dvec2(width, height),
-    };
-    (frame, room)
 }
 
 struct ModalEntry {
@@ -2769,19 +2727,22 @@ mod modal_input_tests {
         };
         let bounds = rect(12.0, 12.0, 1416.0, 876.0);
         // Below a left field, lined up with its left edge, at its measured height.
-        let (frame, room) = dropdown_frame(rect(490.0, 388.0, 60.0, 28.0), 420.0, 230.0, bounds);
+        let (frame, room) =
+            overlay::dropdown_frame(rect(490.0, 388.0, 60.0, 28.0), 420.0, 230.0, bounds);
         assert_eq!(frame, rect(490.0, 420.0, 420.0, 230.0));
         assert_eq!(room, 468.0);
         // A field in the right half lines up with its right edge.
-        let (frame, _) = dropdown_frame(rect(1190.0, 388.0, 86.0, 28.0), 260.0, 80.0, bounds);
+        let (frame, _) =
+            overlay::dropdown_frame(rect(1190.0, 388.0, 86.0, 28.0), 260.0, 80.0, bounds);
         assert_eq!(frame.pos.x, 1016.0);
         // Short room below and more above: it opens upward, ending just above the field.
-        let (frame, room) = dropdown_frame(rect(500.0, 760.0, 120.0, 30.0), 420.0, 300.0, bounds);
+        let (frame, room) =
+            overlay::dropdown_frame(rect(500.0, 760.0, 120.0, 30.0), 420.0, 300.0, bounds);
         assert_eq!(room, 744.0);
         assert_eq!(frame.pos.y + frame.size.y, 756.0);
         // Narrow windows clamp the dropdown inside the margins.
         let narrow = rect(12.0, 12.0, 300.0, 600.0);
-        let (frame, _) = dropdown_frame(rect(250.0, 50.0, 40.0, 28.0), 420.0, 120.0, narrow);
+        let (frame, _) = overlay::dropdown_frame(rect(250.0, 50.0, 40.0, 28.0), 420.0, 120.0, narrow);
         assert_eq!((frame.pos.x, frame.size.x), (12.0, 300.0));
     }
 

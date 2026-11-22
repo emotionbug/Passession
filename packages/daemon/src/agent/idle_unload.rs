@@ -268,6 +268,12 @@ impl AgentManager {
             let mut data = cell.data.lock().await;
             data.owner_ended = true;
             data.session = None;
+            if object(&mut data.snapshot)
+                .remove(crate::providers::pi_omp::extension_ui::SNAPSHOT_KEY)
+                .is_some()
+            {
+                self.publish_state(&data.snapshot);
+            }
         }
         drop(commit);
         drop(residency);

@@ -213,6 +213,9 @@ pub enum ActionKind {
     DeleteProviderSubagents {
         ids: Vec<String>,
     },
+    StopProviderTask {
+        token: String,
+    },
     LookupFile {
         token: String,
         target: super::links::InlinePathTarget,
@@ -842,6 +845,16 @@ impl ChatSession {
             }
             self.loading = false;
             self.flush_buffer();
+            if let Some(agent) = self.agent.as_object_mut() {
+                agent.remove("liveProviderTasks");
+            }
+            if let Some(extra) = self
+                .agent
+                .pointer_mut("/runtimeInfo/extra")
+                .and_then(Value::as_object_mut)
+            {
+                extra.remove("ompExtensionUi");
+            }
             self.project();
         } else if self.observation.is_none() {
             // Never acknowledged (or released after a failure): subscribe again.

@@ -1096,7 +1096,8 @@ impl Store {
                 }
             }
             PlatformPending::PhotoSave => match result {
-                Ok(PlatformValue::Bool(true)) => host::toast(ui, l("Saved to Photos"), false),
+                Ok(PlatformValue::PhotoLibrarySaved) => host::toast(ui, l("Saved to Photos"), false),
+                Ok(PlatformValue::Bool(true)) => host::toast(ui, l("Image saved"), false),
                 Ok(_) => {}
                 Err(error) => {
                     if error.code != "cancelled" {

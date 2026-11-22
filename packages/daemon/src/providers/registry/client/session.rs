@@ -41,6 +41,12 @@ impl AgentSession for Session {
     fn pending_permissions(&self) -> Vec<Value> {
         self.inner.pending_permissions()
     }
+    fn provider_tasks(&self) -> Vec<Value> {
+        self.inner.provider_tasks()
+    }
+    async fn stop_provider_task(&self, token: uuid::Uuid) -> Result<()> {
+        self.inner.stop_provider_task(token).await
+    }
     fn usage_session(&self) -> Option<Value> {
         self.inner.usage_session()
     }

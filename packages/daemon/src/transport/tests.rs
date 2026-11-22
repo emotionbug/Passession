@@ -53,6 +53,18 @@ fn permission_arrays_are_alternatives_and_unknown_operations_fail_closed() {
 }
 
 #[test]
+fn provider_task_stop_requires_workspace_write() {
+    let request = json!({"type":"agent.provider_tasks.stop.request"});
+    assert!(!permissions::allows_inbound(&request, |p| p == "workspace.read"));
+    assert!(!permissions::allows_inbound(&request, |p| p == "hub.execute"));
+    assert!(permissions::allows_inbound(&request, |p| p == "workspace.write"));
+    assert_eq!(
+        permissions::outbound("agent.provider_tasks.stop.response"),
+        Some(&["workspace.write"][..])
+    );
+}
+
+#[test]
 fn remote_desktop_app_update_permissions_mirror_daemon_update_permissions() {
     for (operation, required) in [
         ("check", "daemon.read"),

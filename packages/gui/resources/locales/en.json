@@ -478,6 +478,8 @@
       "accept": "Accept",
       "implement": "Implement",
       "question": "How would you like to proceed?",
+      "mcpDecline": "Decline",
+      "mcpOpen": "Open in browser",
       "proposedPlan": "Proposed plan"
     },
     "approvalPending": "Approval pending ↓",
@@ -2439,6 +2441,19 @@
     "deleteFinishedAction": "Delete finished subagents",
     "deleteFinishedConfirm": "Delete {{count}} finished subagents? Their transcripts are deleted too.",
     "deleteFinishedRetry": "Retry ({{failed}}/{{total}})"
+  },
+  "claudeTasks": {
+    "activeOne": "1 live task",
+    "activeCount": "{{count}} live tasks",
+    "stop": "Stop",
+    "stopping": "Stopping…",
+    "shell": "Shell",
+    "subagent": "Subagent",
+    "workflow": "Workflow",
+    "monitor": "Monitor",
+    "mcpTask": "MCP task",
+    "teammate": "Teammate",
+    "task": "Task"
   },
   "panels": {
     "draft": { "newAgent": "New Agent", "creatingAgent": "Creating agent" },

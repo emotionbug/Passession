@@ -679,6 +679,29 @@ pub(super) fn notice(level: &str, message: &str) -> Value {
     json!({"type":"notification","level":level,"message":message})
 }
 
+/// Codex supplies a presentation directive, not user-visible text, for withheld answers.
+pub(super) fn moderation_notice(raw: &Value) -> Option<&'static str> {
+    if kind(raw) != "agentMessage" {
+        return None;
+    }
+    let display = &raw["moderation"]["display"];
+    match display["mode"].as_str()? {
+        "hide" if display["replacement"]["kind"] == "wellbeingPromptHelpline" => Some(
+            "Codex withheld this response and recommends reaching out to a crisis helpline for support. If you are in immediate danger, contact local emergency services.",
+        ),
+        "hide" => Some("Codex withheld this response."),
+        "block" => Some("Codex blocked this response."),
+        _ => None,
+    }
+}
+
+pub(super) fn moderation_item(id: Option<&str>, message: &str) -> Value {
+    let mut item = notice("warning", message);
+    put(&mut item, "messageId", id);
+    item["metadata"] = json!({"codexModeration":true});
+    item
+}
+
 pub fn item(raw: &Value, include_user: bool, cwd: Option<&str>) -> Option<Value> {
     item_with_images(raw, include_user, cwd, &mut |_, _| None)
 }
@@ -714,6 +737,9 @@ fn item_with_images(
             Some(v)
         }
         "agentMessage" => {
+            if let Some(message) = moderation_notice(raw) {
+                return Some(moderation_item(nonempty(raw, &["id"]), message));
+            }
             if raw["delivery"] == "async"
                 && nonempty(raw, &["id"]).is_some()
                 && let Some(q) = raw["questions"].as_array().filter(|a| {
@@ -1143,6 +1169,14 @@ pub fn item_entries_with_images(
             if let Some(item) = render_image(&image, materialize) {
                 items.push(item);
             }
+        }
+    } else if kind(raw) == "agentMessage" {
+        let display = &raw["moderation"]["display"];
+        if display["mode"] == "show" && display["annotation"]["kind"] == "wellbeingHelpline" {
+            items.push(notice(
+                "info",
+                "Codex recommends reaching out to a crisis helpline for support. If you are in immediate danger, contact local emergency services.",
+            ));
         }
     }
     items

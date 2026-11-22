@@ -285,6 +285,13 @@ fn common_commands() -> Vec<Command> {
             .arg(option("behavior", "behavior").value_parser(["interrupt", "steer"]))
             .arg(super::switch("no-wait", "no-wait")),
         Command::new("inspect").arg(positional("id", true)),
+        Command::new("tasks")
+            .about("List individually stoppable tasks in a live agent session")
+            .arg(positional("id", true)),
+        Command::new("stop-task")
+            .about("Stop one live task using its token from `paseo tasks`")
+            .arg(positional("id", true))
+            .arg(positional("task-token", true)),
         Command::new("stop")
             .arg(positional("id", false))
             .arg(super::switch("all", "all"))
@@ -341,6 +348,8 @@ pub async fn execute(path: &[&str], m: &ArgMatches, context: &Context) -> Result
                     | "attach"
                     | "send"
                     | "inspect"
+                    | "tasks"
+                    | "stop-task"
                     | "stop"
                     | "delete"
                     | "wait"
@@ -394,6 +403,8 @@ fn command_error(command: &str, m: &ArgMatches, failure: anyhow::Error) -> anyho
         "update" => ("UPDATE_FAILED", "update agent"),
         "delete" => ("DELETE_AGENT_FAILED", "delete agent(s)"),
         "stop" => ("STOP_AGENT_FAILED", "stop agent(s)"),
+        "tasks" => ("TASK_LIST_FAILED", "list live tasks"),
+        "stop-task" => ("TASK_STOP_FAILED", "stop the task"),
         "open" => ("OPEN_FAILED", "open agent"),
         "mode" => (
             "MODE_OPERATION_FAILED",
@@ -532,6 +543,7 @@ async fn execute_connected(
                 json!({"agentId":id,"status":status,"message":message}),
             ))
         }
+        "tasks" | "stop-task" => provider_tasks(command, m, context, client).await,
         "stop" | "delete" => stop_delete(command, m, context, client).await,
         "open" => {
             let id = required(m, "id")?;
@@ -740,6 +752,48 @@ async fn send(m: &ArgMatches, context: &Context, client: &DaemonClient) -> Resul
         json!({"agentId":state["final"]["id"].as_str().unwrap_or(id),"status":if status=="idle"{"completed"}else{status},"message":message}),
     ))
 }
+async fn provider_tasks(
+    command: &str,
+    m: &ArgMatches,
+    context: &Context,
+    client: &DaemonClient,
+) -> Result<Output> {
+    if client.server_info()["features"]["providerTaskStop"] != true {
+        return Err(error(
+            "DAEMON_UPDATE_REQUIRED",
+            "Update the host to use individual task controls.",
+        ));
+    }
+    let id = required(m, "id")?;
+    if command == "tasks" {
+        let mut agent = fetch(client, context, id).await?;
+        let tasks = agent["liveProviderTasks"].take();
+        let tasks = match tasks {
+            Value::Array(tasks) => tasks,
+            _ => Vec::new(),
+        };
+        let empty = tasks.is_empty();
+        let output = Output::new(Value::Array(tasks))
+            .columns(&[("TASK TOKEN", "token"), ("TYPE", "kind"), ("DESCRIPTION", "description")])
+            .id("token");
+        return Ok(if empty {
+            output.human("No individually stoppable tasks.")
+        } else {
+            output
+        });
+    }
+    let token = required(m, "task-token")?;
+    let response = rpc(
+        client, context,
+        json!({"type":"agent.provider_tasks.stop.request","agentId":id,"taskToken":token}),
+        "agent.provider_tasks.stop.response",
+    ).await?;
+    if let Some(message) = response["error"].as_str() {
+        return Err(error("TASK_STOP_FAILED", message));
+    }
+    Ok(message_output(json!({"agentId":id,"taskToken":token,"message":"Task stop requested."})))
+}
+
 async fn stop_delete(
     command: &str,
     m: &ArgMatches,

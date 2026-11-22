@@ -294,7 +294,9 @@ fn ui_updates_preserve_the_form_before_during_and_after_submission() {
     for method in ["setStatus", "setWidget", "setTitle", "setEditorText"] {
         let mut mapper = Mapper::new("omp", "omp");
         mapper.map(&json!({"type":"tool_execution_start","toolCallId":"ask-1","toolName":"ask","args":{"html":CLEANUP}}));
-        let update = json!({"type":"extension_ui_request","id":"ui-update","method":method});
+        let update = json!({"type":"extension_ui_request","id":"ui-update","method":method,
+            "statusKey":"form-test","statusText":"Status while asking",
+            "widgetKey":"form-test","widgetLines":["Widget while asking"]});
         mapper.map(&update);
         let mut shown = 0;
         let data = omp(CLEANUP, |dialog| {

@@ -4,6 +4,26 @@ use serde_json::Value;
 pub const MAX_EXPLICIT_AGENT_TITLE_CHARS: usize = 200;
 pub const MAX_SLUG_LENGTH: usize = 50;
 
+/// A displayed, user-openable MCP destination. The sender's URL is untrusted
+/// at both the provider boundary and the UI activation boundary.
+pub fn mcp_elicitation_url(input: &str) -> Option<url::Url> {
+    if input.len() > 16_384
+        || input.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return None;
+    }
+    let (scheme, rest) = input.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let url = url::Url::parse(input).ok()?;
+    url.has_host().then_some(url)
+}
+
 /// JS-compatible string conversion for JSON error values. Actual Rust errors use
 /// their Display implementation; arbitrary objects are not trusted as Errors.
 pub fn error_message(error: &Value) -> String {

@@ -22,6 +22,7 @@ use std::collections::{BTreeSet, HashMap};
 pub struct Question {
     pub question: String,
     pub header: String,
+    answer_key: Option<String>,
     pub options: Vec<Value>,
     pub multi_select: bool,
     pub allow_other: bool,
@@ -40,6 +41,20 @@ impl Question {
     }
 }
 
+pub fn is_elicitation(request: &Value) -> bool {
+    get(get(request, "metadata"), "mcpElicitation") == true
+}
+
+pub fn elicitation_url(request: &Value) -> Option<String> {
+    if !is_elicitation(request) {
+        return None;
+    }
+    let raw = get(get(request, "input"), "url").as_str()?;
+    paseo_protocol::helpers::mcp_elicitation_url(raw).map(Into::into)
+}
+
+pub(crate) const OPEN_ELICITATION_URL: &str = "mcp_open_url";
+
 /// parseQuestionFormQuestions: None unless every question is well formed.
 pub fn questions(request: &Value) -> Option<Vec<Question>> {
     let raw = get(get(request, "input"), "questions").as_array()?;
@@ -47,9 +62,15 @@ pub fn questions(request: &Value) -> Option<Vec<Question>> {
         return None;
     }
     let mut out = Vec::new();
+    let elicitation = is_elicitation(request);
     for q in raw {
         let question = q.get("question")?.as_str()?;
         let header = q.get("header")?.as_str()?;
+        let answer_key = if elicitation {
+            Some(q.get("answerKey")?.as_str()?.to_owned())
+        } else {
+            None
+        };
         let options = q.get("options")?.as_array()?;
         if options
             .iter()
@@ -61,7 +82,7 @@ pub fn questions(request: &Value) -> Option<Vec<Question>> {
         let mut default_options: BTreeSet<usize> = options
             .iter()
             .enumerate()
-            .filter(|(_, o)| is_true(get(o, "default")))
+            .filter(|(_, o)| !elicitation && is_true(get(o, "default")))
             .map(|(i, _)| i)
             .collect();
         if !multi_select && let Some(&first) = default_options.first() {
@@ -70,6 +91,7 @@ pub fn questions(request: &Value) -> Option<Vec<Question>> {
         out.push(Question {
             question: question.to_owned(),
             header: header.to_owned(),
+            answer_key,
             options: options.clone(),
             multi_select,
             allow_other: is_true(get(q, "allowOther")) || is_true(get(q, "isOther")),
@@ -77,7 +99,9 @@ pub fn questions(request: &Value) -> Option<Vec<Question>> {
             placeholder: get(q, "placeholder").as_str().map(str::to_owned),
             dismiss_label: get(q, "dismissLabel").as_str().map(str::to_owned),
             default_options,
-            default_text: get(q, "defaultText").as_str().map(str::to_owned),
+            default_text: (!elicitation)
+                .then(|| get(q, "defaultText").as_str().map(str::to_owned))
+                .flatten(),
         });
     }
     Some(out)
@@ -113,6 +137,9 @@ impl CardState {
     }
 
     pub fn is_answered(&self, q: &Question, index: usize) -> bool {
+        if q.answer_key.is_some() && q.allow_empty {
+            return true;
+        }
         if self.selections.get(&index).is_some_and(|s| !s.is_empty()) {
             return true;
         }
@@ -122,7 +149,7 @@ impl CardState {
         if self
             .other_texts
             .get(&index)
-            .is_some_and(|t| !t.trim().is_empty())
+            .is_some_and(|t| if q.answer_key.is_some() { !t.is_empty() } else { !t.trim().is_empty() })
         {
             return true;
         }
@@ -184,14 +211,19 @@ impl CardState {
                 .get(&i)
                 .into_iter()
                 .flatten()
-                .map(|&o| str_of(get(&q.options[o], "label")))
+                .filter_map(|&o| q.options.get(o))
+                .map(|o| str_of(get(o, "label")))
                 .collect();
             let mut entry = json!({"options": options});
-            let text = self.other_texts.get(&i).map_or("", |t| t.trim());
+            let text = self.other_texts.get(&i).map_or("", |t| {
+                if q.answer_key.is_some() { t.as_str() } else { t.trim() }
+            });
             if q.shows_text_input() && !text.is_empty() {
                 entry["other"] = json!(text);
             }
-            selections.insert(q.header.clone(), entry);
+            if q.answer_key.is_none() || !options.is_empty() || entry.get("other").is_some() {
+                selections.insert(q.answer_key.as_ref().unwrap_or(&q.header).clone(), entry);
+            }
         }
         Value::Object(selections)
     }
@@ -201,6 +233,14 @@ impl CardState {
         let selected = self.selections.entry(index).or_default();
         if q.multi_select {
             if !selected.remove(&option) {
+                if q.answer_key.is_some() {
+                    let exclusive = |index| q.options.get(index).is_some_and(|o| is_true(get(o, "exclusive")));
+                    if exclusive(option) {
+                        selected.clear();
+                    } else {
+                        selected.retain(|&index| !exclusive(index));
+                    }
+                }
                 selected.insert(option);
             }
         } else if selected.contains(&option) {
@@ -390,7 +430,7 @@ pub fn draw(
     }
     if get(r, "kind") == "question" {
         return match questions(r) {
-            Some(qs) => question_form(cx, d, key, &qs, x, y, w),
+            Some(qs) => question_form(cx, d, key, r, &qs, x, y, w),
             None => (0.0, None),
         };
     }
@@ -424,6 +464,7 @@ fn footer(cx: &mut Cx2d, d: &mut Draw, key: &str, r: &Value, x: f64, y: f64, w: 
     let p = d.look.palette;
     let base = d.look.ui(14.0);
     let state = d.state.permission.clone().unwrap_or_default();
+    let elicitation = is_elicitation(r);
     let question = t("agentStream.permission.question");
     let size = d.kit.label(
         cx,
@@ -438,19 +479,37 @@ fn footer(cx: &mut Cx2d, d: &mut Draw, key: &str, r: &Value, x: f64, y: f64, w: 
     let mut cy = y + size.y + 8.0 + 8.0;
     let mut cx_pos = x;
     let mut row_h: f64 = 0.0;
-    for action in actions(r) {
+    let mut choices = actions(r);
+    if elicitation_url(r).is_some() {
+        choices.insert(0, json!({"id":OPEN_ELICITATION_URL}));
+    }
+    for action in choices {
         let id = value_text(get(&action, "id"));
-        let fg = if get(&action, "variant") == "primary" {
+        let opening = id == OPEN_ELICITATION_URL;
+        let fg = if opening || get(&action, "variant") == "primary" {
             p.foreground
         } else {
             p.muted
         };
-        let icon = if get(&action, "behavior") == "allow" {
+        let icon = if opening {
+            "external-link"
+        } else if get(&action, "behavior") == "allow" {
             "check"
         } else {
             "x"
         };
-        let label = str_of(get(&action, "label")).to_owned();
+        let label = if opening {
+            t("agentStream.permission.mcpOpen")
+        } else if elicitation {
+            match id.as_str() {
+                "cancel" => t("common.actions.cancel"),
+                "decline" => t("agentStream.permission.mcpDecline"),
+                "accept" => t("agentStream.permission.accept"),
+                _ => str_of(get(&action, "label")).to_owned(),
+            }
+        } else {
+            str_of(get(&action, "label")).to_owned()
+        };
         let target = HitTarget::PermissionAction {
             key: key.to_owned(),
             action: id.clone(),
@@ -573,7 +632,9 @@ fn permission_card(
                 None,
             ) + 8.0;
         }
-        if get(r, "kind") != "plan" {
+        if let Some(url) = elicitation_url(r) {
+            cy += elicitation_text(cx, d, &url, x + 12.0, cy, inner);
+        } else if get(r, "kind") != "plan" && !is_elicitation(r) {
             let detail = if get(r, "detail").is_object() {
                 get(r, "detail").clone()
             } else {
@@ -601,6 +662,16 @@ fn permission_card(
     d.kit
         .bordered(cx, rect_xywh(x, y, w, h), p.surface1, 8.0, p.border, 1.0);
     paint(cx, d, opts)
+}
+
+fn elicitation_text(cx: &mut Cx2d, d: &mut Draw, text: &str, x: f64, y: f64, width: f64) -> f64 {
+    let base = d.look.ui(14.0);
+    let laid = d.kit.layout(cx, Font::Regular, base,
+        d.look.typo.system_size(22.0) / base, text, Some(width), 0.0);
+    let height = laidout_size(&laid).y + 8.0;
+    d.kit.draw_laidout(cx, Font::Regular, d.look.palette.foreground, dvec2(x, y), &laid);
+    d.canvas.add_run(laid, dvec2(x, y), Some('\n'));
+    height
 }
 
 /// components/plan-card.tsx: collapsible surface1 card with a 16px chevron,
@@ -690,10 +761,12 @@ pub fn plan_card(
     paint(cx, d, opts)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn question_form(
     cx: &mut Cx2d,
     d: &mut Draw,
     key: &str,
+    request: &Value,
     qs: &[Question],
     x: f64,
     y: f64,
@@ -702,6 +775,7 @@ fn question_form(
     let p = d.look.palette;
     let base = d.look.ui(14.0);
     let state = d.state.permission.clone().unwrap_or_default();
+    let elicitation = is_elicitation(request);
     let index = state.active_question.min(qs.len() - 1);
     let q = &qs[index];
     let all_answered = qs.iter().enumerate().all(|(i, q)| state.is_answered(q, i));
@@ -712,16 +786,27 @@ fn question_form(
         } else {
             !state.is_answered(q, index)
         };
-    let dismiss_label = qs
-        .iter()
-        .filter_map(|q| q.dismiss_label.clone())
-        .find(|l| !l.is_empty())
-        .unwrap_or_else(|| t("common.actions.dismiss"));
+    let dismiss_label = if elicitation {
+        t("common.actions.cancel")
+    } else {
+        qs.iter()
+            .filter_map(|q| q.dismiss_label.as_deref())
+            .find(|l| !l.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| t("common.actions.dismiss"))
+    };
+    let decline_label = elicitation.then(|| t("agentStream.permission.mcpDecline"));
     let selected = state.selections.get(&index).cloned().unwrap_or_default();
     let mut field = None;
     let paint = |cx: &mut Cx2d, d: &mut Draw, field: &mut Option<AnswerField>| -> f64 {
         let inner = w - 24.0;
         let mut cy = y + 12.0;
+        if elicitation {
+            cy += elicitation_text(cx, d, &title(request), x + 12.0, cy, inner);
+            if let Some(description) = non_empty_str(get(request, "description")) {
+                cy += elicitation_text(cx, d, description, x + 12.0, cy, inner);
+            }
+        }
         if qs.len() > 1 {
             // Titled tabs per question header (QuestionNavButton).
             let mut tx = x + 24.0;
@@ -859,10 +944,10 @@ fn question_form(
                 inner,
             ) + 12.0;
         }
-        let primary_label = t(if last {
-            "message.question.submit"
-        } else {
-            "message.question.next"
+        let primary_label = t(match (last, elicitation) {
+            (true, true) => "agentStream.permission.accept",
+            (true, false) => "message.question.submit",
+            (false, _) => "message.question.next",
         });
         let dismiss_target = HitTarget::QuestionDismiss {
             key: key.to_owned(),
@@ -874,90 +959,35 @@ fn question_form(
             state.pending && state.responding_action.as_deref() == Some("dismiss");
         let primary_responding =
             state.pending && state.responding_action.as_deref() == Some("submit");
-        // Side by side when both fit, else stacked full width.
-        let stacked = d.look.compact || {
-            let dismiss_w = button_width(
-                d.kit
-                    .measure(cx, Font::Regular, base, 1.4, &dismiss_label, None)
-                    .x,
-            );
-            let primary_w = button_width(
-                d.kit
-                    .measure(cx, Font::Regular, base, 1.4, &primary_label, None)
-                    .x,
-            );
-            dismiss_w + 8.0 + primary_w > inner
-        };
-        if stacked {
-            let s = card_button(
-                cx,
-                d,
-                x + 12.0,
-                cy,
-                Some(inner),
-                inner,
-                &dismiss_label,
-                "x",
-                p.muted,
-                None,
-                p.border_accent,
-                dismiss_responding,
-                state.pending && !dismiss_responding,
-                dismiss_target,
-            );
-            cy += s.y + 8.0;
-            let s = card_button(
-                cx,
-                d,
-                x + 12.0,
-                cy,
-                Some(inner),
-                inner,
-                &primary_label,
-                "check",
-                p.on_tertiary,
-                Some(p.accent),
-                p.accent,
-                primary_responding,
-                primary_disabled,
-                primary_target,
-            );
-            cy += s.y;
-        } else {
-            let s = card_button(
-                cx,
-                d,
-                x + 12.0,
-                cy,
-                None,
-                inner,
-                &dismiss_label,
-                "x",
-                p.muted,
-                None,
-                p.border_accent,
-                dismiss_responding,
-                state.pending && !dismiss_responding,
-                dismiss_target,
-            );
-            let s2 = card_button(
-                cx,
-                d,
-                x + 12.0 + s.x + 8.0,
-                cy,
-                None,
-                inner - s.x - 8.0,
-                &primary_label,
-                "check",
-                p.on_tertiary,
-                Some(p.accent),
-                p.accent,
-                primary_responding,
-                primary_disabled,
-                primary_target,
-            );
-            cy += s.y.max(s2.y);
+        let decline = decline_label.as_deref().map(|label| {
+            let responding = state.responding_action.as_deref() == Some("decline") && state.pending;
+            (label, "x", p.muted, None, p.border_accent, responding, state.pending && !responding,
+                HitTarget::PermissionAction { key: key.to_owned(), action: "decline".into() })
+        });
+        let buttons = [
+            Some((dismiss_label.as_str(), "x", p.muted, None, p.border_accent, dismiss_responding,
+                state.pending && !dismiss_responding, dismiss_target)),
+            decline,
+            Some((primary_label.as_str(), "check", p.on_tertiary, Some(p.accent), p.accent,
+                primary_responding, primary_disabled, primary_target)),
+        ];
+
+        let stacked = d.look.compact || buttons.iter().flatten().map(|(label, ..)| {
+            button_width(d.kit.measure(cx, Font::Regular, base, 1.4, label, None).x) + 8.0
+        }).sum::<f64>() - 8.0 > inner;
+        let mut bx = x + 12.0;
+        let mut row_h: f64 = 0.0;
+        for (label, icon, fg, bg, border, responding, disabled, target) in buttons.into_iter().flatten() {
+            let size = card_button(cx, d, bx, cy, stacked.then_some(inner),
+                x + w - 12.0 - bx, label, icon, fg, bg, border, responding, disabled, target);
+            if stacked {
+                cy += size.y + 8.0;
+            } else {
+                bx += size.x + 8.0;
+                row_h = row_h.max(size.y);
+            }
         }
+        cy += if stacked { -8.0 } else { row_h };
         cy + 12.0 - y
     };
     let mut scratch = None;
@@ -1112,6 +1142,14 @@ fn question_option(
 
 /// The response the question form sends (submit or dismiss).
 pub fn question_response(r: &Value, qs: &[Question], state: &CardState, dismiss: bool) -> Value {
+    if is_elicitation(r) {
+        return if dismiss {
+            json!({"behavior":"deny","selectedActionId":"cancel","interrupt":true})
+        } else {
+            json!({"behavior":"allow","selectedActionId":"accept",
+                "updatedInput":{"selections":state.build_selections(qs)}})
+        };
+    }
     let mut input = map(get(r, "input")).clone();
     if dismiss {
         let submit_empty = qs.iter().all(|q| q.allow_empty && q.options.is_empty());
@@ -1148,5 +1186,46 @@ mod tests {
             response["updatedInput"]["selections"],
             json!({"Items":{"options":["A, B"],"other":"x, y"},"Days":{"options":[],"other":"30"}})
         );
+    }
+
+    #[test]
+    fn mcp_form_omits_unanswered_fields_and_keeps_exact_user_values() {
+        let request = json!({"id":"mcp","kind":"question","metadata":{"mcpElicitation":true},"input":{"questions":[
+            {"question":"Choose labels","header":"Duplicate","answerKey":"tags","multiSelect":true,"allowEmpty":true,
+                "options":[{"label":"A, B","default":true},{"label":"Empty list","exclusive":true}]},
+            {"question":"Provide text","header":"Duplicate","answerKey":"text","allowEmpty":true,
+                "options":[],"defaultText":"Not a user answer"},
+            {"question":"Choose a value","header":"Other","answerKey":"omitted","allowEmpty":true,
+                "options":[{"label":"Other"}]}
+        ]}});
+        let qs = questions(&request).unwrap();
+        let mut state = CardState::for_request(&request);
+        assert!(qs.iter().enumerate().all(|(i, q)| state.is_answered(q, i)));
+        assert_eq!(question_response(&request, &qs, &state, false)["updatedInput"]["selections"], json!({}));
+        state.toggle(&qs[0], 0, 0, qs.len());
+        state.toggle(&qs[0], 0, 1, qs.len());
+        assert_eq!(state.selections[&0], BTreeSet::from([1]));
+        state.toggle(&qs[0], 0, 0, qs.len());
+        assert_eq!(state.selections[&0], BTreeSet::from([0]));
+        state.set_other(&qs[1], 1, " exact text ");
+        assert_eq!(
+            question_response(&request, &qs, &state, false),
+            json!({"behavior":"allow","selectedActionId":"accept","updatedInput":{"selections":{
+                "tags":{"options":["A, B"]},
+                "text":{"options":[],"other":" exact text "}
+            }}})
+        );
+        assert_eq!(question_response(&request, &qs, &state, true),
+            json!({"behavior":"deny","selectedActionId":"cancel","interrupt":true}));
+    }
+
+    #[test]
+    fn mcp_url_open_action_is_separate_from_provider_choices() {
+        let mut request = json!({"metadata":{"mcpElicitation":true},"input":{"url":"https://example.test/path?complete=yes#step"},
+            "actions":[{"id":"decline","behavior":"deny"},{"id":"cancel","behavior":"deny"},{"id":"accept","behavior":"allow"}]});
+        assert_eq!(elicitation_url(&request).as_deref(), request["input"]["url"].as_str());
+        assert!(actions(&request).iter().all(|a| a["id"] != OPEN_ELICITATION_URL));
+        request["input"]["url"] = json!("javascript:alert(1)");
+        assert!(elicitation_url(&request).is_none());
     }
 }

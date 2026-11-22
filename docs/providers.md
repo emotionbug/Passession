@@ -30,6 +30,15 @@ Parent history replay announces child agents by descriptor only: an `upsert` wit
 
 `LaunchContext` binds tools to the agent's authority and environment. Provider options are not an alternate channel for replacing that authority. Exact MCP preapproval must only be advertised when supported; broad “allow all” behavior is not a substitute for an exact tool policy.
 
+Codex and Claude MCP form and URL requests use the same permission stream as
+tool approvals. Acceptance requires an explicit **Accept** action, and a
+form with fields must submit its values.
+Unanswered optional fields are omitted even when the server supplies defaults.
+The **Open in browser** button validates and opens the displayed HTTP(S)
+destination on the client device without responding to the MCP request.
+Codex image-picker choices use their titles and submit their IDs; the client
+does not fetch preview assets from the provider.
+
 ## Catalog and configuration behavior
 
 Keep provider models, modes and configuration scoped to the effective environment and working directory. Native catalogs may be discovered asynchronously; distinguish pending discovery, unsupported discovery, and a real provider error. Configuration changes must not return a snapshot from a different identity/environment.
@@ -128,6 +137,15 @@ Provider configuration UI belongs to `packages/gui/src/features/settings`; creat
 ## Verification
 
 Use an isolated native daemon and real provider credentials for provider end-to-end checks. Exercise a turn, permission decision, interruption, reconnect/history, import/resume and shutdown where supported. Report unavailable credentials/services explicitly. A mock provider can verify controlled states, but it cannot establish real provider interoperability.
+
+In a credential-free Linux smoke test on 2026-11-22, the native GUI canceled
+an MCP form and declined the following URL request without opening the URL.
+The Claude fixture received `cancel` and `decline`, respectively. With two
+background shells listed, stopping one in the GUI left the other available in
+`paseo tasks`; reusing the spent token failed, and `paseo stop-task` stopped
+the remaining shell. The OMP fixture's widget and status appeared above and
+below the composer. These checks cover the GUI, CLI, daemon and native protocol
+frames, not a live provider account.
 
 The historical Linux scenarios exercised Rust adapters and daemon against controlled Claude/ACP/MCP provider-protocol boundary fixtures, plus the now-retired external-Node extension runtime. They were not paid live Claude/ACP LLM executions and do not verify the new native plugin runtime, live account authentication, every provider mode or other operating systems. See [testing](testing.md) for recorded evidence and its authority boundaries.
 

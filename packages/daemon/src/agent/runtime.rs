@@ -1,4 +1,5 @@
 use super::*;
+use crate::providers::pi_omp::extension_ui;
 
 impl AgentManager {
     fn launch_config(&self, mut config: Value) -> Result<Value> {
@@ -853,6 +854,7 @@ impl AgentManager {
         .await?
     }
     async fn reconcile_timeline_message(&self, id: &str, cell: &Arc<AgentCell>, event: Value) {
+        let codex_moderation = event["reason"] == "codex_moderation";
         let snapshot = cell.data.lock().await.snapshot.clone();
         let timeline = cell.timeline.clone();
         let events = self.events.clone();
@@ -897,9 +899,13 @@ impl AgentManager {
             "type":"timeline","provider":provider,
             "item":{
                 "type":"error",
-                "message":"The final OMP message could not be safely applied. Previous history was retained. Retry loading native history to recover the final content.",
+                "message":if codex_moderation {
+                    "Codex withheld a response, but its earlier text could not be removed from the saved timeline."
+                } else {
+                    "The final OMP message could not be safely applied. Previous history was retained. Retry loading native history to recover the final content."
+                },
                 "metadata":{
-                    "code":"omp_timeline_reconcile_retained",
+                    "code":if codex_moderation {"codex_moderation_redaction_failed"} else {"omp_timeline_reconcile_retained"},
                     "recovery":{"action":"reload_native_history","canonicalPreserved":true}
                 }
             }
@@ -1010,7 +1016,10 @@ impl AgentManager {
         if cell.unloaded.load(Ordering::Acquire) {
             return Ok(());
         }
-        cell.activity.touch();
+        let chrome = event["type"] == extension_ui::EVENT;
+        if !chrome {
+            cell.activity.touch();
+        }
         if event["type"] == "omp_catalog_changed" {
             // A live runtime registered or removed model providers (login, logout,
             // omp-kiro accounts); the shared catalog follows without a restart.
@@ -1038,6 +1047,26 @@ impl AgentManager {
             }
         }
         let _commit = cell.commit.lock().await;
+        if chrome {
+            if !from_history {
+                let mut data = cell.data.lock().await;
+                if !data.owner_ended && data.snapshot["_historyOnly"] != true {
+                    let changed = extension_ui::apply(
+                        &mut data.snapshot[extension_ui::SNAPSHOT_KEY],
+                        event,
+                    );
+                    if data.snapshot[extension_ui::SNAPSHOT_KEY].is_null() {
+                        object(&mut data.snapshot).remove(extension_ui::SNAPSHOT_KEY);
+                    }
+                    // Neither status traffic nor widget traffic earns a timeline
+                    // sequence, an activity stamp, or a storage write.
+                    if changed && data.ready {
+                        self.publish_state(&data.snapshot);
+                    }
+                }
+            }
+            return Ok(());
+        }
         if event["type"] == "timeline_reconcile" {
             self.reconcile_timeline_message(id, cell, event).await;
             return Ok(());
@@ -1052,6 +1081,27 @@ impl AgentManager {
             Self::certify_history(cell, None).await?;
             self.apply_subagent_event(id, cell, &event, !from_history)
                 .await?;
+            return Ok(());
+        }
+        if event["type"] == "provider_tasks_changed" {
+            // Read the current runtime at publication time, not a queued copy
+            // that may already have been superseded by a terminal frame.
+            if !from_history {
+                let mut data = cell.data.lock().await;
+                let tasks = data.session
+                    .as_ref()
+                    .filter(|_| !data.owner_ended && data.snapshot["archivedAt"].is_null())
+                    .map(|session| session.provider_tasks())
+                    .unwrap_or_default();
+                if tasks.is_empty() {
+                    object(&mut data.snapshot).remove("liveProviderTasks");
+                } else {
+                    data.snapshot["liveProviderTasks"] = Value::Array(tasks);
+                }
+                if data.ready {
+                    self.publish_state(&data.snapshot);
+                }
+            }
             return Ok(());
         }
         let (mut snapshot, ready, owner_ended) = {
@@ -1154,6 +1204,7 @@ impl AgentManager {
                             data.session = None;
                             data.pending_replacement = false;
                             snapshot["_live"] = json!(false);
+                            object(&mut snapshot).remove(extension_ui::SNAPSHOT_KEY);
                             cell.owner_ended.cancel();
                         }
                         if let Some(turn) = &turn
@@ -1439,6 +1490,11 @@ impl AgentManager {
         live: bool,
     ) -> Result<()> {
         let snapshot = cell.data.lock().await.snapshot.clone();
+        if event["event"]["type"] == "codex_moderation"
+            && (!live || event["provider"] != snapshot["provider"])
+        {
+            bail!("Codex moderation does not match the active subagent owner");
+        }
         let store = self.subagent_store.clone();
         let root = (snapshot["internal"] != true)
             .then(|| self.app().map(|app| app.home.join("agent-subagents")))
@@ -1674,6 +1730,7 @@ impl AgentManager {
         snapshot["activeTurn"] = Value::Null;
         snapshot["pendingPermissions"] = json!([]);
         snapshot["_live"] = json!(false);
+        object(&mut snapshot).remove(extension_ui::SNAPSHOT_KEY);
         // Releasing an idle/history-only view is not user or provider activity.
         self.commit_snapshot(cell, snapshot.clone(), interrupted)
             .await?;
@@ -2290,6 +2347,85 @@ pub(super) mod tests {
         *cell.task.lock().await = Some(manager.start_events(id, &cell, receiver));
         manager.begin_event_stage(&cell).await.unwrap();
         cell
+    }
+
+    #[tokio::test]
+    async fn omp_extension_ui_replaces_removes_and_isolates_live_cells() {
+        use crate::providers::pi_omp::Mapper;
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000095";
+        let sibling_id = "00000000-0000-4000-8000-000000000096";
+        let cell = staged_cell(&app, id).await;
+        let sibling = staged_cell(&app, sibling_id).await;
+        manager.release_event_stage(&cell).await.unwrap();
+        manager.release_event_stage(&sibling).await.unwrap();
+        let before = cell.data.lock().await.snapshot["updatedAt"].clone();
+        let mut events = manager.subscribe_events();
+        let mut mapper = Mapper::new("omp", "mock");
+        for (target, input) in [
+            (&cell, json!({"method":"setStatus","statusKey":"shared","statusText":"first"})),
+            (&cell, json!({"method":"setStatus","statusKey":"shared","statusText":"latest"})),
+            (&cell, json!({"method":"setStatus","statusKey":"shared","statusText":"latest"})),
+            (&sibling, json!({"method":"setStatus","statusKey":"shared","statusText":"sibling"})),
+            (&cell, json!({"method":"setWidget","widgetKey":"shared","widgetLines":["above"]})),
+            (&cell, json!({"method":"setWidget","widgetKey":"shared","widgetLines":["below"],"widgetPlacement":"belowEditor"})),
+            (&cell, json!({"method":"setWidget","widgetKey":"other","widgetLines":["kept"]})),
+            (&cell, json!({"method":"setStatus","statusKey":"shared"})),
+            (&cell, json!({"method":"setWidget","widgetKey":"shared","widgetLines":null})),
+        ] {
+            let mut input = input;
+            input["type"] = json!("extension_ui_request");
+            for event in mapper.map(&input) {
+                target.sink.emit(event).await.unwrap();
+            }
+            manager.drain_events(target).await.unwrap();
+        }
+        let mut latest = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            assert_eq!(event["type"], "agent_state");
+            if event["agent"]["id"] == id {
+                latest.push(wire::snapshot_payload(&event["agent"]));
+            }
+        }
+        assert_eq!(latest.len(), 7, "identical patches publish nothing");
+        let chrome = "/runtimeInfo/extra/ompExtensionUi";
+        assert_eq!(latest[1].pointer(chrome).unwrap()["statuses"], json!({"shared":"latest"}));
+        assert_eq!(latest[3].pointer(chrome).unwrap()["widgets"], json!({
+            "shared":{"placement":"belowEditor","lines":["below"]}
+        }));
+        assert_eq!(latest[6].pointer(chrome).unwrap(), &json!({
+            "widgets":{"other":{"placement":"aboveEditor","lines":["kept"]}}
+        }));
+        assert_eq!(latest[6]["updatedAt"], before);
+        assert_eq!(
+            wire::snapshot_payload(&sibling.data.lock().await.snapshot).pointer(chrome).unwrap(),
+            &json!({"statuses":{"shared":"sibling"}})
+        );
+        assert_eq!(manager.observe_timeline(id, &json!({"limit":0})).await.unwrap()["rows"], json!([]));
+        manager.apply_event(id, &cell, json!({"type":"omp_extension_ui","replacement":null}), true).await.unwrap();
+        assert!(wire::snapshot_payload(&cell.data.lock().await.snapshot).pointer(chrome).is_some());
+        cell.sink
+            .emit(json!({"type":"turn_completed","provider":"mock","turnId":"live-turn"}))
+            .await
+            .unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert!(wire::snapshot_payload(&cell.data.lock().await.snapshot).pointer(chrome).is_some());
+        cell.sink
+            .emit(json!({"type":"turn_failed","provider":"mock","sessionEnded":true,
+                "error":"provider exited"}))
+            .await
+            .unwrap();
+        let mut late = mapper.map(&json!({"type":"extension_ui_request","method":"setStatus",
+            "statusKey":"late","statusText":"not for an ended runtime"}));
+        cell.sink.emit(late.pop().unwrap()).await.unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert!(wire::snapshot_payload(&cell.data.lock().await.snapshot).pointer(chrome).is_none());
+        assert!(wire::snapshot_payload(&sibling.data.lock().await.snapshot).pointer(chrome).is_some());
+        manager.close_cell(id, &cell).await.unwrap();
+        assert!(wire::snapshot_payload(&cell.data.lock().await.snapshot).pointer(chrome).is_none());
+        manager.close_cell(sibling_id, &sibling).await.unwrap();
     }
 
     #[tokio::test]

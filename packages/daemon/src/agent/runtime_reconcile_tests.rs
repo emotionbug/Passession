@@ -344,6 +344,39 @@ async fn omp_message_reconcile_admitted_commit_survives_waiter_cancellation() {
 }
 
 #[tokio::test]
+async fn codex_moderation_invalidates_the_live_projection_without_forwarding_control() {
+    let root = tempfile::tempdir().unwrap();
+    let app = AppState::new(
+        root.path().join("home"),
+        root.path().into(),
+        std::env::current_exe().unwrap(),
+    );
+    let manager = &app.agents;
+    let id = "00000000-0000-4000-8000-000000000099";
+    let cell = staged_cell(&app, id).await;
+    manager.release_event_stage(&cell).await.unwrap();
+    let body = json!({"type":"timeline","provider":"mock","turnId":"live-turn",
+        "item":{"type":"assistant_message","messageId":"answer","text":"withdrawn response"}});
+    emit(&cell, vec![body]).await;
+    manager.drain_events(&cell).await.unwrap();
+    let before = manager.observe_timeline(id, &json!({"limit":0})).await.unwrap();
+    let mut receiver = manager.events.subscribe();
+    let notice = json!({"type":"notification","messageId":"answer","level":"warning",
+        "message":"Codex blocked this response.","metadata":{"codexModeration":true}});
+    emit(&cell, vec![json!({"type":"timeline_reconcile","provider":"mock","reason":"codex_moderation",
+        "messageId":"answer","turnId":"live-turn","item":notice})]).await;
+    manager.drain_events(&cell).await.unwrap();
+    let after = manager.observe_timeline(id, &json!({"limit":0})).await.unwrap();
+    assert_eq!(after["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(after["rows"][0]["item"], notice);
+    assert_ne!(after["epoch"], before["epoch"]);
+    let events = observed(&mut receiver);
+    assert_eq!(events.iter().filter(|e| e["type"] == "timeline_replacement").count(), 1);
+    assert!(!events.iter().any(|e| e["type"] == "timeline_reconcile"));
+    manager.close_cell(id, &cell).await.unwrap();
+}
+
+#[tokio::test]
 async fn model_changes_apply_reported_configuration_and_foreign_forks_are_ignored() {
     let root = tempfile::tempdir().unwrap();
     let app = AppState::new(

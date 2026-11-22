@@ -936,6 +936,37 @@ impl AgentManager {
         })
         .await
     }
+    pub(super) async fn stop_provider_task(
+        &self,
+        actor: &Value,
+        id: &str,
+        token: uuid::Uuid,
+    ) -> Result<()> {
+        let guard = self.lane(id).await.lock_owned().await;
+        self.authorize(actor, id).await?;
+        let cell = self.cell(id).await?;
+        let session = {
+            let data = cell.data.lock().await;
+            if !data.ready
+                || data.owner_ended
+                || data.snapshot["internal"] == true
+                || !data.snapshot["archivedAt"].is_null()
+            {
+                bail!("Agent has no live task runtime");
+            }
+            data.session
+                .clone()
+                .ok_or_else(|| anyhow!("Agent has no live task runtime"))?
+        };
+        // Once admitted, losing the response socket must not leave the provider
+        // halfway through the control exchange or retain a spent action offer.
+        tokio::spawn(async move {
+            let _guard = guard;
+            session.stop_provider_task(token).await
+        })
+        .await?
+    }
+
     async fn interrupt_cell(&self, id: &str, cell: &Arc<AgentCell>) -> Result<Value> {
         let snapshot = cell.data.lock().await.snapshot.clone();
         if !is_busy(&snapshot) {

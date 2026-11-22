@@ -966,6 +966,52 @@ pub fn fit_in_viewport(mut popup: Rect, viewport: Rect, margin: f64) -> Rect {
     popup
 }
 
+/// Frame of a dropdown `width` wide whose sheet measures `natural` (0 until measured), hanging
+/// from `anchor` inside `bounds`, plus the height it may grow to. It opens below its field unless
+/// the room there is short and there is more above, and lines up with the field's nearer edge.
+pub(crate) fn dropdown_frame(anchor: Rect, width: f64, natural: f64, bounds: Rect) -> (Rect, f64) {
+    const GAP: f64 = 4.0;
+    let top = bounds.pos.y;
+    let bottom = top + bounds.size.y;
+    let below_y = (anchor.pos.y + anchor.size.y + GAP).clamp(top, bottom);
+    let above_end = (anchor.pos.y - GAP).clamp(top, bottom);
+    let below = bottom - below_y;
+    let over = above_end - top;
+    let wanted = if natural > 0.0 {
+        natural.min(240.0)
+    } else {
+        240.0
+    };
+    let above = below < wanted && over > below;
+    let room = if above { over } else { below }.max(0.0);
+    let height = if natural > 0.0 {
+        natural.min(room)
+    } else {
+        room
+    };
+    let width = width.min(bounds.size.x).max(0.0);
+    let right_half = anchor.pos.x + anchor.size.x / 2.0 > bounds.pos.x + bounds.size.x / 2.0;
+    let x = if right_half {
+        anchor.pos.x + anchor.size.x - width
+    } else {
+        anchor.pos.x
+    };
+    let x = x.clamp(
+        bounds.pos.x,
+        (bounds.pos.x + bounds.size.x - width).max(bounds.pos.x),
+    );
+    let y = if above {
+        above_end - height
+    } else {
+        below_y
+    };
+    let frame = Rect {
+        pos: dvec2(x, y),
+        size: dvec2(width, height),
+    };
+    (frame, room)
+}
+
 /// A release must resolve to the target that accepted the press, not a neighbour
 /// exposed by scrolling or a redraw. Gesture owners cancel this when they take over.
 pub struct TapTarget<T> {

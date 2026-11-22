@@ -1,6 +1,7 @@
+use crate::providers::mcp_elicitation::{self, Answer, Elicitation};
 use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
-use std::fmt::Write as _;
+use std::{fmt::Write as _, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub struct PendingPermission {
@@ -9,6 +10,7 @@ pub struct PendingPermission {
     pub method: String,
     pub params: Value,
     pub request: Value,
+    pub(super) elicitation: Option<Arc<Elicitation>>,
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -151,20 +153,42 @@ pub fn request(
     method: &str,
     params: Value,
 ) -> Result<PendingPermission> {
+    let elicitation;
     let mut req;
     let id;
     if method == "mcpServer/elicitation/request" {
-        string(&params, "threadId")?;
-        let server = string(&params, "serverName")?;
-        let mode = string(&params, "mode")?;
+        mcp_elicitation::required_text(&params["threadId"], "Codex thread ID")?;
         ensure!(
-            matches!(mode, "form" | "openai/form" | "url"),
-            "Invalid MCP elicitation mode"
+            params["turnId"].is_null() || params["turnId"].is_string(),
+            "Invalid Codex MCP turn ID"
         );
+        let server = mcp_elicitation::required_text(&params["serverName"], "server name")?;
         let message = string(&params, "message")?;
+        let parsed = match string(&params, "mode")? {
+            mode @ ("form" | "openaiForm" | "openai/form") => {
+                ensure!(params["url"].is_null() && params["elicitationId"].is_null(), "Unexpected URL fields in Codex MCP form");
+                Elicitation::form(&params["requestedSchema"], &Value::Null, mode != "form")?
+            }
+            "url" => {
+                ensure!(params["requestedSchema"].is_null(), "Unexpected schema in Codex MCP URL request");
+                Elicitation::url(&params["url"], &params["elicitationId"])?
+            }
+            _ => bail!("Unsupported Codex MCP elicitation mode"),
+        };
         id = format!("permission-{}", uuid::Uuid::new_v4());
-        req = json!({"name":"CodexMcpElicitation","kind":"tool","title":format!("MCP approval: {server}"),"description":message,"input":{"mode":mode,"requestedSchema":params["requestedSchema"],"url":params["url"]},"metadata":{"threadId":params["threadId"],"turnId":params["turnId"],"serverName":server,"elicitationId":params["elicitationId"]}});
+        req = parsed.request(server, message);
+        if params["_meta"]["codex_approval_kind"] == "mcp_tool_call" {
+            let tool = mcp_elicitation::required_text(&params["_meta"]["tool_name"], "Codex tool name")?;
+            let arguments = &params["_meta"]["tool_params"];
+            ensure!(arguments.is_object(), "Missing Codex MCP tool arguments for approval");
+            let description = format!("{message}\n\nTool: {tool}\nArguments: {arguments}");
+            req["description"] = json!(description);
+        }
+        req["metadata"]["threadId"] = params["threadId"].clone();
+        req["metadata"]["turnId"] = params["turnId"].clone();
+        elicitation = Some(Arc::new(parsed));
     } else {
+        elicitation = None;
         let item = string(&params, "itemId")?;
         string(&params, "threadId")?;
         string(&params, "turnId")?;
@@ -242,23 +266,20 @@ pub fn request(
     }
     req["id"] = json!(id);
     req["provider"] = json!(provider);
+    let params = if elicitation.is_some() {
+        // Keep correlation, not the original schema or its embedded preview assets.
+        json!({"threadId":params["threadId"],"turnId":params["turnId"]})
+    } else {
+        params
+    };
     Ok(PendingPermission {
         id,
         native_id: Some(native_id),
         method: method.into(),
         params,
         request: req,
+        elicitation,
     })
-}
-
-/// These elicitations are deliberately declined without presenting an unusable form.
-pub fn automatic_reply(pending: &PendingPermission) -> Option<Value> {
-    (pending.method == "mcpServer/elicitation/request"
-        && (pending.params["mode"] == "url"
-            || pending.params["requestedSchema"]["required"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty())))
-    .then(|| json!({"action":"decline","content":null,"_meta":null}))
 }
 
 /// Offer the session grant and any persistent rules proposed by Codex.
@@ -354,7 +375,12 @@ pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
         } else {
             deny(pending)
         }),
-        "mcpServer/elicitation/request" => Ok(automatic_reply(pending).unwrap_or_else(||json!({"action":decision,"content":if allow { json!({}) } else { Value::Null },"_meta":null}))),
+        "mcpServer/elicitation/request" => pending
+            .elicitation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing Codex MCP elicitation state"))?
+            .answer(response)
+            .map(|answer| answer.native(true)),
         "plan" => Ok(if allow { json!({"followUpPrompt":plan_prompt(pending.params["planText"].as_str().unwrap_or(""))}) } else { Value::Null }),
         "item/tool/requestUserInput" | "tool/requestUserInput" => {
             let questions = normalize_questions(&pending.params["questions"]);
@@ -368,11 +394,6 @@ pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
                         if !values.is_empty() { answers.insert(q["id"].as_str().unwrap_or("").into(),json!({"answers":values})); }
                     }
                 }
-                if answers.is_empty() {
-                    for q in &questions {
-                        if let Some(label) = nonempty(&q["options"][0]["label"]) { answers.insert(q["id"].as_str().unwrap_or("").into(),json!({"answers":[label]})); }
-                    }
-                }
             }
             Ok(json!({"answers":answers}))
         },
@@ -382,7 +403,7 @@ pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
 
 pub fn deny(pending: &PendingPermission) -> Value {
     match pending.method.as_str() {
-        "mcpServer/elicitation/request" => json!({"action":"decline","content":null,"_meta":null}),
+        "mcpServer/elicitation/request" => Answer::cancel().native(true),
         "item/permissions/requestApproval" => json!({"permissions":{},"scope":"turn"}),
         "item/tool/requestUserInput" | "tool/requestUserInput" => json!({"answers":{}}),
         "plan" => Value::Null,
@@ -408,6 +429,7 @@ pub fn plan(provider: &str, id: String, text: &str, turn_id: Option<&str>) -> Pe
         method: "plan".into(),
         params: json!({"planText":text,"turnId":turn_id}),
         request,
+        elicitation: None,
     }
 }
 pub fn plan_prompt(text: &str) -> String {
@@ -698,7 +720,8 @@ impl AsyncQuestions {
 
 /// `outcome` is absent for the proposal, otherwise approved/rejected/canceled.
 pub fn plan_timeline(pending: &PendingPermission, outcome: Option<&str>) -> Value {
-    let mut item = json!({"type":"tool_call","callId":pending.id,"name":"plan_approval","status":match outcome { None => "running", Some("canceled") => "canceled", _ => "completed" },"error":null,"detail":{"type":"plan","text":pending.params["planText"]}});
+    let call_id = pending.params["itemId"].as_str().unwrap_or(&pending.id);
+    let mut item = json!({"type":"tool_call","callId":call_id,"name":"plan_approval","status":match outcome { None => "running", Some("canceled") => "canceled", _ => "completed" },"error":null,"detail":{"type":"plan","text":pending.params["planText"]}});
     if let Some(outcome) = outcome {
         item["metadata"] = if outcome == "canceled" {
             json!({})

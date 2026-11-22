@@ -268,11 +268,10 @@ pub(crate) fn save_image(
         "saveImage",
         json!({"path": path, "mime": mime_type, "name": name}),
         done,
-        |value| {
-            value
-                .as_bool()
-                .map(PlatformValue::Bool)
-                .ok_or_else(|| PlatformError::native("Invalid Android image save result."))
+        |value| match value {
+            Value::String(s) if s == "photos" => Ok(PlatformValue::PhotoLibrarySaved),
+            Value::Bool(saved) => Ok(PlatformValue::Bool(saved)), // Document picker on API < 29.
+            _ => Err(PlatformError::native("Invalid Android image save result.")),
         },
     );
 }

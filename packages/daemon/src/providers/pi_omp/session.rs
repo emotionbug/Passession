@@ -936,15 +936,26 @@ impl Inner {
             self.context.cancel.child_token(),
         )
         .await?;
-        // A resumed runtime can replay more than the bounded event channel holds.
-        // Discard its startup replay, just as the source attaches after get_state.
+        // Discard the new process's transcript replay, but retain its keyed
+        // startup chrome for the generation handoff.
         let done = CancellationToken::new();
         let drain_done = done.clone();
         let drain = tokio::spawn(async move {
+            let mut ui = Value::Null;
             loop {
-                tokio::select! {biased;_=drain_done.cancelled()=>break,event=receiver.recv()=>if event.is_none(){break;}}
+                let frame = tokio::select! {
+                    biased;
+                    _ = drain_done.cancelled() => break,
+                    frame = receiver.recv() => frame,
+                };
+                let Some(frame) = frame else { break };
+                if frame["type"] == "extension_ui_request"
+                    && let Some(patch) = super::extension_ui::patch(&frame)
+                {
+                    super::extension_ui::apply(&mut ui, patch);
+                }
             }
-            receiver
+            (receiver, ui)
         });
         let initialized = async {
             next.negotiate(launch::ready_timeout(&self.spec, &config))
@@ -964,7 +975,7 @@ impl Inner {
         }
         .await;
         done.cancel();
-        let receiver = match drain.await {
+        let (receiver, ui) = match drain.await {
             Ok(receiver) => receiver,
             Err(error) => {
                 next.close().await.ok();
@@ -1019,6 +1030,7 @@ impl Inner {
         if let Some(previous) = previous {
             previous.close().await.ok();
         }
+        self.emit(super::extension_ui::replace(ui)).await?;
         self.accept_events(ended_children).await?;
         if let Some(notice) = notice {
             self.warn(notice).await?;

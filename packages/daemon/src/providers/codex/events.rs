@@ -5,7 +5,33 @@ use super::{
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+
+#[derive(Default)]
+pub(super) struct LiveTurnItems {
+    id: String,
+    mcp_calls: HashMap<String, (String, Option<String>)>,
+    // A None value is a completed item; a late delta must not reopen it.
+    plan_previews: HashMap<String, Option<String>>,
+    plan_explanation: Option<String>,
+    moderation_noticed: bool,
+    buffer_responses: bool,
+}
+
+impl LiveTurnItems {
+    fn get<'a>(state: &'a mut State, child: Option<&str>, turn_id: &Value) -> Option<&'a mut Self> {
+        state
+            .live_items
+            .get_mut(child.unwrap_or(""))
+            .filter(|turn| turn_id.as_str() == Some(turn.id.as_str()))
+    }
+
+    fn cancel_previews(self, child: Option<&str>, events: &mut Vec<Value>) {
+        events.extend(self.plan_previews.into_iter().filter_map(|(id, text)| {
+            Some(timeline(child, plan_preview(&id, &text?, "canceled")))
+        }));
+    }
+}
 
 impl CodexSession {
     pub(super) async fn handle_frame(&self, frame: Value) -> Result<()> {
@@ -27,10 +53,6 @@ impl CodexSession {
                 let params = frame["params"].clone();
                 match permissions::request(&self.spec.id, id.clone(), method, params) {
                     Ok(pending) => {
-                        if let Some(reply) = permissions::automatic_reply(&pending) {
-                            self.client.reply(id.clone(), reply).await?;
-                            continue;
-                        }
                         let question = matches!(
                             pending.method.as_str(),
                             "item/tool/requestUserInput" | "tool/requestUserInput"
@@ -55,26 +77,6 @@ impl CodexSession {
                     Err(error) => self.client.reject(id.clone(), &error.to_string()).await?,
                 }
                 continue;
-            }
-            if method == "serverRequest/resolved" {
-                let native_id = {
-                    let s = self.state.lock().unwrap();
-                    s.pending
-                        .values()
-                        .find(|p| {
-                            p.method == "mcpServer/elicitation/request"
-                                && p.native_id.as_ref() == frame["params"].get("requestId")
-                        })
-                        .and_then(|p| p.native_id.clone())
-                };
-                if let Some(native_id) = native_id {
-                    self.client
-                        .reply(
-                            native_id,
-                            json!({"action":"cancel","content":null,"_meta":null}),
-                        )
-                        .await?;
-                }
             }
             let source_id = frame["params"]["itemId"]
                 .as_str()
@@ -295,8 +297,45 @@ impl CodexSession {
                     ));
                 }
             }
+            "turn/moderationMetadata" => {
+                // The schema leaves moderation metadata opaque. Do not display it or
+                // infer that a response was blocked from the mere presence of metadata.
+                let metadata = &params["metadata"];
+                if !metadata.is_null()
+                    && !metadata.as_object().is_some_and(|data| data.is_empty())
+                    && let Some(turn) =
+                        LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
+                    && !std::mem::replace(&mut turn.moderation_noticed, true)
+                {
+                    events.push(timeline(
+                        child.as_deref(),
+                        projection::notice("info", "Codex reported response moderation."),
+                    ));
+                }
+            }
+            "model/safetyBuffering/updated" => {
+                if params["showBufferingUi"] == true
+                    && let Some(turn) =
+                        LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
+                    && !std::mem::replace(&mut turn.buffer_responses, true)
+                {
+                    events.push(timeline(
+                        child.as_deref(),
+                        projection::notice(
+                            "info",
+                            "Codex is checking its response before displaying it.",
+                        ),
+                    ));
+                }
+            }
             "paseo/transportClosed" => {
                 let active = s.foreground.is_some() || s.native_turn.is_some();
+                for (thread, items) in s.live_items.drain() {
+                    items.cancel_previews(
+                        (!thread.is_empty()).then_some(thread.as_str()),
+                        &mut events,
+                    );
+                }
                 if !s.closed
                     && let Some(event) =
                         transport_close_event(&params, active, s.foreground.as_deref())
@@ -335,6 +374,21 @@ impl CodexSession {
                 }
             }
             "turn/started" => {
+                if let Some(id) = params["turn"]["id"].as_str() {
+                    let key = child.as_deref().unwrap_or("");
+                    if s.live_items.get(key).is_some_and(|turn| turn.id == id) {
+                        return Ok((events, replay));
+                    }
+                    if let Some(previous) = s.live_items.insert(
+                        key.into(),
+                        LiveTurnItems {
+                            id: id.into(),
+                            ..LiveTurnItems::default()
+                        },
+                    ) {
+                        previous.cancel_previews(child.as_deref(), &mut events);
+                    }
+                }
                 if let Some(child) = &child {
                     events.push(subagent_status(&s, child, "running"));
                 } else if let Some(id) = params["turn"]["id"].as_str() {
@@ -343,7 +397,6 @@ impl CodexSession {
                     s.outputs.clear();
                     s.completed.clear();
                     s.last_plan = None;
-                    s.plan_explanation = None;
                     s.assistant_boundary = false;
                     s.completed_compactions = 0;
                     events.push(json!({"type":"turn_started"}));
@@ -351,6 +404,14 @@ impl CodexSession {
             }
             "turn/completed" => {
                 let status = params["turn"]["status"].as_str().unwrap_or("completed");
+                let live_key = child.as_deref().unwrap_or("");
+                if s.live_items.get(live_key).is_some_and(|turn| {
+                    params["turn"]["id"].as_str().is_none_or(|id| id == turn.id)
+                })
+                    && let Some(items) = s.live_items.remove(live_key)
+                {
+                    items.cancel_previews(child.as_deref(), &mut events);
+                }
                 if let Some(child) = &child {
                     events.push(subagent_status(
                         &s,
@@ -378,7 +439,7 @@ impl CodexSession {
                     }
                     if status == "completed"
                         && s.config["featureValues"]["plan_mode"] == true
-                        && let Some(text) = s.last_plan.take()
+                        && let Some((item_id, text)) = s.last_plan.take()
                     {
                         let previous: Vec<_> = s
                             .pending
@@ -398,12 +459,15 @@ impl CodexSession {
                                     "resolution":{"behavior":"deny","message":"Superseded by a newer plan"}}));
                         }
                         let id = format!("permission-{}", uuid::Uuid::new_v4());
-                        let pending = permissions::plan(
+                        let mut pending = permissions::plan(
                             &self.spec.id,
                             id.clone(),
                             &text,
                             s.foreground.as_deref(),
                         );
+                        if let Some(item_id) = item_id {
+                            pending.params["itemId"] = json!(item_id);
+                        }
                         events.push(json!({"type":"timeline","item":permissions::plan_timeline(&pending,None)}));
                         events
                             .push(json!({"type":"permission_requested","request":pending.request}));
@@ -449,11 +513,18 @@ impl CodexSession {
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/textDelta" => {
                 let id = params["itemId"].as_str().unwrap_or("");
-                let delta = params["delta"].as_str().unwrap_or("");
+                let reasoning = method != "item/agentMessage/delta";
                 let key = format!("{}:{id}", thread.as_deref().unwrap_or(""));
+                if !reasoning
+                    && (s.withheld_responses.contains_key(&key)
+                        || LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
+                            .is_some_and(|turn| turn.buffer_responses))
+                {
+                    return Ok((events, replay));
+                }
+                let delta = params["delta"].as_str().unwrap_or("");
                 let first = !s.text.contains_key(&key);
                 s.text.entry(key).or_default().push_str(delta);
-                let reasoning = method.contains("reasoning");
                 let text = if !reasoning && first && s.assistant_boundary && child.is_none() {
                     s.assistant_boundary = false;
                     format!("\n\n---\n\n{delta}")
@@ -475,6 +546,43 @@ impl CodexSession {
                     .or_default()
                     .push_str(params["delta"].as_str().unwrap_or(""));
             }
+            "item/mcpToolCall/progress" => {
+                if let (Some(id), Some(message)) =
+                    (params["itemId"].as_str(), params["message"].as_str())
+                    && !message.trim().is_empty()
+                    && let Some(turn) =
+                        LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
+                    && let Some((name, previous)) = turn.mcp_calls.get_mut(id)
+                    && previous.as_deref() != Some(message)
+                {
+                    // Do not copy the tool arguments or write progress into the result.
+                    *previous = Some(message.into());
+                    events.push(timeline(child.as_deref(), json!({"type":"tool_call","callId":id,
+                        "name":name,"status":"running","metadata":{"progressMessage":message}})));
+                }
+            }
+            "item/plan/delta" => {
+                if let (Some(id), Some(delta)) =
+                    (params["itemId"].as_str(), params["delta"].as_str())
+                    && !id.is_empty()
+                    && !delta.is_empty()
+                    && let Some(turn) =
+                        LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
+                {
+                    let item = match turn.plan_previews.get_mut(id) {
+                        Some(Some(text)) => {
+                            text.push_str(delta);
+                            plan_preview(id, text, "running")
+                        }
+                        Some(None) => return Ok((events, replay)),
+                        None => {
+                            turn.plan_previews.insert(id.into(), Some(delta.into()));
+                            plan_preview(id, delta, "running")
+                        }
+                    };
+                    events.push(timeline(child.as_deref(), item));
+                }
+            }
             "item/started" | "item/completed" => {
                 let mut raw = params["item"].clone();
                 let id = raw["id"].as_str().unwrap_or("").to_owned();
@@ -490,12 +598,66 @@ impl CodexSession {
                 } else if !id.is_empty() && !s.completed.insert(dedup) {
                     return Ok((events, replay));
                 }
-                if !done
-                    && matches!(
-                        kind.as_str(),
-                        "agentMessage" | "reasoning" | "enteredReviewMode" | "exitedReviewMode"
-                    )
+                let is_plan = matches!(kind.as_str(), "plan" | "Plan");
+                let is_mcp = matches!(kind.as_str(), "mcpToolCall" | "McpToolCall");
+                let mut had_progress = false;
+                let mut plan_preview_text = None;
+                if done
+                    && (is_mcp || is_plan)
+                    && let Some(turn) =
+                        LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
                 {
+                    if is_mcp {
+                        had_progress = turn
+                            .mcp_calls
+                            .remove(&id)
+                            .is_some_and(|(_, message)| message.is_some());
+                    } else {
+                        plan_preview_text = turn.plan_previews.insert(id.clone(), None).flatten();
+                    }
+                }
+                if is_plan && !done {
+                    return Ok((events, replay));
+                }
+                let reported = projection::moderation_notice(&raw);
+                if let Some(message) = reported
+                    && !id.is_empty()
+                {
+                    s.withheld_responses.insert(key.clone(), message);
+                }
+                let withheld = if matches!(kind.as_str(), "agentMessage" | "AgentMessage") {
+                    reported.or(s.withheld_responses.get(&key).copied())
+                } else {
+                    None
+                };
+                if !done
+                    && (withheld.is_some()
+                        || matches!(
+                            kind.as_str(),
+                            "agentMessage" | "reasoning" | "enteredReviewMode" | "exitedReviewMode"
+                        ))
+                {
+                    return Ok((events, replay));
+                }
+                if let Some(message) = withheld {
+                    s.text.remove(&key);
+                    let item = projection::moderation_item(Some(&id), message);
+                    if id.is_empty() {
+                        events.push(timeline(child.as_deref(), item));
+                    } else if let Some(child) = child.as_deref() {
+                        let sources = moderation_preview_sources(&s, child, &id);
+                        events.push(json!({"type":"timeline_reconcile","reason":"codex_moderation",
+                            "messageId":id,"previewSources":sources}));
+                        events.push(json!({"type":"provider_subagent","event":{
+                            "type":"codex_moderation","reason":"codex_moderation","id":child,
+                            "messageId":id,"item":item}}));
+                    } else {
+                        let turn = (params["turnId"].as_str() == s.native_turn.as_deref())
+                            .then_some(s.foreground.as_deref())
+                            .flatten();
+                        events.push(json!({"type":"timeline_reconcile","reason":"codex_moderation",
+                            "messageId":id,"turnId":turn,"item":item}));
+                    }
                     return Ok((events, replay));
                 }
                 if done
@@ -574,6 +736,11 @@ impl CodexSession {
                 };
                 let entries =
                     projection::item_entries_with_images(&raw, true, cwd, &mut materialize);
+                if entries.is_empty()
+                    && let Some(text) = plan_preview_text.as_deref()
+                {
+                    events.push(timeline(child.as_deref(), plan_preview(&id, text, "canceled")));
+                }
                 for mut item in entries {
                     if item["type"] == "user_message" {
                         if child.is_none() {
@@ -628,13 +795,26 @@ impl CodexSession {
                             }
                         }
                     }
-                    if item["type"] == "tool_call"
-                        && item["detail"]["type"] == "plan"
-                        && child.is_none()
-                    {
-                        s.last_plan = item["detail"]["text"].as_str().map(str::to_owned);
-                        if s.config["featureValues"]["plan_mode"] == true {
+                    if is_plan && child.is_none() && s.config["featureValues"]["plan_mode"] == true {
+                        if let Some(text) = item["detail"]["text"].as_str() {
+                            s.last_plan =
+                                Some((item["callId"].as_str().map(str::to_owned), text.into()));
+                        }
+                        if plan_preview_text.is_none() {
                             continue;
+                        }
+                    }
+                    if is_mcp && item["type"] == "tool_call" {
+                        if had_progress {
+                            // The timeline merges metadata fields on lifecycle updates.
+                            item["metadata"]["progressMessage"] = Value::Null;
+                        }
+                        if !done
+                            && let Some(turn) =
+                                LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
+                        {
+                            let name = item["name"].as_str().unwrap_or_default();
+                            turn.mcp_calls.insert(id.clone(), (name.into(), None));
                         }
                     }
                     for id in projection::child_threads(&raw) {
@@ -684,27 +864,41 @@ impl CodexSession {
             "turn/plan/updated" => {
                 if let Some(explanation) = params["explanation"].as_str().map(str::trim)
                     && !explanation.is_empty()
-                    && s.plan_explanation.as_deref() != Some(explanation)
+                    && LiveTurnItems::get(&mut s, child.as_deref(), &params["turnId"])
+                        .is_none_or(|turn| {
+                            if turn.plan_explanation.as_deref() == Some(explanation) {
+                                return false;
+                            }
+                            turn.plan_explanation = Some(explanation.to_owned());
+                            true
+                        })
                 {
-                    s.plan_explanation = Some(explanation.to_owned());
                     events.push(timeline(
                         child.as_deref(),
                         projection::notice("info", explanation),
                     ));
                 }
-                let plan = params["plan"].clone();
+                let plan = &params["plan"];
                 if s.config["featureValues"]["plan_mode"] == true && child.is_none() {
-                    s.last_plan = Some(
-                        plan.as_array()
+                    // Checklist updates can arrive after the actual proposal.
+                    if s.last_plan.as_ref().is_none_or(|(id, _)| id.is_none()) {
+                        let mut text = String::new();
+                        for step in plan
+                            .as_array()
                             .into_iter()
                             .flatten()
-                            .filter_map(|s| s["step"].as_str())
-                            .map(|s| format!("- {s}"))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    );
+                            .filter_map(|step| step["step"].as_str().filter(|s| !s.trim().is_empty()))
+                        {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str("- ");
+                            text.push_str(step);
+                        }
+                        s.last_plan = (!text.is_empty()).then_some((None, text));
+                    }
                 } else {
-                    events.push(timeline(child.as_deref(), projection::plan_todo(&plan)));
+                    events.push(timeline(child.as_deref(), projection::plan_todo(plan)));
                 }
             }
             "turn/diff/updated" => {}
@@ -748,13 +942,15 @@ impl CodexSession {
                     .pending
                     .iter()
                     .find(|(_, p)| {
-                        p.method == "mcpServer/elicitation/request"
+                        p.elicitation.is_some()
                             && p.native_id.as_ref() == Some(id)
+                            && p.params["threadId"] == params["threadId"]
                     })
                     .map(|(id, _)| id.clone());
                 if let Some(key) = key {
                     s.pending.remove(&key);
-                    events.push(json!({"type":"permission_resolved","requestId":key,"resolution":{"behavior":"deny","interrupt":true}}));
+                    let resolution = crate::providers::mcp_elicitation::Answer::cancel().resolution();
+                    events.push(json!({"type":"permission_resolved","requestId":key,"resolution":resolution}));
                 }
             }
             "item/commandExecution/terminalInteraction" => {
@@ -826,7 +1022,13 @@ impl CodexSession {
             };
             if update["type"] == "upsert" {
                 state.children.insert(id.to_owned(), update.clone());
-            } else if update["type"] == "timeline" {
+            } else if matches!(update["type"].as_str(), Some("timeline" | "codex_moderation")) {
+                if update["item"]["metadata"]["progressMessage"].is_string()
+                    && update["item"].get("detail").is_none()
+                {
+                    // The child card already holds the full started item.
+                    continue;
+                }
                 let item = update["item"].clone();
                 let key = item["messageId"]
                     .as_str()
@@ -954,6 +1156,39 @@ fn timeline(child: Option<&str>, item: Value) -> Value {
         json!({"type":"timeline","item":item})
     }
 }
+fn plan_preview(id: &str, text: &str, status: &str) -> Value {
+    let mut item = json!({"type":"tool_call","callId":id,"name":"plan","status":status,
+        "error":null,"detail":{"type":"plan","text":text}});
+    if status == "canceled" {
+        // No authoritative plan item may exist for a canceled preview.
+        item["daemonOwned"] = json!(true);
+    }
+    item
+}
+
+fn moderation_preview_sources(state: &State, child: &str, message: &str) -> Vec<Value> {
+    let mut sources = vec![json!({"child":child,"key":message,"kind":"assistant_message"})];
+    let mut current = child;
+    while let (Some(parent), Some(call)) = (
+        state
+            .children
+            .get(current)
+            .and_then(|descriptor| descriptor["parentSubagentId"].as_str()),
+        state
+            .child_tools
+            .get(current)
+            .and_then(|tool| tool["callId"].as_str()),
+    ) {
+        if sources.iter().any(|source| source["child"] == parent) {
+            break;
+        }
+        // Ancestor cards log the immediate child's tool as one block.
+        sources.push(json!({"child":parent,"key":call,"kind":"tool_call"}));
+        current = parent;
+    }
+    sources
+}
+
 fn subagent_status(state: &State, id: &str, status: &str) -> Value {
     let mut event=state.children.get(id).cloned().unwrap_or_else(||json!({"type":"upsert","id":id,"title":"Codex subagent","description":null,"toolCallId":null,"parentSubagentId":null}));
     event["status"] = json!(status);

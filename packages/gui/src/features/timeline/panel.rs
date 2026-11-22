@@ -12,6 +12,7 @@ use super::canvas::*;
 use super::chat_row::{ChatRowEvent, ChatRowWidgetRefExt, RowEventKind, RowModel};
 use super::chrome::{self, Callout, NonReady, Toast, ToastVariant};
 use super::composer_bridge as bridge;
+use super::extension_ui::ExtensionDock;
 use super::find::{self, FindController, Phase as FindPhase};
 use super::i18n::{t, ta};
 use super::images::{self, ImageState};
@@ -28,6 +29,7 @@ use super::session::{
     ActionKind, ChatSession, Completion, Cursor, ExecutionStatus, Io, SessionKey, SyncStatus,
 };
 use super::store::with_store;
+use super::task_controls;
 use super::tool_sheet::SheetMotion;
 use super::tracks::{self, DeleteFinished, SubagentRow, TrackModel, TrackPanel};
 use crate::common::file_drop::FileDropZone;
@@ -837,6 +839,8 @@ pub struct ChatPanel {
     #[rust]
     pending_removal: HashSet<String>,
     #[rust]
+    requested_task_stops: HashSet<String>,
+    #[rust]
     children_requested: bool,
     #[rust]
     providers: Vec<Value>,
@@ -1034,6 +1038,7 @@ impl ChatPanel {
         self.delete_status = DeleteFinished::Idle;
         self.delete_run = DeleteRun::default();
         self.pending_removal.clear();
+        self.requested_task_stops.clear();
         self.children_requested = false;
         self.archiving = false;
         self.unarchiving = false;
@@ -1327,6 +1332,8 @@ impl ChatPanel {
                         }
                     }
                 }
+                self.requested_task_stops
+                    .retain(|token| task_controls::has_offer(task_controls::offered(&snap.agent), token));
                 self.snap = Some(Rc::new(snap));
                 true
             }
@@ -1519,6 +1526,42 @@ impl ChatPanel {
             .unwrap_or_default()
     }
 
+    fn offered_provider_tasks<'a>(&self, snap: Option<&'a Snap>) -> &'a [Value] {
+        if !self.host.connected
+            || !self.feature("providerTaskStop")
+            || self.archiving
+            || self.target.as_ref().is_none_or(ChatTarget::is_subagent)
+        {
+            return &[];
+        }
+        snap
+            .filter(|snap| snap.authorized && !snap.archived)
+            .map(|snap| task_controls::offered(&snap.agent))
+            .unwrap_or_default()
+    }
+
+    fn stop_provider_task(&mut self, cx: &mut Cx, ui: &mut UiContext, token: &str) {
+        if !task_controls::has_offer(self.offered_provider_tasks(self.snap.as_deref()), token)
+            || !self.requested_task_stops.insert(token.to_owned())
+        {
+            return;
+        }
+        if self
+            .with_session(cx, ui, |s, io| {
+                s.action(
+                    io,
+                    ActionKind::StopProviderTask { token: token.to_owned() },
+                    "agent.provider_tasks.stop.request",
+                    "agent.provider_tasks.stop.response",
+                    json!({"taskToken":token}),
+                )
+            })
+            .is_none()
+        {
+            self.requested_task_stops.remove(token);
+        }
+    }
+
     fn tracks_visible(&mut self) -> bool {
         let Some(snap) = &self.snap else { return false };
         if snap.archived || self.archiving {
@@ -1531,7 +1574,10 @@ impl ChatPanel {
             self.latest_tasks()
         };
         let rows = self.subagent_rows();
-        !rows.is_empty() || !tasks.is_empty() || self.delete_status != DeleteFinished::Idle
+        !rows.is_empty()
+            || !tasks.is_empty()
+            || !self.offered_provider_tasks(self.snap.as_deref()).is_empty()
+            || self.delete_status != DeleteFinished::Idle
     }
 
     /// agent-panel.dart `_streamRows` + `_timeline` items, oldest first.
@@ -2849,6 +2895,17 @@ impl ChatPanel {
             _ => {}
         }
         match kind {
+            ActionKind::StopProviderTask { token } => {
+                let failure = match result {
+                    Ok(body) => error_text(get(&body, "error")),
+                    Err(error) => Some(error.message),
+                };
+                if let Some(message) = failure {
+                    self.requested_task_stops.remove(&token);
+                    self.show_failure(cx, message);
+                }
+                self.redraw_modal(cx);
+            }
             ActionKind::Permission { key } => {
                 let state = self.row_state(&format!("perm:{key}"));
                 let mut state = state.borrow_mut();
@@ -3498,6 +3555,12 @@ impl ChatPanel {
                     else {
                         return;
                     };
+                    if action == permission::OPEN_ELICITATION_URL && permission::is_elicitation(&request) {
+                        if let Some(url) = permission::elicitation_url(&request) {
+                            ui.push(UiEffect::OpenExternal { url });
+                        }
+                        return;
+                    }
                     let Some(choice) = permission::actions(&request)
                         .into_iter()
                         .find(|a| str_of(get(a, "id")) == action)
@@ -3593,6 +3656,8 @@ impl ChatPanel {
             other => {
                 if let Some(toast) = other.strip_prefix("toast:") {
                     self.dismiss_toast(cx, ui, toast);
+                } else if let Some(token) = other.strip_prefix(task_controls::HIT_PREFIX) {
+                    self.stop_provider_task(cx, ui, token);
                 } else if let Some(key) = other.strip_prefix("subagent-open:") {
                     if let Some(row) = self.subagent_rows().into_iter().find(|r| r.key() == key) {
                         if !self.opens_in_sheet(ui, &row) {
@@ -4273,10 +4338,16 @@ impl Widget for ChatPanel {
         let composer_shown = self.composer_shown();
         if composer_shown {
             self.sync_composer(cx);
+            let extension = snap
+                .as_ref()
+                .filter(|_| connected && !subagent)
+                .and_then(|snap| ExtensionDock::new(&snap.agent, rect.size.y, look));
             // The pane below its header is the composer dock's stationary viewport.
             self.composer
                 .as_composer_panel()
-                .set_viewport_height(rect.size.y);
+                .set_viewport_height(
+                    rect.size.y - extension.as_ref().map_or(0.0, ExtensionDock::height),
+                );
             let bottom = rect.pos.y + rect.size.y;
             let walk = Walk {
                 abs_pos: Some(dvec2(rect.pos.x, bottom - self.composer_h)),
@@ -4295,6 +4366,10 @@ impl Widget for ChatPanel {
             );
             if self.composer_list.begin_maybe(cx, dirty).is_ok() {
                 cx.begin_turtle(walk, Layout::flow_down());
+                if let Some(extension) = &extension {
+                    self.kit.begin_layer(cx);
+                    extension.above(cx, &mut self.kit, look);
+                }
                 let _ = self.composer.draw_walk(
                     cx,
                     scope,
@@ -4305,6 +4380,9 @@ impl Widget for ChatPanel {
                         height: Size::Fit,
                     },
                 );
+                if let Some(extension) = &extension {
+                    extension.below(cx, &mut self.kit, look);
+                }
                 let range = cx.get_turtle_align_range();
                 let drawn = cx.end_turtle().size.y;
                 if drawn.is_finite() && (drawn - self.composer_h).abs() > 0.5 {
@@ -4462,6 +4540,7 @@ impl Widget for ChatPanel {
         } else {
             Vec::new()
         };
+        let provider_tasks = self.offered_provider_tasks(snap.as_deref());
         let toast = self.panel_toast();
         let prompts_active = self.active_prompt;
         let find_open = self.find_open;
@@ -4487,7 +4566,7 @@ impl Widget for ChatPanel {
         let can_detach = self.feature("agentDetach");
         let delete_status = self.delete_status;
         if match self.modal {
-            Some(Modal::Track(TrackPanel::Tasks)) => tasks.is_empty(),
+            Some(Modal::Track(TrackPanel::Tasks)) => tasks.is_empty() && provider_tasks.is_empty(),
             Some(Modal::Track(TrackPanel::Subagents)) => rows.is_empty(),
             _ => false,
         } {
@@ -4538,6 +4617,8 @@ impl Widget for ChatPanel {
         if tracks_visible {
             let model = TrackModel {
                 tasks: &tasks,
+                provider_tasks,
+                requested_task_stops: &self.requested_task_stops,
                 rows: &rows,
                 delete: delete_status,
                 can_delete_finished: !subagent,
@@ -4675,7 +4756,7 @@ impl Widget for ChatPanel {
 
         // ── modal surfaces ──────────────────────────────────────────────
         if self.track_motion.panel.is_some() {
-            self.paint_tracks(cx, look, rect, &target, &tasks, &rows, &host_label_fn);
+            self.paint_tracks(cx, look, rect, &target, &tasks, provider_tasks, &rows, &host_label_fn);
         } else {
             self.track_overlay.release(cx);
         }
@@ -5602,6 +5683,7 @@ impl ChatPanel {
         rect: Rect,
         target: &ChatTarget,
         tasks: &[Value],
+        provider_tasks: &[Value],
         rows: &[SubagentRow],
         host_label: &dyn Fn(&str) -> String,
     ) {
@@ -5680,6 +5762,8 @@ impl ChatPanel {
                 let texture_revision = crate::features::composer::texture_revision();
                 let model = TrackModel {
                     tasks,
+                    provider_tasks,
+                    requested_task_stops: &self.requested_task_stops,
                     rows,
                     delete: self.delete_status,
                     can_delete_finished: !target.is_subagent(),

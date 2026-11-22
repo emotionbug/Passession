@@ -356,9 +356,9 @@ impl PlatformHandle {
 
     /// Save an image into the device's photo library without a location prompt (Android:
     /// Pictures/Passession in the gallery; iOS: Photos). Only where
-    /// [`Capabilities::photo_library`] is true; completes `Bool(true)` once saved and
-    /// `Bool(false)` when a fallback save dialog is cancelled. The caller retains the source
-    /// until completion.
+    /// [`Capabilities::photo_library`] is true; completes `PhotoLibrarySaved` once published.
+    /// Android's pre-10 document fallback returns `Bool(saved)` instead. The caller retains
+    /// the source until completion.
     pub fn save_image(&self, path: &Path, mime_type: &str, name: &str) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();

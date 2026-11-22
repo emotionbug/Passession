@@ -12,7 +12,7 @@ pub(crate) fn snapshot_payload(agent: &Value) -> Value {
         .or_else(|| agent.get("thinkingOptionId"))
         .cloned()
         .unwrap_or(Value::Null);
-    let runtime = project_fields(
+    let mut runtime = project_fields(
         &agent["runtimeInfo"],
         &[
             "provider",
@@ -23,6 +23,21 @@ pub(crate) fn snapshot_payload(agent: &Value) -> Value {
             "extra",
         ],
     );
+    // Use the existing optional provider extension map. History/saved snapshots
+    // cannot grant live chrome, and older clients can ignore this extra key.
+    if !stored
+        && let Some(ui) = agent
+            .get(crate::providers::pi_omp::extension_ui::SNAPSHOT_KEY)
+            .filter(|value| value.is_object())
+    {
+        if !runtime["provider"].is_string() {
+            runtime["provider"] = agent["provider"].clone();
+        }
+        if runtime.get("sessionId").is_none() {
+            runtime["sessionId"] = agent["persistence"]["sessionId"].clone();
+        }
+        runtime["extra"]["ompExtensionUi"] = ui.clone();
+    }
     let effective = crate::directory_sync::resolve_effective_thinking_option_id(
         Some(&runtime),
         Some(&thinking),
@@ -61,6 +76,13 @@ pub(crate) fn snapshot_payload(agent: &Value) -> Value {
             .filter(|v| v.is_array())
             .cloned()
             .unwrap_or_else(|| json!([]));
+        if agent["archivedAt"].is_null()
+            && status != "closed"
+            && agent["internal"] != true
+            && let Some(tasks) = agent.get("liveProviderTasks").filter(|v| v.is_array())
+        {
+            out["liveProviderTasks"] = tasks.clone();
+        }
         out["activeTurn"] = agent.get("activeTurn").cloned().unwrap_or_else(|| {
             if let Some(turn) = agent.get("activeTurnId").filter(|v| v.is_string()) {
                 json!({"turnId":turn,"startedAt":agent["activeTurnStartedAt"]})
@@ -252,6 +274,33 @@ mod tests {
         assert!(result["persistence"].is_null());
         assert!(result.get("features").is_none());
         assert!(result.get("activeTurn").is_none());
+    }
+
+    #[test]
+    fn omp_extension_ui_uses_an_optional_provider_extra() {
+        use crate::providers::pi_omp::extension_ui::SNAPSHOT_KEY;
+        use paseo_protocol::wire::{Direction, validate_session};
+
+        let mut live = json!({
+            "id":"a","provider":"custom-omp","cwd":"/tmp","lifecycle":"idle",
+            "createdAt":"2026-11-22T00:00:00Z","updatedAt":"2026-11-22T00:00:00Z",
+            "runtimeInfo":{"provider":"custom-omp","sessionId":"native",
+                "extra":{"otherProviderData":true}}
+        });
+        let response = |agent| json!({"type":"fetch_agent_response",
+            "payload":{"requestId":"r","agent":agent,"error":null}});
+        validate_session(&response(snapshot_payload(&live)), Direction::Outbound).unwrap();
+
+        live[SNAPSHOT_KEY] = json!({"statuses":{"ext":"Ready"}});
+        let projected = snapshot_payload(&live);
+        assert!(projected.get(SNAPSHOT_KEY).is_none());
+        assert_eq!(projected["runtimeInfo"]["extra"], json!({
+            "otherProviderData":true,"ompExtensionUi":{"statuses":{"ext":"Ready"}}
+        }));
+        validate_session(&response(projected), Direction::Outbound).unwrap();
+
+        live["_live"] = json!(false);
+        assert!(snapshot_payload(&live)["runtimeInfo"]["extra"].get("ompExtensionUi").is_none());
     }
     #[test]
     fn stream_projection_excludes_internal_lifecycle_events() {

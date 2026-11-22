@@ -14,7 +14,7 @@ use crate::common::transition::{Intent, Transition};
 use crate::common::widgets::{StatusBucket, agent_live_status_bucket, paint_status_badge};
 use crate::common::{PanelTarget, Route, UiContext, icons, json as j, layer, tr, tr_args};
 use crate::shell::hosts::{self, Host};
-use crate::shell::layout::{Axis, CompactDestination, Node};
+use crate::shell::layout::{Axis, CompactDestination, Layout as WindowLayout, Node};
 use crate::shell::ui::{HitScope, Ui, Variant};
 use crate::shell::{PaseoShell, commands, panels, sidebar};
 use crate::theme::{self, ControlSize, Palette, with_alpha};
@@ -22,8 +22,10 @@ use crate::theme::{self, ControlSize, Palette, with_alpha};
 /// Geometry of the last frame, for drags and drops.
 #[derive(Default)]
 pub struct ChromeState {
-    /// (split id, axis, split rect) for divider drags.
-    pub splits: Vec<(String, Axis, Rect)>,
+    splits: Vec<SplitHandle>,
+    /// Child minimums of each split, in draw order. Scratch storage reused across layouts.
+    split_minima: Vec<[DVec2; 2]>,
+    sidebar_stepped_aside: bool,
     pub pane_rects: Vec<(String, Rect)>,
     pub tab_bars: Vec<(String, Rect)>,
     pub tab_rects: Vec<(String, String, Rect)>,
@@ -76,8 +78,8 @@ pub enum Slot {
 pub enum Drag {
     Split {
         id: String,
-        axis: Axis,
-        rect: Rect,
+        grab: f64,
+        last_first: f64,
     },
     Sidebar {
         start_x: f64,
@@ -93,6 +95,34 @@ pub enum Drag {
         start: DVec2,
         moving: bool,
     },
+}
+
+struct SplitHandle {
+    id: String,
+    axis: Axis,
+    start: f64,
+    available: f64,
+    minima: [f64; 2],
+    first: f64,
+}
+
+impl SplitHandle {
+    fn drag_first(&self, pointer: f64, grab: f64, last_first: f64) -> Option<f64> {
+        // A forced split has nowhere to move. Keep the saved ratio for when there is room.
+        if self.available <= self.minima[0] + self.minima[1] {
+            return None;
+        }
+        let ratio = (pointer - self.start - grab) / self.available;
+        let first = split_first(self.available, ratio, self.minima);
+        ((first - last_first).abs() > 0.01).then_some(first)
+    }
+}
+
+fn along(axis: Axis, v: DVec2) -> f64 {
+    match axis {
+        Axis::Horizontal => v.x,
+        Axis::Vertical => v.y,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -362,6 +392,8 @@ fn draw_chrome(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect
     chrome.tab_rects.clear();
     chrome.tab_overflow.clear();
     chrome.sidebar_rect = Rect::default();
+    chrome.explorer_rect = Rect::default();
+    chrome.sidebar_stepped_aside = false;
     chrome.slots.clear();
     let compact = shell.data.compact;
     let sidebar_destination =
@@ -387,6 +419,20 @@ fn draw_chrome(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect
         return;
     }
     let page_shown = shell.data.page.is_some();
+    let mut split_minima = std::mem::take(&mut shell.data.chrome.split_minima);
+    split_minima.clear();
+    let columns = if compact {
+        SideWidths::default()
+    } else {
+        let layout = &shell.data.layout;
+        let min_main = if page_shown || layout.maximized_pane.is_some() {
+            MIN_MAIN
+        } else {
+            measure_split_minima(&layout.tree, &mut split_minima).x.max(MIN_MAIN)
+        };
+        side_widths(layout, body.size.x, min_main, page_shown)
+    };
+    shell.data.chrome.sidebar_stepped_aside = columns.sidebar_stepped_aside;
     let mut y = body.pos.y;
     let show_header =
         !(page_shown || (compact && sidebar_destination) || (compact && host_count == 0));
@@ -416,14 +462,16 @@ fn draw_chrome(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect
     let content = rect(body.pos.x, y, body.size.x, body.pos.y + body.size.y - y);
     shell.data.chrome.content_rect = content;
     if host_count == 0 {
+        shell.data.chrome.split_minima = split_minima;
         crate::shell::sheets::welcome::draw(shell, cx, content);
         return;
     }
     if compact {
         draw_compact(shell, cx, &state, content, page_shown);
     } else {
-        draw_wide(shell, cx, &state, content, page_shown);
+        draw_wide(shell, cx, &state, content, page_shown, columns, &split_minima);
     }
+    shell.data.chrome.split_minima = split_minima;
 }
 
 fn draw_slot(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, slot: Slot) {
@@ -636,7 +684,7 @@ fn draw_header(
     // A compact detail view (file, diff, subagent…) leads with Back to the tab it came from.
     let detail_back = shell.data.layout.compact_back_tab(compact).is_some();
     let shell_sidebar_visible =
-        shell.data.layout.sidebar_visible && !sidebar_crowded(shell, r.size.x);
+        shell.data.layout.sidebar_visible && !shell.data.chrome.sidebar_stepped_aside;
     {
         let mut ui = make_ui(shell);
         let p = ui.p;
@@ -945,22 +993,75 @@ fn draw_header_git(
     }
 }
 
-/// The conversation's and the side panels' minimum widths in the wide layout.
 const MIN_MAIN: f64 = 320.0;
 const MIN_SIDEBAR: f64 = 200.0;
 const MIN_EXPLORER: f64 = 180.0;
+const MIN_SPLIT_WIDTH: f64 = 240.0;
+const MIN_SPLIT_HEIGHT: f64 = 160.0;
+const DIVIDER: f64 = 5.0;
 
-/// True when the sidebar, the conversation and the open Explorer cannot all keep their minimum
-/// widths (a 1366px laptop's half screen): the sidebar steps aside instead of squeezing all
-/// three, and comes back when the window widens or the Explorer closes.
-pub(crate) fn sidebar_crowded(shell: &PaseoShell, width: f64) -> bool {
-    let layout = &shell.data.layout;
-    !shell.data.compact
-        && shell.data.page.is_none()
-        && layout.sidebar_visible
-        && layout.explorer_visible
-        && width > 0.0
-        && width < MIN_SIDEBAR + 5.0 + MIN_MAIN + 5.0 + MIN_EXPLORER
+#[derive(Default)]
+struct SideWidths {
+    sidebar: f64,
+    explorer: f64,
+    sidebar_stepped_aside: bool,
+}
+
+fn side_widths(layout: &WindowLayout, width: f64, min_main: f64, page_shown: bool) -> SideWidths {
+    let explorer_visible = layout.explorer_visible && !page_shown;
+    let sidebar_stepped_aside = layout.sidebar_visible
+        && explorer_visible
+        && width < MIN_SIDEBAR + min_main + MIN_EXPLORER + 2.0 * DIVIDER;
+    let sidebar_visible = layout.sidebar_visible && !sidebar_stepped_aside;
+    let mut sidebar = if sidebar_visible {
+        layout.sidebar_width
+    } else {
+        0.0
+    };
+    let mut explorer = if explorer_visible {
+        layout.explorer_width
+    } else {
+        0.0
+    };
+    let dividers = f64::from(u8::from(sidebar_visible) + u8::from(explorer_visible)) * DIVIDER;
+    let mut over = sidebar + explorer + dividers + min_main - width;
+    // Let the side columns yield before squeezing the split tree. Stepping aside is
+    // presentation only; the saved widths and sidebar visibility stay intact.
+    if over > 0.0 && explorer_visible {
+        let cut = over.min(explorer - MIN_EXPLORER);
+        explorer -= cut;
+        over -= cut;
+    }
+    if over > 0.0 && sidebar_visible {
+        sidebar -= over.min(sidebar - MIN_SIDEBAR);
+    }
+    SideWidths {
+        sidebar,
+        explorer,
+        sidebar_stepped_aside,
+    }
+}
+
+/// Minimums of both child subtrees in the same pre-order as `draw_node`.
+fn measure_split_minima(node: &Node, minima: &mut Vec<[DVec2; 2]>) -> DVec2 {
+    let Node::Split {
+        axis,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return dvec2(MIN_SPLIT_WIDTH, MIN_SPLIT_HEIGHT);
+    };
+    let index = minima.len();
+    minima.push([DVec2::default(); 2]);
+    let a = measure_split_minima(first, minima);
+    let b = measure_split_minima(second, minima);
+    minima[index] = [a, b];
+    match axis {
+        Axis::Horizontal => dvec2(a.x + DIVIDER + b.x, a.y.max(b.y)),
+        Axis::Vertical => dvec2(a.x.max(b.x), a.y + DIVIDER + b.y),
+    }
 }
 
 fn draw_wide(
@@ -969,63 +1070,55 @@ fn draw_wide(
     state: &paseo_gui_core::CoreState,
     content: Rect,
     page_shown: bool,
+    columns: SideWidths,
+    minima: &[[DVec2; 2]],
 ) {
     let p = theme::current_palette();
-    let layout = &shell.data.layout;
-    let explorer_visible = layout.explorer_visible && !page_shown;
-    // Saved side-panel widths apply when they fit; otherwise the Explorer gives way down to
-    // 180px, then the sidebar down to 200px, so the conversation keeps a usable width. Below
-    // the three minimums the sidebar steps aside until the window widens.
-    let mut sidebar_w = if layout.sidebar_visible && !sidebar_crowded(shell, content.size.x) {
-        layout.sidebar_width
-    } else {
-        0.0
-    };
-    let mut explorer_w = if explorer_visible {
-        layout.explorer_width
-    } else {
-        0.0
-    };
-    let dividers =
-        if sidebar_w > 0.0 { 5.0 } else { 0.0 } + if explorer_visible { 5.0 } else { 0.0 };
-    let mut over = sidebar_w + explorer_w + dividers + MIN_MAIN - content.size.x;
-    if over > 0.0 && explorer_visible {
-        let cut = over.min(explorer_w - MIN_EXPLORER).max(0.0);
-        explorer_w -= cut;
-        over -= cut;
-    }
-    if over > 0.0 && sidebar_w > 0.0 {
-        sidebar_w -= over.min(sidebar_w - MIN_SIDEBAR).max(0.0);
-    }
+    let SideWidths {
+        sidebar, explorer, ..
+    } = columns;
     let mut x = content.pos.x;
-    if sidebar_w > 0.0 {
-        let side = rect(x, content.pos.y, sidebar_w, content.size.y);
+    if sidebar > 0.0 {
+        let side = rect(x, content.pos.y, sidebar, content.size.y);
         shell.data.chrome.sidebar_rect = side;
         shell.data.chrome.slots.push(Slot::Sidebar(side));
-        x += sidebar_w;
-        let handle = rect(x, content.pos.y, 5.0, content.size.y);
+        x += sidebar;
+        let handle = rect(x, content.pos.y, DIVIDER, content.size.y);
         shell.painter.fill(cx, handle, p.border, 0.0);
         shell.data.hits.push(handle, "resize:sidebar".into());
-        x += 5.0;
+        x += DIVIDER;
     }
     let main_right = content.pos.x + content.size.x
-        - if explorer_visible {
-            explorer_w + 5.0
+        - if explorer > 0.0 {
+            explorer + DIVIDER
         } else {
             0.0
         };
     let main = rect(x, content.pos.y, main_right - x, content.size.y);
     if page_shown {
         draw_page(shell, cx, main);
+    } else if let Some(maximized) = shell.data.layout.maximized_pane.as_deref() {
+        if let Some(pane) = shell.data.layout.tree.pane(maximized).cloned() {
+            draw_pane(
+                shell,
+                cx,
+                state,
+                &pane.id,
+                &pane.tabs,
+                pane.selected.as_deref(),
+                main,
+                false,
+            );
+        }
     } else {
         let tree = shell.data.layout.tree.clone();
-        draw_node(shell, cx, state, &tree, main);
+        draw_node(shell, cx, state, &tree, main, &mut minima.iter());
     }
-    if explorer_visible {
-        let handle = rect(main_right, content.pos.y, 5.0, content.size.y);
+    if explorer > 0.0 {
+        let handle = rect(main_right, content.pos.y, DIVIDER, content.size.y);
         shell.painter.fill(cx, handle, p.border, 0.0);
         shell.data.hits.push(handle, "resize:explorer".into());
-        let ex = rect(main_right + 5.0, content.pos.y, explorer_w, content.size.y);
+        let ex = rect(main_right + DIVIDER, content.pos.y, explorer, content.size.y);
         shell.data.chrome.explorer_rect = ex;
         let (keys, selected) = explorer_keys(shell);
         draw_pane(
@@ -1047,23 +1140,21 @@ fn draw_node(
     state: &paseo_gui_core::CoreState,
     node: &Node,
     r: Rect,
+    minima: &mut std::slice::Iter<'_, [DVec2; 2]>,
 ) {
     let p = theme::current_palette();
     match node {
         Node::Pane(pane) => {
-            if shell
-                .data
-                .layout
-                .maximized_pane
-                .as_deref()
-                .is_some_and(|m| m != pane.id)
-            {
-                return;
-            }
-            let id = pane.id.clone();
-            let tabs = pane.tabs.clone();
-            let selected = pane.selected.clone();
-            draw_pane(shell, cx, state, &id, &tabs, selected.as_deref(), r, false);
+            draw_pane(
+                shell,
+                cx,
+                state,
+                &pane.id,
+                &pane.tabs,
+                pane.selected.as_deref(),
+                r,
+                false,
+            );
         }
         Node::Split {
             id,
@@ -1072,60 +1163,52 @@ fn draw_node(
             first,
             second,
         } => {
-            if let Some(maximized) = shell.data.layout.maximized_pane.clone() {
-                // Only the branch holding the maximized pane is shown, full size.
-                if first.contains_pane(&maximized) {
-                    draw_node(shell, cx, state, first, r);
-                } else {
-                    draw_node(shell, cx, state, second, r);
-                }
-                return;
-            }
+            let child_minima = minima
+                .next()
+                .expect("measured split")
+                .map(|v| along(*axis, v));
             let horizontal = *axis == Axis::Horizontal;
-            let extent = if horizontal { r.size.x } else { r.size.y };
-            let available = (extent - 5.0).max(0.0);
-            let a = split_first(
-                available,
-                *ratio,
-                if horizontal {
-                    MIN_SPLIT_WIDTH
-                } else {
-                    MIN_SPLIT_HEIGHT
-                },
-            );
+            let extent = along(*axis, r.size);
+            let divider = extent.min(DIVIDER);
+            let available = extent - divider;
+            let a = split_first(available, *ratio, child_minima);
             let (r1, handle, r2) = if horizontal {
                 (
                     rect(r.pos.x, r.pos.y, a, r.size.y),
-                    rect(r.pos.x + a, r.pos.y, 5.0, r.size.y),
-                    rect(r.pos.x + a + 5.0, r.pos.y, r.size.x - a - 5.0, r.size.y),
+                    rect(r.pos.x + a, r.pos.y, divider, r.size.y),
+                    rect(r.pos.x + a + divider, r.pos.y, available - a, r.size.y),
                 )
             } else {
                 (
                     rect(r.pos.x, r.pos.y, r.size.x, a),
-                    rect(r.pos.x, r.pos.y + a, r.size.x, 5.0),
-                    rect(r.pos.x, r.pos.y + a + 5.0, r.size.x, r.size.y - a - 5.0),
+                    rect(r.pos.x, r.pos.y + a, r.size.x, divider),
+                    rect(r.pos.x, r.pos.y + a + divider, r.size.x, available - a),
                 )
             };
-            draw_node(shell, cx, state, first, r1);
+            draw_node(shell, cx, state, first, r1, minima);
             shell.painter.fill(cx, handle, p.border, 0.0);
             shell.data.hits.push(handle, format!("split:{id}"));
-            shell.data.chrome.splits.push((id.clone(), *axis, r));
-            draw_node(shell, cx, state, second, r2);
+            shell.data.chrome.splits.push(SplitHandle {
+                id: id.clone(),
+                axis: *axis,
+                start: along(*axis, r.pos),
+                available,
+                minima: child_minima,
+                first: a,
+            });
+            draw_node(shell, cx, state, second, r2, minima);
         }
     }
 }
 
-/// Each side of a split keeps room for its tab strip and content.
-const MIN_SPLIT_WIDTH: f64 = 240.0;
-const MIN_SPLIT_HEIGHT: f64 = 160.0;
-
-/// The first child's extent: the saved ratio within each side's minimum, or an even split when
-/// the area cannot hold both minimums, so a narrow window never leaves one side a sliver.
-pub(crate) fn split_first(available: f64, ratio: f64, min: f64) -> f64 {
-    if available < 2.0 * min {
-        return available / 2.0;
+/// Display the saved ratio when it fits. In a shortage both subtrees lose the same
+/// share of their minimums, so a nested split is not squeezed into one leaf's space.
+fn split_first(available: f64, ratio: f64, [first, second]: [f64; 2]) -> f64 {
+    let total = first + second;
+    if available <= total {
+        return available * first / total;
     }
-    (available * ratio.clamp(0.15, 0.85)).clamp(min, available - min)
+    (available * ratio.clamp(0.15, 0.85)).clamp(first, available - second)
 }
 
 /// One pane (`_pane`): 38px tab strip + divider (wide, or the compact Explorer), then the
@@ -2035,15 +2118,14 @@ pub(crate) fn sidebar_visible(shell: &PaseoShell) -> bool {
         shell.data.page.is_none()
             && shell.data.layout.compact_destination == CompactDestination::Sidebar
     } else {
-        shell.data.layout.sidebar_visible
-            && !sidebar_crowded(shell, shell.data.chrome.content_rect.size.x)
+        shell.data.layout.sidebar_visible && !shell.data.chrome.sidebar_stepped_aside
     }
 }
 
 /// The wide sidebar toggle. A sidebar that stepped aside for the Explorer comes back by closing
 /// the Explorer, rather than the toggle silently "hiding" what is already out of sight.
 pub(crate) fn toggle_wide_sidebar(shell: &mut PaseoShell) {
-    if sidebar_crowded(shell, shell.data.chrome.content_rect.size.x) {
+    if shell.data.chrome.sidebar_stepped_aside && shell.data.layout.explorer_visible {
         shell.data.layout.show_explorer(false);
     } else {
         let visible = shell.data.layout.sidebar_visible;
@@ -2085,8 +2167,8 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             let hover = shell.data.hits.at(e.abs);
             let cursor = match hover.as_deref() {
                 Some(id) if id.starts_with("split:") => {
-                    let horizontal = shell.data.chrome.splits.iter().any(|(sid, axis, _)| {
-                        format!("split:{sid}") == id && *axis == Axis::Horizontal
+                    let horizontal = shell.data.chrome.splits.iter().any(|handle| {
+                        handle.id == id["split:".len()..] && handle.axis == Axis::Horizontal
                     });
                     if horizontal {
                         MouseCursor::ColResize
@@ -2147,7 +2229,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 shell.redraw_hit_owners(cx, &[previous.as_deref()]);
                 return;
             }
-            if update_drag(shell, cx, fe.abs, fe.time) {
+            if update_drag(shell, fe.abs) {
                 shell.invalidate_layout(cx);
             }
         }
@@ -2224,11 +2306,11 @@ fn start_drag(shell: &mut PaseoShell, id: Option<&str>, abs: DVec2) {
             chrome
                 .splits
                 .iter()
-                .find(|(sid, _, _)| sid == split)
-                .map(|(sid, axis, r)| Drag::Split {
-                    id: sid.clone(),
-                    axis: *axis,
-                    rect: *r,
+                .find(|handle| handle.id == split)
+                .map(|handle| Drag::Split {
+                    id: handle.id.clone(),
+                    grab: along(handle.axis, abs) - handle.start - handle.first,
+                    last_first: handle.first,
                 })
         }
         // Drags start from the width on screen (the saved width may be clamped to fit), so
@@ -2254,28 +2336,25 @@ fn start_drag(shell: &mut PaseoShell, id: Option<&str>, abs: DVec2) {
     };
 }
 
-fn update_drag(shell: &mut PaseoShell, _cx: &mut Cx, abs: DVec2, _time: f64) -> bool {
-    let Some(drag) = shell.data.chrome.drag.clone() else {
+fn update_drag(shell: &mut PaseoShell, abs: DVec2) -> bool {
+    let chrome = &mut shell.data.chrome;
+    let Some(drag) = chrome.drag.as_mut() else {
         return false;
     };
     match drag {
-        Drag::Split { id, axis, rect } => {
-            let (start, extent) = match axis {
-                Axis::Horizontal => (rect.pos.x, rect.size.x),
-                Axis::Vertical => (rect.pos.y, rect.size.y),
+        Drag::Split {
+            id,
+            grab,
+            last_first,
+        } => {
+            let Some(handle) = chrome.splits.iter().find(|handle| handle.id == *id) else {
+                return false;
             };
-            let value = match axis {
-                Axis::Horizontal => abs.x,
-                Axis::Vertical => abs.y,
+            let Some(first) = handle.drag_first(along(handle.axis, abs), *grab, *last_first) else {
+                return false;
             };
-            let available = (extent - 5.0).max(1.0);
-            let min = match axis {
-                Axis::Horizontal => MIN_SPLIT_WIDTH,
-                Axis::Vertical => MIN_SPLIT_HEIGHT,
-            };
-            // Store what the divider shows: the pointer's ratio within each side's minimum.
-            let ratio = split_first(available, (value - start) / available, min) / available;
-            shell.data.layout.resize_split(&id, ratio.clamp(0.15, 0.85));
+            *last_first = first;
+            shell.data.layout.resize_split(id, first / handle.available);
             true
         }
         Drag::Sidebar {
@@ -2285,7 +2364,7 @@ fn update_drag(shell: &mut PaseoShell, _cx: &mut Cx, abs: DVec2, _time: f64) -> 
             shell
                 .data
                 .layout
-                .set_sidebar_width(start_width + abs.x - start_x);
+                .set_sidebar_width(*start_width + abs.x - *start_x);
             true
         }
         Drag::Explorer {
@@ -2295,31 +2374,21 @@ fn update_drag(shell: &mut PaseoShell, _cx: &mut Cx, abs: DVec2, _time: f64) -> 
             shell
                 .data
                 .layout
-                .set_explorer_width(start_width - (abs.x - start_x));
+                .set_explorer_width(*start_width - (abs.x - *start_x));
             true
         }
-        Drag::Tab {
-            key,
-            from_pane,
-            start,
-            moving,
-        } => {
-            let moving = moving || (abs - start).length() > 6.0;
-            let drop = shell
-                .data
-                .chrome
-                .pane_rects
-                .iter()
-                .find(|(id, r)| id != "explorer" && r.contains(abs))
-                .map(|(id, _)| id.clone());
-            shell.data.chrome.drop_pane = if moving { drop } else { None };
-            shell.data.chrome.drag = Some(Drag::Tab {
-                key,
-                from_pane,
-                start,
-                moving,
-            });
-            moving
+        Drag::Tab { start, moving, .. } => {
+            *moving |= (abs - *start).length() > 6.0;
+            chrome.drop_pane = if *moving {
+                chrome
+                    .pane_rects
+                    .iter()
+                    .find(|(id, r)| id != "explorer" && r.contains(abs))
+                    .map(|(id, _)| id.clone())
+            } else {
+                None
+            };
+            *moving
         }
     }
 }
@@ -2667,12 +2736,88 @@ mod tests {
     #[test]
     fn split_sides_keep_their_minimum_or_share_evenly() {
         // Wide: the saved ratio applies as long as both sides keep 240px.
-        assert_eq!(split_first(1000.0, 0.5, 240.0), 500.0);
-        assert_eq!(split_first(1000.0, 0.15, 240.0), 240.0);
-        assert_eq!(split_first(1000.0, 0.85, 240.0), 760.0);
+        let minima = [240.0; 2];
+        assert_eq!(split_first(1000.0, 0.5, minima), 500.0);
+        assert_eq!(split_first(1000.0, 0.15, minima), 240.0);
+        assert_eq!(split_first(1000.0, 0.85, minima), 760.0);
         // Too narrow for two 240px sides: an even split instead of a 15% sliver.
-        assert_eq!(split_first(400.0, 0.15, 240.0), 200.0);
-        assert_eq!(split_first(0.0, 0.5, 240.0), 0.0);
+        assert_eq!(split_first(400.0, 0.15, minima), 200.0);
+        assert_eq!(split_first(0.0, 0.5, minima), 0.0);
+    }
+
+    #[test]
+    fn narrow_wide_columns_yield_room_without_changing_tabs_or_saved_ratios() {
+        let mut layout = WindowLayout::default();
+        layout.open(
+            PanelTarget::new("agent", "a", "ws", "/work").with_id("chat"),
+            false,
+        );
+        layout.open(
+            PanelTarget::new("agent", "b", "ws", "/work").with_id("chat"),
+            true,
+        );
+        let Node::Split { id, .. } = &layout.tree else {
+            panic!("expected two panes");
+        };
+        let split = id.clone();
+        layout.resize_split(&split, 0.625);
+        let min = measure_split_minima(&layout.tree, &mut Vec::new()).x;
+        assert_eq!(min, 485.0);
+        assert_eq!(side_widths(&layout, 600.0, min, false).sidebar, 200.0);
+        assert_eq!(side_widths(&layout, 710.0, min, false).sidebar, 220.0);
+
+        layout.open_explorer(PanelTarget::new("files", "b", "ws", "/work"), true);
+        let saved = layout.to_json();
+        let columns = side_widths(&layout, 600.0, min, false);
+        assert!(columns.sidebar_stepped_aside);
+        assert_eq!((columns.sidebar, columns.explorer), (0.0, 180.0));
+        let columns = side_widths(&layout, 710.0, min, false);
+        assert_eq!((columns.sidebar, columns.explorer), (0.0, 220.0));
+        let columns = side_widths(&layout, 1600.0, min, false);
+        assert!(!columns.sidebar_stepped_aside);
+        assert_eq!((columns.sidebar, columns.explorer), (320.0, 340.0));
+        let Node::Split { ratio, .. } = &layout.tree else {
+            panic!("expected retained split");
+        };
+        assert_eq!(split_first(925.0, *ratio, [240.0; 2]), 578.125);
+        assert_eq!(layout.to_json(), saved);
+    }
+
+    #[test]
+    fn nested_splits_share_a_shortage_by_subtree_minimum() {
+        let mut layout = WindowLayout::default();
+        let right = layout
+            .split_pane(crate::shell::layout::MAIN_PANE, Axis::Horizontal)
+            .unwrap();
+        layout
+            .split_pane(crate::shell::layout::MAIN_PANE, Axis::Horizontal)
+            .unwrap();
+        layout.split_pane(&right, Axis::Vertical).unwrap();
+        let mut minima = Vec::new();
+        assert_eq!(measure_split_minima(&layout.tree, &mut minima), dvec2(730.0, 325.0));
+        assert_eq!(minima[0], [dvec2(485.0, 160.0), dvec2(240.0, 325.0)]);
+        let a = split_first(362.5, 0.2, minima[0].map(|v| v.x));
+        assert_eq!(a, 242.5);
+        assert_eq!(362.5 - a, 120.0);
+    }
+
+    #[test]
+    fn a_split_drag_only_persists_visible_movement() {
+        let mut handle = SplitHandle {
+            id: "split".into(),
+            axis: Axis::Horizontal,
+            start: 100.0,
+            available: 400.0,
+            minima: [240.0; 2],
+            first: 200.0,
+        };
+        assert_eq!(handle.drag_first(340.0, 3.0, 200.0), None);
+        handle.available = 600.0;
+        // The saved split is clamped to 240. Grabbing it 3px in and dragging further
+        // into the clamp must not turn that displayed position into the saved ratio.
+        assert_eq!(handle.drag_first(343.0, 3.0, 240.0), None);
+        assert_eq!(handle.drag_first(330.0, 3.0, 240.0), None);
+        assert_eq!(handle.drag_first(403.0, 3.0, 240.0), Some(300.0));
     }
 
     #[test]

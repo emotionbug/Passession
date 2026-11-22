@@ -99,15 +99,15 @@ impl Transport {
                     if let Some(id) = response["request_id"].as_str() {
                         let sender = transport.control.lock().unwrap().pending.remove(id);
                         if let Some(sender) = sender {
-                            let result = if response["subtype"] == "error" {
-                                Err(anyhow!(
+                            let result = match response["subtype"].as_str() {
+                                Some("success") => Ok(response["response"].clone()),
+                                Some("error") => Err(anyhow!(
                                     "{}",
                                     response["error"]
                                         .as_str()
                                         .unwrap_or("Claude control request failed")
-                                ))
-                            } else {
-                                Ok(response["response"].clone())
+                                )),
+                                _ => Err(anyhow!("Invalid Claude control response subtype")),
                             };
                             let _ = sender.send(result);
                         }

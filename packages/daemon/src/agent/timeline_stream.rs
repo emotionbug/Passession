@@ -146,6 +146,14 @@ pub fn public_subagent(mut descriptor: Value) -> Value {
     descriptor
 }
 
+fn subagent_replacement(parent: &str, provider: &str, id: &str, timeline: &Timeline) -> Value {
+    // Existing child timeline consumers refetch on the changed epoch.
+    timeline.rows.last().map_or(Value::Null, |row| {
+        json!({"type":"timeline","parentAgentId":parent,"subagentId":id,
+            "provider":provider,"row":row,"epoch":timeline.epoch()})
+    })
+}
+
 const DESCRIPTOR_FIELDS: [&str; 7] = [
     "title",
     "description",
@@ -189,6 +197,13 @@ impl SubagentStore {
                 Ok(
                     json!({"type":"timeline","parentAgentId":parent_id,"subagentId":id,"provider":provider,"row":row,"epoch":timeline.epoch()}),
                 )
+            }
+            Some("codex_moderation") => {
+                let timeline = self.timelines.entry(key).or_default();
+                if timeline.reconcile_message(event, None)?.is_none() {
+                    return Ok(Value::Null);
+                }
+                Ok(subagent_replacement(parent_id, provider, id, timeline))
             }
             Some("upsert") => {
                 let Some(descriptor) =

@@ -10,7 +10,7 @@
 
 use super::draw::DrawComposerImage;
 use super::look::Look;
-use super::sheet::{Page, SheetState};
+use super::sheet::SheetState;
 use crate::common::overlay::{self, MenuEntry, MenuItem};
 use crate::common::paint::{HitMap, Painter};
 use crate::common::{UiCommand, UiContext, UiEffect, accessibility};
@@ -118,7 +118,7 @@ pub enum OItem {
     Search,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Overlay {
     None,
     /// Boxed: the sheet's rows dwarf every other overlay state.
@@ -219,9 +219,8 @@ pub struct PanelState {
     pub sheet_scroll: f64,
     pub suggest_scroll_max: f64,
     pub sheet_scroll_max: f64,
-    /// The desktop model sheet's top edge, kept while one page stays open (`(depth, page)`)
-    /// so content changes grow it downward instead of re-centring it under the pointer.
-    pub sheet_top: Option<((usize, Page), f64)>,
+    /// The exact control that opened the wide picker. Its current hit supplies the anchor.
+    sheet_trigger: Option<Item>,
     /// Content offset of each painted sheet row, for [`Self::sheet_keep`].
     pub sheet_row_tops: Vec<f64>,
     /// A row (`Row::key`) and the screen y it must keep after the next build: a favorite
@@ -550,14 +549,30 @@ impl Widget for ComposerPanel {
             return DrawStep::done();
         }
         let window = cx.current_pass_size();
-        self.st.window = window;
+        let previous_window = std::mem::replace(&mut self.st.window, window);
         let look = Look::new(cx, ui, window);
         self.theme_input(cx, &look);
         self.draw_composer(cx, ui, &look, walk);
+        let mut model_anchor = None;
+        if matches!(self.st.overlay(), Overlay::Sheet(_)) {
+            let still_placed = match self.st.sheet_trigger.as_ref() {
+                Some(trigger) if !look.compact && window == previous_window => {
+                    model_anchor = self.st.hits.rect_of(trigger);
+                    model_anchor.is_some()
+                }
+                None => look.compact,
+                _ => false,
+            };
+            if !still_placed {
+                // The trigger moved with a resize, disappeared, or changed presentations.
+                self.close_overlay(cx, ui);
+                SignalToUI::set_ui_signal();
+            }
+        }
         if cx.accessibility_enabled() && !self.st.modal_open() {
             self.record_accessible_controls(cx);
         }
-        self.draw_overlays(cx, ui, &look);
+        self.draw_overlays(cx, ui, &look, model_anchor);
         let editor_walk = self.profile_editor.walk(cx);
         self.profile_editor.draw_walk(cx, scope, editor_walk)?;
         DrawStep::done()
@@ -576,6 +591,7 @@ impl ComposerPanel {
         self.st.search_focus_pending = false;
         self.st.clear_focus_scope = true;
         self.st.overlay = None;
+        self.st.sheet_trigger = None;
         self.st.ohover = None;
         self.st.menus.clear();
         self.st.pending_commands.clear();
@@ -1112,9 +1128,10 @@ impl ComposerPanel {
         self.draw_bg.redraw(cx);
     }
 
-    pub(super) fn open_sheet(&mut self, cx: &mut Cx, ui: &mut UiContext, state: SheetState) {
+    fn open_model_sheet(&mut self, cx: &mut Cx, ui: &mut UiContext, trigger: Item) {
+        let state = SheetState::new(self.ctl_ref().is_draft());
         self.st.cancel_gestures();
-        self.st.sheet_top = None;
+        self.st.sheet_trigger = (!ui.compact).then_some(trigger);
         self.st.sheet_keep = None;
         self.st.restore_input_focus = self.st.input_focused;
         self.ctl().refetch_if_loading(ui);
@@ -1156,6 +1173,7 @@ impl ComposerPanel {
             scope: None,
         });
         self.st.overlay = None;
+        self.st.sheet_trigger = None;
         self.st.ohover = None;
         cx.stop_timer(self.st.picker_timer);
         self.dismiss_tooltip(cx);
@@ -1327,8 +1345,7 @@ impl ComposerPanel {
                 if self.controls_disabled() {
                     return;
                 }
-                let state = SheetState::new(self.ctl_ref().is_draft());
-                self.open_sheet(cx, ui, state);
+                self.open_model_sheet(cx, ui, item);
                 Outputs::default()
             }
             Item::Thinking | Item::Mode | Item::Feature(_) => {

@@ -473,6 +473,7 @@ impl SubagentStore {
         }
         let output = match event["type"].as_str() {
             Some("timeline") => self.append_child(root, parent, provider, id, event),
+            Some("codex_moderation") if live => self.redact_child(root, parent, provider, id, event),
             Some("upsert") => self.upsert_child(root, parent, provider, id, event, live),
             Some("remove") => self.remove_child(root, parent, provider, id, event),
             _ => Err(anyhow!("Unknown provider subagent event")),
@@ -619,6 +620,29 @@ impl SubagentStore {
         let output = json!({"type":"timeline","parentAgentId":parent,"subagentId":id,"provider":provider,"row":row,"epoch":timeline.epoch()});
         self.residency
             .grow(&key, storage::encoded_bytes(&output["row"]));
+        Ok(output)
+    }
+
+    fn redact_child(
+        &mut self,
+        root: &Path,
+        parent: &str,
+        provider: &str,
+        id: &str,
+        event: &Value,
+    ) -> Result<Value> {
+        if !self.ensure_child(root, parent, id)? {
+            self.create_child(root, parent, id, None)?;
+        }
+        let key = (parent.to_owned(), id.to_owned());
+        let timeline = self.timelines.get_mut(&key).expect("hydrated subagent timeline");
+        let path = timeline_path(root, parent, id);
+        let identity = identity(parent, id);
+        if timeline.reconcile_message(event, Some((&path, &identity)))?.is_none() {
+            return Ok(Value::Null);
+        }
+        let output = super::subagent_replacement(parent, provider, id, timeline);
+        self.residency.admit(key, timeline.rows.iter().map(storage::encoded_bytes).sum());
         Ok(output)
     }
 

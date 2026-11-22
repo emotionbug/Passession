@@ -100,6 +100,14 @@ structured recovery guidance and bounded non-text diagnostics, without ending th
 event owner. Do not infer placement from matching text or treat a failed repair as
 successful reconciliation. Native history remains the transcript authority.
 
+## Codex moderation
+
+When Codex withholds an answer, replace its native text with a notice. The daemon retracts
+any earlier streamed chunks and their identified subagent previews before publishing the
+notice. The same epoch invalidation used for message repair refreshes existing views.
+A native replay can withdraw an exact message by ID; a replay without the moderation
+directive cannot restore withdrawn text.
+
 ## Saved history and execution readiness
 
 Reading a conversation and running it are separate. A cold provider start plus full history replay

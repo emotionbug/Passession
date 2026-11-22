@@ -7,6 +7,7 @@ use super::canvas::*;
 use super::i18n::{t, ta};
 use super::json::*;
 use super::paint::{Draw, Look};
+use super::task_controls;
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::{
@@ -15,6 +16,7 @@ use crate::common::widgets::{
 };
 use makepad_widgets::*;
 use serde_json::Value;
+use std::collections::HashSet;
 
 const PILL_MIN_HEIGHT: f64 = 32.0;
 
@@ -242,6 +244,8 @@ pub enum TrackPanel {
 
 pub struct TrackModel<'a> {
     pub tasks: &'a [Value],
+    pub provider_tasks: &'a [Value],
+    pub requested_task_stops: &'a HashSet<String>,
     pub rows: &'a [SubagentRow],
     pub delete: DeleteFinished,
     pub can_delete_finished: bool,
@@ -252,7 +256,10 @@ pub struct TrackModel<'a> {
 }
 
 pub fn visible(model: &TrackModel) -> bool {
-    !model.rows.is_empty() || !model.tasks.is_empty() || model.delete != DeleteFinished::Idle
+    !model.rows.is_empty()
+        || !model.tasks.is_empty()
+        || !model.provider_tasks.is_empty()
+        || model.delete != DeleteFinished::Idle
 }
 
 /// track-presentation.ts buildSubagentPillPresentation.
@@ -400,7 +407,8 @@ pub fn draw_bar(
     let bx = x + (w - outer) * 0.5;
     let y = bottom - pill_clearance(d.look.compact) - height;
     let mut cursor = bx;
-    let pills = (!model.tasks.is_empty()) as usize
+    let has_tasks = !model.tasks.is_empty() || !model.provider_tasks.is_empty();
+    let pills = has_tasks as usize
         + (!model.rows.is_empty() || model.delete != DeleteFinished::Idle) as usize;
     let avail = (outer - 4.0 * pills.saturating_sub(1) as f64).max(80.0);
     let each = if pills > 0 {
@@ -408,19 +416,20 @@ pub fn draw_bar(
     } else {
         avail
     };
-    if !model.tasks.is_empty() {
-        let completed = model
-            .tasks
-            .iter()
-            .filter(|task| is_true(get(task, "completed")) || get(task, "status") == "completed")
-            .count();
-        let label = ta(
-            "message.todo.tasksProgress",
-            &[
-                ("completed", &completed.to_string()),
-                ("total", &model.tasks.len().to_string()),
-            ],
-        );
+    if has_tasks {
+        let label = if model.provider_tasks.is_empty() {
+            let completed = model.tasks.iter()
+                .filter(|task| is_true(get(task, "completed")) || get(task, "status") == "completed")
+                .count();
+            ta(
+                "message.todo.tasksProgress",
+                &[("completed", &completed.to_string()), ("total", &model.tasks.len().to_string())],
+            )
+        } else if model.provider_tasks.len() == 1 {
+            t("claudeTasks.activeOne")
+        } else {
+            ta("claudeTasks.activeCount", &[("count", &model.provider_tasks.len().to_string())])
+        };
         let pw = pill(
             cx,
             d,
@@ -488,6 +497,19 @@ fn panel_rows(
     let mut cy = y;
     match panel {
         TrackPanel::Tasks => {
+            if !model.provider_tasks.is_empty() {
+                cy += task_controls::draw(
+                    cx,
+                    d,
+                    model.provider_tasks,
+                    model.requested_task_stops,
+                    rect_xywh(x + 8.0, cy, w - 16.0, row_h),
+                );
+                if !model.tasks.is_empty() {
+                    d.kit.rect(cx, rect_xywh(x + 8.0, cy + 4.0, w - 16.0, 1.0), p.border_accent, 0.0);
+                    cy += 9.0;
+                }
+            }
             for task in model.tasks {
                 let r = rect_xywh(x + 4.0, cy, w - 8.0, row_h);
                 // Wrapped tasks grow their row; single-line rows keep the

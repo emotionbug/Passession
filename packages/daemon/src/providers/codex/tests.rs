@@ -55,9 +55,13 @@ fn permission_denial_uses_each_native_response_shape() {
     let elicitation=permissions::request("codex",json!(9),"mcpServer/elicitation/request",json!({"threadId":"thread","serverName":"browser","mode":"openai/form","message":"Open page?","requestedSchema":{"type":"object","properties":{}}})).unwrap();
     assert_eq!(
         permissions::deny(&elicitation),
-        json!({"action":"decline","content":null,"_meta":null})
+        json!({"action":"cancel","content":null,"_meta":null})
     );
-    assert!(permissions::automatic_reply(&elicitation).is_none());
+    assert!(permissions::reply(&elicitation, &json!({"behavior":"allow"})).is_err());
+    assert_eq!(
+        permissions::reply(&elicitation, &json!({"behavior":"allow","selectedActionId":"accept"})).unwrap(),
+        json!({"action":"accept","content":{},"_meta":null})
+    );
 }
 
 #[test]
@@ -162,6 +166,223 @@ fn network_approval_offers_the_proposed_allow_and_deny_rules() {
     );
 }
 
+#[test]
+fn codex_question_replies_omit_unanswered_options() {
+    let params = json!({"threadId":"thread","turnId":"native-turn","itemId":"question","questions":[
+        {"id":"first","header":"First","question":"Choose one.","options":[{"label":"A"},{"label":"B"}]},
+        {"id":"second","header":"Second","question":"Choose another.","options":[{"label":"C"}]}
+    ]});
+    for method in ["item/tool/requestUserInput", "tool/requestUserInput"] {
+        let pending = permissions::request("codex", json!(8), method, params.clone()).unwrap();
+        for response in [
+            json!({"behavior":"allow"}),
+            json!({"behavior":"allow","updatedInput":{"answers":{"First":" "}}}),
+            json!({"behavior":"allow","updatedInput":{"selections":{"First":{"options":[],"other":""}}}}),
+            json!({"behavior":"deny","updatedInput":{"answers":{"First":"A"}}}),
+        ] {
+            assert_eq!(permissions::reply(&pending, &response).unwrap(), json!({"answers":{}}));
+            let item = permissions::question_timeline(&pending, Some(&response)).unwrap();
+            assert!(!item["detail"]["text"].as_str().unwrap().contains("Answers:"));
+        }
+        assert_eq!(
+            permissions::reply(&pending, &json!({"behavior":"allow","updatedInput":{"answers":{"First":"B"}}})).unwrap(),
+            json!({"answers":{"first":{"answers":["B"]}}})
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn start_codex_event_turn(session: &session::CodexSession, plan_mode: bool) {
+    {
+        let mut state = session.state.lock().unwrap();
+        state.thread = Some("thread".into());
+        state.foreground = Some("local-turn".into());
+        state.config["featureValues"]["plan_mode"] = json!(plan_mode);
+    }
+    session
+        .handle_frame(json!({"method":"turn/started","params":{
+            "threadId":"thread","turn":{"id":"turn","status":"inProgress"}
+        }}))
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_mcp_progress_updates_existing_call_without_retaining_progress() {
+    use crate::agent::timeline::Timeline;
+    use crate::providers::api::AgentSession;
+
+    let root = tempfile::tempdir().unwrap();
+    let (session, mut events) = open_test_app_server(root.path()).await;
+    start_codex_event_turn(&session, false).await;
+    assert_eq!(events.try_recv().unwrap()["type"], "turn_started");
+    let progress = |turn: &str, message: &str| {
+        json!({"method":"item/mcpToolCall/progress","params":{
+            "threadId":"thread","turnId":turn,"itemId":"call","message":message
+        }})
+    };
+    session.handle_frame(progress("turn", "unknown owner")).await.unwrap();
+    assert!(events.try_recv().is_err());
+    let mut item = json!({"type":"mcpToolCall","id":"call","server":"remote","tool":"browse",
+        "status":"inProgress","arguments":{"query":"needle"},"result":null,"error":null});
+    let frame = |method, item: &Value| json!({"method":method,"params":{
+        "threadId":"thread","turnId":"turn","item":item
+    }});
+    session.handle_frame(frame("item/started", &item)).await.unwrap();
+    let started = events.try_recv().unwrap();
+    let mut timeline = Timeline::new();
+    timeline.append(started["item"].clone(), &started);
+    session.handle_frame(progress("old-turn", "wrong scope")).await.unwrap();
+    assert!(events.try_recv().is_err());
+    for message in ["Connecting", "Reading results"] {
+        session.handle_frame(progress("turn", message)).await.unwrap();
+        let update = events.try_recv().unwrap();
+        assert_eq!(update["item"]["callId"], started["item"]["callId"]);
+        assert_eq!(update["item"]["name"], "remote.browse");
+        assert_eq!(update["item"]["status"], "running");
+        assert!(update["item"].get("detail").is_none());
+        assert_eq!(update["item"]["metadata"]["progressMessage"], message);
+        timeline.append(update["item"].clone(), &update);
+        assert_eq!(timeline.items()[0]["detail"], started["item"]["detail"]);
+    }
+    session.handle_frame(progress("turn", "Reading results")).await.unwrap();
+    assert!(events.try_recv().is_err());
+    item["status"] = json!("completed");
+    item["result"] = json!({"content":[{"type":"text","text":"real result"}]});
+    session.handle_frame(frame("item/completed", &item)).await.unwrap();
+    let completed = events.try_recv().unwrap();
+    timeline.append(completed["item"].clone(), &completed);
+    let rows = timeline.items();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"], "completed");
+    assert_eq!(rows[0]["detail"]["output"], item["result"]);
+    assert!(rows[0]["metadata"]["progressMessage"].is_null());
+    session.handle_frame(progress("turn", "late")).await.unwrap();
+    assert!(events.try_recv().is_err());
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_plan_preview_yields_to_authoritative_text_and_approval_on_same_row() {
+    use crate::agent::timeline::Timeline;
+    use crate::providers::api::AgentSession;
+
+    let root = tempfile::tempdir().unwrap();
+    let (session, mut events) = open_test_app_server(root.path()).await;
+    start_codex_event_turn(&session, true).await;
+    assert_eq!(events.try_recv().unwrap()["type"], "turn_started");
+    let delta = |id, text| json!({"method":"item/plan/delta","params":{
+        "threadId":"thread","turnId":"turn","itemId":id,"delta":text
+    }});
+    let mut timeline = Timeline::new();
+    for (chunk, expected) in [("Draft", "Draft"), (" preview", "Draft preview")] {
+        session.handle_frame(delta("plan", chunk)).await.unwrap();
+        let update = events.try_recv().unwrap();
+        assert_eq!(update["item"]["status"], "running");
+        assert_eq!(update["item"]["detail"]["text"], expected);
+        timeline.append(update["item"].clone(), &update);
+    }
+    session.handle_frame(json!({"method":"item/completed","params":{
+        "threadId":"thread","turnId":"turn","item":{"type":"plan","id":"plan","text":"Final plan"}
+    }})).await.unwrap();
+    let completed = events.try_recv().unwrap();
+    assert_eq!(completed["item"]["status"], "completed");
+    assert_eq!(completed["item"]["detail"]["text"], "Final plan");
+    timeline.append(completed["item"].clone(), &completed);
+    session.handle_frame(delta("plan", " late")).await.unwrap();
+    assert!(events.try_recv().is_err());
+    session.handle_frame(json!({"method":"turn/plan/updated","params":{
+        "threadId":"thread","turnId":"turn","explanation":null,
+        "plan":[{"step":"Checklist is not the proposal","status":"completed"}]
+    }})).await.unwrap();
+    session.handle_frame(json!({"method":"turn/completed","params":{
+        "threadId":"thread","turn":{"id":"turn","status":"completed"}
+    }})).await.unwrap();
+    let approval = events.try_recv().unwrap();
+    assert_eq!(approval["item"]["name"], "plan_approval");
+    assert_eq!(approval["item"]["detail"]["text"], "Final plan");
+    timeline.append(approval["item"].clone(), &approval);
+    let requested = events.try_recv().unwrap();
+    assert_eq!(requested["request"]["input"]["plan"], "Final plan");
+    assert_eq!(events.try_recv().unwrap()["type"], "turn_completed");
+    session.respond_to_permission(
+        requested["request"]["id"].as_str().unwrap(),
+        json!({"behavior":"deny"}),
+    ).await.unwrap();
+    let dismissed = events.try_recv().unwrap();
+    timeline.append(dismissed["item"].clone(), &dismissed);
+    assert_eq!(timeline.items().len(), 1);
+    assert_eq!(timeline.items()[0]["callId"], "plan");
+    assert_eq!(timeline.items()[0]["metadata"]["approved"], false);
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_moderation_buffers_and_retracts_scoped_answers_without_raw_notices() {
+    use crate::providers::api::AgentSession;
+
+    let root = tempfile::tempdir().unwrap();
+    let (session, mut events) = open_test_app_server(root.path()).await;
+    start_codex_event_turn(&session, false).await;
+    assert_eq!(events.try_recv().unwrap()["type"], "turn_started");
+    let delta = |id, text| json!({"method":"item/agentMessage/delta","params":{
+        "threadId":"thread","turnId":"turn","itemId":id,"delta":text
+    }});
+    let complete = |item| json!({"method":"item/completed","params":{
+        "threadId":"thread","turnId":"turn","item":item
+    }});
+    let blocked = json!({"type":"agentMessage","id":"blocked","text":"withheld text",
+        "moderation":{"moderated":true,"display":{"mode":"block","version":1,"reason":{"kind":"cyber"}}}});
+    session.handle_frame(delta("blocked", "partial text")).await.unwrap();
+    assert_eq!(events.try_recv().unwrap()["item"]["text"], "partial text");
+    session.handle_frame(complete(blocked.clone())).await.unwrap();
+    let correction = events.try_recv().unwrap();
+    assert_eq!(correction["type"], "timeline_reconcile");
+    assert_eq!(correction["turnId"], "local-turn");
+    assert_eq!(correction["messageId"], "blocked");
+    assert!(!correction.to_string().contains("withheld text"));
+    assert_eq!(correction["item"], projection::item(&blocked, false, None).unwrap());
+    session.handle_frame(delta("blocked", "late")).await.unwrap();
+    assert!(events.try_recv().is_err());
+    let info = json!({"method":"turn/moderationMetadata","params":{
+        "threadId":"thread","turnId":"turn","metadata":{"opaque":"private moderation detail"}
+    }});
+    session.handle_frame(info.clone()).await.unwrap();
+    assert_eq!(
+        events.try_recv().unwrap()["item"]["message"],
+        "Codex reported response moderation."
+    );
+    session.handle_frame(info).await.unwrap();
+    assert!(events.try_recv().is_err());
+    let buffer = |show| json!({"method":"model/safetyBuffering/updated","params":{
+        "threadId":"thread","turnId":"turn","showBufferingUi":show
+    }});
+    session.handle_frame(buffer(true)).await.unwrap();
+    assert_eq!(events.try_recv().unwrap()["item"]["type"], "notification");
+    session.handle_frame(delta("safe", "buffered")).await.unwrap();
+    session.handle_frame(buffer(false)).await.unwrap();
+    session.handle_frame(delta("safe", " suffix")).await.unwrap();
+    assert!(events.try_recv().is_err());
+    session.handle_frame(complete(json!({"type":"agentMessage","id":"safe","text":"Approved answer",
+        "moderation":{"moderated":true,"display":{"mode":"show","version":1,
+            "annotation":{"kind":"wellbeingHelpline","subject":"answer"},"trustedContacts":"skip"}}
+    }))).await.unwrap();
+    assert_eq!(events.try_recv().unwrap()["item"]["text"], "Approved answer");
+    assert!(
+        events.try_recv().unwrap()["item"]["message"]
+            .as_str().unwrap().contains("crisis helpline")
+    );
+    let hidden = projection::item(&json!({"type":"agentMessage","id":"hidden","text":"not rendered",
+        "moderation":{"moderated":true,"display":{"mode":"hide","version":1,"replacement":{"kind":"wellbeingPromptHelpline"}}}
+    }), false, None).unwrap();
+    assert!(hidden["message"].as_str().unwrap().contains("crisis helpline"));
+    assert!(!hidden.to_string().contains("not rendered"));
+    session.close().await.unwrap();
+}
+
 #[cfg(unix)]
 async fn open_test_app_server(
     root: &std::path::Path,
@@ -233,6 +454,116 @@ done
     .await
     .unwrap();
     (session, events)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_elicitation_round_trips_form_openai_form_and_url() -> anyhow::Result<()> {
+    use crate::providers::api::AgentSession;
+
+    let root = tempfile::tempdir()?;
+    let (session, mut events) = open_test_app_server(root.path()).await;
+    let file = root.path().join("reply.json");
+    let method = "mcpServer/elicitation/request";
+    for (id, params, response, expected) in [
+        (
+            json!(7),
+            json!({"mode":"form","requestedSchema":{"type":"object","required":["count","enabled"],"properties":{
+                "count":{"type":"integer","minimum":1,"maximum":4},
+                "enabled":{"type":"boolean"},
+                "opt":{"type":"string","default":"not a user answer"}
+            }}}),
+            json!({"behavior":"allow","selectedActionId":"accept","updatedInput":{"selections":{
+                "count":{"options":[],"other":"3"},
+                "enabled":{"options":["False"]}
+            }}}),
+            json!({"action":"accept","content":{"count":3,"enabled":false},"_meta":null}),
+        ),
+        (
+            json!("007"),
+            json!({"mode":"openaiForm","requestedSchema":{"type":"object","required":["template"],"properties":{
+                "template":{"type":"openai/imagePicker","title":"Template","items":[
+                    {"id":"monthly-review","title":"Monthly review","image":"data:image/png;base64,AA=="}
+                ]}
+            }}}),
+            json!({"behavior":"allow","selectedActionId":"accept","updatedInput":{"selections":{
+                "template":{"options":["Monthly review"]}
+            }}}),
+            json!({"action":"accept","content":{"template":"monthly-review"},"_meta":null}),
+        ),
+        (
+            json!(8),
+            json!({"mode":"openai/form","requestedSchema":{"type":"object","required":["template"],"properties":{
+                "template":{"type":"string","oneOf":[
+                    {"const":"monthly-review","title":"Monthly review","x-openai-preview":{"src":"data:image/png;base64,AA=="}}
+                ]}
+            }}}),
+            json!({"behavior":"allow","selectedActionId":"accept","updatedInput":{"content":{"template":"monthly-review"}}}),
+            json!({"action":"accept","content":{"template":"monthly-review"},"_meta":null}),
+        ),
+        (
+            json!(9),
+            json!({"mode":"url","url":"https://example.test/authorize?a=1","elicitationId":"oauth"}),
+            json!({"behavior":"allow","selectedActionId":"accept"}),
+            json!({"action":"accept","content":null,"_meta":null}),
+        ),
+        (
+            json!(10),
+            json!({"mode":"url","url":"https://example.test/authorize","elicitationId":"oauth"}),
+            json!({"behavior":"deny","selectedActionId":"decline"}),
+            json!({"action":"decline","content":null,"_meta":null}),
+        ),
+        (
+            json!(11),
+            json!({"mode":"url","url":"https://example.test/authorize","elicitationId":"oauth"}),
+            json!({"behavior":"deny","selectedActionId":"cancel","interrupt":true}),
+            json!({"action":"cancel","content":null,"_meta":null}),
+        ),
+    ] {
+        let mut params = params;
+        params["threadId"] = json!("thread");
+        params["serverName"] = json!("browser");
+        params["message"] = json!("Choose an action");
+        session.handle_frame(json!({"id":id,"method":method,"params":params})).await?;
+        let event = events.try_recv()?;
+        assert_eq!(event["type"], "permission_requested");
+        let request = &event["request"];
+        assert_eq!(request["metadata"]["mcpElicitation"], true);
+        assert_eq!(request["description"], "Choose an action");
+        let public_id = request["id"].as_str().unwrap();
+        if request["kind"] == "question" {
+            assert!(session.respond_to_permission(public_id, json!({"behavior":"allow","selectedActionId":"accept","updatedInput":{"selections":{}}})).await.is_err());
+            assert_eq!(session.pending_permissions()[0]["id"], public_id);
+        } else {
+            assert_eq!(request["input"]["url"], params["url"]);
+        }
+        assert!(session.respond_to_permission(public_id, json!({"behavior":"allow"})).await.is_err());
+        assert!(!file.exists(), "request and invalid answers must not send a native reply");
+        session.respond_to_permission(public_id, response).await?;
+        session.client.request("test/flush", json!({})).await?;
+        let native: Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+        assert_eq!(native, json!({"id":id,"result":expected}));
+        std::fs::remove_file(&file)?;
+        let resolved = events.try_recv()?;
+        assert_eq!(resolved["type"], "permission_resolved");
+        assert_eq!(resolved["requestId"], public_id);
+        assert!(resolved["resolution"].get("updatedInput").is_none());
+    }
+    session.handle_frame(json!({"id":99,"method":method,"params":{
+        "threadId":"thread","serverName":"browser","message":"Open it?","mode":"url",
+        "url":"https://example.test/authorize","elicitationId":"oauth"
+    }})).await?;
+    let pending = events.try_recv()?;
+    session.handle_frame(json!({"method":"serverRequest/resolved","params":{"requestId":99,"threadId":"other"}})).await?;
+    assert_eq!(session.pending_permissions().len(), 1);
+    session.handle_frame(json!({"method":"serverRequest/resolved","params":{"requestId":99,"threadId":"thread"}})).await?;
+    let resolved = events.try_recv()?;
+    assert_eq!(resolved["requestId"], pending["request"]["id"]);
+    assert_eq!(resolved["resolution"]["selectedActionId"], "cancel");
+    session.client.request("test/flush", json!({})).await?;
+    assert!(!file.exists(), "server resolution must not send another reply");
+    assert!(session.pending_permissions().is_empty());
+    session.close().await
 }
 
 #[cfg(unix)]

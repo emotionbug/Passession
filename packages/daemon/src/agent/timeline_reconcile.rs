@@ -15,7 +15,12 @@ impl Timeline {
         event: &Value,
         destination: Option<(&Path, &str)>,
     ) -> Result<Option<String>> {
-        let Some(mut replacement) = self.message_replacement(event)? else {
+        let replacement = if event["reason"] == "codex_moderation" {
+            self.codex_redaction(event)?
+        } else {
+            self.message_replacement(event)?
+        };
+        let Some(mut replacement) = replacement else {
             return Ok(None);
         };
         replacement.bounded = self.bounded;
@@ -25,6 +30,79 @@ impl Timeline {
         let epoch = replacement.epoch.clone();
         *self = replacement;
         Ok(Some(epoch))
+    }
+
+    /// Commit the notice and remove streamed chunks in one write, even when
+    /// unrelated rows sit between chunks.
+    fn codex_redaction(&self, event: &Value) -> Result<Option<Self>> {
+        let message_id = event["messageId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("Missing moderated Codex message identity")?;
+        let turn = event["turnId"].as_str();
+        let previews = event["previewSources"].as_array();
+        let mut notice = if previews.is_none() {
+            Some(
+                event.get("item")
+                    .filter(|item| {
+                        kind(item) == "notification"
+                            && item["metadata"]["codexModeration"] == true
+                            && item["messageId"].as_str() == Some(message_id)
+                    })
+                    .context("Missing Codex moderation notice")?,
+            )
+        } else {
+            None
+        };
+        let history = match self.base {
+            0 => Cow::Borrowed(self.rows.as_slice()),
+            _ => Cow::Owned(self.all_rows()?),
+        };
+        let mut edits = Vec::new();
+        for (index, row) in history.iter().enumerate() {
+            let item = &row["item"];
+            if let Some(sources) = previews {
+                if let Some(item) = redact_preview(item, sources) {
+                    edits.push((index, Some(item)));
+                }
+            } else if item["messageId"].as_str() == Some(message_id)
+                && turn.is_none_or(|turn| row["turnId"].as_str() == Some(turn))
+            {
+                if kind(item) == "assistant_message" {
+                    edits.push((index, None));
+                } else if kind(item) == "notification" && item["metadata"]["codexModeration"] == true {
+                    notice = None;
+                }
+            }
+        }
+        if let Some((_, item)) = edits.first_mut()
+            && notice.is_some()
+        {
+            *item = notice.take().cloned();
+        }
+        if edits.is_empty() && notice.is_none() {
+            return Ok(None);
+        }
+        let mut replacement = Self::new();
+        replacement.rows.reserve(history.len());
+        let mut edits = edits.into_iter().peekable();
+        for (index, row) in history.iter().enumerate() {
+            if edits.peek().is_some_and(|(position, _)| *position == index) {
+                if let Some((_, Some(item))) = edits.next() {
+                    let mut row = row.clone();
+                    row["item"] = item;
+                    replacement.push_rebased(row);
+                }
+            } else {
+                replacement.push_rebased(row.clone());
+            }
+        }
+        if let Some(notice) = notice {
+            let row = replacement.source_row(notice.clone(), event);
+            replacement.push_rebased(row);
+        }
+        replacement.storage_dirty = true;
+        Ok(Some(replacement))
     }
 
     fn message_replacement(&self, event: &Value) -> Result<Option<Self>> {
@@ -202,6 +280,60 @@ impl Timeline {
         self.min_seq = 1;
         self.next_seq += 1;
     }
+}
+
+/// A Codex card describes which child item supplied each run of log lines.
+fn redact_preview(item: &Value, sources: &[Value]) -> Option<Value> {
+    let log = item["detail"]["log"].as_str()?;
+    let entries = item["metadata"]["subagentLog"].as_array()?;
+    let redacted = |entry: &Value| {
+        sources.iter().any(|source| {
+            entry["child"] == source["child"]
+                && entry["key"] == source["key"]
+                && entry["kind"] == source["kind"]
+        })
+    };
+    if !entries.iter().any(redacted) {
+        return None;
+    }
+    let mut lines = log.split('\n');
+    let mut kept = Vec::new();
+    let mut kept_entries = Vec::new();
+    let mut valid = true;
+    for entry in entries {
+        let keep = !redacted(entry);
+        let count = entry["lines"].as_u64().unwrap_or(0);
+        if count == 0 {
+            valid = false;
+            break;
+        }
+        for _ in 0..count {
+            let Some(line) = lines.next() else {
+                valid = false;
+                break;
+            };
+            if keep {
+                kept.push(line);
+            }
+        }
+        if !valid {
+            break;
+        }
+        if keep {
+            kept_entries.push(entry);
+        }
+    }
+    let mut item = item.clone();
+    if valid && lines.next().is_none() {
+        item["detail"]["log"] = json!(kept.join("\n"));
+        item["metadata"]["subagentLog"] = json!(kept_entries);
+    } else {
+        // The matched block is present but its bounds are corrupt. Do not retain
+        // a card log that could still contain the moderated text.
+        item["detail"]["log"] = json!("");
+        item["metadata"]["subagentLog"] = json!([]);
+    }
+    Some(item)
 }
 
 #[cfg(test)]

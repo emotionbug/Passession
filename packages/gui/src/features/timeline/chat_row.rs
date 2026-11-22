@@ -737,7 +737,8 @@ impl Widget for ChatRow {
                 // Enter on the answer acts as the primary button.
                 if self.answer.as_ptext_field().returned(actions).is_some()
                     && let Some(model) = self.model.clone()
-                    && let RowKind::Permission { key, .. } = &model.item.kind
+                    && let RowKind::Permission { key, request } = &model.item.kind
+                    && !permission::is_elicitation(request)
                 {
                     let target = HitTarget::QuestionPrimary { key: key.clone() };
                     self.tap_local(cx, scope, &target);

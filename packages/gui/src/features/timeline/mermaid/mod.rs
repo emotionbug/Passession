@@ -512,7 +512,7 @@ impl Worker {
             PlatformPending::Save(owner, revision, path) => {
                 remove_export_file(path);
                 match result {
-                    Ok(PlatformValue::Bool(true)) => {
+                    Ok(PlatformValue::PhotoLibrarySaved | PlatformValue::Bool(true)) => {
                         set_export(&owner, revision, ExportStatus::Saved)
                     }
                     Ok(_) => set_export(&owner, revision, ExportStatus::Cancelled),

@@ -14,7 +14,6 @@ use makepad_widgets::{Cx, Event, VirtualKeyboardEvent};
 use objc2::{
     class, msg_send,
     runtime::{AnyClass, AnyObject, Bool, Sel},
-    sel,
 };
 use serde_json::Value;
 use std::{
@@ -27,12 +26,6 @@ use std::{
 #[link(name = "UIKit", kind = "framework")]
 unsafe extern "C" {
     fn UIImagePNGRepresentation(image: Id) -> Id;
-    fn UIImageWriteToSavedPhotosAlbum(
-        image: Id,
-        target: Id,
-        selector: Sel,
-        context: *mut std::ffi::c_void,
-    );
     static UIBackgroundTaskInvalid: usize;
     static UIApplicationOpenSettingsURLString: Id;
 }
@@ -884,71 +877,55 @@ pub(crate) fn save_file(
 
 // ----- photo library save -----
 
-static PHOTO_SAVES: Mutex<Vec<(usize, Completion)>> = Mutex::new(Vec::new());
-
-extern "C" fn image_saved(
-    this: &AnyObject,
-    _sel: Sel,
-    _image: Id,
-    error: Id,
-    _context: *mut std::ffi::c_void,
-) {
-    let delegate = this as *const AnyObject as usize;
-    let done = {
-        let mut saves = PHOTO_SAVES.lock().unwrap();
-        saves
-            .iter()
-            .position(|(key, _)| *key == delegate)
-            .map(|index| saves.remove(index).1)
-    };
-    apple::on_main_queue(move || unsafe {
-        let _: () = msg_send![delegate as Id, release];
-    });
-    let Some(done) = done else {
-        return;
-    };
-    if error.is_null() {
-        done.ok(PlatformValue::Bool(true));
-    } else {
-        let reason = rust_string(unsafe { msg_send![error, localizedDescription] });
-        done.fail(PlatformError::native(reason.unwrap_or_else(|| {
-            "The image could not be saved to Photos.".into()
-        })));
-    }
-}
+#[link(name = "Photos", kind = "framework")]
+unsafe extern "C" {}
 
 /// Saves an image into Photos (add-only access, `NSPhotoLibraryAddUsageDescription`).
 pub(crate) fn save_image(
     _shared: &Arc<Shared>,
     path: PathBuf,
     _mime_type: String,
-    _name: String,
+    name: String,
     done: Completion,
 ) {
     apple::on_main_queue(move || unsafe {
-        let image: Id =
-            msg_send![class!(UIImage), imageWithContentsOfFile: ns_string(&path.to_string_lossy())];
-        if image.is_null() {
-            done.fail(PlatformError::invalid("The image could not be read."));
-            return;
-        }
-        let class = apple::define_class(
-            c"PaseoPhotoSaveDelegate",
-            class!(NSObject),
-            &[(
-                c"image:didFinishSavingWithError:contextInfo:",
-                imp!(image_saved),
-                "v@:@@^v",
-            )],
-        );
-        let delegate: Id = msg_send![class, new];
-        PHOTO_SAVES.lock().unwrap().push((delegate as usize, done));
-        UIImageWriteToSavedPhotosAlbum(
-            image,
-            delegate,
-            sel!(image:didFinishSavingWithError:contextInfo:),
-            std::ptr::null_mut(),
-        );
+        let pending = Mutex::new(Some((done, path, name)));
+        let authorized = RcBlock::new(move |status: isize| {
+            let Some((done, path, name)) = pending.lock().unwrap().take() else {
+                return;
+            };
+            // PHAuthorizationStatusAuthorized or Limited.
+            if !matches!(status, 3 | 4) {
+                done.fail(PlatformError::native("Photos did not allow adding the image."));
+                return;
+            }
+            let changes = RcBlock::new(move || {
+                let request: Id = msg_send![class!(PHAssetCreationRequest), creationRequestForAsset];
+                let options: Id = msg_send![class!(PHAssetResourceCreationOptions), new];
+                let _: () = msg_send![options, setOriginalFilename: ns_string(&name)];
+                // PHAssetResourceTypePhoto: import the file, not a decoded UIImage.
+                let _: () = msg_send![request, addResourceWithType: 1isize, fileURL: apple::file_url(&path), options: options];
+                let _: () = msg_send![options, release];
+            });
+            let done = Mutex::new(Some(done));
+            let completed = RcBlock::new(move |success: Bool, error: Id| {
+                let Some(done) = done.lock().unwrap().take() else { return };
+                if success.as_bool() {
+                    done.ok(PlatformValue::PhotoLibrarySaved);
+                } else {
+                    let reason = (!error.is_null())
+                        .then(|| rust_string(msg_send![error, localizedDescription]))
+                        .flatten();
+                    done.fail(PlatformError::native(reason.unwrap_or_else(|| {
+                        "The image could not be saved to Photos.".into()
+                    })));
+                }
+            });
+            let library: Id = msg_send![class!(PHPhotoLibrary), sharedPhotoLibrary];
+            let _: () = msg_send![library, performChanges: &*changes, completionHandler: &*completed];
+        });
+        // PHAccessLevelAddOnly: never ask for access to existing photos.
+        let _: () = msg_send![class!(PHPhotoLibrary), requestAuthorizationForAccessLevel: 1isize, handler: &*authorized];
     });
 }
 

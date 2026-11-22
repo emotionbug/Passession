@@ -4,12 +4,14 @@ mod projection;
 mod prompt;
 mod readiness;
 mod storage;
+mod tasks;
 mod transport;
 
 use super::api::{
     AgentProvider, AgentSession, EventSink, HistoryCoverage, ImportedSession, LaunchContext,
     ProviderSpec, RewindTarget, SubagentHistory, SubagentHistoryRequest, UnloadReadiness,
 };
+use super::mcp_elicitation::{self, Answer, Elicitation};
 use crate::providers::registry::catalog::{
     memo::{self, Loaded, Memo},
     refresh_activity,
@@ -241,6 +243,7 @@ impl ClaudeProvider {
                 anchors,
                 projection: Projection::new(provider),
                 tasks: readiness::TaskLedger::default(),
+                task_controls: tasks::TaskControls::default(),
                 runtime_model: None,
             }),
         });
@@ -705,6 +708,37 @@ impl AgentProvider for ClaudeProvider {
 struct Permission {
     request: Value,
     native_id: String,
+    elicitation: Option<Arc<Elicitation>>,
+}
+
+fn claude_elicitation(request: &Value) -> Result<(Elicitation, Value)> {
+    let server = mcp_elicitation::required_text(&request["mcp_server_name"], "server name")?;
+    let message = request["message"].as_str().ok_or_else(|| anyhow!("Invalid MCP message"))?;
+    let mode = match request.get("mode") {
+        // Claude's SDK declares mode optional for the original form protocol.
+        None => "form",
+        Some(Value::String(mode)) => mode.as_str(),
+        _ => bail!("Invalid Claude MCP elicitation mode"),
+    };
+    let elicitation = match mode {
+        "form" => {
+            anyhow::ensure!(request["url"].is_null() && request["elicitation_id"].is_null(), "Unexpected URL fields in Claude MCP form");
+            Elicitation::form(&request["requested_schema"], &request["property_order"], false)?
+        }
+        "url" => {
+            anyhow::ensure!(request["requested_schema"].is_null() && request["property_order"].is_null(), "Unexpected schema in Claude MCP URL request");
+            Elicitation::url(&request["url"], &request["elicitation_id"])?
+        }
+        _ => bail!("Unsupported Claude MCP elicitation mode"),
+    };
+    let mut public = elicitation.request(server, message);
+    if let Some(title) = request["title"].as_str().filter(|title| !title.trim().is_empty()) {
+        public["title"] = json!(format!("{title} — {server}"));
+    }
+    if let Some(detail) = request["description"].as_str().filter(|detail| !detail.trim().is_empty()) {
+        public["description"] = json!(format!("{message}\n\n{detail}"));
+    }
+    Ok((elicitation, public))
 }
 
 struct State {
@@ -728,6 +762,7 @@ struct State {
     anchors: Vec<(String, Option<String>)>,
     projection: Projection,
     tasks: readiness::TaskLedger,
+    task_controls: tasks::TaskControls,
     runtime_model: Option<String>,
 }
 struct ClaudeSession {
@@ -785,7 +820,7 @@ impl ClaudeSession {
 
     async fn ensure_runtime(&self) -> Result<Arc<Transport>> {
         let _gate = self.gate.lock().await;
-        let (old, config, resume, fresh) = {
+        let (old, config, resume, fresh, tasks_changed) = {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 bail!("Claude session is closed");
@@ -802,10 +837,14 @@ impl ClaudeSession {
                 state.config.clone(),
                 state.native_id.clone(),
                 state.fresh_id.clone(),
+                state.task_controls.invalidate(false),
             )
         };
         if let Some(old) = old {
             old.close().await?;
+        }
+        if tasks_changed {
+            self.sink.emit(tasks::changed(&self.spec.id)).await?;
         }
         let launch = options::build_launch(
             &self.spec,
@@ -825,6 +864,7 @@ impl ClaudeSession {
                 state.runtime = Some(runtime.clone());
                 state.restart = false;
                 state.tasks = readiness::TaskLedger::default();
+                state.task_controls = tasks::TaskControls::default();
                 true
             }
         };
@@ -915,6 +955,9 @@ impl ClaudeSession {
                 &message,
                 error.is::<StdoutFrameError>(),
             ));
+            if state.task_controls.invalidate(false) {
+                events.push(tasks::changed(&self.spec.id));
+            }
             events
         };
         let _ = runtime.close().await;
@@ -952,6 +995,7 @@ impl ClaudeSession {
                             Permission {
                                 request: request.clone(),
                                 native_id: id.to_owned(),
+                                elicitation: None,
                             },
                         );
                         (request, superseded)
@@ -977,22 +1021,37 @@ impl ClaudeSession {
                     return self.emit(events).await;
                 }
                 Some("elicitation") => {
-                    runtime.reply(id, Ok(json!({"action":"cancel"}))).await?;
-                    let server = request["mcp_server_name"]
-                        .as_str()
-                        .unwrap_or("An MCP server");
-                    let prompt = request["message"].as_str().unwrap_or("").trim();
-                    let mut message = format!("{server} asked for input");
-                    if !prompt.is_empty() {
-                        message.push_str(&format!(" ({prompt})"));
+                    let (elicitation, mut request) = match claude_elicitation(request) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            runtime.reply(id, Ok(Answer::cancel().native(false))).await?;
+                            let message = format!("MCP request canceled: {error}");
+                            return self.emit(vec![json!({"type":"timeline","provider":self.spec.id,
+                                "item":{"type":"notification","level":"warning","message":message}})]).await;
+                        }
+                    };
+                    let public_id = format!("permission-{}", uuid::Uuid::new_v4());
+                    request["id"] = json!(public_id);
+                    request["provider"] = json!(self.spec.id);
+                    let superseded = {
+                        let mut state = self.state.lock().unwrap();
+                        if state.closed || state.runtime.as_ref().is_none_or(|active| active.generation != runtime.generation)
+                            || state.permissions.values().any(|permission| permission.native_id == id)
+                        {
+                            return Ok(());
+                        }
+                        state.permissions.insert(public_id.clone(), Permission {
+                            request: request.clone(),
+                            native_id: id.to_owned(),
+                            elicitation: Some(Arc::new(elicitation)),
+                        });
+                        !state.clearing_steers.is_empty()
+                    };
+                    self.emit(vec![json!({"type":"permission_requested","provider":self.spec.id,"request":request})]).await?;
+                    if superseded {
+                        self.respond_to_permission(&public_id, json!({"behavior":"deny","interrupt":true})).await?;
                     }
-                    message
-                        .push_str(", which Passession can't show yet; the request was canceled.");
-                    return self
-                        .sink
-                        .emit(json!({"type":"timeline","provider":self.spec.id,
-                        "item":{"type":"notification","level":"warning","message":message}}))
-                        .await;
+                    return Ok(());
                 }
                 _ => {
                     return runtime
@@ -1016,21 +1075,31 @@ impl ClaudeSession {
                         .iter()
                         .find(|(_, permission)| permission.native_id == id)
                         .map(|(id, _)| id.clone());
-                    if let Some(id) = &public_id {
-                        state.permissions.remove(id);
-                    }
-                    public_id
+                    public_id.and_then(|id| {
+                        let permission = state.permissions.remove(&id)?;
+                        let resolution = if permission.elicitation.is_some() {
+                            Answer::cancel().resolution()
+                        } else {
+                            json!({"behavior":"deny","message":"Permission request canceled"})
+                        };
+                        Some(json!({"type":"permission_resolved","provider":self.spec.id,"requestId":id,"resolution":resolution}))
+                    })
                 };
-                if let Some(id) = public_id {
-                    self.sink.emit(json!({"type":"permission_resolved","provider":self.spec.id,"requestId":id,"resolution":{"behavior":"deny","message":"Permission request canceled"}})).await?;
+                if let Some(event) = public_id {
+                    self.sink.emit(event).await?;
                 }
             }
             return Ok(());
         }
         let mut mode_changed = None;
+        let tasks_changed;
         let mut events = {
             let mut state = self.state.lock().unwrap();
+            if state.runtime.as_ref().is_none_or(|r| r.generation != runtime.generation) {
+                return Ok(());
+            }
             state.tasks.observe(&frame);
+            tasks_changed = state.task_controls.observe(&frame);
             if frame["parent_tool_use_id"].as_str().is_some() {
                 state.projection.project(&frame)
             } else {
@@ -1106,6 +1175,9 @@ impl ClaudeSession {
                 state.projection.project(&frame)
             }
         };
+        if tasks_changed {
+            events.push(tasks::changed(&self.spec.id));
+        }
         if let Some(mode) = mode_changed {
             events.push(json!({"type":"mode_changed","provider":self.spec.id,"currentModeId":mode,"availableModes":catalog::mode_catalog(&self.env)["modes"]}));
         }
@@ -1175,6 +1247,40 @@ impl AgentSession for ClaudeSession {
         Some(
             json!({"provider":self.spec.id,"model":state.config["model"],"env":self.env,"sessionKey":self.usage_key}),
         )
+    }
+
+    fn provider_tasks(&self) -> Vec<Value> {
+        let state = self.state.lock().unwrap();
+        if !state.closed && state.runtime.as_ref().is_some_and(|r| r.is_healthy()) {
+            state.task_controls.list()
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn stop_provider_task(&self, token: uuid::Uuid) -> Result<()> {
+        // Never start or resume a runtime to deliver a task action.
+        let _gate = self.gate.lock().await;
+        let (runtime, request) = {
+            let mut state = self.state.lock().unwrap();
+            let runtime = state.runtime.as_ref()
+                .filter(|r| !state.closed && r.is_healthy())
+                .cloned()
+                .ok_or_else(|| anyhow!("Claude has no live task runtime"))?;
+            // Do not act while an already-read lifecycle frame could revoke the
+            // offer. The runtime may still report an error if the task settles
+            // concurrently with delivery to stdin.
+            if runtime.has_incoming_events() {
+                bail!("Claude task state is updating; try again");
+            }
+            let request = state.task_controls.claim_stop(token)
+                .ok_or_else(|| anyhow!("That Claude task is no longer stoppable"))?;
+            (runtime, request)
+        };
+        let result = runtime.request(request, Duration::from_secs(5)).await;
+        self.sink.emit(tasks::changed(&self.spec.id)).await?;
+        result?;
+        Ok(())
     }
 
     async fn unload_readiness(&self) -> UnloadReadiness {
@@ -1441,6 +1547,20 @@ impl AgentSession for ClaudeSession {
                 .ok_or_else(|| anyhow!("Claude permission transport closed"))?;
             (request, runtime, state.plan_resume.clone())
         };
+        if let Some(elicitation) = permission.elicitation {
+            let answer = elicitation.answer(&response)?;
+            let resolution = answer.resolution();
+            self.state.lock().unwrap().permissions.remove(request_id).ok_or_else(|| {
+                anyhow!("MCP request '{request_id}' was already resolved or canceled")
+            })?;
+            if let Err(error) = runtime.reply(&permission.native_id, Ok(answer.native(false))).await {
+                let _ = self.emit(vec![json!({"type":"permission_resolved","provider":self.spec.id,"requestId":request_id,
+                    "resolution":{"behavior":"deny","message":"MCP response delivery could not be confirmed"}})]).await;
+                return Err(error);
+            }
+            self.emit(vec![json!({"type":"permission_resolved","provider":self.spec.id,"requestId":request_id,"resolution":resolution})]).await?;
+            return Ok(None);
+        }
         let request = permission.request;
         let native_response = projection::permission_response(&request, &response)?;
         if request["kind"] == "plan" && response["behavior"] == "allow" {
@@ -1500,7 +1620,10 @@ impl AgentSession for ClaudeSession {
             state.active_turn = None;
             state.active_generation = None;
             state.clearing_steers.clear();
-            let events = state.projection.interrupt();
+            let mut events = state.projection.interrupt();
+            if started && state.task_controls.invalidate(true) {
+                events.push(tasks::changed(&self.spec.id));
+            }
             (runtime, unstarted, started, events)
         };
         self.emit(events).await?;
@@ -1534,7 +1657,7 @@ impl AgentSession for ClaudeSession {
     }
 
     async fn close(&self) -> Result<()> {
-        let (runtime, id, cwd, events) = {
+        let (runtime, id, cwd, events, elicitations) = {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 return Ok(());
@@ -1542,16 +1665,32 @@ impl AgentSession for ClaudeSession {
             state.closed = true;
             state.active_turn = None;
             state.active_generation = None;
-            let mut events: Vec<_> = state.permissions.drain().map(|(id,_)|json!({"type":"permission_resolved","provider":self.spec.id,"requestId":id,"resolution":{"behavior":"deny","message":"Claude session closed"}})).collect();
+            let mut elicitations = Vec::new();
+            let mut events: Vec<_> = state.permissions.drain().map(|(id, permission)| {
+                let resolution = if permission.elicitation.is_some() {
+                    elicitations.push(permission.native_id);
+                    Answer::cancel().resolution()
+                } else {
+                    json!({"behavior":"deny","message":"Claude session closed"})
+                };
+                json!({"type":"permission_resolved","provider":self.spec.id,"requestId":id,"resolution":resolution})
+            }).collect();
             events.extend(state.projection.interrupt());
+            if state.task_controls.invalidate(false) {
+                events.push(tasks::changed(&self.spec.id));
+            }
             (
                 state.runtime.take(),
                 state.native_id.clone(),
                 state.config["cwd"].as_str().unwrap_or("").to_owned(),
                 events,
+                elicitations,
             )
         };
         if let Some(runtime) = runtime {
+            for id in elicitations {
+                let _ = runtime.reply(&id, Ok(Answer::cancel().native(false))).await;
+            }
             runtime.close().await?;
         }
         let _ = self.emit(events).await;
@@ -1917,6 +2056,112 @@ mod tests {
         assert_eq!(events[0]["item"]["message"], message);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_elicitation_claude_uses_control_response_and_handles_withdrawal() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cancel = CancellationToken::new();
+        let (sink, mut events) = EventSink::channel(16, cancel.child_token());
+        let provider = ClaudeProvider::new(ProviderSpec {
+            id: "custom-claude".into(),
+            family: "claude".into(),
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            options: json!({}),
+            defaults: json!({}),
+            runtime_settings: json!({}),
+            configured_models: Vec::new(),
+        });
+        let session = provider.session(
+            json!({"cwd":root.path()}),
+            LaunchContext {
+                agent_id: "elicitation-test".into(),
+                home: root.path().into(),
+                executable: std::env::current_exe()?,
+                env: BTreeMap::new(),
+                mcp_servers: json!({}),
+                tool_catalog: json!([]),
+                tool_manifest: json!([]),
+                tool_executor: None,
+                cancel: cancel.child_token(),
+            },
+            json!({}), None, sink,
+        ).await?;
+        let script = r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"type":"control_request"'*)
+            id=${line#*'"request_id":"'}
+            id=${id%%'"'*}
+            printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+            ;;
+        *) printf '{"type":"test/wire","frame":%s}\n' "$line" ;;
+    esac
+done
+"#;
+        let (runtime, mut incoming) = Transport::spawn(CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: Some(root.path().into()),
+            env: BTreeMap::new(),
+            clear_env: true,
+        }, cancel.child_token()).await?;
+        session.state.lock().unwrap().runtime = Some(runtime.clone());
+        let form = json!({"subtype":"elicitation","mcp_server_name":"demo","message":"Choose settings",
+            "requested_schema":{"type":"object","required":["email"],"properties":{
+                "email":{"type":"string","format":"email"},
+                "enabled":{"type":"boolean","default":true}
+            }},
+            "property_order":["enabled","email"]
+        });
+        let url = json!({"subtype":"elicitation","mcp_server_name":"demo","message":"Authorize?",
+            "mode":"url","elicitation_id":"auth-1","url":"https://example.test/authorize"});
+        for (id, input, response, expected) in [
+            ("form", &form, json!({"behavior":"allow","selectedActionId":"accept","updatedInput":{"content":{"email":"user@example.test"}}}),
+                json!({"action":"accept","content":{"email":"user@example.test"}})),
+            ("url-accept", &url, json!({"behavior":"allow","selectedActionId":"accept"}), json!({"action":"accept"})),
+            ("url-decline", &url, json!({"behavior":"deny","selectedActionId":"decline"}), json!({"action":"decline"})),
+            ("url-cancel", &url, json!({"behavior":"deny","selectedActionId":"cancel"}), json!({"action":"cancel"})),
+        ] {
+            let frame = json!({"type":"control_request","request_id":id,"request":input});
+            session.receive(&runtime, frame.clone()).await?;
+            session.receive(&runtime, frame).await?;
+            let event = events.try_recv()?;
+            assert_eq!(event["type"], "permission_requested");
+            assert_eq!(event["provider"], "custom-claude");
+            assert!(events.try_recv().is_err(), "duplicate control request opened another form");
+            let request = &event["request"];
+            let public_id = request["id"].as_str().unwrap();
+            if id == "form" {
+                assert_eq!(request["input"]["questions"][0]["answerKey"], "enabled");
+                assert!(session.respond_to_permission(public_id, json!({"behavior":"allow","selectedActionId":"accept","updatedInput":{"content":{"email":false}}})).await.is_err());
+            } else {
+                assert_eq!(request["input"]["url"], "https://example.test/authorize");
+            }
+            assert!(session.respond_to_permission(public_id, json!({"behavior":"allow"})).await.is_err());
+            runtime.request(json!({"subtype":"test/flush"}), Duration::from_secs(3)).await?;
+            assert!(incoming.try_recv().is_err(), "requests and invalid answers must not reply");
+            session.respond_to_permission(public_id, response).await?;
+            runtime.request(json!({"subtype":"test/flush"}), Duration::from_secs(3)).await?;
+            assert_eq!(incoming.try_recv()??["frame"], json!({"type":"control_response",
+                "response":{"request_id":id,"subtype":"success","response":expected}}));
+            let resolved = events.try_recv()?;
+            assert_eq!(resolved["type"], "permission_resolved");
+            assert_eq!(resolved["requestId"], public_id);
+            assert!(resolved["resolution"].get("updatedInput").is_none());
+        }
+        session.receive(&runtime, json!({"type":"control_request","request_id":"withdraw","request":url})).await?;
+        let pending = events.try_recv()?;
+        session.receive(&runtime, json!({"type":"control_cancel_request","request_id":"withdraw"})).await?;
+        let resolved = events.try_recv()?;
+        assert_eq!(resolved["requestId"], pending["request"]["id"]);
+        assert_eq!(resolved["resolution"]["selectedActionId"], "cancel");
+        runtime.request(json!({"subtype":"test/flush"}), Duration::from_secs(3)).await?;
+        assert!(incoming.try_recv().is_err(), "withdrawal must not send another reply");
+        assert!(session.pending_permissions().is_empty());
+        runtime.close().await
+    }
+
     #[tokio::test]
     async fn failed_plan_mode_change_keeps_permission_pending_for_retry() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -1984,6 +2229,7 @@ done
                 Permission {
                     request: request.clone(),
                     native_id: "native-plan".into(),
+                    elicitation: None,
                 },
             );
         }

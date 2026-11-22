@@ -8,6 +8,7 @@ pub mod development;
 pub mod hoplite;
 mod jsonl;
 pub mod manifest;
+mod mcp_elicitation;
 pub mod muse;
 pub mod opencode;
 pub mod options;

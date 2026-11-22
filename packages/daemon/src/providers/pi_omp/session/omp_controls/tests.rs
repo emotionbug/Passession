@@ -89,6 +89,18 @@ fn fake_native_omp() {
         commands
     };
     println!("{}", json!({"type":"ready"}));
+    if args.lines().any(|arg| arg == "--paseo-extension-ui-fixture") {
+        let (key, text) = if arg("--approval-mode") == Some("always-ask") {
+            ("fresh", "new process")
+        } else {
+            ("old", "previous process")
+        };
+        println!(
+            "{}",
+            json!({"type":"extension_ui_request","method":"setStatus","id":"startup",
+                "statusKey":key,"statusText":text})
+        );
+    }
     for line in io::stdin().lock().lines() {
         let q: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let native_command = q["type"].as_str().unwrap();
@@ -529,6 +541,28 @@ async fn until(events: &mut mpsc::Receiver<Value>, predicate: impl Fn(&Value) ->
     })
     .await
     .expect("expected session event")
+}
+
+#[tokio::test]
+async fn omp_extension_ui_restart_replaces_old_generation_with_new_startup_state() {
+    let (_root, session, mut events) =
+        open_fixture_with_args(false, &["--paseo-extension-ui-fixture"]).await;
+    let initial = until(&mut events, |e| e["type"] == "omp_extension_ui").await;
+    assert_eq!(initial["key"], "old");
+    session.set_mode("ask").await.unwrap();
+    let mut current = Value::Null;
+    crate::providers::pi_omp::extension_ui::apply(&mut current, initial);
+    // The process switch always publishes a replacement, even when the fresh
+    // process produced no UI before the startup drain stopped.
+    let replacement = until(&mut events, |e| e["type"] == "omp_extension_ui").await;
+    assert!(replacement.get("replacement").is_some());
+    crate::providers::pi_omp::extension_ui::apply(&mut current, replacement);
+    if current["statuses"]["fresh"].is_null() {
+        let startup = until(&mut events, |e| e["type"] == "omp_extension_ui").await;
+        crate::providers::pi_omp::extension_ui::apply(&mut current, startup);
+    }
+    assert_eq!(current, json!({"statuses":{"fresh":"new process"}}));
+    session.close().await.unwrap();
 }
 
 #[tokio::test]

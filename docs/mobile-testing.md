@@ -377,6 +377,11 @@ password-protected daemon reached through `10.0.2.2`.
 - Files › long-press `diagram-qa.png` › Download showed "Saved to Photos" with
   no location prompt. MediaStore listed it under `Pictures/Passession/` as
   `image/png`, and the pulled copy was byte-identical to the host file.
+- Opening Command Center from the compact sidebar, typing `diagram`, and pressing
+  Android Back twice dismissed the IME first and the palette second. The app
+  stayed in the foreground and a session could be opened from the sidebar.
+  The image-picker intent was restricted to `image/*`; a gallery save left
+  `is_pending=0` and retained the original PNG bytes.
 
 Not covered: the `GET_CONTENT` fallback on Android 11 and older without the
 photo picker, the document-dialog fallback on Android 9 and older, and a

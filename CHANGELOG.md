@@ -13,6 +13,9 @@
 - Codex: the agent shows Codex's retry notices ("Codex is retrying: stream disconnected…"), warnings, configuration warnings, deprecation notices, model switches (for example "Codex switched models: gpt-5.5 → gpt-5.4 (high-risk cyber activity)"), plan explanations, and the start and result of `/review`. Before this, all of them were dropped.
 - Claude: the agent shows Claude's notices (such as a hook's reason for stopping Claude), the output of local slash commands such as `/cost`, failed hooks with their name, event and error output, and a background subagent's final report on that subagent. Before this, these messages were dropped.
 - OMP: an extension that fails shows "OMP extension <file> failed during <event>: <error>", and an extension's editor dialog starts with the text the extension provided (for example the bundled review command's template) instead of an empty field.
+- Claude and Codex: MCP servers can ask for form input or present a URL. Opening the link does not accept the request. Unanswered optional fields are omitted, and Accept, Decline and Cancel are separate choices.
+- Claude: the Tasks panel and `paseo tasks` list stoppable live tasks. Stop one with its row action or `paseo stop-task <session-id> <task-token>` without interrupting the rest of the session.
+- OMP: extension status text and text widgets appear around the composer. Updates replace the same key; removed widgets disappear without adding chat history.
 
 ### Changed
 
@@ -24,11 +27,13 @@
 - In a window shorter than about 640px, the sidebar's New session, History, Search and Schedules rows fold into one row (New session with icons beside it, or only icons in a narrow sidebar), so the session list keeps about 100px more room.
 - In a sidebar narrower than 260px, sessions are indented one step less and show their age in the subtitle ("mock · Idle · 1d") instead of beside the title, so titles keep more of the row.
 - The Settings navigation narrows from 320px to 220px as the window gets narrower, so in a window about 660px wide the settings keep their controls on the same line instead of wrapping them under each label.
+- The model picker in an existing chat opens at its own model control, including in a split pane. Narrow windows keep the bottom sheet. Wider windows give the split panes room before squeezing them, without changing the saved split ratio.
 
 ### Fixed
 
 - OMP 19: a run that pauses (while OMP retries, sends itself a reminder, or waits for a background job or a child agent) stays running until OMP reports that the run ended and the session settled. Before this, Passession could mark the turn finished at the pause, and OMP's later work showed up detached from it.
-- Claude: when an MCP server asks for input (a form or a sign-in link), the agent says that Passession can't show it yet and that the request was canceled. Before this, the request was canceled with nothing shown.
+- Codex: MCP tool progress updates the running card, plan previews give way to the final plan, and moderation notices honor the provider's display decision. An unanswered question no longer sends the first option.
+- Android: Command Center opened from the sidebar receives input and Back before the sidebar. Image selection excludes videos; gallery saves report success only after publication, and the Android 9-and-earlier document fallback no longer claims to have saved to Photos. iOS imports the original image file into Photos instead of decoding and re-encoding it.
 - Codex: approval requests whose id is a string are no longer rejected.
 - A field or button that opened a picker or dialog no longer stays highlighted after the picker closes and the pointer has moved away.
 - Claude: an API error that ends a turn, such as "Invalid API key", now fails the turn and shows it as an error. Before this, the turn showed the error text as a normal reply and was reported as completed.

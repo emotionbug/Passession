@@ -861,6 +861,7 @@ final class PaseoBridge {
     private Intent imagePicker(boolean multiple) {
         if (photoPickerAvailable()) {
             Intent intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            intent.setType("image/*");
             if (multiple) {
                 intent.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, MediaStore.getPickImagesMaxLimit());
             }
@@ -910,8 +911,10 @@ final class PaseoBridge {
                 }
                 values.clear();
                 values.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                resolver.update(destination, values, null, null);
-                reply = ok(true);
+                if (resolver.update(destination, values, null, null) != 1) {
+                    throw new java.io.IOException("The gallery did not publish the image.");
+                }
+                reply = ok("photos");
             } catch (Exception e) {
                 if (destination != null) {
                     try {

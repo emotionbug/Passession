@@ -269,3 +269,60 @@ fn omp_message_reconcile_persistence_failure_retains_checkpoint_and_retry_reload
         .unwrap();
     assert_eq!(Timeline::load(&path, "agent").unwrap().items().len(), 2);
 }
+
+#[test]
+fn codex_moderation_redacts_only_owned_chunks_and_durable_preview() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("timeline.sqlite3");
+    let mut timeline = Timeline::new();
+    let answer = |text| json!({"type":"assistant_message","messageId":"answer","text":text});
+    let sibling = json!({"type":"assistant_message","messageId":"another","text":"keep me"});
+    let card = json!({"type":"tool_call","callId":"tool","name":"task","status":"running",
+        "detail":{"type":"sub_agent","log":"keep before\nredact\nalso redact\nkeep after"},
+        "metadata":{"subagentLog":[
+            {"lines":1,"kind":"recorded"},
+            {"lines":2,"kind":"assistant_message","child":"child","key":"answer"},
+            {"lines":1,"kind":"assistant_message","child":"sibling","key":"answer"}
+        ]}});
+    timeline.append(answer("remove first chunk"), &options());
+    timeline.append(sibling.clone(), &options());
+    timeline.append(answer("remove second chunk"), &options());
+    timeline.append(answer("different turn"), &json!({"turnId":"another-turn"}));
+    timeline.append(card, &options());
+    timeline.persist(&path, "agent").unwrap();
+    let original_epoch = timeline.epoch().to_owned();
+    let notice = json!({"type":"notification","messageId":"answer","level":"warning",
+        "message":"Codex blocked this response.","metadata":{"codexModeration":true}});
+    let redact = json!({"type":"timeline_reconcile","reason":"codex_moderation",
+        "messageId":"answer","turnId":"turn","item":notice});
+    timeline.reconcile_message(&redact, Some((&path, "agent"))).unwrap().unwrap();
+    let preview = json!({"type":"timeline_reconcile","reason":"codex_moderation","messageId":"answer",
+        "previewSources":[{"child":"child","key":"answer","kind":"assistant_message"}]});
+    let epoch = timeline.reconcile_message(&preview, Some((&path, "agent"))).unwrap().unwrap();
+    assert_ne!(epoch, original_epoch);
+    let loaded = Timeline::load(&path, "agent").unwrap();
+    let items = loaded.items();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0], notice);
+    assert_eq!(items[1], sibling);
+    assert_eq!(items[2]["text"], "different turn");
+    assert_eq!(items[3]["detail"]["log"], "keep before\nkeep after");
+    assert_eq!(items[3]["metadata"]["subagentLog"].as_array().unwrap().len(), 2);
+    assert!(timeline.reconcile_message(&redact, None).unwrap().is_none());
+    assert!(timeline.reconcile_message(&preview, None).unwrap().is_none());
+}
+
+#[test]
+fn codex_moderation_replay_never_restores_withdrawn_text() {
+    use crate::providers::api::HistoryCoverage;
+
+    let mut served = Timeline::new();
+    let blocked = json!({"type":"assistant_message","messageId":"answer","text":"withdrawn"});
+    served.append(blocked.clone(), &options());
+    let mut replay = Timeline::new();
+    replay.append(json!({"type":"notification","messageId":"answer","level":"warning",
+        "message":"Codex blocked this response.","metadata":{"codexModeration":true}}), &options());
+    assert!(replay.reconcile_history(&served, HistoryCoverage::Complete, false).unwrap());
+    assert_eq!(replay.items()[0]["type"], "notification");
+    assert!(!served.reconcile_history(&replay, HistoryCoverage::Complete, false).unwrap());
+}

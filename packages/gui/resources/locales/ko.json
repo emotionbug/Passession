@@ -477,6 +477,8 @@
       "accept": "수락",
       "implement": "구현",
       "question": "어떻게 진행할까요?",
+      "mcpDecline": "거절",
+      "mcpOpen": "브라우저에서 열기",
       "proposedPlan": "제안된 계획"
     },
     "approvalPending": "승인 대기 ↓",
@@ -2442,6 +2444,19 @@
     "deleteFinishedAction": "완료된 하위 에이전트 삭제",
     "deleteFinishedConfirm": "완료된 하위 에이전트 {{count}}개를 삭제할까요? 대화 기록도 함께 삭제됩니다.",
     "deleteFinishedRetry": "다시 시도 ({{failed}}/{{total}})"
+  },
+  "claudeTasks": {
+    "activeOne": "실행 중인 작업 1개",
+    "activeCount": "실행 중인 작업 {{count}}개",
+    "stop": "중지",
+    "stopping": "중지 중…",
+    "shell": "셸",
+    "subagent": "하위 에이전트",
+    "workflow": "워크플로",
+    "monitor": "모니터",
+    "mcpTask": "MCP 작업",
+    "teammate": "팀원",
+    "task": "작업"
   },
   "panels": {
     "draft": { "newAgent": "새 에이전트", "creatingAgent": "에이전트 생성 중" },

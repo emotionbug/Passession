@@ -802,8 +802,12 @@ impl PaseoShell {
         }
         let requires_visibility = crate::common::is_user_input(event);
         // The compact sidebar replaces the pane. Its controls must not reach
-        // retained conversation/new-session editors underneath.
-        if requires_visibility && self.data.compact && chrome::sidebar_visible(self) {
+        // retained editors, but the Command Center above the sidebar still owns its input.
+        if requires_visibility
+            && self.data.compact
+            && !self.data.command_center_open
+            && chrome::sidebar_visible(self)
+        {
             return;
         }
         let mut commands = if matches!(event, Event::Signal) {
@@ -1147,7 +1151,11 @@ impl Widget for PaseoShell {
         if !modal && !locked && !motion_blocks {
             chrome::observe_pane_focus(self, cx, event);
         }
-        if !key_consumed && !locked && !explorer_input && (!motion_blocks || window_modal) {
+        if !key_consumed
+            && !locked
+            && !explorer_input
+            && (!motion_blocks || window_modal || command_center)
+        {
             self.dispatch_panels(cx, event, scope, window_modal);
         }
         // Feature-owned modal/editor layers must see Back before shell navigation.
@@ -1380,6 +1388,45 @@ mod dispatch_tests {
         let after = window.dispatch_layout();
         assert!(!Rc::ptr_eq(&before.snapshot, &after.snapshot));
         assert!(Rc::ptr_eq(&after, &window.dispatch_layout()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn back_closes_command_center_above_compact_sidebar() {
+        let dir = std::env::temp_dir().join(format!("paseo-search-{}", uuid::Uuid::new_v4()));
+        let core = paseo_gui_core::GuiCore::start(
+            paseo_gui_core::CoreConfig {
+                state_dir: dir.join("state"),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            std::sync::Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut ui = UiContext::new(core.handle());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        PaseoShell::register_main_module(&mut cx);
+        crate::app::live_design(&mut cx);
+        cx.live_expand();
+        cx.live_scan_dependencies();
+        cx.native_load_dependencies();
+        let mut shell = PaseoShell::new_local(&mut cx);
+        shell.data.compact = true;
+        shell.data.layout.show_sidebar(true, true);
+        let palette = panels::command_center(&mut cx, &shell.templates);
+        panels::open_command_center(&mut cx, &palette, false);
+        shell.data.command_center = Some(palette.clone());
+        shell.data.command_center_open = true;
+        let back = Event::BackPressed { handled: std::cell::Cell::new(false) };
+        let mut scope = Scope::with_data(&mut ui);
+        shell.dispatch_panels(&mut cx, &back, &mut scope, false);
+        shell.dispatch_panels(&mut cx, &Event::Actions(Vec::new()), &mut scope, false);
+        assert!(matches!(back, Event::BackPressed { handled } if handled.get()));
+        assert!(!panels::command_center_open(&palette));
+        assert!(chrome::sidebar_visible(&shell));
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]

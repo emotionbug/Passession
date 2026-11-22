@@ -92,6 +92,7 @@ pub enum PlatformValue {
     Files(Vec<PickedFile>),
     Directory(Option<PathBuf>),
     SaveLocation(Option<PathBuf>),
+    PhotoLibrarySaved,
     Clipboard(ClipboardContent),
     EditorTargets(Vec<EditorTarget>),
     Permission(PermissionState),

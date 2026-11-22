@@ -279,6 +279,17 @@ paseo logs <id> --tail 10        # Last 10 entries
 paseo logs <id> --filter tools   # Only tool calls
 ```
 
+## Stopping an individual Claude task
+
+Use the full session ID and the current task token:
+
+```bash
+paseo tasks <session-id>
+paseo stop-task <session-id> <task-token>
+```
+
+The list shows tasks the current Claude process offers to stop, including background shells. A token is valid only for that task run in that session. Stopping one task does not interrupt the session; Claude's normal task updates report when it settles.
+
 ## Waiting for agents
 
 Block until an agent finishes its current task:

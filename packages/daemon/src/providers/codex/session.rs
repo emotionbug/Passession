@@ -17,6 +17,9 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
+// A certificate from the old projection cannot attest that history honored moderation.
+const HISTORY_PROJECTION_VERSION: u32 = 1;
+
 #[cfg_attr(test, derive(Default))]
 pub(super) struct State {
     pub config: Value,
@@ -38,6 +41,8 @@ pub(super) struct State {
     pub async_questions: permissions::AsyncQuestions,
     pub features: Arc<[Value]>,
     pub text: HashMap<String, String>,
+    /// Keep message identities (never text) so delayed deltas cannot unhide a reply.
+    pub withheld_responses: HashMap<String, &'static str>,
     pub outputs: HashMap<String, String>,
     pub completed: HashSet<String>,
     pub children: HashMap<String, Value>,
@@ -51,9 +56,9 @@ pub(super) struct State {
     pub terminal_pending: HashMap<String, Vec<Value>>,
     pub terminal_seen: HashSet<String>,
     pub terminal_ordinal: u64,
-    pub last_plan: Option<String>,
-    /// The last plan explanation shown; plan updates repeat it while steps progress.
-    pub plan_explanation: Option<String>,
+    /// A completed native plan's item ID and text, or a fallback checklist without an item ID.
+    pub last_plan: Option<(Option<String>, String)>,
+    pub live_items: HashMap<String, super::events::LiveTurnItems>,
     pub assistant_boundary: bool,
     pub manual_compactions: usize,
     pub compactions: HashSet<String>,
@@ -331,7 +336,7 @@ impl CodexSession {
             let before = if let (Some(id), Some(path)) = (&native, &revision) {
                 native_file_revision(path)
                     .await
-                    .map(|file| json!({"threadId":id,"file":file}))
+                    .map(|file| json!({"threadId":id,"file":file,"projectionVersion":HISTORY_PROJECTION_VERSION}))
             } else {
                 None
             };
@@ -356,7 +361,7 @@ impl CodexSession {
                 let after = if let (Some(id), Some(path)) = (&native, &revision) {
                     native_file_revision(path)
                         .await
-                        .map(|file| json!({"threadId":id,"file":file}))
+                        .map(|file| json!({"threadId":id,"file":file,"projectionVersion":HISTORY_PROJECTION_VERSION}))
                 } else {
                     None
                 };
@@ -486,13 +491,14 @@ impl CodexSession {
                 rollout_path,
                 history_skipped,
                 text: HashMap::new(),
+                withheld_responses: HashMap::new(),
                 outputs: HashMap::new(),
                 completed: HashSet::new(),
                 card_logs,
                 children,
                 orphan_events: HashMap::new(),
                 last_plan: None,
-                plan_explanation: None,
+                live_items: HashMap::new(),
                 child_tools,
                 child_items,
                 terminal_commands: HashMap::new(),
@@ -1501,7 +1507,7 @@ impl AgentSession for CodexSession {
             )
         };
         let file = native_file_revision(&path).await?;
-        Some(json!({"native":{"threadId":id,"file":file},"userTurns":turns}))
+        Some(json!({"native":{"threadId":id,"file":file,"projectionVersion":HISTORY_PROJECTION_VERSION},"userTurns":turns}))
     }
     async fn runtime_info(&self) -> Result<Value> {
         let interactive = self.state.lock().unwrap().interactive;
@@ -1582,6 +1588,21 @@ impl AgentSession for CodexSession {
                 .cloned()
                 .ok_or_else(|| anyhow!("No pending Codex permission request '{id}'"))?
         };
+        if let Some(elicitation) = &pending.elicitation {
+            let answer = elicitation.answer(&response)?;
+            let resolution = answer.resolution();
+            let native = pending.native_id.ok_or_else(|| anyhow!("Missing Codex MCP request ID"))?;
+            self.state.lock().unwrap().pending.remove(id)
+                .ok_or_else(|| anyhow!("Codex MCP request '{id}' was already resolved or canceled"))?;
+            if let Err(error) = self.client.reply(native, answer.native(true)).await {
+                let _ = self.emit(json!({"type":"permission_resolved","requestId":id,
+                    "resolution":{"behavior":"deny","message":"MCP response delivery could not be confirmed"}})).await;
+                return Err(error);
+            }
+            self.emit(json!({"type":"permission_resolved","requestId":id,"resolution":resolution}))
+                .await?;
+            return Ok(None);
+        }
         let result = permissions::reply(&pending, &response)?;
         if let Some(native) = pending.native_id.clone() {
             self.client.reply(native, result.clone()).await?;

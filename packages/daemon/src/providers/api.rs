@@ -501,6 +501,13 @@ pub trait AgentSession: Send + Sync {
         response: Value,
     ) -> Result<Option<Value>>;
     async fn interrupt(&self) -> Result<()>;
+    /// Ephemeral action offers for provider tasks owned by this live runtime.
+    fn provider_tasks(&self) -> Vec<Value> {
+        Vec::new()
+    }
+    async fn stop_provider_task(&self, _token: uuid::Uuid) -> Result<()> {
+        anyhow::bail!("This provider does not support stopping individual tasks")
+    }
     async fn close(&self) -> Result<()>;
     async fn list_commands(&self) -> Result<Vec<Value>>;
     async fn set_model(&self, model: Option<&str>) -> Result<()>;

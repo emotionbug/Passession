@@ -607,6 +607,11 @@ impl Mapper {
             }
             "extension_ui_request"=>{
                 if frame["method"]=="notify"{let message=string(&frame["message"]);if let Some(changes)=self.extensions.notification(message){out.extend(self.subagents(changes));}else if !["PASEO_ENTRY_CAPTURE ","PASEO_SUBMITTED_USER_ENTRY ","PASEO_COMMAND_RESULT "].iter().any(|prefix|message.strip_prefix(*prefix).and_then(|body|serde_json::from_str::<Value>(body).ok()).is_some_and(|v|v.is_object()))&&!message.is_empty(){out.push(self.timeline(json!({"type":"notification","level":match string(&frame["notifyType"]){"warning"=>"warning","error"=>"error",_=>"info"},"message":message})));}}
+                else if self.family == "omp"
+                    && matches!(frame["method"].as_str(), Some("setStatus" | "setWidget"))
+                {
+                    out.extend(super::extension_ui::patch(frame));
+                }
                 else if self.family == "omp" && frame["method"] == "open_url" && frame["url"].is_string() {
                     let url = string(&frame["url"]);
                     let mut lines = vec![format!("[Open URL]({url})"), format!("URL: {url}")];

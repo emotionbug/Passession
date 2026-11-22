@@ -515,13 +515,27 @@ fn rows(value: &Value) -> Vec<Value> {
 
 /// Flutter `_agentRow`: the agent object with its project and sync sequence.
 fn agent_row(entry: &Value) -> Value {
-    if !entry["agent"].is_object() {
-        return entry.clone();
+    let mut row = if entry["agent"].is_object() {
+        let mut row = entry["agent"].clone();
+        row["project"] = entry["project"].clone();
+        if let Some(seq) = entry.get("syncSeq") {
+            row["syncSeq"] = seq.clone();
+        }
+        row
+    } else {
+        entry.clone()
+    };
+    // Only a live chat snapshot owns these controls; the offline directory
+    // must not retain provider task tokens or extension UI.
+    if let Some(object) = row.as_object_mut() {
+        object.remove("liveProviderTasks");
     }
-    let mut row = entry["agent"].clone();
-    row["project"] = entry["project"].clone();
-    if let Some(seq) = entry.get("syncSeq") {
-        row["syncSeq"] = seq.clone();
+    if let Some(runtime) = row.get_mut("runtimeInfo").and_then(Value::as_object_mut)
+        && let Some(extra) = runtime.get_mut("extra").and_then(Value::as_object_mut)
+        && extra.remove("ompExtensionUi").is_some()
+        && extra.is_empty()
+    {
+        runtime.remove("extra");
     }
     row
 }
@@ -1156,6 +1170,24 @@ mod tests {
     fn agent_rows_carry_project_and_sync_sequence() {
         let row = agent_row(&json!({"agent":{"id":"a"},"project":{"p":1},"syncSeq":4}));
         assert_eq!(row, json!({"id":"a","project":{"p":1},"syncSeq":4}));
+    }
+
+    #[test]
+    fn omp_extension_ui_does_not_enter_the_directory_replica() {
+        let update = json!({"agent":{"id":"a","runtimeInfo":{"provider":"omp","sessionId":"s",
+            "extra":{"otherRuntimeField":"keep","ompExtensionUi":{"statuses":{"x":"live only"}}}
+        }},"project":{"p":1},"syncSeq":4});
+        let row = agent_row(&update);
+        assert_eq!(row["runtimeInfo"]["extra"], json!({"otherRuntimeField":"keep"}));
+        assert_eq!(row["syncSeq"], 4);
+        assert!(update["agent"]["runtimeInfo"]["extra"]["ompExtensionUi"].is_object());
+    }
+
+    #[test]
+    fn live_task_tokens_do_not_enter_the_directory_replica() {
+        let entry = json!({"id":"a","liveProviderTasks":[{"token":"live"}]});
+        assert_eq!(agent_row(&entry), json!({"id":"a"}));
+        assert_eq!(agent_row(&json!({"agent":entry})), json!({"id":"a","project":null}));
     }
 
     #[test]

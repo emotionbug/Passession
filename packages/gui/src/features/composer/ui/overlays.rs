@@ -6,8 +6,8 @@ use super::layout::{format_session_cost, format_token_count};
 use super::look::Look;
 use super::panel::{ComposerPanel, Item, OItem, Overlay};
 use super::sheet::{Leading, Page, RowAction};
-use crate::common::overlay::{fit_in_viewport, take_dismissal};
-use crate::common::paint::{Font, TextSpec, rect};
+use crate::common::overlay::{dropdown_frame, fit_in_viewport, take_dismissal};
+use crate::common::paint::{Font, TextSpec, inset, rect};
 use crate::common::{Route, UiContext, UiEffect};
 use crate::features::composer::autocomplete::clean_label;
 use crate::features::composer::blobs::ImageIdentity;
@@ -23,6 +23,7 @@ use makepad_widgets::*;
 use serde_json::Value;
 
 const SUGGEST_MAX: f64 = 220.0;
+const MODEL_PICKER_WIDTH: f64 = 480.0;
 
 /// Lucide `star` as one filled path (the icon font only has outlines), for pinned favorites.
 const STAR_FILLED: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="black" d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/></svg>"#;
@@ -40,6 +41,15 @@ fn overlay_viewport(size: DVec2) -> Rect {
         (size.x - insets.left - insets.right).max(0.0),
         (size.y - insets.top - insets.bottom_occlusion()).max(0.0),
     )
+}
+
+fn model_picker_frame(bounds: Rect, anchor: Option<Rect>, width: f64, content_h: f64) -> Rect {
+    let preferred_h = bounds.size.y * 0.8;
+    if let Some(anchor) = anchor {
+        return dropdown_frame(anchor, width, content_h.min(preferred_h), bounds).0;
+    }
+    let h = preferred_h.max(content_h.min(bounds.size.y * 0.9));
+    rect(bounds.pos.x, bounds.pos.y + bounds.size.y - h, width, h)
 }
 
 /// Context window details presentation (`ContextWindowDetails` showTitle/gap/refreshable).
@@ -90,7 +100,13 @@ impl ComposerPanel {
             && !ctl.is_sheet()
     }
 
-    pub(super) fn draw_overlays(&mut self, cx: &mut Cx2d, ui: &mut UiContext, look: &Look) {
+    pub(super) fn draw_overlays(
+        &mut self,
+        cx: &mut Cx2d,
+        ui: &mut UiContext,
+        look: &Look,
+        model_anchor: Option<Rect>,
+    ) {
         self.st.ohits.clear();
         self.st.overlay_rect = None;
         self.st.sheet_viewport = Rect::default();
@@ -101,7 +117,7 @@ impl ComposerPanel {
             size.x,
             (size.y - crate::shell::platform::safe_insets().bottom_occlusion()).max(0.0),
         );
-        match self.st.overlay().clone() {
+        match self.st.overlay() {
             Overlay::None => {
                 if self.suggestions_visible() {
                     self.draw_suggestions(cx, look);
@@ -123,20 +139,25 @@ impl ComposerPanel {
             }
             Overlay::Sheet(_) => {
                 self.st.suggest_revealed = None;
-                self.draw_sheet(cx, ui, look)
+                self.draw_sheet(cx, ui, look, model_anchor)
             }
             Overlay::Forge => self.draw_forge(cx, look, size),
             Overlay::Preview {
                 draft,
                 image_index,
                 identity,
-            } => self.draw_preview(
-                cx,
-                look,
-                size,
-                &draft["images"][image_index],
-                identity.as_deref(),
-            ),
+            } => {
+                let draft = draft.clone();
+                let identity = identity.clone();
+                let image_index = *image_index;
+                self.draw_preview(
+                    cx,
+                    look,
+                    size,
+                    &draft["images"][image_index],
+                    identity.as_deref(),
+                );
+            }
             Overlay::Fullscreen => self.draw_fullscreen(cx, look, size),
             Overlay::Context => self.draw_context_sheet(cx, look, size),
         }
@@ -628,48 +649,12 @@ impl ComposerPanel {
     fn scrim(&mut self, cx: &mut Cx2d, look: &Look, size: DVec2) {
         let full = rect(0.0, 0.0, size.x, size.y);
         self.painter.fill(cx, full, look.p.scrim, 0.0);
-        self.overlay_bg.draw_abs(cx, full);
-        self.st.ohits.push(full, OItem::Scrim);
+        self.capture_backdrop(cx, full);
     }
 
-    /// Sheet frame: a dialog on wide layouts, a bottom sheet at 80% on compact ones. The
-    /// dialog opens centred; while `page` (`(depth, page)`) stays open its top edge stays put
-    /// and it only grows downward to its maximum, then scrolls, so a content change (a pinned
-    /// favorite, a search) never moves the rows under the pointer.
-    fn sheet_frame(
-        &mut self,
-        cx: &mut Cx2d,
-        look: &Look,
-        size: DVec2,
-        content_h: f64,
-        page: (usize, Page),
-    ) -> Rect {
-        const MIN_H: f64 = 120.0;
-        const MARGIN: f64 = 8.0;
-        let r = if look.compact {
-            let h = (size.y * 0.8).max(content_h.min(size.y * 0.9));
-            rect(0.0, size.y - h, size.x, h)
-        } else {
-            let w = 480.0f64.min(size.x - 32.0);
-            let max_h = size.y * 0.8;
-            let top = match self.st.sheet_top {
-                Some((key, top)) if key == page && top + MIN_H <= size.y - MARGIN => top,
-                _ => (size.y - content_h.min(max_h).max(MIN_H)) * 0.5,
-            };
-            self.st.sheet_top = Some((page, top));
-            let h = content_h.min(max_h).min(size.y - MARGIN - top).max(MIN_H);
-            rect((size.x - w) * 0.5, top, w, h)
-        };
-        let r = fit_in_viewport(
-            r,
-            overlay_viewport(cx.current_pass_size()),
-            if look.compact { 0.0 } else { 8.0 },
-        );
-        self.painter
-            .outline(cx, r, look.p.surface0, look.p.border, 1.0, 16.0);
-        self.st.ohits.push(r, OItem::Panel);
-        self.st.overlay_rect = Some(r);
-        r
+    fn capture_backdrop(&mut self, cx: &mut Cx2d, full: Rect) {
+        self.overlay_bg.draw_abs(cx, full);
+        self.st.ohits.push(full, OItem::Scrim);
     }
 
     fn sheet_header_height(&mut self, cx: &mut Cx2d, look: &Look) -> f64 {
@@ -737,7 +722,13 @@ impl ComposerPanel {
         }
     }
 
-    fn draw_sheet(&mut self, cx: &mut Cx2d, ui: &mut UiContext, look: &Look) {
+    fn draw_sheet(
+        &mut self,
+        cx: &mut Cx2d,
+        ui: &mut UiContext,
+        look: &Look,
+        anchor: Option<Rect>,
+    ) {
         let Some(Overlay::Sheet(mut state)) = self.st.overlay.take() else {
             return;
         };
@@ -745,18 +736,17 @@ impl ComposerPanel {
         let query = self.st.search_text.clone();
         let picks = self.ctl_ref().model_picks(ui);
         let view = state.build(self.ctl_ref(), &query, profiles_supported, &picks);
-        let page = (state.pages.len(), state.page());
         let rows = std::mem::take(&mut state.rows);
         self.st.overlay = Some(Overlay::Sheet(state));
         let error = self.sheet_feature_error();
-        self.paint_sheet(cx, look, &view, &rows, error, page);
+        self.paint_sheet(cx, look, &view, &rows, error, anchor);
         // The click handler reads the rows this frame painted.
         if let Some(Overlay::Sheet(state)) = self.st.overlay.as_mut() {
             state.rows = rows;
         }
     }
 
-    /// The controls sheet: scrim, frame, header, optional search row and the rows list.
+    /// A wide dropdown with a transparent dismiss backdrop, or the compact bottom sheet.
     fn paint_sheet(
         &mut self,
         cx: &mut Cx2d,
@@ -764,11 +754,15 @@ impl ComposerPanel {
         view: &super::sheet::SheetView,
         rows: &[super::sheet::Row],
         error: Option<String>,
-        page: (usize, Page),
+        anchor: Option<Rect>,
     ) {
         let p = look.p;
         let size = cx.current_pass_size();
-        self.scrim(cx, look, size);
+        if anchor.is_some() {
+            self.capture_backdrop(cx, rect(0.0, 0.0, size.x, size.y));
+        } else {
+            self.scrim(cx, look, size);
+        }
         let body = TextSpec::new(Font::Regular, look.body(), p.foreground);
         let small = TextSpec::new(Font::Regular, look.small(), p.muted);
         let body_h = self.painter.line_height(cx, body);
@@ -788,7 +782,12 @@ impl ComposerPanel {
                 }
             })
             .collect();
-        let header_h = self.sheet_header_height(cx, look);
+        // The trigger names the dropdown's root; child pages keep their Back control and title.
+        let header_h = if anchor.is_none() || view.back {
+            self.sheet_header_height(cx, look)
+        } else {
+            0.0
+        };
         let search_h = if view.searchable {
             44.0_f64.max(body_h + 16.0)
         } else {
@@ -799,10 +798,16 @@ impl ComposerPanel {
         } else {
             0.0
         };
-        let sheet_width = if look.compact {
-            size.x
+        let viewport = overlay_viewport(size);
+        let (bounds, sheet_width) = if anchor.is_some() {
+            let bounds = inset(
+                viewport,
+                8.0_f64.min(viewport.size.x * 0.5),
+                8.0_f64.min(viewport.size.y * 0.5),
+            );
+            (bounds, MODEL_PICKER_WIDTH.min(bounds.size.x))
         } else {
-            480.0_f64.min(size.x - 32.0)
+            (viewport, viewport.size.x)
         };
         let error_h = error
             .as_ref()
@@ -813,16 +818,32 @@ impl ComposerPanel {
             })
             .unwrap_or(0.0);
         let content_h = heights.iter().sum::<f64>() + 32.0 + error_h + empty_h;
-        let frame = self.sheet_frame(cx, look, size, header_h + search_h + content_h, page);
-        self.sheet_header(
-            cx,
-            look,
-            frame,
-            Header {
-                title: &view.title,
-                back: view.back,
-            },
+        let frame = model_picker_frame(
+            bounds,
+            anchor,
+            sheet_width,
+            header_h + search_h + content_h,
         );
+        self.painter
+            .outline(cx, frame, p.surface0, p.border, 1.0, 16.0);
+        self.st.ohits.push(frame, OItem::Panel);
+        self.st.overlay_rect = Some(frame);
+        self.st.ohits.set_clip(Some(frame));
+        cx.begin_turtle(
+            Walk::abs_rect(frame),
+            Layout::flow_down().with_clip(true, true),
+        );
+        if header_h > 0.0 {
+            self.sheet_header(
+                cx,
+                look,
+                frame,
+                Header {
+                    title: &view.title,
+                    back: view.back,
+                },
+            );
+        }
         let mut y = frame.pos.y + header_h;
         if view.searchable {
             let row = rect(frame.pos.x, y, frame.size.x, search_h);
@@ -1099,6 +1120,7 @@ impl ComposerPanel {
             );
         }
         self.st.ohits.set_clip(None);
+        cx.end_turtle();
         cx.end_turtle();
         if let Some((label, anchor)) = action_tip.filter(|(label, anchor)| {
             !label.is_empty()
@@ -2051,5 +2073,29 @@ mod tests {
         let path = filled_glyph("star").and_then(crate::common::provider_icon::icon_path);
         assert!(path.is_some_and(|p| p.starts_with('M') && p.contains('C')));
         assert_eq!(filled_glyph("pencil"), None);
+    }
+
+    #[test]
+    fn model_picker_follows_each_trigger_and_keeps_the_compact_sheet() {
+        let bounds = rect(12.0, 24.0, 656.0, 400.0);
+        let near_top = rect(80.0, 56.0, 120.0, 28.0);
+        let frame = model_picker_frame(bounds, Some(near_top), 480.0, 140.0);
+        assert_eq!(frame, rect(80.0, 88.0, 480.0, 140.0));
+
+        let near_bottom = rect(520.0, 360.0, 116.0, 28.0);
+        let frame = model_picker_frame(bounds, Some(near_bottom), 480.0, 700.0);
+        assert_eq!(frame, rect(156.0, 36.0, 480.0, 320.0));
+
+        let shallow = rect(12.0, 24.0, 300.0, 100.0);
+        let frame = model_picker_frame(
+            shallow,
+            Some(rect(220.0, 88.0, 64.0, 28.0)),
+            300.0,
+            140.0,
+        );
+        assert_eq!(frame, rect(12.0, 24.0, 300.0, 60.0));
+
+        let frame = model_picker_frame(bounds, None, bounds.size.x, 100.0);
+        assert_eq!(frame, rect(12.0, 104.0, 656.0, 320.0));
     }
 }

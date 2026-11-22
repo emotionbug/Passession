@@ -686,6 +686,8 @@ impl AgentManager {
         let timeline =
             tokio::task::spawn_blocking(move || Timeline::load(&path, &owned_id)).await??;
         object(&mut snapshot).remove("snapshotAvailability");
+        // A resumed snapshot may have been sampled from the previous live cell.
+        object(&mut snapshot).remove(crate::providers::pi_omp::extension_ui::SNAPSHOT_KEY);
         snapshot["_live"] = json!(true);
         snapshot["_providerAvailable"] = json!(true);
         snapshot["lifecycle"] = json!("initializing");
@@ -877,6 +879,7 @@ impl AgentManager {
             data.event_error = Some(message.clone());
             data.owner_ended = true;
             data.snapshot["_live"] = json!(false);
+            object(&mut data.snapshot).remove(crate::providers::pi_omp::extension_ui::SNAPSHOT_KEY);
             data.pending_replacement = false;
             if let Some(turn) = text(&data.snapshot, "activeTurnId").map(str::to_owned) {
                 // A failed terminal commit may already have entered deduplication.
@@ -956,10 +959,12 @@ impl AgentManager {
             "_historyOnly",
             "snapshotAvailability",
             "preparation",
+            crate::providers::pi_omp::extension_ui::SNAPSHOT_KEY,
             "status",
             "lifecycle",
             "session",
             "pendingPermissions",
+            "liveProviderTasks",
             "availableModes",
             "capabilities",
             "activeTurn",

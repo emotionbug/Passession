@@ -3,6 +3,7 @@ mod event_queue;
 mod events;
 #[cfg(test)]
 pub(crate) use events::Mapper;
+pub(crate) mod extension_ui;
 mod history;
 mod host_tools;
 mod launch;

@@ -12513,6 +12513,18 @@
                 "agent": {
                   "type": "object",
                   "properties": {
+                    "liveProviderTasks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "token": { "type": "string" },
+                          "kind": { "type": "string" },
+                          "description": { "type": "string" }
+                        },
+                        "required": ["token", "kind", "description"]
+                      }
+                    },
                     "id": {
                       "type": "string"
                     },
@@ -25861,6 +25873,18 @@
                 {
                   "type": "object",
                   "properties": {
+                    "liveProviderTasks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "token": { "type": "string" },
+                          "kind": { "type": "string" },
+                          "description": { "type": "string" }
+                        },
+                        "required": ["token", "kind", "description"]
+                      }
+                    },
                     "id": {
                       "type": "string"
                     },
@@ -30953,6 +30977,30 @@
         "type",
         "payload"
       ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "agent.provider_tasks.stop.response"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string"
+            },
+            "agentId": {
+              "type": "string"
+            },
+            "error": {
+              "type": ["string", "null"]
+            }
+          },
+          "required": ["requestId", "agentId", "error"]
+        }
+      },
+      "required": ["type", "payload"]
     },
     {
       "type": "object",
