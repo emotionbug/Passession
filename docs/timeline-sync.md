@@ -170,9 +170,9 @@ Large unbounded timeline responses can exceed relay frame limits, so catch-up us
 
 Page limits are projected-item targets. A tool call lifecycle is one projected item even if it spans many source sequence numbers, and assistant/reasoning chunks are merged before counting. The response carries `seqStart`, `seqEnd`, `sourceSeqRanges`, and `collapsed` so clients can advance sequence cursors without rendering delta rows.
 
-When live delivery detects a sequence gap, the app fetches `direction: "after"`. If the daemon
-responds with `hasNewer: true`, the app immediately fetches the next page from `endCursor`. Gap
-recovery is complete only when `hasNewer: false`.
+When live delivery detects a sequence gap, the app fetches `direction: "after"`.
+Each accepted page is readable while the next is in flight. Catch-up continues
+from `endCursor` and the chat stays marked as updating until `hasNewer: false`.
 
 Initialization timeouts guard lack of catch-up progress, not the full multi-page sync. A successful page that queues the next `after` page refreshes the watchdog.
 

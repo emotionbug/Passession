@@ -312,6 +312,12 @@ struct Snap {
 }
 
 impl Snap {
+    fn has_visible_history(&self) -> bool {
+        self.timeline
+            .iter()
+            .any(|entry| is_visible_stream_entry(entry))
+    }
+
     /// Toasts and sync chrome do not change the transcript's retained list.
     fn rows_changed(&self, next: &Self) -> bool {
         !Rc::ptr_eq(&self.timeline, &next.timeline)
@@ -920,7 +926,7 @@ pub struct ChatPanel {
     /// The owning subagent sheet, assigned by its dispatcher before child input.
     #[rust]
     input_parent: Option<u64>,
-    /// The core handle from the last event pass (draws without a UiContext).
+    /// The core handle retained when the view attaches (draws without a UiContext).
     #[rust]
     core: Option<paseo_gui_core::CoreHandle>,
     #[rust]
@@ -1307,6 +1313,18 @@ impl ChatPanel {
     }
 
     // ── snapshots ───────────────────────────────────────────────────────
+
+    /// A root can first be mounted by the draw that selects it. Its initial
+    /// snapshot must not wait for the next event to attach the replica.
+    fn ensure_session(&mut self, cx: &mut Cx, ui: &mut UiContext, visible: bool) {
+        if !self.ensured
+            && let Some(target) = &self.target
+        {
+            with_store(|store| store.ensure(cx, ui, &target.key(), self.uid, visible));
+            self.ensured = true;
+            self.core = Some(ui.core.clone());
+        }
+    }
 
     /// Copies the session's presented facts when its version moved.
     fn refresh_snapshot(&mut self, cx: &mut Cx) -> bool {
@@ -4251,7 +4269,10 @@ impl Widget for ChatPanel {
             self.chrome_layers.push(ChromeLayer::new(cx));
         }
         self.cover_area = Area::Empty;
-        if let Some(ui) = scope.data.get::<UiContext>() {
+        if let Some(ui) = scope.data.get_mut::<UiContext>() {
+            if self.visible && ui.activity.visible {
+                self.ensure_session(cx, ui, true);
+            }
             self.refresh_host(cx, ui);
         }
         let changed = self.refresh_snapshot(cx);
@@ -4619,6 +4640,7 @@ impl Widget for ChatPanel {
                 && !s.hydrated
                 && !s.initial_sync_failed
                 && !s.create_handoff
+                && !s.has_visible_history()
         });
         let outline_shown = !subagent && self.outline_enabled();
         let host_labels: HashMap<String, String> = self.host.labels.clone();
@@ -5093,7 +5115,11 @@ impl ChatPanel {
         let Some(snap) = &self.snap else {
             return Some(NonReady::Loading);
         };
-        if !map(&snap.agent).is_empty() || snap.hydrated || snap.create_handoff {
+        if !map(&snap.agent).is_empty()
+            || snap.hydrated
+            || snap.create_handoff
+            || snap.has_visible_history()
+        {
             return None;
         }
         if !self.host.connected {
@@ -5417,13 +5443,8 @@ impl ChatPanel {
             return;
         };
         let visible = self.visible && ui.activity.visible;
-        if !self.ensured {
-            self.ensured = true;
-            with_store(|store| store.ensure(cx, ui, &target.key(), self.uid, visible));
-            self.redraw_session(cx);
-        }
+        self.ensure_session(cx, ui, visible);
         with_store(|store| store.set_view_visible(cx, self.uid, visible));
-        self.core = Some(ui.core.clone());
         self.refresh_host(cx, ui);
         let changed = self.refresh_snapshot(cx);
 
@@ -6937,6 +6958,109 @@ mod modal_layer_tests {
 #[cfg(test)]
 mod reading_hold_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeline_handoff_first_draw_attaches_and_reentry_paints_available_rows() {
+        use paseo_gui_core::{CoreConfig, CoreEvent, CoreState, GuiCore};
+
+        let dir = std::env::temp_dir().join(format!("paseo-chat-handoff-{}", uuid::Uuid::new_v4()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.join("state"),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut ui = UiContext::new(core.handle());
+        let host_state = |status| {
+            Arc::new(CoreState::new(
+                json!({"hosts": [{"serverId": "host", "status": status}]}),
+            ))
+        };
+        ui.state = host_state("connecting");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        ChatPanel::register_main_module(&mut cx);
+        crate::app::live_design(&mut cx);
+        cx.live_expand();
+        cx.live_scan_dependencies();
+        cx.native_load_dependencies();
+        let module = ChatPanel::live_type_info(&mut cx).module_id;
+        let mut panel = ChatPanel::new_from_module(&mut cx, module, live_id!(ChatPanelRoot)).unwrap();
+        let target = ChatTarget {
+            host_id: "host".into(),
+            agent_id: "agent".into(),
+            ..Default::default()
+        };
+        let key = target.key();
+        panel.set_target(&mut cx, target);
+        panel.set_visible(&mut cx, true);
+
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(420.0, 760.0));
+        let mut window = DrawList2d::new(&mut cx);
+        let overlay = Overlay::new(&mut cx);
+        let mut paint = |cx: &mut Cx, panel: &mut ChatPanel, ui: &mut UiContext| {
+            let event = DrawEvent {
+                redraw_all: true,
+                ..DrawEvent::default()
+            };
+            let mut draw = CxDraw::new(cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            window.begin_always(&mut draw);
+            let mut draw = Cx2d::new(&mut draw);
+            overlay.begin(&mut draw);
+            draw.begin_pass_sized_turtle(Layout::flow_overlay());
+            let _ = panel.draw_walk(&mut draw, &mut Scope::with_data(ui), Walk::fill());
+            draw.end_pass_sized_turtle();
+            overlay.end(&mut draw);
+            window.end(&mut draw);
+            draw.end_pass(&pass);
+        };
+
+        // Host hello precedes the debounced State. The newly mounted root
+        // has not received any widget event yet.
+        ui.events.push(CoreEvent::Connected {
+            host_id: "host".into(),
+            server_info: json!({}),
+        });
+        super::super::store::handle_event(&mut cx, &Event::Signal, &mut ui);
+        ui.events.clear();
+        paint(&mut cx, &mut panel, &mut ui);
+        assert!(with_store(|store| store.sessions[&key].connected));
+        assert!(panel.snap.is_some());
+
+        panel.set_visible(&mut cx, false);
+        ui.state = host_state("connected");
+        ui.events.push(CoreEvent::HostEvent {
+            host_id: "host".into(),
+            event: json!({"type": "agent_stream", "payload": {
+                "agentId": "agent", "epoch": "epoch", "seq": 1,
+                "event": {"type": "timeline", "provider": "codex",
+                    "item": {"type": "assistant_message", "messageId": "past", "text": "History"}}
+            }}),
+        });
+        super::super::store::handle_event(&mut cx, &Event::Signal, &mut ui);
+        ui.events.clear();
+        assert!(panel.snap.as_ref().unwrap().timeline.is_empty());
+
+        // Reentry reads the existing replica in the first paint. Neither the
+        // agent metadata nor an authoritative tail has arrived yet.
+        panel.set_visible(&mut cx, true);
+        paint(&mut cx, &mut panel, &mut ui);
+        let snap = panel.snap.as_ref().unwrap();
+        assert!(!snap.hydrated && !snap.authorized);
+        assert!(panel.non_ready().is_none());
+        assert!(panel.cover_area.is_empty());
+        assert!(panel.items.iter().any(|item| item.id == "stream:seq:1"));
+
+        with_store(|store| store.release_view(&mut cx, panel.uid));
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn snapshot() -> Snap {
         Snap::of(

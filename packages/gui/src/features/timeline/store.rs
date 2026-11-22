@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 struct HostRecord {
-    connected: bool,
+    connected: Option<bool>,
     server_info: Value,
 }
 
@@ -53,14 +53,13 @@ pub fn with_store<R>(f: impl FnOnce(&mut TimelineStore) -> R) -> R {
     STORE.with(|store| f(&mut store.borrow_mut()))
 }
 
-/// The host's connection and hello `server_info`: the shell's record first
-/// (`state.hosts[]` / `ui.server_infos`), then the timeline's own record of
-/// Connected/Disconnected events.
+/// Connection events arrive before the debounced State snapshot. Use the
+/// last observed transport state; State is only a fallback before an event.
 fn host_facts(ui: &UiContext, record: Option<&HostRecord>, host_id: &str) -> (bool, Value) {
     let row = ui.host(host_id);
-    let connected = row
-        .map(|row| get(row, "status") == "connected")
-        .or_else(|| record.map(|r| r.connected))
+    let connected = record
+        .and_then(|r| r.connected)
+        .or_else(|| row.map(|row| get(row, "status") == "connected"))
         .unwrap_or(false);
     let server_info = ui
         .server_infos
@@ -239,7 +238,6 @@ impl TimelineStore {
         if !server_info.is_null() {
             record.server_info = server_info;
         }
-        record.connected = connected;
         self.sessions
             .entry(key.clone())
             .or_insert_with(|| ChatSession::new(key.clone(), connected));
@@ -346,14 +344,14 @@ impl TimelineStore {
                 server_info,
             } => {
                 let record = self.hosts.entry(host_id.clone()).or_default();
-                record.connected = true;
+                record.connected = Some(true);
                 record.server_info = server_info.clone();
                 for key in self.keys_for_host(host_id) {
                     self.with_session(cx, effects, &key, |s, io| s.connection_changed(io, true));
                 }
             }
             CoreEvent::Disconnected { host_id, .. } => {
-                self.hosts.entry(host_id.clone()).or_default().connected = false;
+                self.hosts.entry(host_id.clone()).or_default().connected = Some(false);
                 for key in self.keys_for_host(host_id) {
                     self.with_session(cx, effects, &key, |s, io| s.connection_changed(io, false));
                 }
@@ -441,7 +439,7 @@ impl TimelineStore {
             return;
         }
         if let Some(record) = self.hosts.remove(previous) {
-            self.hosts.insert(next.to_owned(), record);
+            self.hosts.entry(next.to_owned()).or_insert(record);
         }
         for view in self.views.values_mut() {
             if view.key.host_id == previous {
@@ -741,6 +739,12 @@ mod queue_recovery_tests {
         }
         response(&mut store, &mut cx, &mut effects, page(2, true));
         assert_eq!(store.sessions[&key].end_cursor.as_ref().unwrap().seq, 2);
+        store.flush_projections(); // end of this GUI batch; page 3 has not arrived
+        assert_eq!(store.sessions[&key].timeline.last().unwrap()["seqEnd"], 2);
+        assert_eq!(
+            store.sessions[&key].sync_status(),
+            super::super::session::SyncStatus::Pending
+        );
         assert!(matches!(
             store.requests[&only_request(&store)].pending,
             Pending::Fetch {

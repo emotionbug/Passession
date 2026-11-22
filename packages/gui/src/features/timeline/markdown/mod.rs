@@ -1,7 +1,8 @@
 //! Native Markdown for chat and plan cards: HTML normalization, the block
-//! model and the painter. Assistant rows prepare small live revisions inline;
-//! larger revisions are captured cooperatively and parsed on a worker. Legacy
-//! callers retain their synchronous content-keyed block cache.
+//! model and the painter. Assistant rows prepare small live and historical
+//! revisions inline; larger revisions are captured cooperatively and parsed
+//! on a worker. Legacy callers retain their synchronous content-keyed block
+//! cache.
 
 pub mod html;
 pub mod model;

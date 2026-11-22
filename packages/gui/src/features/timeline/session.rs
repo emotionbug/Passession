@@ -1246,9 +1246,9 @@ impl ChatSession {
         }
         active.request = None;
         let page = match result {
-            Ok(page) => {
+            Ok(mut page) => {
                 if !self.disposed && generation == self.generation {
-                    self.apply_page(io, direction, &page, force_replace);
+                    self.apply_page(io, direction, &mut page, force_replace);
                 }
                 page
             }
@@ -1276,6 +1276,10 @@ impl ChatSession {
                         active.forced_tail = true;
                         active.request = Some(self.fetch(io, "tail", true));
                     } else {
+                        // Paint the accepted gap page in this GUI batch, not when
+                        // the last network response arrives. A forced tail above
+                        // replaces the intermediate window instead.
+                        self.projection_pending = true;
                         active.fallback_to_latest_tail = false;
                         active.request = Some(self.fetch(io, "after", false));
                     }
@@ -1302,6 +1306,7 @@ impl ChatSession {
                         && start.is_none_or(|s| s > seq)
                         && start != active.previous_start;
                     if more {
+                        self.projection_pending = true;
                         active.previous_start = start;
                         active.request = Some(self.fetch(io, "before", false));
                         self.active = Some(active);
@@ -1414,28 +1419,27 @@ impl ChatSession {
     // ── authoritative pages ─────────────────────────────────────────────
 
     /// session-stream-reducers.ts processTimelineResponse.
-    fn apply_page(&mut self, io: &mut Io, direction: &str, result: &Value, force_replace: bool) {
+    fn apply_page(&mut self, io: &mut Io, direction: &str, result: &mut Value, force_replace: bool) {
         let next_epoch = str_of(get(result, "epoch")).to_owned();
-        if get(result, "agent").is_object() {
-            self.set_agent(get(result, "agent").clone());
+        if let Some(agent) = result.get_mut("agent").filter(|agent| agent.is_object()) {
+            self.set_agent(agent.take());
         }
-        let source = if self.is_subagent() {
-            get(result, "rows")
-        } else {
-            get(result, "entries")
-        };
-        let incoming: Vec<Value> = list(source)
-            .iter()
-            .filter(|row| row.is_object())
-            .map(|row| {
-                let start = int_or(get(row, "seqStart"), int_of(get(row, "seq")));
-                let end = int_or(get(row, "seqEnd"), start);
-                let mut next = map(row).clone();
-                next.insert("seqStart".into(), json!(start));
-                next.insert("seqEnd".into(), json!(end));
-                Value::Object(next)
-            })
-            .collect();
+        let row_key = if self.is_subagent() { "rows" } else { "entries" };
+        let mut incoming = result
+            .get_mut(row_key)
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        incoming.retain_mut(|row| {
+            if !row.is_object() {
+                return false;
+            }
+            let start = int_or(get(row, "seqStart"), int_of(get(row, "seq")));
+            let end = int_or(get(row, "seqEnd"), start);
+            row["seqStart"] = json!(start);
+            row["seqEnd"] = json!(end);
+            true
+        });
         let page_start = if get(result, "startCursor").is_object() {
             Some(int_of(get(get(result, "startCursor"), "seq")))
         } else {
@@ -1458,7 +1462,6 @@ impl ChatSession {
             Prepend,
             Discard,
         }
-        let mut units = incoming.clone();
         let mode = if force_replace || is_true(get(result, "reset")) {
             Mode::Replace
         } else if direction == "tail" {
@@ -1475,7 +1478,7 @@ impl ChatSession {
                 Some(end) if window_max == end => Mode::Discard,
                 Some(end) if window_max < end => Mode::Replace,
                 Some(end) if page_start.is_some_and(|s| s <= end + 1) => {
-                    units.retain(|row| int_of(get(row, "seqEnd")) > end);
+                    incoming.retain(|row| int_of(get(row, "seqEnd")) > end);
                     Mode::Append
                 }
                 Some(_) => Mode::Replace,
@@ -1533,7 +1536,7 @@ impl ChatSession {
                 self.has_older = is_true(get(result, "hasOlder"));
             }
             Mode::Append => {
-                self.merge(units);
+                self.merge(incoming);
                 self.epoch = Some(next_epoch.clone());
                 if let Some(end) = page_end
                     && local_end.is_none_or(|local| end > local)
@@ -1554,7 +1557,7 @@ impl ChatSession {
                 }
             }
             Mode::Prepend => {
-                self.merge(units);
+                self.merge(incoming);
                 let seq = page_start.or(local_start).unwrap_or_default();
                 self.start_cursor = Some(Cursor {
                     epoch: next_epoch.clone(),

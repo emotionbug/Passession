@@ -520,18 +520,21 @@ fn entry(
             let (cx0, cw) = content_box(&look, x, w, false);
             // Preparation alone advances capture and publication. The final
             // paint pass uses the same complete source/layout snapshot.
+            // draw_worker will request another frame only if work still
+            // remains after preparing and publishing this frame's layout.
             if !d.state.managed_preparation || d.state.preparing {
                 let options = markdown::worker::ParseOptions {
                     root: ctx.cwd.as_deref(),
                     linkify: true,
                     find: find.as_ref().map(|mark| &mark.pattern),
                 };
-                d.animating |= d.state.markdown_worker.update(
+                d.state.markdown_worker.update(
                     (id, &ctx.host_id, &ctx.agent_id),
                     row.entry.clone(),
                     live,
                     options,
                     d.now,
+                    |bytes| markdown::view::admit_history_inline(cx, bytes),
                 );
             }
             let top = 12.0;

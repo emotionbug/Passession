@@ -34,6 +34,7 @@
 
 ### Fixed
 
+- Opening a chat no longer waits for another UI event to start loading its history. Available messages stay visible while the rest sync, and short completed replies can appear in the first draw instead of briefly leaving a blank row.
 - OMP 19: a run that pauses (while OMP retries, sends itself a reminder, or waits for a background job or a child agent) stays running until OMP reports that the run ended and the session settled. Before this, Passession could mark the turn finished at the pause, and OMP's later work showed up detached from it.
 - Codex: MCP tool progress updates the running card, plan previews give way to the final plan, and moderation notices honor the provider's display decision. An unanswered question no longer sends the first option.
 - Android: Command Center opened from the sidebar receives input and Back before the sidebar. Image selection excludes videos; gallery saves report success only after publication, and the Android 9-and-earlier document fallback no longer claims to have saved to Photos. iOS imports the original image file into Photos instead of decoding and re-encoding it.

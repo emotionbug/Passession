@@ -92,6 +92,11 @@ impl RowCache {
     }
 
     fn height(&self, width: f64, theme_epoch: u64, revision: u64, dirty: bool) -> Option<f64> {
+        // A visible draw driven by scrolling can collect completed worker
+        // work now, without waiting for a separate dirty-row clock tick.
+        if self.layout_pending {
+            return None;
+        }
         self.measurement
             .filter(|measured| {
                 !dirty
@@ -1200,6 +1205,17 @@ mod cache_tests {
         // A matching source is insufficient when an image, font layout or
         // highlight completed, or an interactive child requested a redraw.
         assert_eq!(cache.height(640.0, 3, 7, true), None);
+    }
+
+    #[test]
+    fn pending_measurement_is_retried_on_scroll_without_a_child_redraw() {
+        let mut cache = settled();
+        // A row measured while entering/leaving the viewport can have a
+        // worker result even when scrolling only invalidates the parent.
+        cache.layout_pending = true;
+        assert_eq!(cache.height(640.0, 3, 7, false), None);
+        cache.layout_pending = false;
+        assert_eq!(cache.height(640.0, 3, 7, false), Some(112.0));
     }
 
     #[test]

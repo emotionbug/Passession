@@ -77,6 +77,18 @@ impl Scene {
     }
 }
 
+/// Screen-local overlays are not composed above the transition. Keep the
+/// incoming screen linked for dirty-list traversal only, so a transcript
+/// update can redraw the window without waiting for motion to settle.
+fn isolate_animated_scene(cx: &mut Cx, scene: DrawListId, redraw_parent: Option<DrawListId>) {
+    let detached = redraw_parent.map(|parent| cx.draw_lists[parent].redraw_id.wrapping_sub(1));
+    let scene = &mut cx.draw_lists[scene];
+    scene.codeflow_parent_id = redraw_parent;
+    if let Some(detached) = detached {
+        scene.codeflow_parent_redraw_id = detached;
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Navigation {
     scenes: Vec<Scene>,
@@ -375,9 +387,11 @@ pub(super) fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: 
                 scene.dim = draw_scrim(shell, cx, rect, pose.dim);
             }
             if let Some(list) = &scene.list {
-                // The old pane may still have a cached external overlay. It is not part of either
-                // snapshot and must not stay attached above the actual destination.
-                cx.draw_lists[list.draw_list_id()].codeflow_parent_id = None;
+                isolate_animated_scene(
+                    cx,
+                    list.id(),
+                    (index == nav.target).then_some(composition.id()),
+                );
             }
         }
         nav.place(cx);
@@ -416,6 +430,46 @@ mod tests {
             .list
             .get_or_insert_with(|| DrawList2d::new(cx));
         nav.ready = true;
+    }
+
+    #[test]
+    fn timeline_handoff_repaints_incoming_compact_transcript_without_restoring_overlays() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let window = DrawList2d::new(&mut cx);
+        let composition = DrawList2d::new(&mut cx);
+        let incoming = DrawList2d::new(&mut cx);
+        let transcript = DrawList2d::new(&mut cx);
+        let outgoing = DrawList2d::new(&mut cx);
+        let popover = DrawList2d::new(&mut cx);
+        let overlay = DrawList2d::new(&mut cx);
+        cx.draw_lists[window.id()].clear_draw_items(1);
+        for (list, parent) in [
+            (&composition, &window),
+            (&incoming, &composition),
+            (&transcript, &incoming),
+            (&outgoing, &composition),
+            (&popover, &incoming),
+        ] {
+            let list = &mut cx.draw_lists[list.id()];
+            list.clear_draw_items(1);
+            list.codeflow_parent_id = Some(parent.id());
+            list.codeflow_parent_redraw_id = 1;
+        }
+        cx.draw_lists[overlay.id()].store_sub_list(1, popover.id());
+        cx.draw_lists.compose_overlays(overlay.id(), window.id());
+        assert_eq!(cx.draw_lists[overlay.id()].draw_items.len(), 1);
+
+        isolate_animated_scene(&mut cx, incoming.id(), Some(composition.id()));
+        isolate_animated_scene(&mut cx, outgoing.id(), None);
+        cx.draw_lists.compose_overlays(overlay.id(), window.id());
+        assert_eq!(cx.draw_lists[overlay.id()].draw_items.len(), 0);
+
+        transcript.redraw(&mut cx);
+        assert!(cx.new_draw_event.draw_list_will_redraw(&cx, incoming.id()));
+        assert!(cx.new_draw_event.draw_list_will_redraw(&cx, window.id()));
+        cx.new_draw_event = DrawEvent::default();
+        outgoing.redraw(&mut cx);
+        assert!(!cx.new_draw_event.draw_list_will_redraw(&cx, window.id()));
     }
 
     #[test]

@@ -14,7 +14,8 @@ use super::super::links::FileLinkSourceType;
 use super::super::paint::{Draw, Look};
 use super::model::{AlertKind, Block, Inline, ListItem, Style};
 use super::worker::{
-    INTERACTIVE_SOURCE_BYTES, ParagraphKey, ParsedChunk, ParsedSnapshot, SemanticParagraph,
+    INTERACTIVE_SOURCE_BYTES, InlinePreparation, ParagraphKey, ParsedChunk, ParsedSnapshot,
+    SemanticParagraph,
 };
 use makepad_widgets::makepad_draw::text::AsyncLayout;
 use makepad_widgets::makepad_draw::text::layouter::{LaidoutText, Span as FontSpan};
@@ -114,6 +115,60 @@ struct CachedParagraph {
 /// Soft allowance of one document preparation pass, checked between paragraphs.
 const PREPARATION_PASS: Duration = Duration::from_millis(4);
 
+/// The short-history fast path is shared across the draw, not multiplied by
+/// the number of cold/recycled rows encountered by the virtual list.
+#[derive(Default)]
+struct HistoryInlineBudget {
+    redraw: u64,
+    deadline: Option<Instant>,
+    parse_remaining: usize,
+    layout_remaining: usize,
+}
+
+impl HistoryInlineBudget {
+    fn for_draw(cx: &mut Cx) -> &mut Self {
+        let redraw = cx.redraw_id();
+        let budget = cx.global::<Self>();
+        budget.begin(redraw, Instant::now());
+        budget
+    }
+
+    fn begin(&mut self, redraw: u64, now: Instant) {
+        if self.redraw != redraw || self.deadline.is_none() {
+            *self = Self {
+                redraw,
+                deadline: Some(now + PREPARATION_PASS),
+                parse_remaining: INTERACTIVE_SOURCE_BYTES,
+                layout_remaining: INTERACTIVE_SOURCE_BYTES,
+            };
+        }
+    }
+
+    fn before_deadline(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now < deadline)
+    }
+
+    fn admit_parse(&mut self, bytes: usize, now: Instant) -> bool {
+        if bytes > self.parse_remaining || !self.before_deadline(now) {
+            return false;
+        }
+        self.parse_remaining -= bytes;
+        true
+    }
+
+    fn can_layout(&self, bytes: usize, now: Instant) -> bool {
+        bytes <= self.layout_remaining && self.before_deadline(now)
+    }
+
+    fn take_layout(&mut self, bytes: usize) {
+        self.layout_remaining -= bytes;
+    }
+}
+
+pub fn admit_history_inline(cx: &mut Cx, bytes: usize) -> bool {
+    HistoryInlineBudget::for_draw(cx).admit_parse(bytes, Instant::now())
+}
+
 /// Paragraph cache key: inline run address, wrap width bits, line height bits, bold.
 type LayoutCacheKey = (usize, u64, u64, bool);
 
@@ -126,16 +181,26 @@ pub struct ParagraphCache {
     advance_available: bool,
     advance_deadline: Option<Instant>,
     frozen: bool,
+    inline_policy: InlinePreparation,
     inline_remaining: usize,
     inline_deadline: Option<Instant>,
 }
 
 impl ParagraphCache {
-    fn can_layout_inline(&self, bytes: usize) -> bool {
+    fn can_layout_inline(&self, cx: &mut Cx, bytes: usize) -> bool {
         bytes <= self.inline_remaining
             && self
                 .inline_deadline
                 .is_some_and(|deadline| Instant::now() < deadline)
+            && (self.inline_policy != InlinePreparation::History
+                || HistoryInlineBudget::for_draw(cx).can_layout(bytes, Instant::now()))
+    }
+
+    fn take_inline_layout(&mut self, cx: &mut Cx, bytes: usize) {
+        self.inline_remaining -= bytes;
+        if self.inline_policy == InlinePreparation::History {
+            cx.get_global::<HistoryInlineBudget>().take_layout(bytes);
+        }
     }
 
     /// Admits one paragraph's background advance (span mapping, layout
@@ -229,7 +294,7 @@ impl DocumentLayout {
     }
 }
 
-/// Publish coherent source/layout revisions. Small live revisions can finish
+/// Publish coherent source/layout revisions. Small live and historical revisions can finish
 /// in this frame; larger or over-budget work retains the previous snapshot.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f64, w: f64) -> f64 {
@@ -333,12 +398,14 @@ fn prepare_document(
     doc.cache.advance_available = true;
     doc.cache.advance_deadline = Some(deadline);
     doc.cache.frozen = false;
-    doc.cache.inline_remaining = if doc.snapshot.interactive {
+    doc.cache.inline_policy = doc.snapshot.inline;
+    let inline = doc.snapshot.inline != InlinePreparation::Background;
+    doc.cache.inline_remaining = if inline {
         INTERACTIVE_SOURCE_BYTES
     } else {
         0
     };
-    doc.cache.inline_deadline = doc.snapshot.interactive.then_some(deadline);
+    doc.cache.inline_deadline = inline.then_some(deadline);
     measured(cx, d, opts, |cx, d, opts| {
         draw_document(cx, d, opts, doc, x, y)
     });
@@ -569,7 +636,7 @@ fn prepare_semantic(
         !pending.layout.is_pending()
             && d.state
                 .markdown_paragraphs
-                .can_layout_inline(pending.rich.text.len())
+                .can_layout_inline(cx, pending.rich.text.len())
     });
     // Evaluated first: an inline paragraph must not end the pass for the
     // background paragraphs after it.
@@ -682,9 +749,11 @@ fn prepare_semantic(
             let laidout = if inline
                 && d.state
                     .markdown_paragraphs
-                    .can_layout_inline(pending.rich.text.len())
+                    .can_layout_inline(cx, pending.rich.text.len())
             {
-                d.state.markdown_paragraphs.inline_remaining -= pending.rich.text.len();
+                d.state
+                    .markdown_paragraphs
+                    .take_inline_layout(cx, pending.rich.text.len());
                 Some(d.kit.layout_mapped_rich(
                     cx,
                     &pending.rich.text,
@@ -2228,7 +2297,7 @@ mod list_column_tests {
 
 #[cfg(test)]
 mod preparation_pass_tests {
-    use super::{PREPARATION_PASS, ParagraphCache};
+    use super::{HistoryInlineBudget, INTERACTIVE_SOURCE_BYTES, PREPARATION_PASS, ParagraphCache};
     use std::time::{Duration, Instant};
 
     fn pass(start: Instant) -> ParagraphCache {
@@ -2237,6 +2306,32 @@ mod preparation_pass_tests {
             advance_deadline: Some(start + PREPARATION_PASS),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn history_inline_allowance_is_shared_by_rows_until_the_next_draw() {
+        let start = Instant::now();
+        let mut budget = HistoryInlineBudget::default();
+        budget.begin(7, start);
+        let row = INTERACTIVE_SOURCE_BYTES / 2;
+        assert!(budget.admit_parse(row, start));
+        assert!(budget.can_layout(row, start));
+        budget.take_layout(row);
+
+        budget.begin(7, start);
+        assert!(budget.admit_parse(row, start));
+        assert!(budget.can_layout(row, start));
+        budget.take_layout(row);
+        assert!(!budget.admit_parse(1, start));
+        assert!(!budget.can_layout(1, start));
+
+        let next = start + PREPARATION_PASS;
+        budget.begin(8, next);
+        assert!(budget.admit_parse(row, next));
+        assert!(budget.can_layout(row, next));
+        budget.begin(8, next + PREPARATION_PASS);
+        assert!(!budget.admit_parse(row, next + PREPARATION_PASS));
+        assert!(!budget.can_layout(row, next + PREPARATION_PASS));
     }
 
     #[test]
@@ -2280,7 +2375,7 @@ mod font_epoch_tests {
             source,
             replaces_previous: false,
             find_pattern: None,
-            interactive: true,
+            inline: InlinePreparation::Live,
             prefix: None,
             stable_end: 0,
             tail: Rc::new(ParsedChunk {
@@ -2331,7 +2426,7 @@ mod font_epoch_tests {
             source: Rc::new(serde_json::json!({"item": {"text": "A paragraph"}})),
             replaces_previous: false,
             find_pattern: None,
-            interactive: true,
+            inline: InlinePreparation::Live,
             prefix: None,
             stable_end: 0,
             tail: Rc::new(ParsedChunk {

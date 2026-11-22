@@ -21,9 +21,11 @@ counting as 1/60 s), so the backlog decays geometrically and settles in about
 `150 ms × ln(backlog bytes)` plus nine frames (10 kB in about 1.1 s at 60 Hz);
 the end of the turn releases everything. Text that arrived while the
 conversation was off screen (hidden tab or pane, app in the background) is
-released whole when it is shown again. Small live documents (at most 16 KiB of captured
-source) normalize, parse and flatten inline using the same parser as the worker.
-The final update of an inline-published document uses that path too. Preparation
+released whole when it is shown again. Short completed messages can use the
+same inline parser and layout as small live updates. Historical rows share a
+16 KiB parse allowance, a 16 KiB layout allowance, and a soft 4 ms deadline
+per draw, so opening a full screen of replies doesn't block on shaping them
+all. Rows outside that budget use the worker. For live text, preparation
 admits at most 16 KiB of inline layout text per pass, with a soft 4 ms deadline
 checked between layout calls. Multiple ready paragraphs can therefore publish
 in the current frame instead of requiring a worker round trip for every reveal.
