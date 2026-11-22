@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.47 - 2026-11-22
+
 ### Added
 
 - Claude: permission cards offer Claude's own "don't ask again" choices next to Allow and Deny, such as "Allow all edits for this session", "Always allow Bash(npm test) in this project" and "Allow access to <folder> for this session". Before this, the card offered only Allow and Deny.

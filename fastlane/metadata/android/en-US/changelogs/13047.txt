@@ -1,0 +1,11 @@
+Added
+- Share photos from Android to an existing chat or a new draft. Nothing is sent until you send the draft.
+- Save or share original images from the chat viewer.
+
+Changed
+- Add images from the photo picker. Download photos to Pictures/Passession on Android 10 or later. Other files use the document saver.
+
+Fixed
+- Switching chats shows available history without waiting for another tap or message.
+
+Full notes: https://github.com/emotionbug/Passession/releases/tag/v0.13.47
