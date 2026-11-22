@@ -118,6 +118,245 @@ fn approvals_offer_session_and_prefix_rule_choices() {
         json!({"decision":"decline"})
     );
 }
+
+#[test]
+fn network_approval_offers_the_proposed_allow_and_deny_rules() {
+    let amendments = json!([
+        {"action":"allow","host":"example.test:443"},
+        {"action":"deny","host":"example.test:443"},
+    ]);
+    let pending = permissions::request(
+        "codex",
+        json!(5),
+        "item/commandExecution/requestApproval",
+        json!({"threadId":"thread","turnId":"turn","itemId":"network",
+            "reason":"Fetch package metadata",
+            "networkApprovalContext":{"host":"example.test:443","protocol":"https"},
+            "proposedNetworkPolicyAmendments":amendments}),
+    )
+    .unwrap();
+    let description = pending.request["description"].as_str().unwrap();
+    for expected in ["example.test:443", "https", "Fetch package metadata"] {
+        assert!(description.contains(expected));
+    }
+    let actions = pending.request["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 5);
+    for (action, amendment) in actions[3..].iter().zip(amendments.as_array().unwrap()) {
+        assert_eq!(action["behavior"], amendment["action"]);
+        assert_eq!(
+            permissions::reply(
+                &pending,
+                &json!({"behavior":action["behavior"],"selectedActionId":action["id"]}),
+            )
+            .unwrap(),
+            json!({"decision":{"applyNetworkPolicyAmendment":{"network_policy_amendment":amendment}}})
+        );
+    }
+    assert_eq!(
+        permissions::reply(
+            &pending,
+            &json!({"behavior":"deny","selectedActionId":actions[3]["id"]}),
+        )
+        .unwrap(),
+        json!({"decision":"decline"})
+    );
+}
+
+#[cfg(unix)]
+async fn open_test_app_server(
+    root: &std::path::Path,
+) -> (
+    std::sync::Arc<session::CodexSession>,
+    tokio::sync::mpsc::Receiver<Value>,
+) {
+    use crate::providers::api::{EventSink, LaunchContext, ProviderSpec};
+    use tokio_util::sync::CancellationToken;
+
+    let script = r#"
+if [ "$2" = --version ]; then
+    echo 'codex 0.171.0'
+    exit
+fi
+while IFS= read -r frame; do
+    case "$frame" in
+        *'"method":"initialized"'*) ;;
+        *'"method":'*)
+            id=${frame#*\"id\":}
+            printf '{"id":%s,"result":{"data":[],"config":{},"userAgent":"codex/0.171.0"}}\n' "${id%%,*}"
+            ;;
+        *) printf '%s\n' "$frame" > "$1" ;;
+    esac
+done
+"#;
+    let spec = ProviderSpec {
+        id: "codex".into(),
+        family: "codex".into(),
+        command: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+            "paseo-codex-test".into(),
+            root.join("reply.json").to_string_lossy().into_owned(),
+        ],
+        env: [
+            ("HOME".into(), root.to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), root.to_string_lossy().into_owned()),
+        ]
+        .into(),
+        options: json!({}),
+        defaults: json!({}),
+        runtime_settings: json!({}),
+        configured_models: vec![],
+    };
+    let cancel = CancellationToken::new();
+    let (sink, events) = EventSink::channel(32, cancel.clone());
+    let context = LaunchContext {
+        agent_id: "codex-test".into(),
+        home: root.into(),
+        executable: "/bin/sh".into(),
+        env: Default::default(),
+        mcp_servers: Value::Null,
+        tool_catalog: Value::Null,
+        tool_manifest: Value::Null,
+        tool_executor: None,
+        cancel,
+    };
+    let session = session::CodexSession::open(
+        spec,
+        json!({"cwd":root}),
+        context,
+        json!({}),
+        None,
+        sink,
+        &super::metadata::MetadataCache::default(),
+    )
+    .await
+    .unwrap();
+    (session, events)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_approval_replies_echo_string_and_integer_ids_without_coercion() {
+    use crate::providers::api::AgentSession;
+
+    let root = tempfile::tempdir().unwrap();
+    let (session, mut events) = open_test_app_server(root.path()).await;
+    let profile = json!({"network":{"enabled":true},"fileSystem":{"entries":[
+        {"access":"write","path":{"type":"path","path":"/work/cache"}}
+    ]}});
+    for (id, response, result) in [
+        (
+            json!("007"),
+            json!({"behavior":"allow","selectedActionId":"accept_session"}),
+            json!({"permissions":profile,"scope":"session"}),
+        ),
+        (
+            json!(7),
+            json!({"behavior":"allow","selectedActionId":"accept"}),
+            json!({"permissions":profile,"scope":"turn"}),
+        ),
+        (
+            json!(-7),
+            json!({"behavior":"deny","selectedActionId":"decline"}),
+            json!({"permissions":{},"scope":"turn"}),
+        ),
+    ] {
+        session
+            .handle_frame(json!({"id":id,"method":"item/permissions/requestApproval","params":{
+                "threadId":"thread","turnId":"turn","itemId":"access","cwd":"/work","startedAtMs":0,
+                "permissions":profile,"reason":"Package cache access",
+            }}))
+            .await
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert_eq!(event["type"], "permission_requested");
+        let request = &event["request"];
+        assert_eq!(request["description"], "Package cache access");
+        let text = request["detail"]["text"].as_str().unwrap();
+        for expected in [
+            "Working directory: /work",
+            "Network access:",
+            "Write: /work/cache",
+        ] {
+            assert!(text.contains(expected));
+        }
+        assert!(
+            request["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["id"] == response["selectedActionId"])
+        );
+        session
+            .respond_to_permission(request["id"].as_str().unwrap(), response)
+            .await
+            .unwrap();
+        // The stub answers this after reading and recording the previous reply.
+        session
+            .client
+            .request("test/flush", json!({}))
+            .await
+            .unwrap();
+        let reply: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("reply.json")).unwrap())
+                .unwrap();
+        assert_eq!(reply, json!({"id":id,"result":result}));
+        while events.try_recv().is_ok() {}
+    }
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retries_are_visible_and_terminal_errors_only_surface_once() {
+    use crate::providers::api::AgentSession;
+
+    let root = tempfile::tempdir().unwrap();
+    let (session, mut events) = open_test_app_server(root.path()).await;
+    session.state.lock().unwrap().thread = Some("thread".into());
+    session
+        .handle_frame(json!({"method":"turn/started","params":{
+            "threadId":"thread","turn":{"id":"turn","status":"inProgress"}
+        }}))
+        .await
+        .unwrap();
+    assert_eq!(events.try_recv().unwrap()["type"], "turn_started");
+    let error = json!({"message":"Stream disconnected","additionalDetails":"Connection reset\nextra context"});
+    let frame = |will_retry| {
+        json!({"method":"error","params":{
+            "threadId":"thread","turnId":"turn","error":error,"willRetry":will_retry
+        }})
+    };
+    session.handle_frame(frame(true)).await.unwrap();
+    let retry = events.try_recv().unwrap();
+    assert_eq!(retry["item"]["level"], "warning");
+    let message = retry["item"]["message"].as_str().unwrap();
+    assert!(message.contains("Stream disconnected") && message.contains("Connection reset"));
+    session.handle_frame(frame(false)).await.unwrap();
+    assert!(events.try_recv().is_err());
+    session
+        .handle_frame(json!({"method":"turn/completed","params":{
+            "threadId":"thread","turn":{"id":"turn","status":"failed","error":error}
+        }}))
+        .await
+        .unwrap();
+    let failed = events.try_recv().unwrap();
+    assert_eq!(failed["type"], "turn_failed");
+    assert_eq!(failed["error"], error["message"]);
+    assert!(events.try_recv().is_err());
+    session.handle_frame(frame(false)).await.unwrap();
+    let idle = events.try_recv().unwrap();
+    assert_eq!(idle["item"]["level"], "error");
+    assert!(
+        idle["item"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Stream disconnected")
+    );
+    session.close().await.unwrap();
+}
+
 #[test]
 fn multi_select_answers_keep_labels_that_contain_commas() {
     let params = json!({"threadId":"thread","turnId":"native-turn","itemId":"tool","questions":[

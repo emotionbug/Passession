@@ -675,6 +675,10 @@ fn file_text(f: &Value) -> Value {
         json!({"content":text})
     }
 }
+pub(super) fn notice(level: &str, message: &str) -> Value {
+    json!({"type":"notification","level":level,"message":message})
+}
+
 pub fn item(raw: &Value, include_user: bool, cwd: Option<&str>) -> Option<Value> {
     item_with_images(raw, include_user, cwd, &mut |_, _| None)
 }
@@ -897,6 +901,17 @@ fn item_with_images(
                 cwd,
             ))
         }
+        // Entering names what is reviewed; exiting carries the review itself.
+        "enteredReviewMode" => Some(match nonempty(raw, &["review"]) {
+            Some(review) => notice("info", &format!("Codex started reviewing {review}")),
+            None => notice("info", "Codex started a review"),
+        }),
+        "exitedReviewMode" => Some(match nonempty(raw, &["review"]) {
+            Some(review) => {
+                json!({"type":"assistant_message","messageId":raw["id"],"text":review})
+            }
+            None => notice("info", "Codex finished the review"),
+        }),
         "collabAgentToolCall" | "subAgentActivity" => subagent(raw),
         "toolCall" | "tool_call" => tool_envelope(raw, cwd),
         _ => None,

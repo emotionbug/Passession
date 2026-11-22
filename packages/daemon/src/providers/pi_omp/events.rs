@@ -595,6 +595,16 @@ impl Mapper {
             "tool_execution_start"=>{let id=string(&frame["toolCallId"]);let name=string(&frame["toolName"]);let args=&frame["args"];self.tools.insert(id.into(),(name.into(),args.clone()));if let Some(req)=self.permissions.start(&self.family,&self.provider,id,name,args){let mut e=self.event("permission_requested");e["request"]=req;out.push(e);}out.extend(self.tool_events(ToolCall { id, name, args },"running",&Value::Null,&Value::Null,false));},
             "tool_execution_update"=>{let id=string(&frame["toolCallId"]);if let Some((name,args))=self.tools.get(id).cloned(){out.extend(self.tool_events(ToolCall { id, name: &name, args: &args },"running",&frame["partialResult"],&Value::Null,false));}},
             "tool_execution_end"=>{let id=string(&frame["toolCallId"]);let (name,args)=self.tools.remove(id).unwrap_or_else(||(string(&frame["toolName"]).into(),Value::Null));self.permissions.finish(id,&name);let result=&frame["result"];let failed=frame["isError"]==true||(self.family=="omp"&&name=="web_search"&&result["details"]["error"].is_string());let error=if !failed{Value::Null}else if self.family=="omp"{json!(tools::failure(result))}else{result.clone()};out.extend(self.tool_events(ToolCall { id, name: &name, args: &args },if failed{"failed"}else{"completed"},result,&error,false));if name=="task"{self.extensions.finish_card(id);self.card_updates.remove(id);}},
+            "extension_error" if self.family == "omp" => {
+                let extension = string(&frame["extensionPath"])
+                    .rsplit(['/', '\\'])
+                    .find(|part| !part.is_empty())
+                    .unwrap_or("unknown");
+                let event = first(&[&frame["event"]]).unwrap_or("an event");
+                let error = first(&[&frame["error"]]).unwrap_or("Unknown error");
+                out.push(self.timeline(json!({"type":"notification","level":"error",
+                    "message":format!("OMP extension {extension} failed during {event}: {error}")})));
+            }
             "extension_ui_request"=>{
                 if frame["method"]=="notify"{let message=string(&frame["message"]);if let Some(changes)=self.extensions.notification(message){out.extend(self.subagents(changes));}else if !["PASEO_ENTRY_CAPTURE ","PASEO_SUBMITTED_USER_ENTRY ","PASEO_COMMAND_RESULT "].iter().any(|prefix|message.strip_prefix(*prefix).and_then(|body|serde_json::from_str::<Value>(body).ok()).is_some_and(|v|v.is_object()))&&!message.is_empty(){out.push(self.timeline(json!({"type":"notification","level":match string(&frame["notifyType"]){"warning"=>"warning","error"=>"error",_=>"info"},"message":message})));}}
                 else if self.family == "omp" && frame["method"] == "open_url" && frame["url"].is_string() {
@@ -1534,6 +1544,16 @@ mod tests {
             mapper.drain_responses(),
             vec![json!({"type":"extension_ui_response","id":"native","value":"2. Two — second"})]
         );
+    }
+
+    #[test]
+    fn omp_editor_projects_prefill_as_an_editable_answer_default() {
+        let mut mapper = Mapper::new("omp", "omp");
+        let events = mapper.map(&json!({"type":"extension_ui_request","id":"editor",
+            "method":"editor","title":"Edit text","prefill":"line one\n  line two"}));
+        let question = &events[0]["request"]["input"]["questions"][0];
+        assert_eq!(question["defaultText"], "line one\n  line two");
+        assert!(question.get("placeholder").is_none());
     }
 
     #[test]

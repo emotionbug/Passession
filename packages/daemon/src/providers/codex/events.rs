@@ -15,9 +15,12 @@ impl CodexSession {
                 .as_str()
                 .ok_or_else(|| anyhow!("Codex notification is missing its method"))?;
             if let Some(id) = frame.get("id") {
-                if !id.is_number() {
+                if !(id.is_string() || id.is_i64()) {
                     self.client
-                        .reject(id.clone(), "Codex server request IDs must be numeric")
+                        .reject(
+                            id.clone(),
+                            "Codex server request IDs must be strings or integers",
+                        )
                         .await?;
                     continue;
                 }
@@ -240,6 +243,58 @@ impl CodexSession {
             }
         }
         match method.as_str() {
+            "error" => {
+                let active = match &child {
+                    Some(id) => s.children[id]["status"] == "running",
+                    None => s.foreground.is_some() || s.native_turn.is_some(),
+                };
+                if let Some(item) = error_notification(&params, active) {
+                    events.push(timeline(child.as_deref(), item));
+                }
+            }
+            "warning" | "guardianWarning" => {
+                if let Some(message) = params["message"].as_str() {
+                    events.push(timeline(
+                        child.as_deref(),
+                        projection::notice("warning", message),
+                    ));
+                }
+            }
+            "configWarning" | "deprecationNotice" => {
+                if let Some(summary) = params["summary"].as_str() {
+                    let level = if method == "configWarning" {
+                        "warning"
+                    } else {
+                        "info"
+                    };
+                    let item = match params["details"].as_str().map(str::trim) {
+                        Some(details) if !details.is_empty() => {
+                            projection::notice(level, &format!("{summary}\n{details}"))
+                        }
+                        _ => projection::notice(level, summary),
+                    };
+                    events.push(timeline(child.as_deref(), item));
+                }
+            }
+            "model/rerouted" => {
+                if let (Some(from), Some(to)) =
+                    (params["fromModel"].as_str(), params["toModel"].as_str())
+                {
+                    let message = match params["reason"].as_str() {
+                        Some("highRiskCyberActivity") => {
+                            format!(
+                                "Codex switched models: {from} → {to} (high-risk cyber activity)"
+                            )
+                        }
+                        Some(reason) => format!("Codex switched models: {from} → {to} ({reason})"),
+                        None => format!("Codex switched models: {from} → {to}"),
+                    };
+                    events.push(timeline(
+                        child.as_deref(),
+                        projection::notice("info", &message),
+                    ));
+                }
+            }
             "paseo/transportClosed" => {
                 let active = s.foreground.is_some() || s.native_turn.is_some();
                 if !s.closed
@@ -288,6 +343,7 @@ impl CodexSession {
                     s.outputs.clear();
                     s.completed.clear();
                     s.last_plan = None;
+                    s.plan_explanation = None;
                     s.assistant_boundary = false;
                     s.completed_compactions = 0;
                     events.push(json!({"type":"turn_started"}));
@@ -434,7 +490,12 @@ impl CodexSession {
                 } else if !id.is_empty() && !s.completed.insert(dedup) {
                     return Ok((events, replay));
                 }
-                if !done && matches!(kind.as_str(), "agentMessage" | "reasoning") {
+                if !done
+                    && matches!(
+                        kind.as_str(),
+                        "agentMessage" | "reasoning" | "enteredReviewMode" | "exitedReviewMode"
+                    )
+                {
                     return Ok((events, replay));
                 }
                 if done
@@ -621,6 +682,16 @@ impl CodexSession {
                 }
             }
             "turn/plan/updated" => {
+                if let Some(explanation) = params["explanation"].as_str().map(str::trim)
+                    && !explanation.is_empty()
+                    && s.plan_explanation.as_deref() != Some(explanation)
+                {
+                    s.plan_explanation = Some(explanation.to_owned());
+                    events.push(timeline(
+                        child.as_deref(),
+                        projection::notice("info", explanation),
+                    ));
+                }
                 let plan = params["plan"].clone();
                 if s.config["featureValues"]["plan_mode"] == true && child.is_none() {
                     s.last_plan = Some(
@@ -905,6 +976,38 @@ fn upsert_child_item(items: &mut Vec<(String, Value)>, key: String, mut item: Va
     } else {
         items.push((key, item));
     }
+}
+
+fn error_notification(params: &Value, active: bool) -> Option<Value> {
+    let retry = params["willRetry"] == true;
+    if active && !retry {
+        // The failed turn carries this error on turn/completed.
+        return None;
+    }
+    let error = &params["error"];
+    let text = error["message"].as_str()?;
+    let mut message = if retry {
+        format!("Codex is retrying: {text}")
+    } else {
+        text.to_owned()
+    };
+    if let Some(detail) = error["additionalDetails"]
+        .as_str()
+        .and_then(|details| details.lines().map(str::trim).find(|line| !line.is_empty()))
+        .filter(|detail| *detail != text)
+    {
+        message.push_str(" — ");
+        if let Some((end, _)) = detail.char_indices().nth(240) {
+            message.push_str(&detail[..end]);
+            message.push('…');
+        } else {
+            message.push_str(detail);
+        }
+    }
+    Some(projection::notice(
+        if retry { "warning" } else { "error" },
+        &message,
+    ))
 }
 
 fn transport_close_event(params: &Value, active: bool, foreground: Option<&str>) -> Option<Value> {

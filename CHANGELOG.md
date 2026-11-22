@@ -8,6 +8,11 @@
 - Codex: command and file-change approval cards offer "Allow this command for this session" (or "Allow changes to these files for this session"), and "Always allow commands starting with `…`" when Codex proposes a rule.
 - Claude: while Claude retries a failed API request (for example when the API is overloaded or the key is rejected), the agent shows a "Claude API retry 2/10" row with the error and the wait time. Before this, the agent showed nothing for the minutes Claude spent retrying.
 - `paseo permit allow` and `paseo permit deny` accept `--action <id>` to pick one of a request's own choices, and `paseo permit ls --json` lists each request's choices.
+- Codex: a command approval that needs network access shows the destination ("Network destination: example.com (https)"), and offers Codex's proposed "Always allow network access to <host>" (or deny) rule when Codex suggests one. Before this, the card did not say where the command wanted to connect.
+- Codex: when Codex asks for additional permissions (file system or network access), the agent shows a permission card listing the requested access, its reason and working directory, with Allow (for this turn), "Allow these permissions for this session" and Deny. Before this, Passession rejected the request, so Codex went without the access and the user was never asked.
+- Codex: the agent shows Codex's retry notices ("Codex is retrying: stream disconnected…"), warnings, configuration warnings, deprecation notices, model switches (for example "Codex switched models: gpt-5.5 → gpt-5.4 (high-risk cyber activity)"), plan explanations, and the start and result of `/review`. Before this, all of them were dropped.
+- Claude: the agent shows Claude's notices (such as a hook's reason for stopping Claude), the output of local slash commands such as `/cost`, failed hooks with their name, event and error output, and a background subagent's final report on that subagent. Before this, these messages were dropped.
+- OMP: an extension that fails shows "OMP extension <file> failed during <event>: <error>", and an extension's editor dialog starts with the text the extension provided (for example the bundled review command's template) instead of an empty field.
 
 ### Changed
 
@@ -16,9 +21,14 @@
 - On desktop, the New session pickers (project, host, What to launch, model, mode, thinking and provider options), the schedule form's pickers, the Schedules host filter and a schedule's actions menu open as a dropdown under the field you clicked, like a native select, instead of a dialog in the middle of the window. A dropdown opens above its field when there is more room there, closes with one Escape or a click outside, and closes when the window is resized. Phone-sized windows keep the titled bottom sheet.
 - In a window shorter than about 640px, the sidebar's New session, History, Search and Schedules rows fold into one row (New session with icons beside it, or only icons in a narrow sidebar), so the session list keeps about 100px more room.
 - In a sidebar narrower than 260px, sessions are indented one step less and show their age in the subtitle ("mock · Idle · 1d") instead of beside the title, so titles keep more of the row.
+- The Settings navigation narrows from 320px to 220px as the window gets narrower, so in a window about 660px wide the settings keep their controls on the same line instead of wrapping them under each label.
 
 ### Fixed
 
+- OMP 19: a run that pauses (while OMP retries, sends itself a reminder, or waits for a background job or a child agent) stays running until OMP reports that the run ended and the session settled. Before this, Passession could mark the turn finished at the pause, and OMP's later work showed up detached from it.
+- Claude: when an MCP server asks for input (a form or a sign-in link), the agent says that Passession can't show it yet and that the request was canceled. Before this, the request was canceled with nothing shown.
+- Codex: approval requests whose id is a string are no longer rejected.
+- A field or button that opened a picker or dialog no longer stays highlighted after the picker closes and the pointer has moved away.
 - Claude: an API error that ends a turn, such as "Invalid API key", now fails the turn and shows it as an error. Before this, the turn showed the error text as a normal reply and was reported as completed.
 - After the window was made narrower and then wider again, some chat messages kept the narrow line wrapping until they were scrolled. They now wrap to the new width.
 - Split panes keep at least 240px of width (160px of height) on each side, and share the space evenly when there is not enough for both. Before this, a pane in a narrow window could shrink to a sliver whose tabs, `+N` chip and new-tab button overlapped.

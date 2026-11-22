@@ -30,7 +30,16 @@ use crate::common::{Route, UiContext, UiEffect};
 use crate::features::workspace::{WorkspacePanelWidgetRefExt, WorkspaceTarget};
 
 const SIDEBAR_W: f64 = 320.0;
+const SIDEBAR_MIN_W: f64 = 220.0;
 const DETAIL_MAX: f64 = 720.0;
+
+/// Settings nav width for a `total`-wide panel: 320px when there is room, narrowing to 220px
+/// (its longest labels) as the window shrinks so the detail column keeps the space.
+fn sidebar_width(total: f64) -> f64 {
+    (total * 0.3)
+        .clamp(SIDEBAR_MIN_W, SIDEBAR_W)
+        .min(total * 0.5)
+}
 
 /// What another feature asked Settings to open (see [`open_profile_editor`]).
 pub enum Intent {
@@ -969,7 +978,7 @@ impl Widget for SettingsPanel {
                     // Wide: sidebar + detail column.
                     let sidebar = Rect {
                         pos: rect.pos,
-                        size: dvec2(SIDEBAR_W.min(rect.size.x * 0.5), rect.size.y),
+                        size: dvec2(sidebar_width(rect.size.x), rect.size.y),
                     };
                     kit.rect(sidebar, pal.sidebar, None, 0.0);
                     kit.rect(
@@ -1055,7 +1064,7 @@ impl Widget for SettingsPanel {
                         size: dvec2(rect.size.x, rect.size.y - compact_header_h),
                     }
                 } else {
-                    let sx = SIDEBAR_W.min(rect.size.x * 0.5);
+                    let sx = sidebar_width(rect.size.x);
                     Rect {
                         pos: dvec2(rect.pos.x + sx, rect.pos.y + wide_header_h),
                         size: dvec2(rect.size.x - sx, rect.size.y - wide_header_h),

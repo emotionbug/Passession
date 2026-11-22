@@ -458,7 +458,12 @@ fn generic(event: &Value, provider: &str, label: &str) -> Option<Value> {
                 event["title"].as_str().unwrap_or("Enter a value").into()
             }
         }
-        "editor" => event["title"].as_str().unwrap_or("Edit text").into(),
+        "editor" => {
+            if label == "OMP" {
+                put(&mut extra, "defaultText", event["prefill"].as_str());
+            }
+            event["title"].as_str().unwrap_or("Edit text").into()
+        }
         "confirm" => {
             options = vec![json!({"label":"Yes"}), json!({"label":"No"})];
             [event["title"].as_str(), event["message"].as_str()]

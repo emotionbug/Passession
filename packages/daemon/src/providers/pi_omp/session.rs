@@ -59,6 +59,7 @@ struct State {
     turn_has_user: bool,
     live: bool,
     settling: bool,
+    settle_epoch: u64,
     bridged_tools: Value,
     followed_children: HashSet<String>,
     /// The current prompt's native acknowledgement, taken once by the manager.
@@ -257,13 +258,21 @@ impl Inner {
     }
     /// The nominal idle deadline bounds the refresh RPC itself, and every state
     /// change re-checks this runtime generation and turn after each await.
-    async fn settle(self: Arc<Self>, frame: Value, generation: u64, turn: Option<String>) {
+    async fn settle(
+        self: Arc<Self>,
+        frame: Value,
+        generation: u64,
+        turn: Option<String>,
+        epoch: u64,
+    ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         let owned = |inner: &Self, state: &State| {
             !inner.closed.load(Ordering::Acquire)
                 && inner.generation.load(Ordering::Acquire) == generation
                 && !state.dead
                 && state.active == turn
+                && state.settling
+                && state.settle_epoch == epoch
         };
         loop {
             if !owned(self.as_ref(), &self.state.lock().unwrap()) {
@@ -274,6 +283,7 @@ impl Inner {
                 result = tokio::time::timeout_at(deadline, self.refresh()) => result.ok(),
             };
             if tokio::time::Instant::now() >= deadline && refreshed.is_none() {
+                let _frames = self.frame_gate.lock().await;
                 {
                     let mut state = self.state.lock().unwrap();
                     if !owned(self.as_ref(), &state) {
@@ -289,18 +299,22 @@ impl Inner {
             if let Some(Ok(state)) = refreshed
                 && state["isStreaming"] != true
                 && state["isCompacting"] != true
+                && state.get("isSettled").is_none_or(|settled| settled == true)
             {
-                let events = {
+                let frames = self.frame_gate.lock().await;
+                let (events, refresh_controls) = {
                     let mut state = self.state.lock().unwrap();
                     if !owned(self.as_ref(), &state) {
                         return;
                     }
                     state.settling = false;
-                    state.mapper.map(&frame)
+                    (
+                        state.mapper.map(&frame),
+                        std::mem::take(&mut state.refresh_after_prompt),
+                    )
                 };
-                let refresh_controls =
-                    std::mem::take(&mut self.state.lock().unwrap().refresh_after_prompt);
                 let _ = self.accept_events(events).await;
+                drop(frames);
                 if refresh_controls {
                     self.schedule_control_refresh(generation, true);
                 }
@@ -525,15 +539,22 @@ impl Inner {
             }
         }
         if self.spec.family == "omp" && frame["type"] == "agent_end" {
-            let turn = {
+            let (turn, epoch) = {
                 let mut state = self.state.lock().unwrap();
-                if state.settling {
+                if frame["isTerminal"] == false {
+                    // A model loop paused, not the run. Invalidate any idle
+                    // deadline from an earlier run in this session stretch.
+                    state.settling = false;
+                    return Ok(());
+                }
+                if state.settling && frame["isTerminal"] != true {
                     return Ok(());
                 }
                 state.settling = true;
-                state.active.clone()
+                state.settle_epoch += 1;
+                (state.active.clone(), state.settle_epoch)
             };
-            tokio::spawn(self.clone().settle(frame, generation, turn));
+            tokio::spawn(self.clone().settle(frame, generation, turn, epoch));
             return Ok(());
         }
         if frame["type"] == "agent_start" {
@@ -1351,6 +1372,7 @@ impl Session {
                 turn_has_user: false,
                 live: persistence.is_none(),
                 settling: false,
+                settle_epoch: 0,
                 bridged_tools,
                 followed_children: HashSet::new(),
                 acknowledgement: None,

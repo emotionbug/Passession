@@ -1,5 +1,6 @@
 use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
+use std::fmt::Write as _;
 
 #[derive(Clone, Debug)]
 pub struct PendingPermission {
@@ -77,6 +78,73 @@ fn format_questions(questions: &[Value]) -> String {
         .to_owned()
 }
 
+fn permission_path(path: &Value) -> Option<&str> {
+    match path["type"].as_str()? {
+        "path" => nonempty(&path["path"]),
+        "glob_pattern" => nonempty(&path["pattern"]),
+        "special" => match path["value"]["kind"].as_str()? {
+            "root" => Some("filesystem root"),
+            "minimal" => Some("minimal defaults"),
+            "project_roots" => Some("project roots"),
+            "tmpdir" => Some("system temporary directory"),
+            "slash_tmp" => Some("/tmp"),
+            "unknown" => nonempty(&path["value"]["path"]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn permission_profile_text(params: &Value) -> String {
+    let profile = &params["permissions"];
+    let mut text = String::new();
+    if let Some(cwd) = nonempty(&params["cwd"]) {
+        let _ = writeln!(text, "Working directory: {cwd}");
+    }
+    let start = text.len();
+    if let Some(enabled) = profile["network"]["enabled"].as_bool() {
+        let access = if enabled { "enabled" } else { "disabled" };
+        let _ = writeln!(text, "Network access: {access}");
+    }
+    let fs = &profile["fileSystem"];
+    for (key, label) in [("read", "Read"), ("write", "Write")] {
+        for path in fs[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(nonempty)
+        {
+            let _ = writeln!(text, "{label}: {path}");
+        }
+    }
+    for entry in fs["entries"].as_array().into_iter().flatten() {
+        let path = &entry["path"];
+        let (Some(location), Some(access)) = (permission_path(path), entry["access"].as_str())
+        else {
+            continue;
+        };
+        let label = match access {
+            "read" => "Read",
+            "write" => "Write",
+            "deny" => "Deny",
+            other => other,
+        };
+        if let Some(subpath) = nonempty(&path["value"]["subpath"]) {
+            let _ = writeln!(text, "{label}: {location}/{subpath}");
+        } else {
+            let _ = writeln!(text, "{label}: {location}");
+        }
+    }
+    if let Some(depth) = fs["globScanMaxDepth"].as_u64() {
+        let _ = writeln!(text, "File glob scan depth: {depth}");
+    }
+    if text.len() == start {
+        text.push_str("No additional permissions.");
+    }
+    text.truncate(text.trim_end().len());
+    text
+}
+
 pub fn request(
     provider: &str,
     native_id: Value,
@@ -124,6 +192,15 @@ pub fn request(
             "item/fileChange/requestApproval" => {
                 json!({"name":"CodexFileChange","kind":"tool","title":"Apply file changes","detail":{"type":"unknown","input":{"reason":params["reason"]},"output":null},"metadata":metadata})
             }
+            "item/permissions/requestApproval" => {
+                ensure!(
+                    params["permissions"].is_object(),
+                    "Missing Codex permission profile"
+                );
+                json!({"name":"CodexPermissions","kind":"tool","title":"Grant additional permissions",
+                    "input":{"permissions":params["permissions"],"cwd":params["cwd"]},"metadata":metadata,
+                    "detail":{"type":"plain_text","label":"Requested permissions","text":permission_profile_text(&params)}})
+            }
             "item/tool/requestUserInput" | "tool/requestUserInput" => {
                 ensure!(params["questions"].is_array(), "Missing Codex questions");
                 let questions = normalize_questions(&params["questions"]);
@@ -145,7 +222,18 @@ pub fn request(
                 req["detail"] = mapped["detail"].clone();
             }
         }
-        if let Some(reason) = params["reason"].as_str() {
+        let reason = nonempty(&params["reason"]);
+        let context = &params["networkApprovalContext"];
+        if method == "item/commandExecution/requestApproval"
+            && let (Some(host), Some(protocol)) =
+                (nonempty(&context["host"]), nonempty(&context["protocol"]))
+        {
+            let destination = format!("Network destination: {host} ({protocol})");
+            req["description"] = json!(match reason {
+                Some(reason) => format!("{reason}\n{destination}"),
+                None => destination,
+            });
+        } else if let Some(reason) = reason {
             req["description"] = json!(reason);
         }
         if let Some(actions) = approval_actions(method, &params) {
@@ -173,11 +261,12 @@ pub fn automatic_reply(pending: &PendingPermission) -> Option<Value> {
     .then(|| json!({"action":"decline","content":null,"_meta":null}))
 }
 
-/// Codex's approval choices: this call, this session, or a lasting command prefix rule.
+/// Offer the session grant and any persistent rules proposed by Codex.
 fn approval_actions(method: &str, params: &Value) -> Option<Value> {
     let session = match method {
         "item/commandExecution/requestApproval" => "Allow this command for this session",
         "item/fileChange/requestApproval" => "Allow changes to these files for this session",
+        "item/permissions/requestApproval" => "Allow these permissions for this session",
         _ => return None,
     };
     let mut actions = vec![
@@ -185,8 +274,21 @@ fn approval_actions(method: &str, params: &Value) -> Option<Value> {
         json!({"id":"accept","label":"Allow","behavior":"allow","variant":"primary"}),
         json!({"id":"accept_session","label":session,"behavior":"allow","variant":"secondary"}),
     ];
-    if let Some(prefix) = execpolicy_amendment(params) {
-        actions.push(json!({"id":"accept_always","label":format!("Always allow commands starting with `{}`", prefix.join(" ")),"behavior":"allow","variant":"secondary"}));
+    if method == "item/commandExecution/requestApproval" {
+        if let Some(prefix) = execpolicy_amendment(params) {
+            actions.push(json!({"id":"accept_always","label":format!("Always allow commands starting with `{}`", prefix.join(" ")),"behavior":"allow","variant":"secondary"}));
+        }
+        if let Some(amendments) = params["proposedNetworkPolicyAmendments"].as_array() {
+            for (index, amendment) in amendments.iter().enumerate() {
+                if let Some((action, host)) = network_amendment(amendment) {
+                    actions.push(json!({
+                        "id":format!("network_policy_{index}"),
+                        "label":format!("Always {action} network access to {host}"),
+                        "behavior":action,"variant":"secondary",
+                    }));
+                }
+            }
+        }
     }
     Some(json!(actions))
 }
@@ -197,6 +299,14 @@ fn execpolicy_amendment(params: &Value) -> Option<Vec<&str>> {
         .filter_map(Value::as_str)
         .collect();
     (!prefix.is_empty()).then_some(prefix)
+}
+
+fn network_amendment(amendment: &Value) -> Option<(&str, &str)> {
+    let action = amendment["action"].as_str()?;
+    if !matches!(action, "allow" | "deny") {
+        return None;
+    }
+    Some((action, nonempty(&amendment["host"])?))
 }
 
 pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
@@ -210,6 +320,20 @@ pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
     };
     match pending.method.as_str() {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            if pending.method == "item/commandExecution/requestApproval"
+                && response["interrupt"] != true
+                && let Some(index) = response["selectedActionId"]
+                    .as_str()
+                    .and_then(|id| id.strip_prefix("network_policy_"))
+                    .and_then(|index| index.parse::<usize>().ok())
+                && let Some(amendment) = pending.params["proposedNetworkPolicyAmendments"].get(index)
+                && let Some((action, _)) = network_amendment(amendment)
+                && response["behavior"] == action
+            {
+                return Ok(json!({"decision":{"applyNetworkPolicyAmendment":{
+                    "network_policy_amendment":amendment
+                }}}));
+            }
             let decision = match response["selectedActionId"].as_str().filter(|_| allow) {
                 Some("accept_session") => json!("acceptForSession"),
                 Some("accept_always") => match execpolicy_amendment(&pending.params) {
@@ -220,6 +344,16 @@ pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
             };
             Ok(json!({ "decision": decision }))
         }
+        "item/permissions/requestApproval" => Ok(if allow {
+            let scope = if response["selectedActionId"] == "accept_session" {
+                "session"
+            } else {
+                "turn"
+            };
+            json!({"permissions":pending.params["permissions"],"scope":scope})
+        } else {
+            deny(pending)
+        }),
         "mcpServer/elicitation/request" => Ok(automatic_reply(pending).unwrap_or_else(||json!({"action":decision,"content":if allow { json!({}) } else { Value::Null },"_meta":null}))),
         "plan" => Ok(if allow { json!({"followUpPrompt":plan_prompt(pending.params["planText"].as_str().unwrap_or(""))}) } else { Value::Null }),
         "item/tool/requestUserInput" | "tool/requestUserInput" => {
@@ -249,6 +383,7 @@ pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
 pub fn deny(pending: &PendingPermission) -> Value {
     match pending.method.as_str() {
         "mcpServer/elicitation/request" => json!({"action":"decline","content":null,"_meta":null}),
+        "item/permissions/requestApproval" => json!({"permissions":{},"scope":"turn"}),
         "item/tool/requestUserInput" | "tool/requestUserInput" => json!({"answers":{}}),
         "plan" => Value::Null,
         _ => json!({"decision":"decline"}),

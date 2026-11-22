@@ -976,6 +976,24 @@ impl ClaudeSession {
                     runtime.reply(id, response).await?;
                     return self.emit(events).await;
                 }
+                Some("elicitation") => {
+                    runtime.reply(id, Ok(json!({"action":"cancel"}))).await?;
+                    let server = request["mcp_server_name"]
+                        .as_str()
+                        .unwrap_or("An MCP server");
+                    let prompt = request["message"].as_str().unwrap_or("").trim();
+                    let mut message = format!("{server} asked for input");
+                    if !prompt.is_empty() {
+                        message.push_str(&format!(" ({prompt})"));
+                    }
+                    message
+                        .push_str(", which Passession can't show yet; the request was canceled.");
+                    return self
+                        .sink
+                        .emit(json!({"type":"timeline","provider":self.spec.id,
+                        "item":{"type":"notification","level":"warning","message":message}}))
+                        .await;
+                }
                 _ => {
                     return runtime
                         .reply(

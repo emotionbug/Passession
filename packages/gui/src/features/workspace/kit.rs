@@ -594,6 +594,19 @@ impl WaButton {
     }
 }
 
+/// A press that opens a picker or dialog hands the pointer to it, so the control never sees its
+/// hover-out; the first pointer move outside its area clears the stale hover.
+fn hover_left(cx: &Cx, event: &Event, area: Area, hovered: &mut bool) -> bool {
+    if *hovered
+        && let Event::MouseMove(e) = event
+        && !area.rect(cx).contains(e.abs)
+    {
+        *hovered = false;
+        return true;
+    }
+    false
+}
+
 impl Widget for WaButton {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if !self.visible {
@@ -609,6 +622,9 @@ impl Widget for WaButton {
                 WaButtonAction::Clicked(KeyModifiers::default()),
             );
             return;
+        }
+        if hover_left(cx, event, self.area, &mut self.hovered) {
+            self.redraw(cx);
         }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(fe) => {
@@ -1085,6 +1101,9 @@ impl Widget for WaTrigger {
                 WaButtonAction::Clicked(KeyModifiers::default()),
             );
             return;
+        }
+        if hover_left(cx, event, self.area, &mut self.hovered) {
+            self.redraw(cx);
         }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(fe) => {

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write,
     io::Read,
 };
 
@@ -270,7 +271,7 @@ impl Projection {
             self.close_retry(None, &mut events);
         }
         match s(frame, "type").unwrap_or("") {
-            "system" if owner.is_none() => self.system(frame, &mut events),
+            "system" => self.system(frame, owner.as_deref(), &mut events),
             "assistant"
                 if owner.is_none()
                     && !self.replaying
@@ -775,8 +776,63 @@ impl Projection {
         events.push(self.todo_event(owner));
     }
 
-    fn system(&mut self, frame: &Value, events: &mut Vec<Value>) {
+    fn system(&mut self, frame: &Value, owner: Option<&str>, events: &mut Vec<Value>) {
         match s(frame, "subtype").unwrap_or("") {
+            "informational" => {
+                if let Some(content) = s(frame, "content") {
+                    let item = if frame["prevent_continuation"] == true {
+                        json!({"type":"notification","level":"warning","message":format!("Claude stopped: {content}")})
+                    } else {
+                        let level = s(frame, "level")
+                            .filter(|level| matches!(*level, "warning" | "error"))
+                            .unwrap_or("info");
+                        json!({"type":"notification","level":level,"message":content})
+                    };
+                    events.push(self.timeline(item, owner));
+                }
+            }
+            "local_command_output" => {
+                if let Some(text) = s(frame, "content") {
+                    let mut item =
+                        json!({"type":"assistant_message","text":text,"daemonOwned":true});
+                    copy(frame, "uuid", &mut item, "messageId");
+                    events.push(self.timeline(item, owner));
+                }
+            }
+            "hook_response" => {
+                // A hook cancelled with its turn is not a failure worth a warning.
+                let outcome = s(frame, "outcome");
+                let exit = frame["exit_code"].as_i64().filter(|code| *code != 0);
+                if outcome != Some("cancelled")
+                    && (exit.is_some()
+                        || outcome
+                            .is_some_and(|outcome| !matches!(outcome, "success" | "approved")))
+                {
+                    let name = s(frame, "hook_name").unwrap_or("unnamed");
+                    let mut message = format!("Claude hook '{name}' failed");
+                    if let Some(event) = s(frame, "hook_event") {
+                        message.push_str(" during ");
+                        message.push_str(event);
+                    }
+                    if let Some(code) = exit {
+                        let _ = write!(message, " (exit code {code})");
+                    }
+                    if let Some(output) = first(frame, &["stderr", "stdout"]).map(str::trim) {
+                        message.push_str(": ");
+                        if let Some((end, _)) = output.char_indices().nth(300) {
+                            message.push_str(output[..end].trim_end());
+                            message.push('…');
+                        } else {
+                            message.push_str(output);
+                        }
+                    }
+                    events.push(self.timeline(
+                        json!({"type":"notification","level":"warning","message":message}),
+                        owner,
+                    ));
+                }
+            }
+            _ if owner.is_some() => {}
             "init" => {
                 if let Some(model) = s(frame, "model") {
                     if self.model.as_deref() != Some(model) {
@@ -815,9 +871,8 @@ impl Projection {
             }
             "task_started" => self.task_started(frame, events),
             "task_updated" | "task_progress" | "task_notification" => {
-                let id = s(frame, "task_id")
-                    .and_then(|id| self.task_ids.get(id))
-                    .cloned();
+                let task_id = s(frame, "task_id");
+                let id = task_id.and_then(|id| self.task_ids.get(id)).cloned();
                 if let Some(id) = id {
                     if let Some(child) = self.tasks.get_mut(&id) {
                         if let Some(background) = frame["patch"]["is_backgrounded"].as_bool() {
@@ -827,7 +882,18 @@ impl Projection {
                             child.tokens = Some(tokens);
                         }
                     }
+                    let summary_is_report = frame["summary_is_report"] == true;
                     if s(frame, "subtype") == Some("task_notification")
+                        && summary_is_report
+                        && let (Some(task_id), Some(report)) = (task_id, s(frame, "summary"))
+                    {
+                        // A later notification revises this task's report, not the
+                        // assistant's last transcript message.
+                        let item = json!({"type":"tool_call","callId":format!("claude-task-report-{task_id}"),
+                            "name":"task_notification","status":"completed","error":null,
+                            "detail":{"type":"plain_text","label":"Subagent report","text":report,"icon":"wrench"}});
+                        events.push(self.timeline(item, Some(&id)));
+                    } else if s(frame, "subtype") == Some("task_notification")
                         && self.tasks.get(&id).is_some_and(|c| c.workflow)
                         && let Some(text) = s(frame, "output_file").and_then(read_workflow_result)
                     {
@@ -2860,7 +2926,13 @@ impl Projection {
         if row["type"] == "system"
             && !matches!(
                 s(row, "subtype"),
-                Some("compact_boundary" | "task_notification")
+                Some(
+                    "compact_boundary"
+                        | "task_notification"
+                        | "informational"
+                        | "local_command_output"
+                        | "hook_response"
+                )
             )
         {
             return Vec::new();
@@ -3315,5 +3387,68 @@ mod tests {
                 .iter()
                 .any(|event| event["item"]["type"] == "assistant_message")
         );
+    }
+
+    #[test]
+    fn task_notification_report_replaces_the_previous_child_report() {
+        let mut projection = Projection::new("claude");
+        let mut store = crate::agent::timeline::SubagentStore::default();
+        projection.begin_turn("t1");
+        let events = projection.project(&json!({"type":"system","subtype":"task_started",
+            "task_id":"agent-1","task_type":"local_agent","tool_use_id":"tool-1",
+            "subagent_type":"Explore","is_backgrounded":true}));
+        for event in events.iter().filter(|v| v["type"] == "provider_subagent") {
+            store.apply("parent", "claude", &event["event"]).unwrap();
+        }
+
+        for (uuid, summary) in [("notice-1", "First report"), ("notice-2", "Revised report")] {
+            // Reports can arrive after the launch turn, or after other turns.
+            projection.begin_turn(uuid);
+            let events = projection.project(&json!({"type":"system","subtype":"task_notification",
+                "task_id":"agent-1","uuid":uuid,"status":"completed","summary":summary,
+                "summary_is_report":true,"usage":{"total_tokens":30}}));
+            assert!(events.iter().all(|v| v["type"] == "provider_subagent"));
+            for event in events {
+                store.apply("parent", "claude", &event["event"]).unwrap();
+            }
+            let child = store.get("parent", "tool-1").unwrap();
+            assert_eq!(child["status"], "completed");
+            let timeline = store
+                .fetch_timeline("parent", "tool-1", &json!({}))
+                .unwrap();
+            let rows = timeline["rows"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["item"]["detail"]["text"], summary);
+        }
+    }
+
+    #[test]
+    fn hook_response_notifies_only_on_failure() {
+        let mut projection = Projection::new("claude");
+        let mut frame = json!({"type":"system","subtype":"hook_response","hook_name":"check",
+            "hook_event":"PreToolUse","outcome":"success","exit_code":0,
+            "stderr":"  invalid input  ","stdout":"fallback"});
+        assert!(projection.project(&frame).is_empty());
+        frame["outcome"] = json!("approved");
+        assert!(projection.project(&frame).is_empty());
+
+        frame["outcome"] = json!("error");
+        let events = projection.project(&frame);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["item"]["type"], "notification");
+        assert_eq!(events[0]["item"]["level"], "warning");
+        let message = events[0]["item"]["message"].as_str().unwrap();
+        assert!(message.contains("check") && message.contains("PreToolUse"));
+        assert!(message.ends_with("invalid input") && !message.contains("fallback"));
+
+        frame["outcome"] = json!("success");
+        frame["exit_code"] = json!(2);
+        frame["stderr"] = json!(" \n");
+        frame["stdout"] = json!(format!("{}omitted", "é".repeat(300)));
+        let events = projection.project(&frame);
+        assert_eq!(events.len(), 1);
+        let message = events[0]["item"]["message"].as_str().unwrap();
+        assert!(message.contains("exit code 2"));
+        assert!(message.ends_with("é…") && !message.contains("omitted"));
     }
 }

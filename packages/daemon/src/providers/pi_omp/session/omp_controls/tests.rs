@@ -60,6 +60,8 @@ fn fake_native_omp() {
     let mut removed = false;
     let mut promoted = false;
     let mut todo_phases = json!([]);
+    let mut is_settled = Some(true);
+    let mut terminal_polls = None;
     let notice =
         |id, text| json!({"type":"extension_ui_request","method":"notify","id":id,"message":text});
     let respond = |q: &Value, data: Value| {
@@ -102,8 +104,17 @@ fn fake_native_omp() {
                 } else {
                     json!(["other", "promote me"])
                 };
-                let mut state = json!({"sessionId":native_id,"sessionFile":file,"model":{"provider":provider,"id":"one","reasoning":true},"isSettled":true,"isStreaming":false,"isCompacting":false,"thinkingLevel":level,
+                let mut state = json!({"sessionId":native_id,"sessionFile":file,"model":{"provider":provider,"id":"one","reasoning":true},"isStreaming":false,"isCompacting":false,"thinkingLevel":level,
                     "steeringMode":"all","followUpMode":"one-at-a-time","queuedMessages":{"steering":steering,"followUp":follow_up,"liveSteered":1},"todoPhases":todo_phases});
+                if let Some(settled) = is_settled {
+                    state["isSettled"] = json!(settled);
+                }
+                if let Some(polls) = terminal_polls.as_mut() {
+                    *polls += 1;
+                    if *polls == 2 {
+                        println!("{}", notice("terminal-poll", "Still unsettled".into()));
+                    }
+                }
                 if native_id == "imported-fork" {
                     state["fastModeEnabled"] = json!(fast);
                     state["fastModeActive"] = json!(fast);
@@ -173,6 +184,42 @@ fn fake_native_omp() {
                 signed_out = true;
                 models_changed = false;
                 respond(&q, json!({}));
+            }
+            "prompt"
+                if matches!(
+                    q["message"].as_str(),
+                    Some("pause fixture" | "legacy fixture")
+                ) =>
+            {
+                let paused = q["message"] == "pause fixture";
+                is_settled = paused.then_some(false);
+                respond(&q, json!({"agentInvoked":true}));
+                println!("{}", json!({"type":"agent_start"}));
+                println!("{}", json!({"type":"turn_start"}));
+                let mut end = json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]});
+                if paused {
+                    end["isTerminal"] = json!(false);
+                    end["yielded"] = json!(true);
+                    end["awaitingAsyncWork"] = json!(true);
+                }
+                println!("{end}");
+                if paused {
+                    println!("{}", notice("pause", "Waiting for async work".into()));
+                }
+            }
+            "fixture_terminal" => {
+                terminal_polls = Some(0);
+                println!(
+                    "{}",
+                    json!({"type":"agent_end","isTerminal":true,"yielded":true,
+                    "messages":[{"role":"assistant","stopReason":"stop"}]})
+                );
+                respond(&q, Value::Null);
+            }
+            "fixture_settle" => {
+                terminal_polls = None;
+                is_settled = Some(true);
+                respond(&q, Value::Null);
             }
             "prompt"
                 if q["message"] == "prompt during shell"
@@ -482,6 +529,61 @@ async fn until(events: &mut mpsc::Receiver<Value>, predicate: impl Fn(&Value) ->
     })
     .await
     .expect("expected session event")
+}
+
+#[tokio::test]
+async fn omp_terminal_agent_end_waits_for_settlement_but_legacy_end_still_completes() {
+    let (_root, session, mut events) = open_fixture(true).await;
+    let runtime = session.inner.runtime().unwrap();
+    let paused = session
+        .start_turn(json!("pause fixture"), json!({}))
+        .await
+        .unwrap();
+    let terminal_event = |event: &Value| {
+        matches!(
+            event["type"].as_str(),
+            Some("turn_completed" | "turn_failed" | "turn_canceled")
+        )
+    };
+    until(&mut events, |event| {
+        assert!(!terminal_event(event), "ended on pause: {event}");
+        event["item"]["message"] == "Waiting for async work"
+    })
+    .await;
+    {
+        let state = session.inner.state.lock().unwrap();
+        assert_eq!(state.active.as_deref(), paused["turnId"].as_str());
+        assert!(!state.settling, "a pause must not start the idle deadline");
+    }
+    runtime
+        .request(json!({"type":"fixture_terminal"}))
+        .await
+        .unwrap();
+    until(&mut events, |event| {
+        assert!(
+            !terminal_event(event),
+            "ended before native settlement: {event}"
+        );
+        event["item"]["message"] == "Still unsettled"
+    })
+    .await;
+    runtime
+        .request(json!({"type":"fixture_settle"}))
+        .await
+        .unwrap();
+    let completed = until(&mut events, terminal_event).await;
+    assert_eq!(completed["type"], "turn_completed");
+    assert_eq!(completed["turnId"], paused["turnId"]);
+
+    let legacy = session
+        .start_turn(json!("legacy fixture"), json!({}))
+        .await
+        .unwrap();
+    let completed = until(&mut events, terminal_event).await;
+    assert_eq!(completed["type"], "turn_completed");
+    assert_eq!(completed["turnId"], legacy["turnId"]);
+    assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| terminal_event(&event)));
+    session.close().await.unwrap();
 }
 
 #[tokio::test]

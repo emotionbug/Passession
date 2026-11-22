@@ -52,6 +52,8 @@ pub(super) struct State {
     pub terminal_seen: HashSet<String>,
     pub terminal_ordinal: u64,
     pub last_plan: Option<String>,
+    /// The last plan explanation shown; plan updates repeat it while steps progress.
+    pub plan_explanation: Option<String>,
     pub assistant_boundary: bool,
     pub manual_compactions: usize,
     pub compactions: HashSet<String>,
@@ -490,6 +492,7 @@ impl CodexSession {
                 children,
                 orphan_events: HashMap::new(),
                 last_plan: None,
+                plan_explanation: None,
                 child_tools,
                 child_items,
                 terminal_commands: HashMap::new(),
