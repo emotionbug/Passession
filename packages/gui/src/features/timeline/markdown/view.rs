@@ -252,36 +252,34 @@ pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f6
         if let Some(candidate) = candidate
             && presentation.retarget(&candidate, d.look, w, opts, theme_epoch)
         {
+            let entries = presentation
                 .published
                 .as_ref()
-                let entries = presentation
-                    .published
-                    .as_ref()
-                    .filter(|doc| {
-                        doc.look == d.look
-                            && doc.theme_epoch == theme_epoch
-                            && doc.width == w
-                            && doc.font_size == opts.font_size
-                            && doc.occurrence == opts.find.as_ref().map(|find| find.occurrence)
-                    })
-                    .map(|doc| doc.cache.entries.clone())
-                    .unwrap_or_default();
-                entries
-                    .borrow_mut()
-                    .retain(|_, entry| entry.owner.strong_count() > 0);
-                presentation.preparing = Some(DocumentLayout {
-                    snapshot: candidate.clone(),
-                    chunks: candidate.chunks(),
-                    look: d.look,
-                    theme_epoch,
-                    width: w,
-                    font_size: opts.font_size,
-                    occurrence: opts.find.as_ref().map(|find| find.occurrence),
-                    cache: ParagraphCache {
-                        entries,
-                        ..Default::default()
-                    },
-                });
+                .filter(|doc| {
+                    doc.look == d.look
+                        && doc.theme_epoch == theme_epoch
+                        && doc.width == w
+                        && doc.font_size == opts.font_size
+                        && doc.occurrence == opts.find.as_ref().map(|find| find.occurrence)
+                })
+                .map(|doc| doc.cache.entries.clone())
+                .unwrap_or_default();
+            entries
+                .borrow_mut()
+                .retain(|_, entry| entry.owner.strong_count() > 0);
+            presentation.preparing = Some(DocumentLayout {
+                snapshot: candidate.clone(),
+                chunks: candidate.chunks(),
+                look: d.look,
+                theme_epoch,
+                width: w,
+                font_size: opts.font_size,
+                occurrence: opts.find.as_ref().map(|find| find.occurrence),
+                cache: ParagraphCache {
+                    entries,
+                    ..Default::default()
+                },
+            });
         }
         if let Some(mut preparing) = presentation.preparing.take() {
             prepare_document(cx, d, opts, &mut preparing, x, y);
