@@ -1009,7 +1009,8 @@ impl ClaudeSession {
             }
             return Ok(());
         }
-        let events = {
+        let mut mode_changed = None;
+        let mut events = {
             let mut state = self.state.lock().unwrap();
             state.tasks.observe(&frame);
             if frame["parent_tool_use_id"].as_str().is_some() {
@@ -1020,18 +1021,25 @@ impl ClaudeSession {
                     state.fresh_id = None;
                 }
                 if frame["type"] == "system" {
+                    // Claude reports its mode at each turn and when a permission
+                    // response or plan approval switches it.
+                    if matches!(frame["subtype"].as_str(), Some("init" | "status"))
+                        && let Some(mode) = frame["permissionMode"].as_str()
+                    {
+                        if state.mode != mode {
+                            mode_changed = Some(mode.to_owned());
+                        }
+                        state.mode = mode.to_owned();
+                        state.config["modeId"] = json!(mode);
+                        if mode != "plan" {
+                            state.plan_resume = Some(mode.to_owned());
+                        }
+                    }
                     match frame["subtype"].as_str() {
                         Some("init") => {
                             state.main_running = true;
                             state.runtime_model = frame["model"].as_str().map(str::to_owned);
                             state.interrupt_pending = false;
-                            if let Some(mode) = frame["permissionMode"].as_str() {
-                                state.mode = mode.to_owned();
-                                state.config["modeId"] = json!(mode);
-                                if mode != "plan" {
-                                    state.plan_resume = Some(mode.to_owned());
-                                }
-                            }
                             state.projection.set_context_window(catalog::context_window(
                                 frame["model"].as_str(),
                             ));
@@ -1080,6 +1088,9 @@ impl ClaudeSession {
                 state.projection.project(&frame)
             }
         };
+        if let Some(mode) = mode_changed {
+            events.push(json!({"type":"mode_changed","provider":self.spec.id,"currentModeId":mode,"availableModes":catalog::mode_catalog(&self.env)["modes"]}));
+        }
         self.emit(events).await
     }
 
@@ -1433,9 +1444,26 @@ impl AgentSession for ClaudeSession {
             .ok_or_else(|| {
                 anyhow!("Permission request '{request_id}' was already resolved or canceled")
             })?;
+        // "Allow all edits for this session" switches Claude's mode with the reply.
+        let granted_mode = native_response["updatedPermissions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .rev()
+            .filter(|update| update["type"] == "setMode" && update["destination"] == "session")
+            .find_map(|update| update["mode"].as_str())
+            .map(str::to_owned);
         runtime
             .reply(&permission.native_id, Ok(native_response))
             .await?;
+        if let Some(mode) = granted_mode {
+            let mut state = self.state.lock().unwrap();
+            if mode != "plan" {
+                state.plan_resume = Some(mode.clone());
+            }
+            state.config["modeId"] = json!(mode);
+            state.mode = mode;
+        }
         self.emit(projection::permission_resolution_events(
             &self.spec.id,
             &request,

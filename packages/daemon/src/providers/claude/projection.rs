@@ -36,6 +36,11 @@ pub struct Projection {
     emitted_handbacks: HashSet<String>,
     counter: u64,
     next_turn_ordinal: u64,
+    /// Claude's placeholder reply for a failed API request; the result decides the turn outcome.
+    api_error: Option<Value>,
+    /// Open "retrying the API" row and the number of rows opened so far.
+    retry: Option<String>,
+    retry_rows: u64,
 }
 
 #[derive(Default)]
@@ -114,6 +119,9 @@ impl Projection {
             emitted_handbacks: HashSet::new(),
             counter: 0,
             next_turn_ordinal: 1,
+            api_error: None,
+            retry: None,
+            retry_rows: 0,
         }
     }
 
@@ -255,8 +263,22 @@ impl Projection {
                 events.push(self.event(json!({"type":"thread_started","sessionId":session}), None));
             }
         }
+        if owner.is_none()
+            && matches!(s(frame, "type"), Some("stream_event" | "assistant"))
+            && frame["error"].is_null()
+        {
+            self.close_retry(None, &mut events);
+        }
         match s(frame, "type").unwrap_or("") {
             "system" if owner.is_none() => self.system(frame, &mut events),
+            "assistant"
+                if owner.is_none()
+                    && !self.replaying
+                    && frame["error"].is_string()
+                    && s(&frame["message"], "model") == Some("<synthetic>") =>
+            {
+                self.api_error = Some(frame.clone());
+            }
             "assistant" => {
                 if let Some(id) = owner.as_deref() {
                     if let Some(child) = self.tasks.get_mut(id) {
@@ -774,6 +796,7 @@ impl Projection {
                     }
                 }
             }
+            "api_retry" => self.retry_row(frame, events),
             "compact_boundary" => {
                 self.compaction_open = false;
                 let metadata = frame
@@ -982,8 +1005,65 @@ impl Projection {
         events.push(self.timeline(item, owner.as_deref()));
     }
 
+    /// Claude retries failed API requests silently for minutes; one row shows the latest attempt.
+    fn retry_row(&mut self, frame: &Value, events: &mut Vec<Value>) {
+        let id = match &self.retry {
+            Some(id) => id.clone(),
+            None => {
+                self.retry_rows += 1;
+                let id = format!("claude-api-retry-{}", self.retry_rows);
+                self.retry = Some(id.clone());
+                id
+            }
+        };
+        let reason = [
+            frame["error_status"].to_string(),
+            s(frame, "error").unwrap_or_default().to_owned(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty() && part != "null")
+        .collect::<Vec<_>>()
+        .join(" ");
+        let delay = number(frame, "retry_delay_ms").unwrap_or(0.0) / 1000.0;
+        let text = format!(
+            "Retrying in {delay:.1}s{}",
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(": {reason}")
+            }
+        );
+        let label = format!(
+            "Claude API retry {}/{}",
+            frame["attempt"], frame["max_retries"]
+        );
+        let item = json!({"type":"tool_call","callId":id,"name":"claude_api_retry","status":"running","error":null,
+            "detail":{"type":"plain_text","label":label,"text":text,"icon":"sparkles"},
+            "metadata":{"attempt":frame["attempt"],"maxRetries":frame["max_retries"],"errorStatus":frame["error_status"]}});
+        events.push(self.timeline(item, None));
+    }
+
+    fn close_retry(&mut self, error: Option<&str>, events: &mut Vec<Value>) {
+        let Some(id) = self.retry.take() else {
+            return;
+        };
+        let (status, label) = match error {
+            None => ("completed", "Claude API recovered"),
+            Some(_) => ("failed", "Claude API retries failed"),
+        };
+        let mut detail = json!({"type":"plain_text","label":label,"icon":"sparkles"});
+        if let Some(error) = error {
+            detail["text"] = json!(error);
+        }
+        let item = json!({"type":"tool_call","callId":id,"name":"claude_api_retry","status":status,"error":error,"detail":detail});
+        events.push(self.timeline(item, None));
+    }
+
     fn result(&mut self, frame: &Value, events: &mut Vec<Value>) {
         let usage = self.usage.result(frame, self.model.as_deref());
+        // A "success" result can still report an API error (`is_error`), such as an invalid key.
+        let failed = s(frame, "subtype") != Some("success") || frame["is_error"] == true;
+        let placeholder = self.api_error.take();
         if !self.announces_tasks {
             let ids: Vec<_> = self
                 .tasks
@@ -992,18 +1072,16 @@ impl Projection {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in ids {
-                self.set_status(
-                    &id,
-                    if frame["subtype"] == "success" {
-                        "completed"
-                    } else {
-                        "failed"
-                    },
-                    events,
-                );
+                self.set_status(&id, if failed { "failed" } else { "completed" }, events);
             }
         }
-        if s(frame, "subtype") == Some("success") {
+        if !failed {
+            self.close_retry(None, events);
+            if let Some(placeholder) = placeholder {
+                let content = &placeholder["message"]["content"];
+                let id = self.message_id(&placeholder, None, false);
+                self.text_content(content, &id, None, true, events);
+            }
             if !self.assistant_text
                 && number(&frame["usage"], "output_tokens") == Some(0.0)
                 && let Some(text) = s(frame, "result")
@@ -1027,7 +1105,13 @@ impl Projection {
                         .join("\n")
                 })
                 .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    s(frame, "result")
+                        .filter(|text| !text.trim().is_empty())
+                        .map(str::to_owned)
+                })
                 .unwrap_or_else(|| "Claude run failed".to_owned());
+            self.close_retry(Some(&error), events);
             let mut terminal = self.terminate_turn(false, &error);
             if let Some(event) = terminal.last_mut().filter(|e| e["type"] == "turn_canceled") {
                 event["type"] = json!("turn_failed");
@@ -1050,6 +1134,8 @@ impl Projection {
     }
     fn terminate_turn(&mut self, failed: bool, reason: &str) -> Vec<Value> {
         let mut events = Vec::new();
+        self.api_error = None;
+        self.close_retry(Some(reason), &mut events);
         let children: Vec<_> = self
             .tasks
             .iter()
@@ -1784,6 +1870,26 @@ pub fn permission_request(
         .or_else(|| native.get("suggestions"))
     {
         request["suggestions"] = suggestions.clone();
+        // Claude's own "don't ask again" choices, such as allowing all edits this session.
+        let remembered: Vec<Value> = suggestions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, update)| valid_permission_update(update))
+            .filter_map(|(index, update)| {
+                let label = suggestion_label(update)?;
+                Some(json!({"id":format!("allow_suggestion_{index}"),"label":label,"behavior":"allow","variant":"secondary"}))
+            })
+            .collect();
+        if kind == "tool" && !remembered.is_empty() {
+            let mut actions = vec![
+                json!({"id":"deny","label":"Deny","behavior":"deny","variant":"danger","intent":"dismiss"}),
+                json!({"id":"allow","label":"Allow","behavior":"allow","variant":"primary"}),
+            ];
+            actions.extend(remembered);
+            request["actions"] = json!(actions);
+        }
     }
     request
 }
@@ -1844,15 +1950,20 @@ pub fn permission_response(request: &Value, response: &Value) -> Result<Value> {
                 input = Value::Object(merged);
             }
             let mut result = json!({"behavior":"allow","updatedInput":input});
-            if let Some(updates) = response["updatedPermissions"].as_array() {
-                let updates: Vec<_> = updates
-                    .iter()
-                    .filter(|u| valid_permission_update(u))
-                    .cloned()
-                    .collect();
-                if !updates.is_empty() {
-                    result["updatedPermissions"] = json!(updates);
-                }
+            let chosen = s(response, "selectedActionId")
+                .and_then(|id| id.strip_prefix("allow_suggestion_"))
+                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|index| request["suggestions"].get(index));
+            let updates: Vec<_> = response["updatedPermissions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(chosen)
+                .filter(|u| valid_permission_update(u))
+                .cloned()
+                .collect();
+            if !updates.is_empty() {
+                result["updatedPermissions"] = json!(updates);
             }
             Ok(result)
         }
@@ -1860,12 +1971,67 @@ pub fn permission_response(request: &Value, response: &Value) -> Result<Value> {
     }
 }
 fn valid_permission_update(update: &Value) -> bool {
-    matches!(
-        s(update, "type"),
-        Some("addRules" | "replaceRules" | "removeRules")
-    ) && update["rules"].is_array()
-        && update["behavior"].is_string()
-        && update["destination"].is_string()
+    update["destination"].is_string()
+        && match s(update, "type") {
+            Some("addRules" | "replaceRules" | "removeRules") => {
+                update["rules"].is_array() && update["behavior"].is_string()
+            }
+            Some("setMode") => update["mode"].is_string(),
+            Some("addDirectories" | "removeDirectories") => update["directories"].is_array(),
+            _ => false,
+        }
+}
+/// The button label for one of Claude's permission suggestions; `None` hides it.
+fn suggestion_label(update: &Value) -> Option<String> {
+    let scope = match s(update, "destination")? {
+        "session" | "cliArg" => "for this session",
+        "localSettings" | "projectSettings" => "in this project",
+        "userSettings" => "in all projects",
+        _ => return None,
+    };
+    let label = match s(update, "type")? {
+        "addRules" if s(update, "behavior") == Some("allow") => {
+            let rules: Vec<String> = update["rules"]
+                .as_array()?
+                .iter()
+                .filter_map(|rule| {
+                    let tool = s(rule, "toolName")?;
+                    Some(match s(rule, "ruleContent").filter(|c| !c.is_empty()) {
+                        Some(content) => format!("{tool}({content})"),
+                        None => tool.to_owned(),
+                    })
+                })
+                .collect();
+            if rules.is_empty() {
+                return None;
+            }
+            let rules = rules.join(", ");
+            let rules = if rules.chars().count() > 80 {
+                format!("{}…", rules.chars().take(79).collect::<String>())
+            } else {
+                rules
+            };
+            format!("Always allow {rules} {scope}")
+        }
+        "setMode" => match s(update, "mode")? {
+            "acceptEdits" => format!("Allow all edits {scope}"),
+            "bypassPermissions" => format!("Bypass permissions {scope}"),
+            mode => format!("Switch to {mode} mode {scope}"),
+        },
+        "addDirectories" => {
+            let directories: Vec<&str> = update["directories"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if directories.is_empty() {
+                return None;
+            }
+            format!("Allow access to {} {scope}", directories.join(", "))
+        }
+        _ => return None,
+    };
+    Some(label)
 }
 pub fn permission_resolution_events(
     provider: &str,
@@ -3050,6 +3216,104 @@ mod tests {
             native["updatedInput"]["questions"][0]
                 .get("allowOther")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn permission_suggestions_become_remembered_choices() {
+        let native = json!({"tool_name":"Bash","input":{"command":"touch a"},"tool_use_id":"tu","permission_suggestions":[
+            {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch a"}],"behavior":"allow","destination":"localSettings"},
+            {"type":"addDirectories","directories":["/w"],"destination":"session"},
+            {"type":"setMode","mode":"acceptEdits","destination":"session"}]});
+        let request = permission_request("claude", "p1", &native, None);
+        let labels: Vec<_> = request["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["label"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Deny",
+                "Allow",
+                "Always allow Bash(touch a) in this project",
+                "Allow access to /w for this session",
+                "Allow all edits for this session"
+            ]
+        );
+        let edits = permission_response(
+            &request,
+            &json!({"behavior":"allow","selectedActionId":"allow_suggestion_2"}),
+        )
+        .unwrap();
+        assert_eq!(
+            edits["updatedPermissions"],
+            json!([native["permission_suggestions"][2]])
+        );
+        let once = permission_response(
+            &request,
+            &json!({"behavior":"allow","selectedActionId":"allow"}),
+        )
+        .unwrap();
+        assert!(once.get("updatedPermissions").is_none());
+    }
+
+    #[test]
+    fn api_errors_fail_the_turn_and_retries_show_progress() {
+        let mut projection = Projection::new("claude");
+        projection.begin_turn("t1");
+        let retry = projection.project(&json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,
+            "retry_delay_ms":1500,"error_status":401,"error":"authentication_failed","session_id":"s"}));
+        let row = retry
+            .iter()
+            .find(|event| event["item"]["name"] == "claude_api_retry")
+            .unwrap();
+        assert_eq!(row["item"]["status"], "running");
+        assert_eq!(
+            row["item"]["detail"]["text"],
+            "Retrying in 1.5s: 401 authentication_failed"
+        );
+        // Claude's placeholder reply is replaced by the failed turn's error.
+        let placeholder = projection.project(&json!({"type":"assistant","error":"authentication_failed","session_id":"s",
+            "message":{"id":"m","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Invalid API key"}]}}));
+        assert!(
+            !placeholder
+                .iter()
+                .any(|event| event["item"]["type"] == "assistant_message")
+        );
+        let end = projection.project(&json!({"type":"result","subtype":"success","is_error":true,
+            "result":"Invalid API key","session_id":"s","usage":{"output_tokens":0}}));
+        assert_eq!(
+            end.iter()
+                .find(|event| event["type"] == "turn_failed")
+                .unwrap()["error"],
+            "Invalid API key"
+        );
+        assert!(
+            end.iter()
+                .any(|event| event["item"]["name"] == "claude_api_retry"
+                    && event["item"]["status"] == "failed")
+        );
+
+        // A retry that recovers closes as soon as Claude streams again.
+        projection.begin_turn("t2");
+        projection.project(
+            &json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,
+            "retry_delay_ms":500,"error_status":529,"error":"overloaded","session_id":"s"}),
+        );
+        let recovered = projection.project(&json!({"type":"assistant","session_id":"s",
+            "message":{"id":"m2","model":"claude-sonnet-5-5","role":"assistant","content":[{"type":"text","text":"Hi"}]}}));
+        assert!(
+            recovered
+                .iter()
+                .any(|event| event["item"]["name"] == "claude_api_retry"
+                    && event["item"]["status"] == "completed")
+        );
+        assert!(
+            recovered
+                .iter()
+                .any(|event| event["item"]["type"] == "assistant_message")
         );
     }
 }

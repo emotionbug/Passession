@@ -1427,6 +1427,20 @@ impl AgentManager {
                     .respond_to_permission(request_id, response.clone())
                     .await?;
                 self.drain_events(&cell).await?;
+                // A response can switch the provider's mode, such as Claude leaving plan
+                // mode on approval or allowing all edits for the session.
+                if let Some(mode) = session.current_mode().await?
+                    && cell.data.lock().await.snapshot["currentModeId"] != json!(mode)
+                {
+                    let info = session.runtime_info().await?;
+                    self.update_snapshot(&cell, |snapshot| {
+                        snapshot["currentModeId"] = json!(mode);
+                        snapshot["config"]["modeId"] = json!(mode);
+                        snapshot["runtimeInfo"] = info;
+                        Ok(())
+                    })
+                    .await?;
+                }
                 let pending = cell.data.lock().await.snapshot["pendingPermissions"]
                     .as_array()
                     .is_some_and(|requests| {
