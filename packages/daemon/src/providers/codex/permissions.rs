@@ -148,6 +148,9 @@ pub fn request(
         if let Some(reason) = params["reason"].as_str() {
             req["description"] = json!(reason);
         }
+        if let Some(actions) = approval_actions(method, &params) {
+            req["actions"] = actions;
+        }
     }
     req["id"] = json!(id);
     req["provider"] = json!(provider);
@@ -170,6 +173,32 @@ pub fn automatic_reply(pending: &PendingPermission) -> Option<Value> {
     .then(|| json!({"action":"decline","content":null,"_meta":null}))
 }
 
+/// Codex's approval choices: this call, this session, or a lasting command prefix rule.
+fn approval_actions(method: &str, params: &Value) -> Option<Value> {
+    let session = match method {
+        "item/commandExecution/requestApproval" => "Allow this command for this session",
+        "item/fileChange/requestApproval" => "Allow changes to these files for this session",
+        _ => return None,
+    };
+    let mut actions = vec![
+        json!({"id":"decline","label":"Deny","behavior":"deny","variant":"danger","intent":"dismiss"}),
+        json!({"id":"accept","label":"Allow","behavior":"allow","variant":"primary"}),
+        json!({"id":"accept_session","label":session,"behavior":"allow","variant":"secondary"}),
+    ];
+    if let Some(prefix) = execpolicy_amendment(params) {
+        actions.push(json!({"id":"accept_always","label":format!("Always allow commands starting with `{}`", prefix.join(" ")),"behavior":"allow","variant":"secondary"}));
+    }
+    Some(json!(actions))
+}
+fn execpolicy_amendment(params: &Value) -> Option<Vec<&str>> {
+    let prefix: Vec<&str> = params["proposedExecpolicyAmendment"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    (!prefix.is_empty()).then_some(prefix)
+}
+
 pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
     let allow = response["behavior"] == "allow";
     let decision = if allow {
@@ -180,7 +209,17 @@ pub fn reply(pending: &PendingPermission, response: &Value) -> Result<Value> {
         "decline"
     };
     match pending.method.as_str() {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => Ok(json!({"decision":decision})),
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            let decision = match response["selectedActionId"].as_str().filter(|_| allow) {
+                Some("accept_session") => json!("acceptForSession"),
+                Some("accept_always") => match execpolicy_amendment(&pending.params) {
+                    Some(prefix) => json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":prefix}}),
+                    None => json!(decision),
+                },
+                _ => json!(decision),
+            };
+            Ok(json!({ "decision": decision }))
+        }
         "mcpServer/elicitation/request" => Ok(automatic_reply(pending).unwrap_or_else(||json!({"action":decision,"content":if allow { json!({}) } else { Value::Null },"_meta":null}))),
         "plan" => Ok(if allow { json!({"followUpPrompt":plan_prompt(pending.params["planText"].as_str().unwrap_or(""))}) } else { Value::Null }),
         "item/tool/requestUserInput" | "tool/requestUserInput" => {

@@ -61,6 +61,64 @@ fn permission_denial_uses_each_native_response_shape() {
 }
 
 #[test]
+fn approvals_offer_session_and_prefix_rule_choices() {
+    let params = json!({"threadId":"thread","turnId":"turn","itemId":"cmd","command":"cargo test",
+        "proposedExecpolicyAmendment":["cargo","test"]});
+    let pending = permissions::request(
+        "codex",
+        json!(3),
+        "item/commandExecution/requestApproval",
+        params,
+    )
+    .unwrap();
+    let ids: Vec<_> = pending.request["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            json!("decline"),
+            json!("accept"),
+            json!("accept_session"),
+            json!("accept_always")
+        ]
+    );
+    let reply = |id: &str| {
+        permissions::reply(&pending, &json!({"behavior":"allow","selectedActionId":id})).unwrap()
+    };
+    assert_eq!(
+        reply("accept_session"),
+        json!({"decision":"acceptForSession"})
+    );
+    assert_eq!(
+        reply("accept_always"),
+        json!({"decision":{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["cargo","test"]}}})
+    );
+    assert_eq!(
+        permissions::reply(&pending, &json!({"behavior":"allow"})).unwrap(),
+        json!({"decision":"accept"})
+    );
+    let files = permissions::request(
+        "codex",
+        json!(4),
+        "item/fileChange/requestApproval",
+        json!({"threadId":"thread","turnId":"turn","itemId":"patch"}),
+    )
+    .unwrap();
+    assert_eq!(files.request["actions"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        permissions::reply(
+            &files,
+            &json!({"behavior":"deny","selectedActionId":"decline"})
+        )
+        .unwrap(),
+        json!({"decision":"decline"})
+    );
+}
+#[test]
 fn multi_select_answers_keep_labels_that_contain_commas() {
     let params = json!({"threadId":"thread","turnId":"native-turn","itemId":"tool","questions":[
         {"id":"q","header":"Pick","question":"Which?","multiSelect":true,"isOther":true,
