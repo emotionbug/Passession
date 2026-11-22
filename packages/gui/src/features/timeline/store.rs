@@ -493,6 +493,7 @@ pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
         return;
     }
     super::mermaid::handle_event(cx, event);
+    super::attachment_export::handle_event(event);
     if ui
         .events
         .iter()

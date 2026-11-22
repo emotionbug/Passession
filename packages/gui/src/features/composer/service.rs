@@ -5,6 +5,7 @@
 //! The shell feeds it each core event batch (`handle_core_events`) and background signals
 //! (`poll_background`). GUI thread only.
 
+use super::attachments::ImageImportError;
 use super::blobs::{BlobJob, BlobResult, BlobStore, StatFile};
 use super::drafts::*;
 use super::i18n::t;
@@ -13,6 +14,7 @@ use super::state_keys;
 use crate::common::{UiContext, UiEffect};
 use makepad_widgets::{Cx, SignalToUI};
 use paseo_gui_core::{CoreError, CoreEvent, CoreHandle, CoreState};
+use paseo_gui_platform::{ClipboardImage, PickedFile};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -66,7 +68,7 @@ pub enum PanelNotice {
     /// Image blobs stored for a paste/pick/drop.
     ImagesStored {
         token: u64,
-        images: Result<Vec<Value>, String>,
+        images: Result<Vec<Value>, ImageImportError>,
     },
     /// Dropped/picked paths were inspected.
     FilesStat {
@@ -237,6 +239,19 @@ impl Drop for DraftSaveTimer {
     }
 }
 
+struct SentAttachments {
+    host: String,
+    agent: String,
+    message: String,
+    content: Value,
+}
+
+impl SentAttachments {
+    fn matches(&self, host: &str, agent: &str, message: &str) -> bool {
+        self.host == host && self.agent == agent && self.message == message
+    }
+}
+
 pub struct ComposerService {
     pub(super) core: Option<CoreHandle>,
     pub drafts: DraftStore,
@@ -247,7 +262,7 @@ pub struct ComposerService {
     /// Draft keys with a send in flight → message id (Flutter `sending`/`_activeSendId`).
     pub(super) active_sends: HashMap<String, String>,
     pub(super) creations: HashMap<String, super::creation::DraftCreation>,
-    sent: VecDeque<(String, Value)>,
+    sent: VecDeque<SentAttachments>,
     handoffs: HashSet<String>,
     handoff_revision: u64,
     pub blobs: BlobStore,
@@ -397,31 +412,39 @@ impl ComposerService {
     // ----- sent messages / handoffs (timeline read API) -----
 
     /// Flutter SentUserMessages.remember (64 entries).
-    pub(super) fn remember_sent(&mut self, agent_id: &str, message: &Value) {
+    pub(super) fn remember_sent(&mut self, host: &str, agent_id: &str, message: &Value) {
         let id = s(get(message, "messageId"));
         let images = list(get(message, "images"));
         let attachments = list(get(message, "attachments"));
-        if agent_id.is_empty() || id.is_empty() || (images.is_empty() && attachments.is_empty()) {
+        if host.is_empty()
+            || agent_id.is_empty()
+            || id.is_empty()
+            || (images.is_empty() && attachments.is_empty())
+        {
             return;
         }
-        let key = format!("{agent_id}/{id}");
-        self.sent.retain(|(k, _)| k != &key);
-        self.sent
-            .push_back((key, json!({"images": images, "attachments": attachments})));
+        self.sent.retain(|entry| !entry.matches(host, agent_id, id));
+        self.sent.push_back(SentAttachments {
+            host: host.to_owned(),
+            agent: agent_id.to_owned(),
+            message: id.to_owned(),
+            content: json!({"images": images, "attachments": attachments}),
+        });
         while self.sent.len() > 64 {
             self.sent.pop_front();
         }
     }
 
-    pub fn sent_lookup(&self, agent_id: &str, client_message_id: &str) -> Option<Value> {
-        if client_message_id.is_empty() {
-            return None;
-        }
-        let key = format!("{agent_id}/{client_message_id}");
+    pub(super) fn sent_lookup(
+        &self,
+        host: &str,
+        agent_id: &str,
+        client_message_id: &str,
+    ) -> Option<Value> {
         self.sent
             .iter()
-            .find(|(k, _)| k == &key)
-            .map(|(_, v)| v.clone())
+            .find(|entry| entry.matches(host, agent_id, client_message_id))
+            .map(|entry| entry.content.clone())
     }
 
     fn handoff_key(host: &str, agent: &str) -> String {
@@ -698,7 +721,7 @@ impl ComposerService {
             s(get(&job.message, "messageId")).to_owned(),
         );
         if job.origin == SendOrigin::Pending || matches!(job.origin, SendOrigin::Queue { .. }) {
-            self.remember_sent(&job.agent_id, &job.message);
+            self.remember_sent(&job.host, &job.agent_id, &job.message);
         }
         self.bump();
         self.flush_then(AfterFlush::Send(job));
@@ -884,20 +907,14 @@ impl ComposerService {
     // ----- blobs -----
 
     /// Store clipboard image bytes for `panel`; the result arrives as `ImagesStored`.
-    pub fn store_image_bytes(
-        &mut self,
-        panel: u64,
-        bytes: std::sync::Arc<Vec<u8>>,
-        mime: Option<String>,
-    ) -> u64 {
+    pub fn store_image_bytes(&mut self, panel: u64, image: ClipboardImage) -> u64 {
         let token = self.blobs.next_token();
         self.blob_owners.insert(token, panel);
-        self.blobs
-            .submit(BlobJob::StoreBytes { token, bytes, mime });
+        self.blobs.submit(BlobJob::StoreBytes { token, image });
         token
     }
 
-    pub fn import_images(&mut self, panel: u64, files: Vec<(std::path::PathBuf, String)>) -> u64 {
+    pub fn import_images(&mut self, panel: u64, files: Vec<PickedFile>) -> u64 {
         let token = self.blobs.next_token();
         self.blob_owners.insert(token, panel);
         self.blobs.submit(BlobJob::ImportImages { token, files });
@@ -958,6 +975,24 @@ impl ComposerService {
 mod queue_recovery_tests {
     use super::*;
     use paseo_gui_core::{CoreConfig, GuiCore};
+
+    #[test]
+    fn sent_attachment_receipts_are_isolated_by_host() {
+        let mut service = ComposerService::new();
+        let message = |id| json!({"messageId": "same", "images": [{"blobId": id}]});
+        service.remember_sent("host-a", "agent", &message("a"));
+        service.remember_sent("host-b", "agent", &message("b"));
+        service.remember_sent("host-a", "agent", &message("a-new"));
+        assert_eq!(
+            service.sent_lookup("host-a", "agent", "same").unwrap()["images"][0]["blobId"],
+            "a-new"
+        );
+        assert_eq!(
+            service.sent_lookup("host-b", "agent", "same").unwrap()["images"][0]["blobId"],
+            "b"
+        );
+        assert!(service.sent_lookup("host-c", "agent", "same").is_none());
+    }
 
     #[test]
     fn overflow_wakes_pending_delivery_on_the_same_connection() {

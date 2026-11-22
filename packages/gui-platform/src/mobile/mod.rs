@@ -35,6 +35,9 @@ pub(crate) enum MobileSignal {
     Link(String),
     /// A notification tap: (delivery identity, application data).
     NotificationTap(String, Map<String, Value>),
+    /// The Android Sharesheet handed us private copies, not provider URI grants.
+    #[cfg(target_os = "android")]
+    SharedImages(Result<Arc<crate::SharedImages>, crate::ImageShareError>),
     /// The app returned to the foreground.
     Resumed,
     Insets(SafeInsets),
@@ -204,6 +207,10 @@ pub(crate) fn handle_event(
         match signal {
             MobileSignal::Link(url) => shared.mobile.route(PlatformEvent::ConnectionLink { url }),
             MobileSignal::NotificationTap(id, data) => receive_tap(shared, id, data),
+            #[cfg(target_os = "android")]
+            MobileSignal::SharedImages(share) => {
+                shared.mobile.route(PlatformEvent::SharedImages(share));
+            }
             MobileSignal::Resumed => {
                 // Original didChangeAppLifecycleState(resumed). The badge is not reset here:
                 // the shell re-sends the count of sessions still waiting once it is visible.

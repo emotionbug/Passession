@@ -1951,9 +1951,8 @@ impl ChatSession {
             || (self.rows.is_empty() && !self.timeline.is_empty())
         {
             let refold = self.fold.consumed == 0;
-            let agent_id = self.key.agent_id.clone();
             for row in &self.rows[self.fold.consumed..] {
-                self.fold.add(&agent_id, row);
+                self.fold.add(&self.key.host_id, &self.key.agent_id, row);
             }
             self.fold.consumed = self.rows.len();
             if refold && !self.timeline.is_empty() {

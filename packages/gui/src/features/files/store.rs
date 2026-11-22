@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use makepad_widgets::*;
@@ -98,8 +99,8 @@ enum PlatformPending {
     SaveLocation(u64),
     /// Open/share of a finished download; the transfer card is already gone.
     TransferFinish,
-    /// A downloaded image saving into the phone's photo library.
-    PhotoSave,
+    /// Native save reads the staging copy until its completion, including cancellation.
+    SaveCopy(PathBuf),
     Clipboard {
         owner: String,
     },
@@ -947,42 +948,34 @@ impl Store {
                 return;
             }
         };
-        let local = value
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let mime = value
-            .get("mime")
-            .and_then(Value::as_str)
-            .unwrap_or("application/octet-stream")
-            .to_owned();
         if value.get("saved") == Some(&Value::Bool(true)) {
-            host::toast(ui, lf("Saved to {path}", &[("path", &local)]), false);
+            let local = value["path"].as_str().unwrap_or("");
+            host::toast(ui, lf("Saved to {path}", &[("path", local)]), false);
             return;
         }
         let Some(platform) = host::platform() else {
+            transfer::remove_staging_later(transfer.staging);
+            host::toast(ui, l("Platform services are not available"), true);
             return;
         };
-        let path = std::path::PathBuf::from(&local);
-        let request = match transfer.mode {
-            TransferMode::Open => platform.open_path(&path),
-            // Phones save an image into the photo library, like "Save image" elsewhere.
-            TransferMode::Save if platform.capabilities().photo_library && is_photo_mime(&mime) => {
-                let request = platform.save_image(&path, &mime, &transfer.name);
-                self.platform_pending
-                    .insert(request, PlatformPending::PhotoSave);
-                return;
-            }
-            // Mobile "save" shares (no save dialog), like the original.
-            TransferMode::Share | TransferMode::Save => {
-                platform.share_file(&path, &mime, &transfer.name)
-            }
+        let path = transfer.staging;
+        let mime = value["mime"].as_str().unwrap_or("application/octet-stream");
+        if transfer.mode == TransferMode::Save {
+            let request = if platform.capabilities().photo_library && is_photo_mime(mime) {
+                platform.save_image(&path, mime, &transfer.name)
+            } else {
+                platform.save_file(&path, mime, &transfer.name)
+            };
+            self.platform_pending.insert(request, PlatformPending::SaveCopy(path));
+            return;
+        }
+        // An external reader can keep using the staged copy after the chooser closes.
+        let request = if transfer.mode == TransferMode::Open {
+            platform.open_path(&path)
+        } else {
+            platform.share_file(&path, mime, &transfer.name)
         };
-        self.platform_pending
-            .insert(request, PlatformPending::TransferFinish);
-        // The staging copy is kept: it must outlive the external app/share sheet and lives in
-        // the temp directory, as in the original.
+        self.platform_pending.insert(request, PlatformPending::TransferFinish);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1095,16 +1088,15 @@ impl Store {
                     host::toast(ui, error.message, true);
                 }
             }
-            PlatformPending::PhotoSave => match result {
-                Ok(PlatformValue::PhotoLibrarySaved) => host::toast(ui, l("Saved to Photos"), false),
-                Ok(PlatformValue::Bool(true)) => host::toast(ui, l("Image saved"), false),
-                Ok(_) => {}
-                Err(error) => {
-                    if error.code != "cancelled" {
-                        host::toast(ui, error.message, true);
-                    }
+            PlatformPending::SaveCopy(path) => {
+                transfer::remove_staging_later(path);
+                match result {
+                    Ok(PlatformValue::PhotoLibrarySaved) => host::toast(ui, l("Saved to Photos"), false),
+                    Ok(PlatformValue::Bool(true)) => host::toast(ui, l("File saved"), false),
+                    Err(error) if error.code != "cancelled" => host::toast(ui, error.message, true),
+                    _ => {}
                 }
-            },
+            }
             PlatformPending::Clipboard { owner } => match result {
                 Ok(PlatformValue::Clipboard(content)) => {
                     if let Some(text) = content.text {

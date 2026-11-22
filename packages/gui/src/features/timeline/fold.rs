@@ -251,7 +251,7 @@ impl TimelineFold {
         self.consumed = 0;
     }
 
-    pub fn add(&mut self, agent_id: &str, row: &Value) {
+    pub(super) fn add(&mut self, host_id: &str, agent_id: &str, row: &Value) {
         let item = get(row, "item");
         let kind = str_of(get(item, "type"));
         let mut next_item = None;
@@ -300,13 +300,28 @@ impl TimelineFold {
                 self.plugins.insert(identity, self.entries.len());
             }
             "user_message" => {
+                // A daemon row can carry inline image bytes, but only the local
+                // composer may name a file in the client's content-addressed store.
+                if list(get(item, "images"))
+                    .iter()
+                    .any(|image| image.get("blobId").is_some())
+                {
+                    let mut sanitized = item.clone();
+                    if let Some(images) = sanitized["images"].as_array_mut() {
+                        for image in images.iter_mut().filter_map(Value::as_object_mut) {
+                            image.remove("blobId");
+                        }
+                    }
+                    next_item = Some(sanitized);
+                }
                 // stream.ts produceUserMessage "existing": the daemon echoes a
                 // prompt without its images/attachments; the sending composer kept them.
                 if let Some(local) = super::composer_bridge::sent_attachments(
+                    host_id,
                     agent_id,
                     str_of(get(item, "clientMessageId")),
                 ) {
-                    let mut m = map(item).clone();
+                    let mut m = map(next_item.as_ref().unwrap_or(item)).clone();
                     if list(get(item, "images")).is_empty() {
                         m.insert("images".into(), get(&local, "images").clone());
                     }
@@ -437,6 +452,23 @@ fn value_text(value: &Value) -> String {
 mod streaming_fold_tests {
     use super::*;
 
+    #[test]
+    fn wire_images_cannot_reference_the_local_blob_store() {
+        let mut fold = TimelineFold::default();
+        fold.add(
+            "host",
+            "agent",
+            &json!({"item": {"type": "user_message", "images": [
+                {"blobId": "another-hosts-local-blob"},
+                {"blobId": "some-other-blob", "data": "aW1hZ2U=", "mimeType": "image/png"}
+            ]}}),
+        );
+        let images = &fold.entries[0]["item"]["images"];
+        assert!(images[0].get("blobId").is_none());
+        assert!(images[1].get("blobId").is_none());
+        assert_eq!(images[1]["data"], "aW1hZ2U=");
+    }
+
     fn chunk(seq: i64, text: &str, message: &str) -> Value {
         json!({
             "seqStart": seq,
@@ -451,11 +483,11 @@ mod streaming_fold_tests {
     #[test]
     fn streaming_append_preserves_published_snapshot_and_source_ranges() {
         let mut fold = TimelineFold::default();
-        fold.add("agent", &chunk(1, "한", "message"));
+        fold.add("host", "agent", &chunk(1, "한", "message"));
         let published = fold.entries[0].clone();
-        fold.add("agent", &chunk(3, "\r글", "message"));
-        fold.add("agent", &chunk(4, "\u{1f469}\u{200d}", "message"));
-        fold.add("agent", &chunk(5, "\u{1f4bb}", "message"));
+        fold.add("host", "agent", &chunk(3, "\r글", "message"));
+        fold.add("host", "agent", &chunk(4, "\u{1f469}\u{200d}", "message"));
+        fold.add("host", "agent", &chunk(5, "\u{1f4bb}", "message"));
 
         assert_eq!(published["item"]["text"], "한");
         assert_eq!(published["seqEnd"], 1);
@@ -476,9 +508,9 @@ mod streaming_fold_tests {
     #[test]
     fn distinct_message_identity_is_not_joined_by_batching() {
         let mut fold = TimelineFold::default();
-        fold.add("agent", &chunk(1, "first", "one"));
-        fold.add("agent", &chunk(2, "second", "two"));
-        fold.add("agent", &chunk(3, " continued", "two"));
+        fold.add("host", "agent", &chunk(1, "first", "one"));
+        fold.add("host", "agent", &chunk(2, "second", "two"));
+        fold.add("host", "agent", &chunk(3, " continued", "two"));
         assert_eq!(
             fold.entries
                 .iter()

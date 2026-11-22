@@ -707,7 +707,7 @@ impl ComposerService {
             );
         }
         let message = creation.message.clone();
-        self.remember_sent(&agent_id, &message);
+        self.remember_sent(&creation.host, &agent_id, &message);
         let workspace_id = s_or(get(&agent, "workspaceId"), &creation.workspace_id).to_owned();
         let cwd = s_or(get(&agent, "cwd"), &creation.cwd).to_owned();
         let title = s_or(get(&agent, "title"), &t("sessionNavigation.newSession")).to_owned();

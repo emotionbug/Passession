@@ -307,15 +307,13 @@ pub(crate) fn read_clipboard(shared: &Arc<Shared>, images_only: bool, done: Comp
         if let Some(path) = reply.get("imagePath").and_then(Value::as_str) {
             let bytes = std::fs::read(path)?;
             let _ = crate::paths::remove_transfer_staging(std::path::Path::new(path));
-            let mime = crate::image::sniff_image_mime(&bytes)
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    PlatformError::invalid("The clipboard image is not PNG, JPEG, GIF or WebP.")
-                })?;
+            let hint = reply.get("mimeType").and_then(Value::as_str);
+            let mime = crate::image::sniff_image_mime_with_hint(&bytes, hint)
+                .ok_or_else(|| PlatformError::invalid("Unsupported or invalid clipboard image."))?;
             return Ok(PlatformValue::Clipboard(ClipboardContent {
                 images: vec![ClipboardImage {
                     bytes: Arc::new(bytes),
-                    mime_type: mime,
+                    mime_type: mime.to_owned(),
                 }],
                 text: None,
             }));

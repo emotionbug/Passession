@@ -8,8 +8,8 @@ pub(crate) mod native;
 
 use crate::{
     action::{
-        PlatformError, PlatformEvent, PlatformRequestId, PlatformValue, TailnetControl, post_event,
-        post_result,
+        ImageShareError, PickedFile, PlatformError, PlatformEvent, PlatformRequestId,
+        PlatformValue, SharedImages, TailnetControl, post_event, post_result,
     },
     mobile::{MobileSignal, deliver},
     platform::Completion,
@@ -22,7 +22,8 @@ use jni::{
 use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
-    sync::{LazyLock, Mutex, atomic::AtomicI64},
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex, atomic::AtomicI64},
 };
 
 type Convert = fn(Value) -> Result<PlatformValue, PlatformError>;
@@ -215,6 +216,55 @@ pub extern "system" fn Java_sh_paseo_sessions_PaseoBridge_nativeResult(
     finish(id, parse_reply(&reply));
 }
 
+fn shared_images(payload: &Value) -> Result<Arc<SharedImages>, ImageShareError> {
+    use ImageShareError::*;
+
+    if let Some(error) = payload.get("error").and_then(Value::as_str) {
+        return Err(match error {
+            "unsupported" => Unsupported,
+            "limits" => Limits,
+            "unreadable" => Unreadable,
+            "busy" => Busy,
+            _ => Invalid,
+        });
+    }
+    // Only PaseoShareActivity's one-time, in-process hand-off constructs this
+    // payload; extras from exported activities cannot supply cache paths.
+    let directory = PathBuf::from(payload["directory"].as_str().ok_or(Invalid)?);
+    if !directory.is_absolute()
+        || directory
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("paseo-inbound-share")
+        || !directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("batch-"))
+    {
+        return Err(Invalid);
+    }
+    let mut share = SharedImages {
+        directory,
+        files: Vec::new(),
+    };
+    let files = payload["files"].as_array().ok_or(Invalid)?;
+    if files.is_empty() {
+        return Err(Invalid);
+    }
+    share.files.reserve(files.len());
+    for (index, file) in files.iter().enumerate() {
+        share.files.push(PickedFile {
+            path: share.directory.join(format!("image-{}", index + 1)),
+            name: file["name"].as_str().ok_or(Invalid)?.to_owned(),
+            mime_type: Some(file["mimeType"].as_str().ok_or(Invalid)?.to_owned()),
+            size: file["size"].as_u64().ok_or(Invalid)?,
+            temporary: true,
+        });
+    }
+    Ok(Arc::new(share))
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_sh_paseo_sessions_PaseoBridge_nativeEvent(
     mut env: JNIEnv,
@@ -233,6 +283,7 @@ pub extern "system" fn Java_sh_paseo_sessions_PaseoBridge_nativeEvent(
     };
     match kind.as_str() {
         "link" => deliver(MobileSignal::Link(text("url"))),
+        "sharedImages" => deliver(MobileSignal::SharedImages(shared_images(&payload))),
         "notificationTap" => {
             let data = payload
                 .get("data")

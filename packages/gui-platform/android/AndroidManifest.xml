@@ -88,6 +88,23 @@
             </intent-filter>
         </activity>
 
+        <!-- Incoming shares copy under a task-scoped read grant, then open MainActivity. -->
+        <activity
+            android:name=".PaseoShareActivity"
+            android:exported="true"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <action android:name="android.intent.action.SEND_MULTIPLE"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="image/*"/>
+            </intent-filter>
+        </activity>
+
         <!-- Firebase is optional; without google-services.json FirebaseApp never
              initializes and this service receives nothing. -->
         <service

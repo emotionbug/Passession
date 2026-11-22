@@ -80,7 +80,7 @@ const KO: &[(&str, &str)] = &[
     ("Cancel", "취소"),
     ("Saved to {path}", "{path}에 저장했습니다"),
     ("Saved to Photos", "사진에 저장했습니다"),
-    ("Image saved", "이미지를 저장했습니다"),
+    ("File saved", "파일을 저장했습니다"),
     ("Copied", "복사했습니다"),
     (
         "Local desktop host is not available",

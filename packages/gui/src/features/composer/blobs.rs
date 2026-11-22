@@ -1,16 +1,21 @@
 //! Retained composer images. Pasted, picked and dropped images become immutable,
 //! content-addressed files (`<blob_dir>/<sha256>`); drafts keep only
-//! `{blobId, mimeType, byteSize}`. The worker handles retained-blob IO and hashing, plus
-//! image decoding. Legacy inline drafts fingerprint each attachment when admitted. Decoded
-//! pixels arrive through a `ToUIReceiver` and become cached textures on the GUI thread.
+//! `{blobId, mimeType, byteSize}` and an optional original filename. The worker handles
+//! retained-blob IO, hashing and decoding. Legacy inline drafts fingerprint each attachment
+//! at admission. Decoded pixels arrive through a `ToUIReceiver` and become cached textures
+//! on the GUI thread.
 
-use super::attachments::{raster_image_mime_type, sniff_image_mime};
+use super::attachments::{
+    ImageImportError, clipboard_image_mime, raster_image_mime_type, read_image_file,
+};
 use makepad_widgets::image_cache::ImageBuffer;
 use makepad_widgets::*;
+use paseo_gui_platform::image::sniff_image_header;
+use paseo_gui_platform::{ClipboardImage, PickedFile};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
@@ -26,15 +31,21 @@ pub enum BlobJob {
     /// Store raw image bytes (clipboard).
     StoreBytes {
         token: u64,
-        bytes: Arc<Vec<u8>>,
-        mime: Option<String>,
+        image: ClipboardImage,
     },
     /// Read image files from disk and store them (picker/drop).
     ImportImages {
         token: u64,
-        files: Vec<(PathBuf, String)>,
+        files: Vec<PickedFile>,
     },
-    /// Stat dropped/picked paths: (path, name, size, raster image mime).
+    /// Import a user-accepted inbound share for an exact draft. The source lease
+    /// moves with the job, including if its requester closes before IO finishes.
+    ImportSharedImages {
+        share: Arc<paseo_gui_platform::SharedImages>,
+        inline: bool,
+        reply: ToUISender<Result<Vec<Value>, String>>,
+    },
+    /// Inspect dropped paths before routing them to the image tray or file upload.
     Stat { token: u64, paths: Vec<PathBuf> },
     Decode {
         key: String,
@@ -123,10 +134,10 @@ pub struct DecodedImage {
 }
 
 pub enum BlobResult {
-    /// Draft image entries `{blobId, mimeType, byteSize}` or the error text.
+    /// Draft entries `{blobId, mimeType, byteSize}` or an import failure.
     Stored {
         token: u64,
-        images: Result<Vec<Value>, String>,
+        images: Result<Vec<Value>, ImageImportError>,
     },
     Stat {
         token: u64,
@@ -140,10 +151,39 @@ pub enum BlobResult {
 
 #[derive(Clone, Debug)]
 pub struct StatFile {
-    pub path: PathBuf,
-    pub name: String,
-    pub size: u64,
-    pub image_mime: Option<&'static str>,
+    pub file: PickedFile,
+    pub is_image: bool,
+}
+
+impl StatFile {
+    pub(crate) fn inspect(path: PathBuf) -> Result<Self, String> {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let error = |error: std::io::Error| format!("{name}: {error}");
+        let metadata = std::fs::metadata(&path).map_err(error)?;
+        let size = metadata.len();
+        let mut is_image = raster_image_mime_type(&name).is_some();
+        if !is_image && metadata.is_file() && let Ok(len) = usize::try_from(size) {
+            let mut header = [0; 512];
+            let count = header.len().min(len);
+            std::fs::File::open(&path)
+                .and_then(|mut file| file.read_exact(&mut header[..count]))
+                .map_err(error)?;
+            is_image = sniff_image_header(&header[..count], len).is_some();
+        }
+        Ok(Self {
+            file: PickedFile {
+                path,
+                name,
+                size,
+                mime_type: None,
+                temporary: false,
+            },
+            is_image,
+        })
+    }
 }
 
 fn blob_path(dir: &Path, id: &str) -> Option<PathBuf> {
@@ -155,11 +195,7 @@ fn blob_path(dir: &Path, id: &str) -> Option<PathBuf> {
     .then(|| dir.join(id))
 }
 
-fn store(dir: &Path, bytes: &[u8], mime: Option<&str>) -> Result<Value, String> {
-    let mime = sniff_image_mime(bytes)
-        .map(str::to_owned)
-        .or_else(|| mime.map(str::to_owned))
-        .unwrap_or_else(|| "image/png".to_owned());
+fn store(dir: &Path, bytes: &[u8], mime: &str) -> Result<Value, String> {
     let id = format!("{:x}", Sha256::digest(bytes));
     let path = blob_path(dir, &id).ok_or("invalid blob id")?;
     if !path.exists() {
@@ -174,6 +210,36 @@ fn store(dir: &Path, bytes: &[u8], mime: Option<&str>) -> Result<Value, String> 
         std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
     }
     Ok(json!({"blobId": id, "mimeType": mime, "byteSize": bytes.len()}))
+}
+
+/// Retain a validated image with its original bytes. The caller owns the source file.
+pub(crate) fn import_image(dir: &Path, file: &PickedFile) -> Result<Value, ImageImportError> {
+    let (bytes, mime) = read_image_file(file)?;
+    let mut image = store(dir, &bytes, mime).map_err(ImageImportError::Io)?;
+    set_image_file_name(&mut image, &file.name);
+    Ok(image)
+}
+
+/// The New Session form keeps inline images until its creation request is saved.
+pub(crate) fn encode_picked_image(file: &PickedFile) -> Result<Value, ImageImportError> {
+    let (bytes, mime) = read_image_file(file)?;
+    let mut image = encode_image(&bytes, mime);
+    set_image_file_name(&mut image, &file.name);
+    Ok(image)
+}
+
+fn set_image_file_name(image: &mut Value, name: &str) {
+    if !name.is_empty() {
+        image["fileName"] = json!(name);
+    }
+}
+
+pub(crate) fn encode_image(bytes: &[u8], mime: &str) -> Value {
+    use base64::Engine;
+    json!({
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "mimeType": mime,
+    })
 }
 
 /// Read a retained blob (also used by send operations on the core runtime).
@@ -231,38 +297,38 @@ fn run_worker(
 ) {
     while let Ok(job) = jobs.recv() {
         let result = match job {
-            BlobJob::StoreBytes { token, bytes, mime } => BlobResult::Stored {
+            BlobJob::StoreBytes { token, image } => BlobResult::Stored {
                 token,
-                images: store(&dir, &bytes, mime.as_deref()).map(|image| vec![image]),
+                images: clipboard_image_mime(&image)
+                    .and_then(|mime| store(&dir, &image.bytes, mime).map_err(ImageImportError::Io))
+                    .map(|image| vec![image]),
             },
             BlobJob::ImportImages { token, files } => {
                 let images = files
                     .iter()
-                    .map(|(path, name)| {
-                        let bytes = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
-                        store(&dir, &bytes, raster_image_mime_type(name))
-                    })
+                    .map(|file| import_image(&dir, file))
                     .collect();
                 BlobResult::Stored { token, images }
             }
-            BlobJob::Stat { token, paths } => {
-                let files = paths
-                    .into_iter()
-                    .map(|path| {
-                        let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                        let image_mime = raster_image_mime_type(&name);
-                        Ok(StatFile {
-                            path,
-                            name,
-                            size: metadata.len(),
-                            image_mime,
-                        })
+            BlobJob::ImportSharedImages { share, inline, reply } => {
+                let images = share
+                    .files()
+                    .iter()
+                    .map(|file| {
+                        if inline {
+                            encode_picked_image(file)
+                        } else {
+                            import_image(&dir, file)
+                        }
                     })
-                    .collect();
+                    .collect::<Result<_, ImageImportError>>()
+                    .map_err(|error| format!("{error:?}"));
+                drop(share);
+                let _ = reply.send(images);
+                continue;
+            }
+            BlobJob::Stat { token, paths } => {
+                let files = paths.into_iter().map(StatFile::inspect).collect();
                 BlobResult::Stat { token, files }
             }
             BlobJob::Decode { key, source, max } => BlobResult::Decoded {
@@ -334,7 +400,7 @@ impl BlobStore {
         self.next_token
     }
 
-    pub fn submit(&mut self, job: BlobJob) {
+    pub fn submit(&mut self, job: BlobJob) -> bool {
         if self.jobs.is_none() {
             let (sender, receiver) = channel();
             let dir = self.dir.clone();
@@ -343,13 +409,11 @@ impl BlobStore {
                 .name("paseo-composer-blobs".into())
                 .spawn(move || run_worker(dir, receiver, results));
             if spawned.is_err() {
-                return;
+                return false;
             }
             self.jobs = Some(sender);
         }
-        if let Some(jobs) = &self.jobs {
-            let _ = jobs.send(job);
-        }
+        self.jobs.as_ref().is_some_and(|jobs| jobs.send(job).is_ok())
     }
 
     pub fn try_recv(&mut self) -> Option<BlobResult> {
@@ -448,6 +512,30 @@ impl BlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_image_import_preserves_picker_mime_and_original_bytes() {
+        let dir = std::env::temp_dir().join(format!("paseo-image-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("opaque");
+        let blobs = dir.join("blobs");
+        let bytes = b"\0\0\0\x10ftypmif1\0\0\0\0\0\0\0\x14meta\0\0\0\0\0\0\0\x08free";
+        std::fs::write(&source, bytes).unwrap();
+        let mut picked = StatFile::inspect(source).unwrap();
+        assert!(picked.is_image);
+        picked.file.mime_type = Some("image/heic".into());
+        let image = import_image(&blobs, &picked.file).unwrap();
+        assert_eq!(image["mimeType"], "image/heic");
+        assert_eq!(image["fileName"], "opaque");
+        assert_eq!(image["byteSize"], bytes.len());
+        let id = image["blobId"].as_str().unwrap();
+        assert_eq!(read_blob(&blobs, id).unwrap(), bytes.as_slice());
+
+        std::fs::write(&picked.file.path, b"invalid").unwrap();
+        assert!(import_image(&blobs, &picked.file).is_err());
+        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn inline_texture_hits_reuse_identity_without_opening_decode_source() {

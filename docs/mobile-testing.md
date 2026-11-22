@@ -383,7 +383,31 @@ password-protected daemon reached through `10.0.2.2`.
   The image-picker intent was restricted to `image/*`; a gallery save left
   `is_pending=0` and retained the original PNG bytes.
 
-Not covered: the `GET_CONTENT` fallback on Android 11 and older without the
-photo picker, the document-dialog fallback on Android 9 and older, and a
-Mermaid "Save PNG" (same `save_image` call). The iOS photo picker and Photos
-save were type-checked for `aarch64-apple-ios` on Linux; nothing ran on iOS.
+- Mermaid › Save PNG on API 35 published `diagram.png` in `Pictures/Passession/`.
+  The stored PNG decoded to a 132×164 diagram with both nodes and their edge.
+- On API 35, Files › Download for `report.txt` opened `CREATE_DOCUMENT` with
+  `text/plain`. Cancel left Downloads empty; Save created a byte-identical
+  file. Share file opened the Android Sharesheet instead.
+- The chat image viewer saved a workspace PNG (1,730 bytes) and a picked,
+  sent JPEG (1,858 bytes). The gallery copies matched the source SHA-256 and
+  MIME. Sharing the workspace image opened the system Sharesheet.
+- A private test provider shared two extensionless URIs, a PNG and a HEIC,
+  through the API 35 Sharesheet. Passession asked for a destination. Cancel
+  removed the staged files; choosing an existing chat retained both original
+  byte streams and left every test-host timeline unchanged. A cold single-image
+  share to New session showed an unsent thumbnail without creating a session.
+  An existing chat also accepted an unsent attachment while its host was offline.
+- An Android 9/API 28 Google APIs emulator opened `GET_CONTENT` with `image/*`
+  for Add image. DocumentsUI handled it on that image; selecting the photo
+  added it to the unsent draft. Saving a photo opened `CREATE_DOCUMENT` with
+  `image/png` and its original name. The copy in Downloads matched the source.
+
+The iOS photo picker and Photos save were type-checked for `aarch64-apple-ios`
+on Linux. Add-only permission denial and cancellation still need an iPhone
+with a signed build; neither was exercised on hardware.
+
+On a signed iPhone build, start with an existing draft and cancel Add image
+both with Cancel and by dismissing the picker. The draft should be unchanged.
+With Photos add-only access not yet decided, tap Save on a known PNG and
+choose not to allow access. Check for an error, no “Saved” acknowledgement,
+and no new asset. These are hardware checks, not results from the cross-build.

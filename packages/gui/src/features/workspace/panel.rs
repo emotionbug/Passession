@@ -155,6 +155,22 @@ impl Widget for WorkspacePanel {
 }
 
 impl WorkspacePanelRef {
+    /// A share-created tab receives its draft images before the first draw.
+    pub(crate) fn add_shared_images(&self, images: Vec<Value>) -> bool {
+        let Some(inner) = self.borrow() else {
+            return false;
+        };
+        if inner.active != Active::NewTab {
+            return false;
+        }
+        let composer = inner.view.wa_new_tab_view(id!(new_tab));
+        let Some(mut composer) = composer.borrow_mut() else {
+            return false;
+        };
+        composer.add_shared_images(images);
+        true
+    }
+
     /// Mounts the panel on a workspace tab target.
     pub fn set_target(&self, cx: &mut Cx, target: WorkspaceTarget) {
         let Some(mut inner) = self.borrow_mut() else {

@@ -16,6 +16,8 @@ The main navigation tree remains host → directory → session, including exist
 
 Files are read/written through the daemon. Markdown and source editing share the same remote identity and revision. Git Log opens historical commit details and lazy patch bodies. The working-tree Changes view and session added/deleted-line badge are removed.
 
+On mobile, Download copies a photo to the photo library or opens a document saver for other files. Share opens the system share sheet instead. Cancelling either picker does not count as saving a copy.
+
 Plain file-link clicks in conversations and Markdown previews stay inside the app.
 Ctrl+click on Windows/Linux or Command+click on macOS reveals a local file in the OS
 file manager (opens a directory directly). Carry this intent through asynchronous

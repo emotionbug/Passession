@@ -4473,6 +4473,7 @@ pub fn handle_platform_actions(
     ui: &mut UiContext,
 ) {
     process_routes(shell, cx, ui);
+    super::image_share::present_pending(shell, cx);
     // Host removals waiting on push revocation: the 2.5 s bound passed.
     if let Some(index) = shell
         .data
@@ -4547,6 +4548,9 @@ pub fn handle_platform_actions(
             }
             PlatformAction::Event(event) => match event {
                 PlatformEvent::Route(route) if main => queue_route(shell, route),
+                PlatformEvent::SharedImages(share) if main => {
+                    super::image_share::receive(shell, cx, share)
+                }
                 PlatformEvent::ConnectionLink { url } if main => {
                     host_dialog::open_flow(shell, cx, None, None, Some(url))
                 }

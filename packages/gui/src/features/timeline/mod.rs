@@ -8,6 +8,7 @@
 //! resolves in other modules' `live_design!`; [`ChatTimelineModules`] registers
 //! the submodule DSL (kit, row, panel) before this file's body.
 
+mod attachment_export;
 pub mod attention;
 pub mod canvas;
 pub mod chat_row;

@@ -130,7 +130,7 @@ pub fn platform() -> Option<paseo_gui_platform::PlatformHandle> {
     paseo_gui_platform::platform()
 }
 
-/// Whether a platform save dialog exists (desktop) — mobile always shares.
+/// Desktop chooses a path before downloading; mobile exports the staged file.
 pub fn has_save_dialog() -> bool {
     !cfg!(any(target_os = "android", target_os = "ios"))
 }

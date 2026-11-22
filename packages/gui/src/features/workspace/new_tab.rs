@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 
 use super::kit::WaModalWidgetExt;
-use base64::Engine;
 use makepad_widgets::*;
 use serde_json::{Map, Value, json};
 
@@ -38,12 +37,13 @@ use crate::common::paint::{Font, Painter, TextSpec, rect};
 use crate::common::provider_icon::ProviderIconWidgetRefExt;
 use crate::common::widgets::{PSegmentedWidgetRefExt, Segment, SurfaceWidgetRefExt};
 use crate::common::{PanelTarget, UiContext, UiEffect};
+use crate::features::composer::blobs::{StatFile, encode_image, encode_picked_image};
 use crate::features::composer::forge::ForgeAutoAttach;
 use crate::features::composer::ui::draw::DrawComposerImage;
 use crate::features::composer::{agent_form, attachments, controls_model, forge, ops};
 use crate::features::files::picker::{RemoteFolderPickerAction, RemoteFolderPickerWidgetExt};
 use crate::theme;
-use paseo_gui_platform::{PickFilesOptions, PlatformAction, PlatformValue, platform};
+use paseo_gui_platform::{PickFilesOptions, PickedFile, PlatformAction, PlatformValue, platform};
 
 live_design! {
     use link::theme::*;
@@ -739,6 +739,11 @@ impl WaNewTabView {
         self.initialized = false;
         self.presentation_dirty = true;
         self.root().area().redraw(cx);
+    }
+
+    pub(super) fn add_shared_images(&mut self, images: Vec<Value>) {
+        self.images.extend(images);
+        self.presentation_dirty = true;
     }
 
     /// `initState` + `didChangeDependencies`.
@@ -1839,7 +1844,13 @@ impl WaNewTabView {
                 Ok(Ok(body)) => self
                     .images
                     .extend(array_of(&body, "images").iter().cloned()),
-                Ok(Err(error)) => self.toast_upload_error(ctx, str_of(&error, "message")),
+                Ok(Err(error)) => {
+                    if let Some(name) = error.get("invalidImageFile").and_then(Value::as_str) {
+                        self.toast_upload_error(ctx, &attachments::invalid_image_file_message(name));
+                    } else {
+                        self.toast_upload_error(ctx, str_of(&error, "message"));
+                    }
+                }
                 Err(error) => self.toast_upload_error(ctx, &error.to_string()),
             },
             Req::Dropped => {
@@ -2236,24 +2247,7 @@ impl WaNewTabView {
             };
             match (kind, result) {
                 (PlatformReq::PickImages, Ok(PlatformValue::Files(files))) if !files.is_empty() => {
-                    let files: Vec<(std::path::PathBuf, String)> = files
-                        .iter()
-                        .map(|f| {
-                            (
-                                f.path.clone(),
-                                attachments::raster_image_mime_type(&f.name)
-                                    .map(str::to_owned)
-                                    .or(f.mime_type.clone())
-                                    .unwrap_or_else(|| "image/png".into()),
-                            )
-                        })
-                        .collect();
-                    let id = ctx
-                        .core
-                        .operation(&self.target.host_id, move |_client| async move {
-                            Ok(encode_images(files))
-                        });
-                    self.pending.track_operation(id, Req::Images);
+                    self.import_images(ctx, files.clone());
                 }
                 (PlatformReq::PickFiles, Ok(PlatformValue::Files(files))) if !files.is_empty() => {
                     let files = files
@@ -2275,12 +2269,22 @@ impl WaNewTabView {
                             message: t("composer.errors.noClipboardImage"),
                             is_error: true,
                         });
-                    }
-                    for image in &content.images {
-                        self.images.push(json!({
-                            "data": base64::engine::general_purpose::STANDARD.encode(image.bytes.as_slice()),
-                            "mimeType": image.mime_type,
-                        }));
+                    } else {
+                        let images = content
+                            .images
+                            .iter()
+                            .map(|image| {
+                                attachments::clipboard_image_mime(image)
+                                    .map(|mime| encode_image(&image.bytes, mime))
+                            })
+                            .collect::<Result<Vec<_>, _>>();
+                        match images {
+                            Ok(images) => self.images.extend(images),
+                            Err(error) => ctx.effects.push(UiEffect::Toast {
+                                message: error.message(),
+                                is_error: true,
+                            }),
+                        }
                     }
                 }
                 (PlatformReq::Paste, Err(_)) => {
@@ -2296,6 +2300,15 @@ impl WaNewTabView {
             }
             self.presentation_dirty = true;
         }
+    }
+
+    fn import_images(&mut self, ctx: &UiContext, files: Vec<PickedFile>) {
+        let id = ctx
+            .core
+            .operation(&self.target.host_id, move |_client| async move {
+                Ok(encode_images(&files))
+            });
+        self.pending.track_operation(id, Req::Images);
     }
 
     /// actions.ts uploadFileAttachments: every file is size-checked before any upload starts.
@@ -2362,23 +2375,26 @@ impl WaNewTabView {
                 std::path::PathBuf::from(str_of(file, "path")),
                 str_of(file, "name"),
             );
-            match attachments::raster_image_mime_type(name) {
-                Some(mime) => images.push((path, mime.to_owned())),
-                None => uploads.push(UploadFile {
+            let size = file.get("size").and_then(Value::as_u64).unwrap_or(0);
+            if file.get("isImage") == Some(&Value::Bool(true)) {
+                images.push(PickedFile {
+                    path,
+                    name: name.to_owned(),
+                    size,
+                    mime_type: None,
+                    temporary: false,
+                });
+            } else {
+                uploads.push(UploadFile {
                     path,
                     name: name.to_owned(),
                     mime: attachments::mime_type_for_path(name).to_owned(),
-                    size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
-                }),
+                    size,
+                });
             }
         }
         if !images.is_empty() {
-            let id = ctx
-                .core
-                .operation(&self.target.host_id, move |_client| async move {
-                    Ok(encode_images(images))
-                });
-            self.pending.track_operation(id, Req::Images);
+            self.import_images(ctx, images);
         }
         if !uploads.is_empty() {
             self.upload_files(ctx, uploads);
@@ -3601,16 +3617,16 @@ impl WaNewTabView {
 }
 
 /// Reads and encodes picked images off the GUI thread (`{"ok", "payload": {"images"}}`).
-fn encode_images(files: Vec<(std::path::PathBuf, String)>) -> Value {
+fn encode_images(files: &[PickedFile]) -> Value {
     let mut images = Vec::with_capacity(files.len());
-    for (path, mime) in files {
-        match std::fs::read(&path) {
-            Ok(bytes) => images.push(json!({
-                "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
-                "mimeType": attachments::sniff_image_mime(&bytes).unwrap_or(mime.as_str()),
-            })),
+    for file in files {
+        match encode_picked_image(file) {
+            Ok(image) => images.push(image),
+            Err(attachments::ImageImportError::InvalidFile(name)) => {
+                return json!({ "ok": false, "error": { "invalidImageFile": name } });
+            }
             Err(error) => {
-                return json!({ "ok": false, "error": { "message": format!("{}: {error}", path.display()) } });
+                return json!({ "ok": false, "error": { "message": error.message() } });
             }
         }
     }
@@ -3625,21 +3641,19 @@ struct UploadFile {
     size: u64,
 }
 
-/// Inspects dropped files off the GUI thread (`{"ok", "payload": {"files": [{"path", "name",
-/// "size"}]}}`).
+/// Inspects dropped files off the GUI thread before routing them to the image tray or upload.
 fn stat_files(paths: Vec<std::path::PathBuf>) -> Value {
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        match std::fs::metadata(&path) {
-            Ok(metadata) => files.push(
-                json!({ "path": path.to_string_lossy(), "name": name, "size": metadata.len() }),
-            ),
+        match StatFile::inspect(path) {
+            Ok(stat) => files.push(json!({
+                "path": stat.file.path.to_string_lossy(),
+                "name": stat.file.name,
+                "size": stat.file.size,
+                "isImage": stat.is_image,
+            })),
             Err(error) => {
-                return json!({ "ok": false, "error": { "message": format!("{name}: {error}") } });
+                return json!({ "ok": false, "error": { "message": error } });
             }
         }
     }
@@ -4079,15 +4093,24 @@ mod completion_tests {
     #[test]
     fn new_session_local_file_operations_preserve_images_and_stat_errors() {
         let mut h = Harness::new(false, false);
-        let path = h.dir.join("한글 그림.png");
-        let bytes = b"\x89PNG\r\n\x1a\n";
-        std::fs::write(&path, bytes).unwrap();
-        h.deliver_operation(Req::Images, encode_images(vec![(path, "image/png".into())]));
+        use base64::Engine;
+        let path = h.dir.join("한글 그림");
+        let bytes = paseo_gui_platform::image::encode_rgba_png(1, 1, &[255, 0, 0, 255]).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let picked = PickedFile {
+            name: "한글 그림.jpg".into(),
+            path: path.clone(),
+            mime_type: Some("image/jpeg".into()),
+            size: bytes.len() as u64,
+            temporary: false,
+        };
+        h.deliver_operation(Req::Images, encode_images(&[picked]));
         assert_eq!(
             h.view.images,
             vec![json!({
                 "data": base64::engine::general_purpose::STANDARD.encode(bytes),
                 "mimeType": "image/png",
+                "fileName": "한글 그림.jpg",
             })]
         );
         assert!(
@@ -4096,6 +4119,23 @@ mod completion_tests {
                 .iter()
                 .any(|effect| matches!(effect, UiEffect::Toast { .. }))
         );
+
+        let stat = stat_files(vec![path]);
+        assert_eq!(stat["payload"]["files"][0]["isImage"], true);
+
+        let malformed = PickedFile {
+            path: h.dir.join("opaque.jpg"),
+            name: "opaque.jpg".into(),
+            mime_type: Some("image/jpeg".into()),
+            size: 7,
+            temporary: false,
+        };
+        std::fs::write(&malformed.path, "not jpg").unwrap();
+        h.deliver_operation(Req::Images, encode_images(&[malformed]));
+        assert_eq!(h.view.images.len(), 1);
+        assert!(h.ctx.effects.iter().any(|effect| matches!(
+            effect, UiEffect::Toast { message, is_error: true } if message.starts_with("opaque.jpg:")
+        )));
 
         let text_path = h.dir.join("한글 문서.txt");
         std::fs::write(&text_path, "attachment contents").unwrap();

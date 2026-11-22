@@ -70,6 +70,25 @@ pub fn flush_drafts(ui: &UiContext) -> Result<(), String> {
     service::with(|svc| svc.flush_for_quit(ui))
 }
 
+/// Append local images to this exact conversation, independently of any mounted
+/// composer. This edits the draft only; it never enters the delivery queue.
+pub(crate) fn append_shared_images(
+    host_id: &str,
+    workspace_id: &str,
+    agent_id: &str,
+    images: Vec<Value>,
+) -> bool {
+    service::with(|svc| {
+        if !svc.drafts.is_loaded() {
+            return false;
+        }
+        let key = drafts::draft_key(host_id, workspace_id, agent_id);
+        svc.drafts.append_images(&key, images);
+        svc.after_mutation();
+        true
+    })
+}
+
 /// Pending and sending outgoing prompts of this agent not yet echoed by the timeline.
 pub fn outgoing_rows(
     host_id: &str,
@@ -166,8 +185,12 @@ pub fn restore_text_if_empty(
 }
 
 /// SentUserMessages.lookup.
-pub fn sent_message_attachments(agent_id: &str, client_message_id: &str) -> Option<Value> {
-    service::with(|svc| svc.sent_lookup(agent_id, client_message_id))
+pub fn sent_message_attachments(
+    host: &str,
+    agent_id: &str,
+    client_message_id: &str,
+) -> Option<Value> {
+    service::with(|svc| svc.sent_lookup(host, agent_id, client_message_id))
 }
 
 /// A stable cached texture for a composer image reference (`{blobId}` or legacy inline

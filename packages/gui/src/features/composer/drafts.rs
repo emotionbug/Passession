@@ -307,6 +307,20 @@ impl DraftStore {
         self.save(Some(key), delivery);
     }
 
+    pub(crate) fn append_images(&mut self, key: &str, images: Vec<Value>) {
+        if images.is_empty() {
+            return;
+        }
+        let mut current = match self.draft_mut(key)["images"].take() {
+            Value::Array(current) => current,
+            _ => Vec::new(),
+        };
+        current.extend(images);
+        let mut fields = Map::new();
+        fields.insert("images".into(), Value::Array(current));
+        self.update(key, Value::Object(fields));
+    }
+
     pub fn add_attachments(
         &mut self,
         server_id: &str,
@@ -679,6 +693,33 @@ impl DraftStore {
 #[cfg(test)]
 mod image_tests {
     use super::*;
+
+    #[test]
+    fn inbound_files_append_only_to_the_chosen_host_and_session_draft() {
+        let mut store = DraftStore::default();
+        let chosen = draft_key("host-b", "directory", "session");
+        let other = draft_key("host-a", "directory", "session");
+        let previous = json!({"blobId": "old", "mimeType": "image/png"});
+        let incoming = json!({"blobId": "new", "mimeType": "image/jpeg"});
+        store.load(&json!({}));
+        store.update(&other, json!({"text": "other host"}));
+        store.update(&chosen, json!({
+            "text": "unsent draft",
+            "images": [previous.clone()],
+            "attachments": [{"id": "file"}],
+            "queue": [{"messageId": "existing"}]
+        }));
+
+        store.append_images(&chosen, vec![incoming.clone()]);
+
+        let draft = store.draft(&chosen);
+        assert_eq!(draft["text"], "unsent draft");
+        assert_eq!(draft["images"], json!([previous, incoming]));
+        assert_eq!(draft["attachments"], json!([{"id": "file"}]));
+        assert_eq!(draft["queue"], json!([{"messageId": "existing"}]));
+        assert!(draft.get("pending").is_none());
+        assert_eq!(store.draft(&other)["images"], json!([]));
+    }
 
     #[test]
     fn inline_identity_survives_typing_and_attachment_reordering() {

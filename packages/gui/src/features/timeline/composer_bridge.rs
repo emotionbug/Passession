@@ -11,11 +11,12 @@ pub use composer::{
 };
 
 /// stream.ts produceUserMessage "existing" (SentUserMessages.lookup).
-pub fn sent_attachments(agent_id: &str, client_message_id: &str) -> Option<Value> {
-    if agent_id.is_empty() || client_message_id.is_empty() {
-        return None;
-    }
-    composer::sent_message_attachments(agent_id, client_message_id)
+pub(super) fn sent_attachments(
+    host_id: &str,
+    agent_id: &str,
+    client_message_id: &str,
+) -> Option<Value> {
+    composer::sent_message_attachments(host_id, agent_id, client_message_id)
 }
 
 /// Optimistic prompts not yet echoed by the timeline (`_streamEntries`).
@@ -49,6 +50,12 @@ pub fn restore_text_if_empty(
 /// Retained composer blob or legacy inline image → cached texture.
 pub fn image_texture(cx: &mut Cx, image: &Value, thumbnail: bool) -> Option<Texture> {
     composer::image_texture(cx, image, thumbnail)
+}
+
+pub(super) use composer::blobs::ImageContent as OriginalContent;
+
+pub(super) fn read_original_blob(id: &str) -> Result<Vec<u8>, String> {
+    composer::blobs::read_blob(&composer::state_keys::blob_dir(), id)
 }
 
 /// AttachmentPill.label: the attachment's title and secondary label.

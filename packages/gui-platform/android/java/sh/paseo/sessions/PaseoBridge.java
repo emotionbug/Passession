@@ -406,12 +406,25 @@ final class PaseoBridge {
         if (audio != null) audio.release();
     }
 
-    /** Links forwarded by PaseoLinkActivity and notification taps that started or reached the activity. */
+    /** Shares, links and notification taps forwarded to the one native activity. */
     void onIntent(Intent intent) {
         if (intent == null) return;
         try {
             Bundle extras = intent.getExtras();
             if (extras == null) return;
+            if (extras.containsKey(PaseoShareActivity.EXTRA_SHARE)) {
+                String token = extras.getString(PaseoShareActivity.EXTRA_SHARE);
+                intent.removeExtra(PaseoShareActivity.EXTRA_SHARE);
+                String share = PaseoShareActivity.take(token);
+                if (share != null) nativeEvent("sharedImages", share);
+                return;
+            }
+            if (extras.containsKey(PaseoShareActivity.EXTRA_SHARE_ERROR)) {
+                String error = extras.getString(PaseoShareActivity.EXTRA_SHARE_ERROR);
+                intent.removeExtra(PaseoShareActivity.EXTRA_SHARE_ERROR);
+                nativeEvent("sharedImages", new JSONObject().put("error", error).toString());
+                return;
+            }
             String link = extras.getString(EXTRA_LINK);
             if (link != null) {
                 nativeEvent("link", new JSONObject().put("url", link).toString());
@@ -774,7 +787,7 @@ final class PaseoBridge {
                 if (input == null) continue;
                 copy(input, output);
             }
-            return ok(new JSONObject().put("imagePath", out.getAbsolutePath()));
+            return ok(new JSONObject().put("imagePath", out.getAbsolutePath()).put("mimeType", type));
         }
         if (imagesOnly) return ok(new JSONObject());
         CharSequence text = clip.getItemAt(0).coerceToText(activity);

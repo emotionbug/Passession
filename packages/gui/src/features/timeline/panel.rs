@@ -7,6 +7,7 @@
 //! sheets, the image lightbox and the subagent sheet. Session state lives in
 //! the module-level store (`store.rs`); the panel only presents it.
 
+use super::attachment_export::{Export as LightboxExport, HostRoute, Mode as ExportMode, Original};
 use super::attention::{self, AttentionClear};
 use super::canvas::*;
 use super::chat_row::{ChatRowEvent, ChatRowWidgetRefExt, RowEventKind, RowModel};
@@ -394,6 +395,10 @@ enum Modal {
     Usage,
     Lightbox {
         source: LightboxSource,
+        epoch: Option<String>,
+        file_route: Option<HostRoute>,
+        export_available: bool,
+        export: LightboxExport,
         scale: f64,
         offset: DVec2,
     },
@@ -528,7 +533,20 @@ const TRACK_SCRIM_ALPHA: f64 = 115.0 / 255.0;
 
 enum LightboxSource {
     Assistant { url: String, row: String },
-    User(Value),
+    User { entry: Rc<Value>, index: usize },
+}
+
+impl LightboxSource {
+    fn user_image(entry: &Value, index: usize) -> Option<&Value> {
+        list(get(get(entry, "item"), "images")).get(index)
+    }
+
+    fn original(&self, cwd: Option<&str>) -> Option<Original<'_>> {
+        match self {
+            Self::Assistant { url, .. } => Original::assistant(url, cwd),
+            Self::User { entry, index } => Original::user(Self::user_image(entry, *index)?),
+        }
+    }
 }
 
 /// What a session reveal (older pages until a seq is loaded) was for.
@@ -1008,6 +1026,14 @@ impl ChatPanel {
             self.reset_session_state(cx);
             // A new conversation opens at its latest edge.
             self.list.as_portal_list().set_tail_range(true);
+        } else if matches!(self.modal, Some(Modal::Lightbox { .. }))
+            && self.target.as_ref().is_some_and(|old| {
+                old.cwd != target.cwd
+                    || old.workspace_id != target.workspace_id
+                    || old.tab_key != target.tab_key
+            })
+        {
+            self.dismiss_modal(cx);
         }
         self.target = Some(target);
         self.ensured = false;
@@ -3464,23 +3490,13 @@ impl ChatPanel {
                     self.open_inline_path(cx, ui, target, intent);
                 }
                 HitTarget::Image { key } => {
-                    self.modal = Some(Modal::Lightbox {
-                        source: LightboxSource::Assistant { url: key, row },
-                        scale: 1.0,
-                        offset: DVec2::default(),
-                    });
-                    self.modal_state = RowState::default();
+                    self.open_lightbox(ui, LightboxSource::Assistant { url: key, row });
                 }
                 HitTarget::UserImage { index } => {
                     if let Some(entry) = self.entry_of(&row)
-                        && let Some(image) = list(get(get(&entry, "item"), "images")).get(index)
+                        && LightboxSource::user_image(&entry, index).is_some()
                     {
-                        self.modal = Some(Modal::Lightbox {
-                            source: LightboxSource::User(image.clone()),
-                            scale: 1.0,
-                            offset: DVec2::default(),
-                        });
-                        self.modal_state = RowState::default();
+                        self.open_lightbox(ui, LightboxSource::User { entry, index });
                     }
                 }
                 HitTarget::OpenSheet(sheet) => {
@@ -3645,6 +3661,8 @@ impl ChatPanel {
                     });
                 }
             }
+            "lightbox:save" => self.export_lightbox(ui, ExportMode::Save),
+            "lightbox:share" => self.export_lightbox(ui, ExportMode::Share),
             "lightbox:zoom-in" => self.zoom(1.5),
             "lightbox:zoom-out" => self.zoom(1.0 / 1.5),
             "lightbox:reset" => {
@@ -3682,6 +3700,53 @@ impl ChatPanel {
         self.redraw_modal(cx);
         if id == "unarchive" {
             self.redraw_chrome_part(cx, CALLOUTS);
+        }
+    }
+
+    fn open_lightbox(&mut self, ui: &UiContext, source: LightboxSource) {
+        let Some(target) = &self.target else {
+            return;
+        };
+        let (export_available, file_route) = if MOBILE {
+            match source.original(target.cwd.as_deref()) {
+                Some(Original::File { .. }) => {
+                    let route = HostRoute::capture(ui, &target.host_id);
+                    (route.is_some(), route)
+                }
+                Some(_) => (true, None),
+                None => (false, None),
+            }
+        } else {
+            (false, None)
+        };
+        self.modal = Some(Modal::Lightbox {
+            source,
+            epoch: self.snap.as_ref().and_then(|snap| snap.epoch.clone()),
+            file_route,
+            export_available,
+            export: LightboxExport::default(),
+            scale: 1.0,
+            offset: DVec2::default(),
+        });
+        self.modal_state = RowState::default();
+    }
+
+    fn export_lightbox(&mut self, ui: &UiContext, mode: ExportMode) {
+        let (
+            Some(target),
+            Some(Modal::Lightbox {
+                source,
+                export_available: true,
+                file_route,
+                export,
+                ..
+            }),
+        ) = (&self.target, &mut self.modal)
+        else {
+            return;
+        };
+        if let Some(original) = source.original(target.cwd.as_deref()) {
+            export.start(ui, file_route.as_ref(), mode, original);
         }
     }
 
@@ -5223,7 +5288,7 @@ impl ChatPanel {
                                 return Some(format!("outline:{seq}"));
                             }
                         }
-                        "track-panel" | "lightbox:image" | "sheet:body" => {}
+                        "track-panel" | "lightbox:image" | "lightbox:footer" | "sheet:body" => {}
                         _ => return Some(id),
                     },
                     HitTarget::Copy { key, text } => {
@@ -5419,6 +5484,15 @@ impl ChatPanel {
             self.snapshot_stale = false;
             self.on_session_changed(cx, ui);
         }
+        if let Some(Modal::Lightbox { epoch, file_route, .. }) = &self.modal
+            && (!visible
+                || epoch.as_deref() != self.snap.as_ref().and_then(|snap| snap.epoch.as_deref())
+                || file_route
+                    .as_ref()
+                    .is_some_and(|route| !route.still_current(ui, &target.host_id)))
+        {
+            self.dismiss_modal(cx);
+        }
 
         // Provider catalog pushes for this cwd (use-providers-snapshot.ts).
         let scope_of = |cwd: &str| cwd.trim().trim_end_matches('/').to_owned();
@@ -5568,6 +5642,19 @@ impl ChatPanel {
             } else {
                 self.on_chrome_tap(cx, ui, &tap);
             }
+        }
+        // A valid close tap in this event wins over an already-prepared file.
+        let owner = self.widget_uid().0;
+        if let Some(Modal::Lightbox { export, .. }) = &mut self.modal
+            && export.busy()
+            && export.poll(
+                ui,
+                visible
+                    && ui.activity.app_active
+                    && overlay::window_modal_accepts_owner(&ui.window_id, owner),
+            )
+        {
+            self.redraw_modal(cx);
         }
 
         // Attention.
@@ -6044,8 +6131,11 @@ impl ChatPanel {
             }
             Modal::Lightbox {
                 source,
+                export_available,
+                export,
                 scale,
                 offset,
+                ..
             } => {
                 let texture = match source {
                     LightboxSource::Assistant { url, row } => {
@@ -6072,11 +6162,16 @@ impl ChatPanel {
                             _ => None,
                         }
                     }
-                    LightboxSource::User(image) => {
-                        bridge::image_texture(cx, image, false).map(|t| {
-                            let size = t.get_format(cx).vec_width_height().unwrap_or((1, 1));
-                            (t, size.0 as f64, size.1 as f64)
-                        })
+                    LightboxSource::User { entry, index } => {
+                        LightboxSource::user_image(entry, *index)
+                            .and_then(|image| bridge::image_texture(cx, image, false))
+                            .map(|texture| {
+                                let size = texture
+                                    .get_format(cx)
+                                    .vec_width_height()
+                                    .unwrap_or((1, 1));
+                                (texture, size.0 as f64, size.1 as f64)
+                            })
                     }
                 };
                 let mut d = Draw {
@@ -6090,7 +6185,11 @@ impl ChatPanel {
                     animating: false,
                     indicators: None,
                 };
-                lightbox(cx, &mut d, rect, texture, *scale, *offset);
+                let footer = MOBILE.then_some(LightboxFooter {
+                    bottom_inset,
+                    export: export_available.then_some(export),
+                });
+                lightbox(cx, &mut d, rect, texture, *scale, *offset, footer);
             }
             Modal::Subagent {
                 label, provider, ..
@@ -6441,6 +6540,11 @@ fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect, bottom_in
         .add_hit(close, HitTarget::Chrome("sheet:close".into()));
 }
 
+struct LightboxFooter<'a> {
+    bottom_inset: f64,
+    export: Option<&'a LightboxExport>,
+}
+
 /// components/attachment-lightbox.tsx: a 90% black backdrop over the image
 /// fitted inside 16px padding and at most 960×640, zoom in / out / reset and
 /// close 8px from the top-right corner; "Couldn't load image" on failure.
@@ -6451,30 +6555,43 @@ fn lightbox(
     image: Option<(Texture, f64, f64)>,
     scale: f64,
     offset: DVec2,
+    footer: Option<LightboxFooter<'_>>,
 ) {
     let p = d.look.palette;
     d.kit.rect(cx, rect, rgba(0xe6000000), 0.0);
-    let fit_w = (rect.size.x - 32.0).clamp(0.0, 960.0);
-    let fit_h = (rect.size.y - 32.0).clamp(0.0, 640.0);
+    let mut content = rect;
+    let (status, footer_height) = if let Some(footer) = &footer {
+        let status = match footer.export {
+            Some(export) => export.status(),
+            None => Some((t("message.attachments.lightbox.originalUnavailable"), false)),
+        };
+        let height = footer.bottom_inset + if footer.export.is_some() { 90.0 } else { 30.0 };
+        content.size.y = (content.size.y - height).max(0.0);
+        (status, height.min(rect.size.y))
+    } else {
+        (None, 0.0)
+    };
+    let fit_w = (content.size.x - 32.0).clamp(0.0, 960.0);
+    let fit_h = (content.size.y - 32.0).clamp(0.0, 640.0);
     match image {
         Some((texture, w, h)) => {
             let ratio = (fit_w / w.max(1.0)).min(fit_h / h.max(1.0));
             let size = dvec2(w * ratio * scale, h * ratio * scale);
-            let pos = rect.center() - size * 0.5 + offset;
+            let pos = content.center() - size * 0.5 + offset;
             let r = Rect { pos, size };
             cx.begin_turtle(
                 Walk {
-                    abs_pos: Some(rect.pos),
+                    abs_pos: Some(content.pos),
                     margin: Margin::default(),
-                    width: Size::Fixed(rect.size.x),
-                    height: Size::Fixed(rect.size.y),
+                    width: Size::Fixed(content.size.x),
+                    height: Size::Fixed(content.size.y),
                 },
                 Layout::default(),
             );
             d.kit.texture(cx, r, &texture, 0.0);
             cx.end_turtle();
             d.canvas.add_hit(
-                r.clip((rect.pos, rect.pos + rect.size)),
+                r.clip((content.pos, content.pos + content.size)),
                 HitTarget::Chrome("lightbox:image".into()),
             );
         }
@@ -6489,7 +6606,7 @@ fn lightbox(
                 d.look.ui(14.0),
                 1.4,
                 p.muted,
-                rect.center() - s * 0.5,
+                content.center() - s * 0.5,
                 &text,
                 None,
             );
@@ -6519,6 +6636,66 @@ fn lightbox(
         d.canvas.add_hit(r, HitTarget::Chrome(id.into()));
         if id == "lightbox:close" {
             x -= 8.0;
+        }
+    }
+    if let Some(footer) = footer {
+        let top = content.pos.y + content.size.y;
+        let area = rect_xywh(rect.pos.x, top, rect.size.x, footer_height);
+        d.kit.rect(cx, area, rgba(0xe6000000), 0.0);
+        d.canvas.add_hit(area, HitTarget::Chrome("lightbox:footer".into()));
+        if let Some((status, error)) = &status {
+            let size = d.look.ui(13.0);
+            let width = (area.size.x - 24.0).max(0.0);
+            let measured = d.kit.measure(cx, Font::Regular, size, 1.3, status, None).x;
+            d.kit.label_line(
+                cx,
+                Font::Regular,
+                size,
+                1.3,
+                if *error { p.danger } else { rgba(0xffffffff) },
+                dvec2(area.center().x - measured.min(width) * 0.5, top + 8.0),
+                status,
+                width,
+            );
+        }
+        if let Some(export) = footer.export {
+            let y = top + 38.0;
+            let w = ((area.size.x - 32.0) * 0.5).clamp(0.0, 156.0);
+            let left = area.center().x - w - 4.0;
+            for (i, (id, key)) in [
+                ("lightbox:save", "message.attachments.lightbox.saveImage"),
+                ("lightbox:share", "message.attachments.lightbox.share"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let button = rect_xywh(left + i as f64 * (w + 8.0), y, w, 44.0);
+                let busy = export.busy();
+                let hovered = d.state.hover_hit.as_deref() == Some(id);
+                d.kit.rect(
+                    cx,
+                    button,
+                    rgba(if hovered && !busy { 0x66ffffff } else { 0x33ffffff }),
+                    8.0,
+                );
+                let label = t(key);
+                let size = d.look.ui(14.0);
+                let width = (w - 12.0).max(0.0);
+                let measured = d.kit.measure(cx, Font::Medium, size, 1.3, &label, None);
+                d.kit.label_line(
+                    cx,
+                    Font::Medium,
+                    size,
+                    1.3,
+                    rgba(if busy { 0x99ffffff } else { 0xffffffff }),
+                    button.center() - dvec2(measured.x.min(width), measured.y) * 0.5,
+                    &label,
+                    width,
+                );
+                if !busy {
+                    d.canvas.add_hit(button, HitTarget::Chrome(id.into()));
+                }
+            }
         }
     }
 }

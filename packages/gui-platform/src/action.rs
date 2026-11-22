@@ -109,6 +109,53 @@ pub struct PickedFile {
     pub temporary: bool,
 }
 
+/// A private, process-local copy of an Android Sharesheet selection. Keep the
+/// lease alive through the local import; dropping it removes the staging batch.
+#[derive(Debug)]
+pub struct SharedImages {
+    pub(crate) directory: PathBuf,
+    pub(crate) files: Vec<PickedFile>,
+}
+
+impl SharedImages {
+    pub fn files(&self) -> &[PickedFile] {
+        &self.files
+    }
+}
+
+impl Drop for SharedImages {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[test]
+fn inbound_share_copies_exist_only_while_a_lease_is_held() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("paseo-inbound-share/batch-test");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("image-1");
+    std::fs::write(&path, b"staged").unwrap();
+    let chooser = Arc::new(SharedImages {
+        directory: directory.clone(),
+        files: Vec::new(),
+    });
+    let worker = chooser.clone();
+    drop(chooser);
+    assert!(path.exists());
+    drop(worker);
+    assert!(!directory.exists());
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ImageShareError {
+    Invalid,
+    Unsupported,
+    Limits,
+    Unreadable,
+    Busy,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClipboardContent {
     pub images: Vec<ClipboardImage>,
@@ -324,6 +371,7 @@ pub enum TailnetControl {
 #[derive(Debug, Clone)]
 pub enum PlatformEvent {
     Route(PlatformRoute),
+    SharedImages(Result<Arc<SharedImages>, ImageShareError>),
     ConnectionLink {
         url: String,
     },

@@ -541,8 +541,7 @@ unsafe fn present_photo_picker(
         let _: () = msg_send![config, setFilter: images];
         // 0 is unlimited.
         let _: () = msg_send![config, setSelectionLimit: if multiple { 0isize } else { 1isize }];
-        // PHPickerConfigurationAssetRepresentationModeCompatible: HEIC arrives as JPEG, which
-        // every provider accepts.
+        // PHPickerConfigurationAssetRepresentationModeCurrent avoids transcoding HEIC to JPEG.
         let _: () = msg_send![config, setPreferredAssetRepresentationMode: 1isize];
         let picker: Id = msg_send![controller, alloc];
         let picker: Id = msg_send![picker, initWithConfiguration: config];
@@ -978,7 +977,10 @@ pub(crate) fn read_clipboard(_shared: &Arc<Shared>, images_only: bool, done: Com
     apple::on_main_queue(move || unsafe {
         let board = pasteboard();
         let mut bytes = Vec::new();
+        let mut hint = None;
         for kind in [
+            "public.heic",
+            "public.heif",
             "public.png",
             "public.jpeg",
             "com.compuserve.gif",
@@ -987,6 +989,9 @@ pub(crate) fn read_clipboard(_shared: &Arc<Shared>, images_only: bool, done: Com
             let data: Id = msg_send![board, dataForPasteboardType: ns_string(kind)];
             if !data.is_null() {
                 bytes = apple::data_bytes(data);
+                if kind == "public.heic" {
+                    hint = Some("image/heic");
+                }
                 break;
             }
         }
@@ -997,7 +1002,7 @@ pub(crate) fn read_clipboard(_shared: &Arc<Shared>, images_only: bool, done: Com
                 bytes = apple::data_bytes(UIImagePNGRepresentation(image));
             }
         }
-        if let Some(mime) = crate::image::sniff_image_mime(&bytes) {
+        if let Some(mime) = crate::image::sniff_image_mime_with_hint(&bytes, hint) {
             done.ok(PlatformValue::Clipboard(ClipboardContent {
                 images: vec![ClipboardImage {
                     bytes: Arc::new(bytes),

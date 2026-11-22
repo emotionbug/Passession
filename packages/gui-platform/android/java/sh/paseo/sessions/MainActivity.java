@@ -21,6 +21,7 @@ public class MainActivity extends MakepadActivity {
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
+        PaseoShareActivity.recoverCache(this);
         // Rust may call into the bridge from the Makepad startup that
         // super.onCreate triggers, so it exists first.
         bridge = new PaseoBridge(this);

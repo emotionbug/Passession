@@ -14,6 +14,7 @@ use super::model_picks::{MODEL_PICKS_KEY, ModelPicks, ModelRef, record_recent, t
 use super::service::{self, PanelNotice, SendJob, SendOrigin};
 use crate::common::{UiContext, UiEffect};
 use paseo_gui_core::{CoreError, CoreEvent};
+use paseo_gui_platform::PickedFile;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1254,46 +1255,35 @@ impl Controller {
     pub fn picked_files(
         &mut self,
         ui: &mut UiContext,
-        files: Vec<paseo_gui_platform::PickedFile>,
+        files: Vec<PickedFile>,
         images: bool,
     ) {
         if files.is_empty() {
             return;
         }
         if images {
-            let list: Vec<(std::path::PathBuf, String)> =
-                files.into_iter().map(|f| (f.path, f.name)).collect();
-            let token = service::with(|svc| svc.import_images(self.panel, list));
+            let token = service::with(|svc| svc.import_images(self.panel, files));
             self.blob_tokens.insert(token, false);
             return;
         }
-        let stat: Vec<super::blobs::StatFile> = files
-            .into_iter()
-            .map(|f| super::blobs::StatFile {
-                image_mime: None,
-                size: f.size,
-                name: f.name,
-                path: f.path,
-            })
-            .collect();
-        self.upload(ui, stat);
+        self.upload(ui, files);
     }
 
     pub fn files_stat(&mut self, ui: &mut UiContext, files: Vec<super::blobs::StatFile>) {
         let (images, uploads): (Vec<_>, Vec<_>) =
-            files.into_iter().partition(|f| f.image_mime.is_some());
+            files.into_iter().partition(|f| f.is_image);
         if !images.is_empty() {
-            let list = images.into_iter().map(|f| (f.path, f.name)).collect();
+            let list = images.into_iter().map(|f| f.file).collect();
             let token = service::with(|svc| svc.import_images(self.panel, list));
             self.blob_tokens.insert(token, true);
         }
         if !uploads.is_empty() {
-            self.upload(ui, uploads);
+            self.upload(ui, uploads.into_iter().map(|f| f.file).collect());
         }
     }
 
     /// actions.ts uploadFileAttachments.
-    fn upload(&mut self, ui: &mut UiContext, files: Vec<super::blobs::StatFile>) {
+    fn upload(&mut self, ui: &mut UiContext, files: Vec<PickedFile>) {
         if let Err(too_large) = check_upload_sizes(files.iter().map(|f| (f.name.as_str(), f.size)))
         {
             ui.toast(
@@ -2173,14 +2163,7 @@ impl Controller {
                     if self.blob_tokens.remove(&token).is_some() {
                         match images {
                             Ok(images) => self.add_images(images),
-                            Err(error) => {
-                                let message = if error.trim().is_empty() {
-                                    t("composer.errors.uploadFailed")
-                                } else {
-                                    error
-                                };
-                                ui.toast(message, true);
-                            }
+                            Err(error) => ui.toast(error.message(), true),
                         }
                     }
                 }
@@ -2244,13 +2227,7 @@ impl Controller {
                 Ok(PlatformValue::Clipboard(content)),
             ) => {
                 if let Some(image) = content.images.into_iter().next() {
-                    let token = service::with(|svc| {
-                        svc.store_image_bytes(
-                            self.panel,
-                            image.bytes.clone(),
-                            Some(image.mime_type.clone()),
-                        )
-                    });
+                    let token = service::with(|svc| svc.store_image_bytes(self.panel, image));
                     self.blob_tokens.insert(token, false);
                 } else if silent {
                     // Ctrl/Cmd+V: the platform already pasted any text into the editor.

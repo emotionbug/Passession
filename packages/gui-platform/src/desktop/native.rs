@@ -271,11 +271,10 @@ pub(crate) fn read_clipboard(shared: &Arc<Shared>, images_only: bool, done: Comp
             // Platform clipboards expose decoded pixels: encode real PNG bytes
             // instead of mislabeling the data.
             let bytes = encode_rgba_png(image.width as u32, image.height as u32, &image.bytes)?;
-            let mime = sniff_image_mime(&bytes).unwrap_or("image/png").to_owned();
             return Ok(PlatformValue::Clipboard(ClipboardContent {
                 images: vec![ClipboardImage {
                     bytes: Arc::new(bytes),
-                    mime_type: mime,
+                    mime_type: "image/png".to_owned(),
                 }],
                 text: None,
             }));

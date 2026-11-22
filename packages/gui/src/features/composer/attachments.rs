@@ -2,6 +2,8 @@
 //! helpers of `attachment_pill.dart`.
 
 use super::json::*;
+use paseo_gui_platform::image::sniff_image_mime_with_hint;
+use paseo_gui_platform::{ClipboardImage, PickedFile};
 use serde_json::{Map, Value, json};
 
 /// attachments/upload-limit.ts FILE_UPLOAD_MAX_BYTES.
@@ -285,19 +287,63 @@ pub fn wire_attachment(attachment: &Value) -> Value {
     })
 }
 
-/// Sniff an image's mime type from its leading bytes (image_clipboard.dart `_imageMime`).
-pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 8 && bytes[..8] == [0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10] {
-        return Some("image/png");
+#[derive(Clone, Debug)]
+pub enum ImageImportError {
+    InvalidFile(String),
+    InvalidClipboard,
+    Io(String),
+}
+
+impl ImageImportError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::InvalidFile(name) => invalid_image_file_message(&name),
+            Self::InvalidClipboard => super::i18n::t("composer.errors.pasteImageFailed"),
+            Self::Io(message) => message,
+        }
     }
-    if bytes.len() >= 3 && bytes[..3] == [0xff, 0xd8, 0xff] {
-        return Some("image/jpeg");
+}
+
+pub(crate) fn invalid_image_file_message(name: &str) -> String {
+    format!("{name}: {}", super::i18n::t("composer.errors.uploadFailed"))
+}
+
+pub(crate) fn read_image_file(
+    file: &PickedFile,
+) -> Result<(Vec<u8>, &'static str), ImageImportError> {
+    let bytes = std::fs::read(&file.path)
+        .map_err(|error| ImageImportError::Io(format!("{}: {error}", file.name)))?;
+    let mime = sniff_image_mime_with_hint(&bytes, file.mime_type.as_deref())
+        .ok_or_else(|| ImageImportError::InvalidFile(file.name.clone()))?;
+    Ok((bytes, mime))
+}
+
+pub(crate) fn clipboard_image_mime(
+    image: &ClipboardImage,
+) -> Result<&'static str, ImageImportError> {
+    sniff_image_mime_with_hint(&image.bytes, Some(&image.mime_type))
+        .ok_or(ImageImportError::InvalidClipboard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn clipboard_image_import_uses_bytes_instead_of_the_declared_mime() {
+        let png = paseo_gui_platform::image::encode_rgba_png(1, 1, &[0, 0, 0, 255]).unwrap();
+        let mut clipboard = ClipboardImage {
+            bytes: Arc::new(png),
+            mime_type: "text/plain".into(),
+        };
+        assert_eq!(clipboard_image_mime(&clipboard).unwrap(), "image/png");
+
+        clipboard.bytes = Arc::new(b"not an image".to_vec());
+        clipboard.mime_type = "image/png".into();
+        assert!(matches!(
+            clipboard_image_mime(&clipboard),
+            Err(ImageImportError::InvalidClipboard)
+        ));
     }
-    if bytes.len() >= 6 && bytes[..4] == [71, 73, 70, 56] {
-        return Some("image/gif");
-    }
-    if bytes.len() >= 12 && bytes[..4] == [82, 73, 70, 70] && bytes[8..12] == [87, 69, 66, 80] {
-        return Some("image/webp");
-    }
-    None
 }

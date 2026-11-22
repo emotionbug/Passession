@@ -225,6 +225,20 @@
     }
   },
   "shell": {
+    "imageShare": {
+      "title": "Add shared images to a draft",
+      "choose_one": "Choose where to add {{count}} image. Nothing is sent until you submit the draft.",
+      "choose_other": "Choose where to add {{count}} images. Nothing is sent until you submit the draft.",
+      "adding": "Adding images to the draft…",
+      "offline": "Offline",
+      "noDestination": "There is no saved host. Cancel, add a host, then share the images again.",
+      "destinationUnavailable": "That draft is no longer available.",
+      "invalid": "Share images from Photos or Files.",
+      "unsupported": "This image format is not supported for Android sharing.",
+      "limits": "Share up to 8 images, 12 MiB each and 24 MiB total, at up to 8,192 pixels per side and 32 megapixels.",
+      "unreadable": "Could not read the shared images. Share them again from Photos or Files.",
+      "busy": "Finish or cancel the current image share before sharing more images."
+    },
     "menu": {
       "sessionActions": "Session actions",
       "toggleSidebar": "Toggle sidebar",
@@ -755,6 +769,20 @@
       "imageUnavailable": "Image unavailable",
       "imagePreviewUnavailable": "Image preview unavailable.",
       "imagePreviewLoadFailed": "Unable to load image preview.",
+      "lightbox": {
+        "saveImage": "Save image",
+        "share": "Share",
+        "originalUnavailable": "Original image unavailable",
+        "saving": "Saving original image…",
+        "preparingShare": "Preparing original image…",
+        "readFailed": "Couldn't read the original image",
+        "stageFailed": "Couldn't prepare the original image",
+        "savedToPhotos": "Saved to Photos",
+        "savedFile": "Image saved",
+        "saveFailed": "Couldn't save the image: {{error}}",
+        "shareFailed": "Couldn't open sharing: {{error}}",
+        "unexpectedResult": "Unexpected result from the system"
+      },
       "review": "Review",
       "commentsOne": "1 comment",
       "commentsMany": "{{count}} comments",
