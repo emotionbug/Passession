@@ -9,9 +9,16 @@
 - Claude: while Claude retries a failed API request (for example when the API is overloaded or the key is rejected), the agent shows a "Claude API retry 2/10" row with the error and the wait time. Before this, the agent showed nothing for the minutes Claude spent retrying.
 - `paseo permit allow` and `paseo permit deny` accept `--action <id>` to pick one of a request's own choices, and `paseo permit ls --json` lists each request's choices.
 
+### Changed
+
+- When the window is too narrow for the sidebar, the conversation and the Explorer together (under about 710px, such as half of a 1366px laptop screen), the sidebar steps aside while the Explorer is open instead of squeezing all three. The sidebar button brings it back by closing the Explorer, and widening the window shows both again.
+- A tab whose label would be cut to a letter or two shows only its icon, with the full title in its tooltip, and its room goes to the other tabs. The Explorer's default width no longer shows "Fi…" and "Gi…" next to an open Commit tab.
+
 ### Fixed
 
 - Claude: an API error that ends a turn, such as "Invalid API key", now fails the turn and shows it as an error. Before this, the turn showed the error text as a normal reply and was reported as completed.
+- After the window was made narrower and then wider again, some chat messages kept the narrow line wrapping until they were scrolled. They now wrap to the new width.
+- Split panes keep at least 240px of width (160px of height) on each side, and share the space evenly when there is not enough for both. Before this, a pane in a narrow window could shrink to a sliver whose tabs, `+N` chip and new-tab button overlapped.
 - Claude: approving a plan now shows the mode Claude switched to (Accept Edits, or the mode the agent used before planning). Before this, the agent kept showing Plan Mode. Mode changes that Claude reports itself are also shown.
 - OMP 19: `/handoff` now shows a "Context handed off" marker. OMP 19 hands off by compacting the conversation in place, and before this the agent showed nothing when it worked. When it fails, the agent shows OMP's reason, such as "Handoff generation produced an invalid document", instead of a generic error.
 - OMP: `/compact` with nothing to compact shows "Context compaction skipped" and OMP's reason, such as "Nothing to compact (session too small)", instead of "Context compaction failed" and an error. An automatic compaction that OMP skips is also shown as skipped instead of as compacted. Compaction markers now come from OMP's own start and end events, so compactions that OMP starts itself are shown too.

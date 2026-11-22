@@ -1487,15 +1487,15 @@ pub fn execute(
             shell.data.layout.move_focused_tab(direction(action));
         }
         "sidebar.toggle.left" => {
-            let show = if compact {
-                shell.data.page.is_some()
-                    || shell.data.layout.compact_destination != CompactDestination::Sidebar
+            if compact {
+                let show = shell.data.page.is_some()
+                    || shell.data.layout.compact_destination != CompactDestination::Sidebar;
+                shell.data.layout.show_sidebar(compact, show);
+                if show && shell.data.page.is_some() {
+                    close_page(shell, cx);
+                }
             } else {
-                !shell.data.layout.sidebar_visible
-            };
-            shell.data.layout.show_sidebar(compact, show);
-            if compact && show && shell.data.page.is_some() {
-                close_page(shell, cx);
+                chrome::toggle_wide_sidebar(shell);
             }
         }
         "sidebar.toggle.right" => {
@@ -2379,11 +2379,11 @@ pub fn click(
     match id {
         "banner:settings" => open_settings(shell, cx, None, ""),
         "hdr:sidebar" => {
-            let visible = shell.data.layout.sidebar_visible;
-            shell
-                .data
-                .layout
-                .show_sidebar(compact, if compact { true } else { !visible });
+            if compact {
+                shell.data.layout.show_sidebar(true, true);
+            } else {
+                chrome::toggle_wide_sidebar(shell);
+            }
         }
         "hdr:back" => {
             back(shell, cx, ui);

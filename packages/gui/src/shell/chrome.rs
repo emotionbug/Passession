@@ -635,7 +635,8 @@ fn draw_header(
     let git_natural = shell.data.chrome.header_git_w;
     // A compact detail view (file, diff, subagent…) leads with Back to the tab it came from.
     let detail_back = shell.data.layout.compact_back_tab(compact).is_some();
-    let shell_sidebar_visible = shell.data.layout.sidebar_visible;
+    let shell_sidebar_visible =
+        shell.data.layout.sidebar_visible && !sidebar_crowded(shell, r.size.x);
     {
         let mut ui = make_ui(shell);
         let p = ui.p;
@@ -944,6 +945,24 @@ fn draw_header_git(
     }
 }
 
+/// The conversation's and the side panels' minimum widths in the wide layout.
+const MIN_MAIN: f64 = 320.0;
+const MIN_SIDEBAR: f64 = 200.0;
+const MIN_EXPLORER: f64 = 180.0;
+
+/// True when the sidebar, the conversation and the open Explorer cannot all keep their minimum
+/// widths (a 1366px laptop's half screen): the sidebar steps aside instead of squeezing all
+/// three, and comes back when the window widens or the Explorer closes.
+pub(crate) fn sidebar_crowded(shell: &PaseoShell, width: f64) -> bool {
+    let layout = &shell.data.layout;
+    !shell.data.compact
+        && shell.data.page.is_none()
+        && layout.sidebar_visible
+        && layout.explorer_visible
+        && width > 0.0
+        && width < MIN_SIDEBAR + 5.0 + MIN_MAIN + 5.0 + MIN_EXPLORER
+}
+
 fn draw_wide(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
@@ -955,9 +974,9 @@ fn draw_wide(
     let layout = &shell.data.layout;
     let explorer_visible = layout.explorer_visible && !page_shown;
     // Saved side-panel widths apply when they fit; otherwise the Explorer gives way down to
-    // 180px, then the sidebar down to 200px, so the conversation keeps a usable width.
-    const MIN_MAIN: f64 = 320.0;
-    let mut sidebar_w = if layout.sidebar_visible {
+    // 180px, then the sidebar down to 200px, so the conversation keeps a usable width. Below
+    // the three minimums the sidebar steps aside until the window widens.
+    let mut sidebar_w = if layout.sidebar_visible && !sidebar_crowded(shell, content.size.x) {
         layout.sidebar_width
     } else {
         0.0
@@ -971,12 +990,12 @@ fn draw_wide(
         if sidebar_w > 0.0 { 5.0 } else { 0.0 } + if explorer_visible { 5.0 } else { 0.0 };
     let mut over = sidebar_w + explorer_w + dividers + MIN_MAIN - content.size.x;
     if over > 0.0 && explorer_visible {
-        let cut = over.min(explorer_w - 180.0).max(0.0);
+        let cut = over.min(explorer_w - MIN_EXPLORER).max(0.0);
         explorer_w -= cut;
         over -= cut;
     }
     if over > 0.0 && sidebar_w > 0.0 {
-        sidebar_w -= over.min(sidebar_w - 200.0).max(0.0);
+        sidebar_w -= over.min(sidebar_w - MIN_SIDEBAR).max(0.0);
     }
     let mut x = content.pos.x;
     if sidebar_w > 0.0 {
@@ -1065,7 +1084,15 @@ fn draw_node(
             let horizontal = *axis == Axis::Horizontal;
             let extent = if horizontal { r.size.x } else { r.size.y };
             let available = (extent - 5.0).max(0.0);
-            let a = available * ratio.clamp(0.15, 0.85);
+            let a = split_first(
+                available,
+                *ratio,
+                if horizontal {
+                    MIN_SPLIT_WIDTH
+                } else {
+                    MIN_SPLIT_HEIGHT
+                },
+            );
             let (r1, handle, r2) = if horizontal {
                 (
                     rect(r.pos.x, r.pos.y, a, r.size.y),
@@ -1086,6 +1113,19 @@ fn draw_node(
             draw_node(shell, cx, state, second, r2);
         }
     }
+}
+
+/// Each side of a split keeps room for its tab strip and content.
+const MIN_SPLIT_WIDTH: f64 = 240.0;
+const MIN_SPLIT_HEIGHT: f64 = 160.0;
+
+/// The first child's extent: the saved ratio within each side's minimum, or an even split when
+/// the area cannot hold both minimums, so a narrow window never leaves one side a sliver.
+pub(crate) fn split_first(available: f64, ratio: f64, min: f64) -> f64 {
+    if available < 2.0 * min {
+        return available / 2.0;
+    }
+    (available * ratio.clamp(0.15, 0.85)).clamp(min, available - min)
 }
 
 /// One pane (`_pane`): 38px tab strip + divider (wide, or the compact Explorer), then the
@@ -1405,16 +1445,26 @@ fn draw_tab_strip(
         // their label's width and show close on hover, so labels fit before anything ellipsizes.
         let slim = explorer && !pill;
         let slim_chrome_w = 10.0 + 15.0 + 7.0 + 10.0;
+        // Without its menu and close (a narrow chip drops them), a tab needs this beside its label.
+        let bare_chrome_w = if pill {
+            10.0 + 14.0 + 6.0 + 10.0
+        } else {
+            slim_chrome_w
+        };
+        let icon_tab_w = 10.0 + if pill { 14.0 } else { 15.0 } + 10.0;
+        let mut bare_chrome = Vec::with_capacity(tabs.len());
+        let mut icon_widths = Vec::with_capacity(tabs.len());
         for (_, _, active, label, spec, modified, width) in &mut tabs {
             let text_w = ui.measure(cx, *spec, label);
+            let dot = if *modified { 12.0 } else { 0.0 };
             let chrome = if slim && !*active {
                 slim_chrome_w
             } else {
                 chrome_w
             };
-            *width = (chrome + text_w + if *modified { 12.0 } else { 0.0 })
-                .min(240.0)
-                .min(available);
+            bare_chrome.push(bare_chrome_w + dot);
+            icon_widths.push(icon_tab_w + dot);
+            *width = (chrome + text_w + dot).min(240.0).min(available);
         }
         let natural: Vec<f64> = tabs.iter().map(|t| t.6).collect();
         let active = tabs.iter().position(|tab| tab.2).unwrap_or(0);
@@ -1428,7 +1478,19 @@ fn draw_tab_strip(
             (10.0 + if pill { 14.0 } else { 15.0 } + 10.0 + 24.0).min(available),
             36.0,
         );
-        for (tab, width) in tabs.iter_mut().zip(&fit.widths) {
+        let mut widths = fit.widths;
+        // A label cut to a letter or two says less than the icon: such tabs show the icon
+        // (full title in the tooltip) and their room goes to the other labels.
+        let icon_only = collapse_labels(
+            &mut widths,
+            &natural,
+            &bare_chrome,
+            &icon_widths,
+            active,
+            fit.first..fit.end,
+            36.0,
+        );
+        for (tab, width) in tabs.iter_mut().zip(&widths) {
             tab.6 = *width;
         }
         let overflow_w = 36.0;
@@ -1440,9 +1502,10 @@ fn draw_tab_strip(
             .map(|(_, t)| t.1.clone())
             .collect();
         let shown = end.saturating_sub(first);
-        for (target, key, active, label, label_spec, modified, w) in
-            tabs.into_iter().skip(first).take(shown)
+        for (index, (target, key, active, label, label_spec, modified, w)) in
+            tabs.into_iter().enumerate().skip(first).take(shown)
         {
+            let icon_only = icon_only[index];
             let chip = if pill {
                 rect(x + 2.0, bar.pos.y + 5.0, w, bar.size.y - 10.0)
             } else {
@@ -1511,15 +1574,19 @@ fn draw_tab_strip(
                 (chip.pos.x + chip.size.x - buttons_w - dot_w - cx_x).max(0.0),
                 chip.size.y,
             );
-            let drawn = ui.text(
-                cx,
-                text_rect,
-                crate::common::paint::TextSpec {
-                    color: fg,
-                    ..label_spec
-                },
-                &label,
-            );
+            let drawn = if icon_only {
+                rect(icon_rect.pos.x, chip.pos.y, icon_size, chip.size.y)
+            } else {
+                ui.text(
+                    cx,
+                    text_rect,
+                    crate::common::paint::TextSpec {
+                        color: fg,
+                        ..label_spec
+                    },
+                    &label,
+                )
+            };
             if modified {
                 let dot_x = drawn.pos.x + drawn.size.x + 4.0 + 4.0;
                 ui.dot(
@@ -1536,7 +1603,8 @@ fn draw_tab_strip(
                 chip
             };
             // A shrunk tab keeps its full title as a tooltip.
-            let truncated = ui.measure(cx, label_spec, &label) > text_rect.size.x + 0.5;
+            let truncated =
+                icon_only || ui.measure(cx, label_spec, &label) > text_rect.size.x + 0.5;
             ui.control(
                 cx,
                 tab_hit,
@@ -1968,6 +2036,18 @@ pub(crate) fn sidebar_visible(shell: &PaseoShell) -> bool {
             && shell.data.layout.compact_destination == CompactDestination::Sidebar
     } else {
         shell.data.layout.sidebar_visible
+            && !sidebar_crowded(shell, shell.data.chrome.content_rect.size.x)
+    }
+}
+
+/// The wide sidebar toggle. A sidebar that stepped aside for the Explorer comes back by closing
+/// the Explorer, rather than the toggle silently "hiding" what is already out of sight.
+pub(crate) fn toggle_wide_sidebar(shell: &mut PaseoShell) {
+    if sidebar_crowded(shell, shell.data.chrome.content_rect.size.x) {
+        shell.data.layout.show_explorer(false);
+    } else {
+        let visible = shell.data.layout.sidebar_visible;
+        shell.data.layout.show_sidebar(false, !visible);
     }
 }
 
@@ -2189,10 +2269,13 @@ fn update_drag(shell: &mut PaseoShell, _cx: &mut Cx, abs: DVec2, _time: f64) -> 
                 Axis::Vertical => abs.y,
             };
             let available = (extent - 5.0).max(1.0);
-            shell
-                .data
-                .layout
-                .resize_split(&id, ((value - start) / available).clamp(0.15, 0.85));
+            let min = match axis {
+                Axis::Horizontal => MIN_SPLIT_WIDTH,
+                Axis::Vertical => MIN_SPLIT_HEIGHT,
+            };
+            // Store what the divider shows: the pointer's ratio within each side's minimum.
+            let ratio = split_first(available, (value - start) / available, min) / available;
+            shell.data.layout.resize_split(&id, ratio.clamp(0.15, 0.85));
             true
         }
         Drag::Sidebar {
@@ -2495,6 +2578,50 @@ pub(crate) fn fit_tabs(
     TabFit { widths, first, end }
 }
 
+/// After `fit_tabs`, collapses other visible tabs (`shown`) whose label would show fewer than
+/// `min_label` px (a letter or two and an ellipsis) to their `icon_w`, one at a time from the
+/// most cut, giving the freed room back to cut visible labels in strip order. `bare_chrome` is
+/// each chip's width without its label. Returns which tabs show only their icon.
+pub(crate) fn collapse_labels(
+    widths: &mut [f64],
+    natural: &[f64],
+    bare_chrome: &[f64],
+    icon_w: &[f64],
+    active: usize,
+    shown: std::ops::Range<usize>,
+    min_label: f64,
+) -> Vec<bool> {
+    let mut icon_only = vec![false; widths.len()];
+    loop {
+        let cut = shown
+            .clone()
+            .filter(|&i| {
+                i != active
+                    && !icon_only[i]
+                    && widths[i] + 0.5 < natural[i]
+                    && widths[i] - bare_chrome[i] < min_label
+                    && icon_w[i] < widths[i]
+            })
+            .min_by(|&a, &b| (widths[a] - bare_chrome[a]).total_cmp(&(widths[b] - bare_chrome[b])));
+        let Some(cut) = cut else {
+            return icon_only;
+        };
+        let mut freed = widths[cut] - icon_w[cut];
+        widths[cut] = icon_w[cut];
+        icon_only[cut] = true;
+        for i in shown.clone() {
+            if freed <= 0.0 {
+                break;
+            }
+            if !icon_only[i] && widths[i] < natural[i] {
+                let grow = (natural[i] - widths[i]).min(freed);
+                widths[i] += grow;
+                freed -= grow;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2535,5 +2662,40 @@ mod tests {
         let fit = fit_tabs(&[200.0, 200.0, 200.0, 200.0], 2, 400.0, 0.0, 138.0, 36.0);
         assert_eq!((fit.first, fit.end), (1, 3));
         assert!(fit.widths[1] + fit.widths[2] <= 400.0 - 36.0);
+    }
+
+    #[test]
+    fn split_sides_keep_their_minimum_or_share_evenly() {
+        // Wide: the saved ratio applies as long as both sides keep 240px.
+        assert_eq!(split_first(1000.0, 0.5, 240.0), 500.0);
+        assert_eq!(split_first(1000.0, 0.15, 240.0), 240.0);
+        assert_eq!(split_first(1000.0, 0.85, 240.0), 760.0);
+        // Too narrow for two 240px sides: an even split instead of a 15% sliver.
+        assert_eq!(split_first(400.0, 0.15, 240.0), 200.0);
+        assert_eq!(split_first(0.0, 0.5, 240.0), 0.0);
+    }
+
+    #[test]
+    fn labels_cut_to_a_letter_become_icons_and_give_their_room_to_the_others() {
+        // The default Explorer: Files and Git Log were squeezed to "Fi…" and "Gi…" beside the
+        // active Commit tab. Files becomes an icon and Git Log gets its whole label back.
+        let natural = [72.0, 87.0, 140.0];
+        let mut widths = vec![64.0, 64.0, 140.0];
+        let icons = collapse_labels(&mut widths, &natural, &[42.0; 3], &[35.0; 3], 2, 0..3, 36.0);
+        assert_eq!(icons, [true, false, false]);
+        assert_eq!(widths, [35.0, 87.0, 140.0]);
+        // Tabs that keep a readable part of their label are left alone, and so is the active one.
+        let mut widths = vec![90.0, 50.0];
+        let natural = [120.0, 140.0];
+        let icons = collapse_labels(&mut widths, &natural, &[42.0; 2], &[35.0; 2], 1, 0..2, 36.0);
+        assert_eq!(icons, [false, false]);
+        assert_eq!(widths, [90.0, 50.0]);
+        // A tab already in the +N overflow frees no room: the clamped active tab must not grow
+        // into the overflow chip and the new-tab button.
+        let mut widths = vec![115.0, 59.0];
+        let natural = [151.0, 151.0];
+        let icons = collapse_labels(&mut widths, &natural, &[42.0; 2], &[35.0; 2], 0, 0..1, 36.0);
+        assert_eq!(icons, [false, false]);
+        assert_eq!(widths, [115.0, 59.0]);
     }
 }

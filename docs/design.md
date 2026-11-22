@@ -22,7 +22,7 @@ Host, directory and session rows have distinct actions. A directory's create act
 
 ## Responsive interaction
 
-Design the compact case explicitly. The sidebar, session and supporting file view must remain reachable with Back and visible controls. Keyboard insets, safe areas, text scaling and rotation must not hide primary actions or change session identity. Wider layouts may show more context without creating a second state model.
+Design the compact case explicitly. The sidebar, session and supporting file view must remain reachable with Back and visible controls. Keyboard insets, safe areas, text scaling and rotation must not hide primary actions or change session identity. Wider layouts may show more context without creating a second state model. In the wide layout the conversation keeps 320px, the sidebar 200px and the Explorer 180px; when a window cannot hold all three, the sidebar steps aside while the Explorer is open (its toggle brings it back by closing the Explorer) rather than squeezing every column. Split panes keep 240px (160px tall) per side and share evenly below that.
 
 Mobile multiline editors insert a newline on Enter and keep the keyboard open; single-line fields complete their action and dismiss it. Touch scrolling preserves the current editor, draft and keyboard. Only a completed outside tap changes focus. Bound long compact composers to their available viewport so the current line and action row remain reachable without forcing ordinary scrolling back to the caret.
 
