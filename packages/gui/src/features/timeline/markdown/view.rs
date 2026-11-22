@@ -183,6 +183,32 @@ impl MarkdownPresentation {
     pub fn invalidate_interaction(&mut self) {
         self.reprepare_published = true;
     }
+
+    /// Drops an unfinished preparation for another source, width, font or theme,
+    /// and reports whether `candidate` needs a new one. Finishing an obsolete
+    /// preparation would publish it over a current document: a row last laid out
+    /// in a narrow window kept its narrow wrap after the window was widened.
+    fn retarget(
+        &mut self,
+        candidate: &Rc<ParsedSnapshot>,
+        look: Look,
+        width: f64,
+        opts: &MdOpts,
+        theme_epoch: u64,
+    ) -> bool {
+        let current = self
+            .published
+            .as_ref()
+            .is_some_and(|doc| doc.matches(candidate, look, width, opts, theme_epoch));
+        let pending = self
+            .preparing
+            .as_ref()
+            .is_some_and(|doc| doc.matches(candidate, look, width, opts, theme_epoch));
+        if !pending {
+            self.preparing = None;
+        }
+        !current && !pending
+    }
 }
 
 impl DocumentLayout {
@@ -223,16 +249,11 @@ pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f6
                 .as_ref()
                 .map(|doc| doc.snapshot.clone())
         });
-        if let Some(candidate) = candidate {
-            let current = presentation
+        if let Some(candidate) = candidate
+            && presentation.retarget(&candidate, d.look, w, opts, theme_epoch)
+        {
                 .published
                 .as_ref()
-                .is_some_and(|doc| doc.matches(&candidate, d.look, w, opts, theme_epoch));
-            let pending = presentation
-                .preparing
-                .as_ref()
-                .is_some_and(|doc| doc.matches(&candidate, d.look, w, opts, theme_epoch));
-            if !current && !pending {
                 let entries = presentation
                     .published
                     .as_ref()
@@ -261,7 +282,6 @@ pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f6
                         ..Default::default()
                     },
                 });
-            }
         }
         if let Some(mut preparing) = presentation.preparing.take() {
             prepare_document(cx, d, opts, &mut preparing, x, y);
@@ -2303,6 +2323,75 @@ mod font_epoch_tests {
         // Neither source, width, font size nor palette changed: only a newly
         // discovered face changes the glyph coverage of this retained layout.
         assert!(!published.matches(&snapshot, look, 320.0, &opts, 8));
+    }
+
+    #[test]
+    fn an_unfinished_preparation_for_another_width_never_replaces_the_current_document() {
+        let snapshot = Rc::new(ParsedSnapshot {
+            revision: 1,
+            epoch: 1,
+            source: Rc::new(serde_json::json!({"item": {"text": "A paragraph"}})),
+            replaces_previous: false,
+            find_pattern: None,
+            interactive: true,
+            prefix: None,
+            stable_end: 0,
+            tail: Rc::new(ParsedChunk {
+                blocks: Rc::new(Vec::new()),
+                codes: HashMap::new(),
+                paragraphs: HashMap::new(),
+            }),
+        });
+        let look = Look {
+            palette: crate::theme::current_palette(),
+            typo: crate::theme::current_typography(),
+            compact: false,
+            mobile: false,
+            list_inset: 16.0,
+            syntax: paseo_highlight::SyntaxThemeId::One,
+        };
+        let opts = MdOpts {
+            font_size: 14.0,
+            key: "resize",
+            find: None,
+            core: None,
+            host_id: "test",
+            workspace_root: None,
+            syntax_theme: "one",
+            counter: 0,
+        };
+        let doc = |width: f64| DocumentLayout {
+            snapshot: snapshot.clone(),
+            chunks: snapshot.chunks(),
+            look,
+            theme_epoch: 1,
+            width,
+            font_size: opts.font_size,
+            occurrence: None,
+            cache: ParagraphCache::default(),
+        };
+        // Wide again after a narrow window: the published wide layout is current, and the
+        // preparation the narrow window started must not finish and replace it.
+        let mut presentation = MarkdownPresentation {
+            epoch: 1,
+            published: Some(doc(722.0)),
+            preparing: Some(doc(210.0)),
+            reprepare_published: false,
+        };
+        assert!(!presentation.retarget(&snapshot, look, 722.0, &opts, 1));
+        assert!(presentation.preparing.is_none());
+        // A preparation for the requested width keeps going.
+        presentation.preparing = Some(doc(722.0));
+        presentation.published = Some(doc(210.0));
+        assert!(!presentation.retarget(&snapshot, look, 722.0, &opts, 1));
+        assert_eq!(
+            presentation.preparing.as_ref().map(|doc| doc.width),
+            Some(722.0)
+        );
+        // Neither matches: the stale preparation goes and a new one is needed.
+        presentation.preparing = Some(doc(210.0));
+        assert!(presentation.retarget(&snapshot, look, 500.0, &opts, 1));
+        assert!(presentation.preparing.is_none());
     }
 }
 
