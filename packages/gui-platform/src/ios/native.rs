@@ -13,7 +13,8 @@ use block2::RcBlock;
 use makepad_widgets::{Cx, Event, VirtualKeyboardEvent};
 use objc2::{
     class, msg_send,
-    runtime::{AnyObject, Bool, Sel},
+    runtime::{AnyClass, AnyObject, Bool, Sel},
+    sel,
 };
 use serde_json::Value;
 use std::{
@@ -26,6 +27,12 @@ use std::{
 #[link(name = "UIKit", kind = "framework")]
 unsafe extern "C" {
     fn UIImagePNGRepresentation(image: Id) -> Id;
+    fn UIImageWriteToSavedPhotosAlbum(
+        image: Id,
+        target: Id,
+        selector: Sel,
+        context: *mut std::ffi::c_void,
+    );
     static UIBackgroundTaskInvalid: usize;
     static UIApplicationOpenSettingsURLString: Id;
 }
@@ -124,6 +131,7 @@ pub(crate) fn capabilities() -> Capabilities {
         push: true,
         qr_scan: true,
         share: true,
+        photo_library: true,
         idle: false,
     }
 }
@@ -461,7 +469,10 @@ extern "C" fn picker_cancelled(_this: &AnyObject, _sel: Sel, _picker: Id) {
 
 pub(crate) fn pick_files(_shared: &Arc<Shared>, options: PickFilesOptions, done: Completion) {
     apple::on_main_queue(move || unsafe {
-        if PICKER.lock().unwrap().is_some() || SAVE_PICKER.lock().unwrap().is_some() {
+        if PICKER.lock().unwrap().is_some()
+            || SAVE_PICKER.lock().unwrap().is_some()
+            || PHOTO_PICKER.lock().unwrap().is_some()
+        {
             done.fail(PlatformError::native("A file picker is already open."));
             return;
         }
@@ -472,6 +483,15 @@ pub(crate) fn pick_files(_shared: &Arc<Shared>, options: PickFilesOptions, done:
             ));
             return;
         }
+        // Images come from the photo library, like other apps' "add photo".
+        let done = if options.images_only {
+            match present_photo_picker(root, options.multiple, done) {
+                Ok(()) => return,
+                Err(done) => done,
+            }
+        } else {
+            done
+        };
         let class = apple::define_class(
             c"PaseoDocumentPickerDelegate",
             class!(NSObject),
@@ -499,6 +519,183 @@ pub(crate) fn pick_files(_shared: &Arc<Shared>, options: PickFilesOptions, done:
         let _: () = msg_send![root, presentViewController: picker, animated: true, completion: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![picker, release];
     });
+}
+
+// ----- photo picker -----
+
+#[link(name = "PhotosUI", kind = "framework")]
+unsafe extern "C" {}
+
+static PHOTO_PICKER: Mutex<Option<(Completion, usize)>> = Mutex::new(None);
+
+/// Presents `PHPickerViewController` for images; gives `done` back when PhotosUI is missing.
+unsafe fn present_photo_picker(
+    root: Id,
+    multiple: bool,
+    done: Completion,
+) -> Result<(), Completion> {
+    let (Some(configuration), Some(controller), Some(filter)) = (
+        AnyClass::get(c"PHPickerConfiguration"),
+        AnyClass::get(c"PHPickerViewController"),
+        AnyClass::get(c"PHPickerFilter"),
+    ) else {
+        return Err(done);
+    };
+    unsafe {
+        let config: Id = msg_send![configuration, alloc];
+        let config: Id = msg_send![config, init];
+        let images: Id = msg_send![filter, imagesFilter];
+        let _: () = msg_send![config, setFilter: images];
+        // 0 is unlimited.
+        let _: () = msg_send![config, setSelectionLimit: if multiple { 0isize } else { 1isize }];
+        // PHPickerConfigurationAssetRepresentationModeCompatible: HEIC arrives as JPEG, which
+        // every provider accepts.
+        let _: () = msg_send![config, setPreferredAssetRepresentationMode: 1isize];
+        let picker: Id = msg_send![controller, alloc];
+        let picker: Id = msg_send![picker, initWithConfiguration: config];
+        let _: () = msg_send![config, release];
+        let class = apple::define_class(
+            c"PaseoPhotoPickerDelegate",
+            class!(NSObject),
+            &[
+                (c"picker:didFinishPicking:", imp!(photos_picked), "v@:@@"),
+                (
+                    c"presentationControllerDidDismiss:",
+                    imp!(photo_picker_dismissed),
+                    "v@:@",
+                ),
+            ],
+        );
+        let delegate: Id = msg_send![class, new];
+        let _: () = msg_send![picker, setDelegate: delegate];
+        let presentation: Id = msg_send![picker, presentationController];
+        if !presentation.is_null() {
+            let _: () = msg_send![presentation, setDelegate: delegate];
+        }
+        *PHOTO_PICKER.lock().unwrap() = Some((done, delegate as usize));
+        let _: () = msg_send![root, presentViewController: picker, animated: true, completion: std::ptr::null_mut::<AnyObject>()];
+        let _: () = msg_send![picker, release];
+    }
+    Ok(())
+}
+
+/// Takes the pending photo pick; the delegate is released after the current callback returns.
+fn take_photo_picker() -> Option<Completion> {
+    let (done, delegate) = PHOTO_PICKER.lock().unwrap().take()?;
+    apple::on_main_queue(move || unsafe {
+        let _: () = msg_send![delegate as Id, release];
+    });
+    Some(done)
+}
+
+extern "C" fn photo_picker_dismissed(_this: &AnyObject, _sel: Sel, _presentation: Id) {
+    if let Some(done) = take_photo_picker() {
+        done.ok(PlatformValue::Files(Vec::new()));
+    }
+}
+
+struct PhotoPick {
+    done: Option<Completion>,
+    remaining: usize,
+    files: Vec<Option<PickedFile>>,
+    failure: Option<PlatformError>,
+}
+
+extern "C" fn photos_picked(_this: &AnyObject, _sel: Sel, picker: Id, results: Id) {
+    let Some(done) = take_photo_picker() else {
+        return;
+    };
+    unsafe {
+        // PHPicker leaves dismissal to its delegate.
+        let _: () = msg_send![picker, dismissViewControllerAnimated: true, completion: std::ptr::null_mut::<AnyObject>()];
+    }
+    let count: usize = if results.is_null() {
+        0
+    } else {
+        unsafe { msg_send![results, count] }
+    };
+    if count == 0 {
+        done.ok(PlatformValue::Files(Vec::new()));
+        return;
+    }
+    let pick = Arc::new(Mutex::new(PhotoPick {
+        done: Some(done),
+        remaining: count,
+        files: (0..count).map(|_| None).collect(),
+        failure: None,
+    }));
+    for index in 0..count {
+        unsafe {
+            let result: Id = msg_send![results, objectAtIndex: index];
+            let provider: Id = msg_send![result, itemProvider];
+            let suggested = rust_string(msg_send![provider, suggestedName]);
+            let pick = pick.clone();
+            let loaded = RcBlock::new(move |url: Id, error: Id| {
+                // The provider deletes its temporary file once this handler returns.
+                let copied = copy_picked_photo(url, error, suggested.as_deref());
+                let mut pick = pick.lock().unwrap();
+                match copied {
+                    Ok(file) => pick.files[index] = Some(file),
+                    Err(error) => pick.failure = Some(error),
+                }
+                pick.remaining -= 1;
+                if pick.remaining == 0
+                    && let Some(done) = pick.done.take()
+                {
+                    let files: Vec<PickedFile> = pick.files.drain(..).flatten().collect();
+                    match pick.failure.take() {
+                        Some(error) if files.is_empty() => done.fail(error),
+                        _ => done.ok(PlatformValue::Files(files)),
+                    }
+                }
+            });
+            let _: Id = msg_send![provider, loadFileRepresentationForTypeIdentifier: ns_string("public.image"), completionHandler: &*loaded];
+        }
+    }
+}
+
+fn copy_picked_photo(
+    url: Id,
+    error: Id,
+    suggested: Option<&str>,
+) -> Result<PickedFile, PlatformError> {
+    if url.is_null() {
+        let reason = (!error.is_null())
+            .then(|| rust_string(unsafe { msg_send![error, localizedDescription] }))
+            .flatten();
+        return Err(PlatformError::native(
+            reason.unwrap_or_else(|| "The photo could not be loaded.".into()),
+        ));
+    }
+    let source = rust_string(unsafe { msg_send![url, path] })
+        .map(PathBuf::from)
+        .ok_or_else(|| PlatformError::native("The photo has no file path."))?;
+    let file_name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "photo.jpg".into());
+    let extension = source.extension().map(|e| e.to_string_lossy().into_owned());
+    // Photos names an asset without its extension ("IMG_0042").
+    let name = match (suggested.filter(|s| !s.is_empty()), extension) {
+        (Some(stem), Some(extension))
+            if !stem
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{}", extension.to_ascii_lowercase())) =>
+        {
+            format!("{stem}.{extension}")
+        }
+        (Some(stem), _) => stem.to_owned(),
+        (None, _) => file_name,
+    };
+    let target = crate::paths::transfer_staging_file(&name).map_err(|e| PlatformError::io(&e))?;
+    let size = std::fs::copy(&source, &target).map_err(|e| PlatformError::io(&e))?;
+    Ok(PickedFile {
+        mime_type: crate::paths::mime_for_name(&name),
+        path: target,
+        name,
+        size,
+        temporary: true,
+    })
 }
 
 pub(crate) fn pick_directory(_shared: &Arc<Shared>, _title: Option<String>, done: Completion) {
@@ -682,6 +879,76 @@ pub(crate) fn save_file(
         if !presentation.is_null() {
             let _: () = msg_send![presentation, setDelegate: delegate];
         }
+    });
+}
+
+// ----- photo library save -----
+
+static PHOTO_SAVES: Mutex<Vec<(usize, Completion)>> = Mutex::new(Vec::new());
+
+extern "C" fn image_saved(
+    this: &AnyObject,
+    _sel: Sel,
+    _image: Id,
+    error: Id,
+    _context: *mut std::ffi::c_void,
+) {
+    let delegate = this as *const AnyObject as usize;
+    let done = {
+        let mut saves = PHOTO_SAVES.lock().unwrap();
+        saves
+            .iter()
+            .position(|(key, _)| *key == delegate)
+            .map(|index| saves.remove(index).1)
+    };
+    apple::on_main_queue(move || unsafe {
+        let _: () = msg_send![delegate as Id, release];
+    });
+    let Some(done) = done else {
+        return;
+    };
+    if error.is_null() {
+        done.ok(PlatformValue::Bool(true));
+    } else {
+        let reason = rust_string(unsafe { msg_send![error, localizedDescription] });
+        done.fail(PlatformError::native(reason.unwrap_or_else(|| {
+            "The image could not be saved to Photos.".into()
+        })));
+    }
+}
+
+/// Saves an image into Photos (add-only access, `NSPhotoLibraryAddUsageDescription`).
+pub(crate) fn save_image(
+    _shared: &Arc<Shared>,
+    path: PathBuf,
+    _mime_type: String,
+    _name: String,
+    done: Completion,
+) {
+    apple::on_main_queue(move || unsafe {
+        let image: Id =
+            msg_send![class!(UIImage), imageWithContentsOfFile: ns_string(&path.to_string_lossy())];
+        if image.is_null() {
+            done.fail(PlatformError::invalid("The image could not be read."));
+            return;
+        }
+        let class = apple::define_class(
+            c"PaseoPhotoSaveDelegate",
+            class!(NSObject),
+            &[(
+                c"image:didFinishSavingWithError:contextInfo:",
+                imp!(image_saved),
+                "v@:@@^v",
+            )],
+        );
+        let delegate: Id = msg_send![class, new];
+        PHOTO_SAVES.lock().unwrap().push((delegate as usize, done));
+        UIImageWriteToSavedPhotosAlbum(
+            image,
+            delegate,
+            sel!(image:didFinishSavingWithError:contextInfo:),
+            std::ptr::null_mut(),
+        );
     });
 }
 

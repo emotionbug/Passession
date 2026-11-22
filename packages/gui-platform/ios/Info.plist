@@ -64,6 +64,8 @@
 	<string>Allow Passession to use your camera to scan pairing QR codes.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to your Paseo daemon on your local network.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Allow Passession to save images to your photo library.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

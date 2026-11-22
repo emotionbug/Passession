@@ -365,3 +365,20 @@ Not covered: a logged-in tailnet and real host traffic, Android 12–14 and
 API 24–28, refused background starts, and a picker opened by the app itself.
 macOS, iOS and the Windows `gui-platform` crate were type-checked on Linux;
 nothing ran on those systems.
+
+## Photo picker and photo library saves (2026-11-22)
+
+An API 35 x86_64 AOSP emulator ran the x64 dev-fast APK against a disposable
+password-protected daemon reached through `10.0.2.2`.
+
+- New session › + › Add image opened the system photo picker
+  (`PhotoPickerActivity`), not DocumentsUI. The selected photo arrived as an
+  attachment in the composer. Upload file still opened DocumentsUI.
+- Files › long-press `diagram-qa.png` › Download showed "Saved to Photos" with
+  no location prompt. MediaStore listed it under `Pictures/Passession/` as
+  `image/png`, and the pulled copy was byte-identical to the host file.
+
+Not covered: the `GET_CONTENT` fallback on Android 11 and older without the
+photo picker, the document-dialog fallback on Android 9 and older, and a
+Mermaid "Save PNG" (same `save_image` call). The iOS photo picker and Photos
+save were type-checked for `aarch64-apple-ios` on Linux; nothing ran on iOS.

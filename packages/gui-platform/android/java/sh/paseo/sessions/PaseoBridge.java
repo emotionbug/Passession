@@ -8,6 +8,8 @@ import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipDescription;
 import android.content.ClipboardManager;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -28,9 +30,12 @@ import android.net.NetworkRequest;
 import android.net.RouteInfo;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.ext.SdkExtensions;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.util.Log;
 import android.util.DisplayMetrics;
@@ -795,6 +800,9 @@ final class PaseoBridge {
                     case "saveFile":
                         saveFile(id, new File(args.getString("path")), args.getString("mime"), args.getString("name"));
                         break;
+                    case "saveImage":
+                        saveImage(id, new File(args.getString("path")), args.getString("mime"), args.getString("name"));
+                        break;
                     case "share":
                         share(id, new File(args.getString("path")), args.optString("mime", "application/octet-stream"), args.optString("name"));
                         break;
@@ -830,10 +838,12 @@ final class PaseoBridge {
             nativeResult(id, error("busy", "A document save is already in progress."));
             return;
         }
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType(imagesOnly ? "image/*" : "*/*");
-        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple);
+        Intent intent = imagesOnly ? imagePicker(multiple) : new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        if (!imagesOnly) {
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple);
+        }
         int code = requestCode();
         activityRequests.put(code, id);
         try {
@@ -842,6 +852,78 @@ final class PaseoBridge {
             activityRequests.remove(code);
             nativeResult(id, error("native", "No document picker is available."));
         }
+    }
+
+    /**
+     * Images come from the system photo picker (Android 13+, or 11+ with its module update), like
+     * other apps' "add photo"; older systems offer their gallery apps through GET_CONTENT.
+     */
+    private Intent imagePicker(boolean multiple) {
+        if (photoPickerAvailable()) {
+            Intent intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            if (multiple) {
+                intent.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, MediaStore.getPickImagesMaxLimit());
+            }
+            return intent;
+        }
+        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple);
+        return intent;
+    }
+
+    private static boolean photoPickerAvailable() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return true;
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                && SdkExtensions.getExtensionVersion(Build.VERSION_CODES.R) >= 2;
+    }
+
+    /**
+     * Saves an image into the gallery (Pictures/Passession) without asking for a location, like
+     * "Save image" in other apps. Before Android 10 the shared Pictures folder needs a storage
+     * permission, so those systems keep the document save dialog.
+     */
+    private void saveImage(long id, File source, String mime, String name) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            saveFile(id, source, mime, name);
+            return;
+        }
+        io.execute(() -> {
+            ContentResolver resolver = activity.getApplicationContext().getContentResolver();
+            Uri destination = null;
+            String reply;
+            try {
+                requireSaveSource(source);
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Passession");
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                destination = resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+                if (destination == null) throw new java.io.IOException("The gallery did not accept the image.");
+                try (InputStream input = new FileInputStream(source);
+                     OutputStream output = resolver.openOutputStream(destination, "w")) {
+                    if (output == null) throw new java.io.IOException("The gallery could not open the image for writing.");
+                    copy(input, output);
+                    output.flush();
+                }
+                values.clear();
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                resolver.update(destination, values, null, null);
+                reply = ok(true);
+            } catch (Exception e) {
+                if (destination != null) {
+                    try {
+                        resolver.delete(destination, null, null);
+                    } catch (Exception ignored) {
+                        // The failed entry stays pending and is hidden from the gallery.
+                    }
+                }
+                reply = error("io", "Cannot save the image to the gallery: " + e.getMessage());
+            }
+            nativeResult(id, reply);
+        });
     }
 
     void onActivityResult(int requestCode, int resultCode, Intent data) {

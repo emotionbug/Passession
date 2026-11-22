@@ -68,6 +68,7 @@ pub(crate) fn capabilities() -> Capabilities {
         push: true,
         qr_scan: true,
         share: true,
+        photo_library: true,
         idle: false,
     }
 }
@@ -211,7 +212,8 @@ fn files(value: Value) -> Result<PlatformValue, PlatformError> {
     ))
 }
 
-/// ACTION_OPEN_DOCUMENT; selections are copied into a private cache directory.
+/// ACTION_OPEN_DOCUMENT, or the system photo picker for images; selections are copied into a
+/// private cache directory.
 pub(crate) fn pick_files(_shared: &Arc<Shared>, options: PickFilesOptions, done: Completion) {
     call_async(
         "pickFiles",
@@ -250,6 +252,27 @@ pub(crate) fn save_file(
                 .as_bool()
                 .map(PlatformValue::Bool)
                 .ok_or_else(|| PlatformError::native("Invalid Android document save result."))
+        },
+    );
+}
+
+/// MediaStore Pictures/Passession (Android 10+; earlier systems fall back to ACTION_CREATE_DOCUMENT).
+pub(crate) fn save_image(
+    _shared: &Arc<Shared>,
+    path: PathBuf,
+    mime_type: String,
+    name: String,
+    done: Completion,
+) {
+    call_async(
+        "saveImage",
+        json!({"path": path, "mime": mime_type, "name": name}),
+        done,
+        |value| {
+            value
+                .as_bool()
+                .map(PlatformValue::Bool)
+                .ok_or_else(|| PlatformError::native("Invalid Android image save result."))
         },
     );
 }

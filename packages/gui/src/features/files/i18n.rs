@@ -79,6 +79,7 @@ const KO: &[(&str, &str)] = &[
     ("{received} / {total} bytes", "{received} / {total} 바이트"),
     ("Cancel", "취소"),
     ("Saved to {path}", "{path}에 저장했습니다"),
+    ("Saved to Photos", "사진에 저장했습니다"),
     ("Copied", "복사했습니다"),
     (
         "Local desktop host is not available",

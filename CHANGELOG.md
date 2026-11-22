@@ -16,6 +16,8 @@
 
 ### Changed
 
+- On Android and iOS, adding an image (to a message or as a project icon) opens the photo picker instead of the file browser. Android 11 and older without the system photo picker offer their gallery apps instead.
+- On Android and iOS, saving an image puts it straight into the photo library instead of asking for a file location or opening the share sheet: a Mermaid diagram's "Save PNG", and "Save a copy" of a PNG, JPEG, GIF, WebP or HEIC file. Android saves to Pictures/Passession and shows "Saved to Photos"; Android 9 and older, which need a storage permission for that folder, keep the save dialog. SVG and other files keep the save dialog or share sheet.
 - When the window is too narrow for the sidebar, the conversation and the Explorer together (under about 710px, such as half of a 1366px laptop screen), the sidebar steps aside while the Explorer is open instead of squeezing all three. The sidebar button brings it back by closing the Explorer, and widening the window shows both again.
 - A tab whose label would be cut to a letter or two shows only its icon, with the full title in its tooltip, and its room goes to the other tabs. The Explorer's default width no longer shows "Fi…" and "Gi…" next to an open Commit tab.
 - On desktop, the New session pickers (project, host, What to launch, model, mode, thinking and provider options), the schedule form's pickers, the Schedules host filter and a schedule's actions menu open as a dropdown under the field you clicked, like a native select, instead of a dialog in the middle of the window. A dropdown opens above its field when there is more room there, closes with one Escape or a click outside, and closes when the window is resized. Phone-sized windows keep the titled bottom sheet.

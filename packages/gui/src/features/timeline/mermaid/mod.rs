@@ -428,8 +428,15 @@ impl Worker {
                         Ok(Some(path)) => {
                             if export_is_current(&owner, revision) {
                                 if let Some(platform) = paseo_gui_platform::platform() {
-                                    let request =
-                                        platform.save_file(&path, format.mime(), format.name());
+                                    // A PNG goes to the photo library on phones; SVG is a
+                                    // document and keeps the document save.
+                                    let request = if format == ExportFormat::Png
+                                        && platform.capabilities().photo_library
+                                    {
+                                        platform.save_image(&path, format.mime(), format.name())
+                                    } else {
+                                        platform.save_file(&path, format.mime(), format.name())
+                                    };
                                     self.platform.insert(
                                         request,
                                         PlatformPending::Save(owner, revision, path),

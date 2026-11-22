@@ -98,6 +98,8 @@ enum PlatformPending {
     SaveLocation(u64),
     /// Open/share of a finished download; the transfer card is already gone.
     TransferFinish,
+    /// A downloaded image saving into the phone's photo library.
+    PhotoSave,
     Clipboard {
         owner: String,
     },
@@ -965,6 +967,13 @@ impl Store {
         let path = std::path::PathBuf::from(&local);
         let request = match transfer.mode {
             TransferMode::Open => platform.open_path(&path),
+            // Phones save an image into the photo library, like "Save image" elsewhere.
+            TransferMode::Save if platform.capabilities().photo_library && is_photo_mime(&mime) => {
+                let request = platform.save_image(&path, &mime, &transfer.name);
+                self.platform_pending
+                    .insert(request, PlatformPending::PhotoSave);
+                return;
+            }
             // Mobile "save" shares (no save dialog), like the original.
             TransferMode::Share | TransferMode::Save => {
                 platform.share_file(&path, &mime, &transfer.name)
@@ -1086,6 +1095,15 @@ impl Store {
                     host::toast(ui, error.message, true);
                 }
             }
+            PlatformPending::PhotoSave => match result {
+                Ok(PlatformValue::Bool(true)) => host::toast(ui, l("Saved to Photos"), false),
+                Ok(_) => {}
+                Err(error) => {
+                    if error.code != "cancelled" {
+                        host::toast(ui, error.message, true);
+                    }
+                }
+            },
             PlatformPending::Clipboard { owner } => match result {
                 Ok(PlatformValue::Clipboard(content)) => {
                     if let Some(text) = content.text {
@@ -1562,6 +1580,26 @@ pub fn register_picker(owner: &str, host_id: &str) {
 /// Explorer entry parent (re-exported for the view).
 pub fn parent_of(path: &str) -> String {
     parent_explorer_path(path)
+}
+
+/// Raster formats a phone photo library shows; SVG and other images stay documents.
+fn is_photo_mime(mime: &str) -> bool {
+    matches!(
+        mime.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/gif"
+            | "image/webp"
+            | "image/heic"
+            | "image/heif"
+            | "image/bmp"
+    )
 }
 
 #[cfg(test)]

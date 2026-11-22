@@ -27,6 +27,7 @@ pub(crate) fn capabilities() -> Capabilities {
         push: false,
         qr_scan: false,
         share: true,
+        photo_library: false,
         idle: os::idle_supported(),
     }
 }
@@ -168,6 +169,19 @@ pub(crate) fn save_location(shared: &Arc<Shared>, suggested_name: String, done: 
             file.map(|f| f.path().to_path_buf()),
         ));
     });
+}
+
+/// Desktop has no photo library; images save through [`save_file`]'s dialog.
+pub(crate) fn save_image(
+    _shared: &Arc<Shared>,
+    _path: PathBuf,
+    _mime_type: String,
+    _name: String,
+    done: Completion,
+) {
+    done.fail(PlatformError::unsupported(
+        "Desktop saves images through the save dialog.",
+    ));
 }
 
 pub(crate) fn save_file(
