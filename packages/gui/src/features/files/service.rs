@@ -179,7 +179,7 @@ pub async fn download_into(
 ) -> anyhow::Result<Value> {
     use paseo_protocol::binary_frames::{FileTransferFrame, decode_file_transfer_frame};
     let id = uuid::Uuid::new_v4().to_string();
-    let mut binary = client.subscribe_binary();
+    let mut frames = client.file_transfer_frames(&id);
     let cancel = paseo_client::RequestOptions::default().cancel;
     let request = client.request_cancellable(
         json!({
@@ -225,11 +225,8 @@ pub async fn download_into(
                         "revision": entry.get("revision").cloned().unwrap_or(Value::Null),
                     }));
                 }
-                frame = binary.recv() => {
-                    let frame = frame.map_err(|_| anyhow::anyhow!("Connection lost during file download"))?;
-                    if frame.first().is_none_or(|byte| !matches!(*byte, 0x10..=0x12)) {
-                        continue;
-                    }
+                frame = frames.recv() => {
+                    let frame = frame.ok_or_else(|| anyhow::anyhow!("Connection lost during file download"))?;
                     match decode_file_transfer_frame(&frame)? {
                         FileTransferFrame::Begin { request_id, metadata: begin } if request_id == id => {
                             anyhow::ensure!(metadata.is_none(), "Duplicate file transfer header");

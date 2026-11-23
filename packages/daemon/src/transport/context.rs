@@ -374,20 +374,21 @@ impl RequestContext {
                 bail!("Binary frame lacks live source ownership");
             }
         }
-        self.bulk_room(bytes.len()).await?;
+        // A frame larger than the window waits for an empty queue rather than forever.
+        self.backlog_at_most(BULK_WINDOW_BYTES.saturating_sub(bytes.len()))
+            .await?;
         self.queue(OutboundFrame::Binary(bytes)).await
     }
-    /// Waits until a bulk frame of `bytes` fits within BULK_WINDOW_BYTES of queued output, or
-    /// nothing is queued, so the transfer runs at the link's pace instead of overflowing it.
-    async fn bulk_room(&self, bytes: usize) -> Result<()> {
+    /// Waits until at most `limit` bytes are queued for this client's socket, so bulk output
+    /// runs at the link's pace instead of overflowing it.
+    pub async fn backlog_at_most(&self, limit: usize) -> Result<()> {
         let owner_cancel = self.cancellation();
         loop {
             let drained = self.source.drained.notified();
             tokio::pin!(drained);
             // Register before reading the count, so a release in between still wakes us.
             drained.as_mut().enable();
-            let queued = self.source.queued.load(Ordering::Acquire);
-            if queued == 0 || queued.saturating_add(bytes) <= BULK_WINDOW_BYTES {
+            if self.source.queued.load(Ordering::Acquire) <= limit {
                 return Ok(());
             }
             tokio::select! { biased;

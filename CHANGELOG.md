@@ -5,7 +5,11 @@
 ### Fixed
 
 - Downloading a file larger than about 64 MB over a connection slower than the daemon's disk (Wi-Fi, the relay, Tailscale or a phone network) no longer drops the app's connection. Before this, the app disconnected a few seconds into the download, the download failed, and the app reconnected shortly after. The download now runs at the connection's speed, and the daemon log records when it has to disconnect a client that cannot keep up.
-- Switching back to the app window on desktop, reopening the app on a phone, or a phone changing networks during a download no longer drops and reopens the connection. The app's quick connection check waited only three seconds for the daemon's reply, which can queue behind the download on a slow link; data that keeps arriving now counts as a working connection.
+- Switching back to the app window on desktop, reopening the app on a phone, or a phone changing networks during a download or upload no longer drops and reopens the connection. The app's quick connection check waited only three seconds for the daemon's reply, which can queue behind the transfer on a slow link; traffic that keeps moving in either direction now counts as a working connection.
+- Uploading a large attachment over a slow connection no longer disconnects the app after about 30 seconds with "Liveness check timed out". The app's connection checks were queued behind the upload and replies from the daemon went unread while it was sending; the check now goes ahead of queued data, replies are read while sending, and an upload the daemon keeps accepting counts as a working connection.
+- A terminal printing a lot of output (a build log, `cat` of a large file) on a slow connection no longer disconnects the app. Each time the client fell behind, the daemon queued another full screen snapshot until the connection's buffer overflowed; it now sends one snapshot once the client has caught up.
+- With more than one saved way to reach a host, a download or upload no longer makes the app switch to another route mid-transfer. A connection check that waited behind the transfer looked slower than an idle alternative.
+- A download no longer fails with "Connection lost during file download" when many chunks arrive at once, for example after the app was busy for a moment or a phone came back to the foreground. The app dropped chunks it had not read in time and reported the connection as lost although it was fine; a download now receives every chunk of its own.
 
 ## 0.13.47 - 2026-11-22
 

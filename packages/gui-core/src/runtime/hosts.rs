@@ -691,6 +691,7 @@ async fn heartbeat(core: Rc<Core>, host: Rc<Host>, conn: Rc<Conn>) {
             return;
         }
         let started = Instant::now();
+        let moved = conn.liveness.progress();
         cadence.sent_at = started;
         let result = tokio::select! { biased;
             _ = cancel.cancelled() => return,
@@ -705,12 +706,22 @@ async fn heartbeat(core: Rc<Core>, host: Rc<Host>, conn: Rc<Conn>) {
         };
         match result {
             Ok(Ok(())) => {
-                host.link.borrow_mut().rtt = Some(started.elapsed());
+                // A pong that waited behind other traffic measures that traffic, not the path;
+                // comparing it with an idle alternative would switch paths mid-transfer.
+                if conn.liveness.progress().wrapping_sub(moved) <= 1 {
+                    host.link.borrow_mut().rtt = Some(started.elapsed());
+                }
             }
             Ok(Err(_)) => return,
             Err(_) => {
                 if conn.closed.get() {
                     return;
+                }
+                // The daemon kept accepting queued data (an upload): the pong is late, the
+                // socket is not dead.
+                if conn.liveness.progress() != moved {
+                    cadence.settled_at = Instant::now();
+                    continue;
                 }
                 let failures = conn.liveness.failures.get() + 1;
                 conn.liveness.failures.set(failures);
@@ -916,15 +927,16 @@ fn verify_connection(core: &Rc<Core>, host: &Rc<Host>) {
     let core = core.clone();
     let host = host.clone();
     tokio::task::spawn_local(async move {
-        let sent = chrono::Utc::now().timestamp_millis();
-        let pong = conn.request(
-            json!({"type":"ping","clientSentAt":sent}),
-            "pong",
-            None,
-            None,
-            None,
-        );
-        let result = while_heard(pong, || conn.liveness.received.get()).await;
+        // An envelope ping is written ahead of queued uploads; a session request would wait
+        // behind them.
+        let (reply, answered) = oneshot::channel();
+        let pong = async {
+            conn.control
+                .send(Control::Ping(reply))
+                .map_err(|_| connection_closed())?;
+            answered.await.map_err(|_| connection_closed())
+        };
+        let result = while_heard(pong, || conn.liveness.progress()).await;
         if let Err(error) = result
             && host.conn_generation() == Some(conn.generation)
         {
@@ -940,13 +952,17 @@ fn verify_connection(core: &Rc<Core>, host: &Rc<Host>) {
     });
 }
 
-/// How long a verifying probe waits without hearing any daemon frame.
+/// How long a verifying probe waits while no traffic moves in either direction.
 const VERIFY_SILENCE: Duration = Duration::from_secs(3);
 
-/// Waits for `reply`, failing only after VERIFY_SILENCE in which `heard` did not move. Frames
-/// that keep arriving prove the socket survived; the reply is just queued behind them, for
-/// example behind a download over a slow link. Data the OS buffered before a suspension is
-/// read at once, so a dead socket still fails one window later.
+fn connection_closed() -> CoreError {
+    CoreError::new("DAEMON_CONNECTION_LOST", "Daemon connection closed", true)
+}
+
+/// Waits for `reply`, failing only after VERIFY_SILENCE in which `heard` did not move. Traffic
+/// that keeps moving proves the socket survived; the reply is just queued behind it, for
+/// example behind a download or an upload over a slow link. Data the OS buffered before a
+/// suspension moves at once, so a dead socket still fails one window later.
 async fn while_heard<T>(
     reply: impl std::future::Future<Output = Result<T, CoreError>>,
     heard: impl Fn() -> u64,

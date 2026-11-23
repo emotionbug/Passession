@@ -230,11 +230,14 @@ shows Updating messages for a conversation that cannot be out of date. Closing t
 obligation too, so a reopened chat starts from authoritative state instead of a stale optimistic
 one; disconnect and backgrounding keep it.
 
-Foregrounding probes a nominally connected session immediately. A healthy response preserves the
-socket; a probe that hears nothing from the daemon for three seconds starts reconnecting without
-waiting for the background heartbeat or retry backoff. Frames that keep arriving count as a healthy
-socket: a download over a slow link queues the reply behind it. This cannot keep a mobile socket
-alive after the operating system suspends it.
+Foregrounding probes a nominally connected session immediately. The envelope ping is written ahead
+of queued outbound data, and the transport reads while it writes. A healthy response preserves the
+socket; a probe that sees no traffic move for three seconds starts reconnecting without waiting for
+the background heartbeat or retry backoff. Traffic in either direction counts as a healthy socket:
+frames that keep arriving (a download) or queued frames the daemon keeps accepting (an upload). The
+background heartbeat applies the same rule, and a pong delayed behind such traffic does not update
+the latency used to pick between a host's connections. This cannot keep a mobile socket alive after
+the operating system suspends it.
 
 - The same epoch and `window.maxSeq` is an exact display no-op. The app advances synchronization
   bookkeeping without replacing timeline arrays, preserving an upward-scrolled viewport.

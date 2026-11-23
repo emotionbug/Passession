@@ -14,6 +14,8 @@ Ghostty bounds scrollback in bytes and prunes whole pages. `paseo_terminal::Opti
 
 An interactive terminal sends input and its claimed size. A log observer sends neither and drops emulator replies; its local viewport size is not a PTY resize request. Restore authoritative dimensions and remap the observation slot before consuming binary frames after reconnect.
 
+Output that outruns the client's link is dropped, not queued: once more than 4 MiB waits for the client's socket (or a routed client produced 256 KiB), the daemon stops forwarding raw output, waits until at most 1 MiB is queued, then sends one snapshot of the current screen. A flood over a slow link therefore queues one snapshot at a time instead of a snapshot per burst, which used to exceed the connection's 64 MiB limit and disconnect the client.
+
 Terminal and log Find index the folded text of the presented rows separately from
 the query. Extending a query filters earlier candidates; changing it searches the
 index without fetching scrollback from Ghostty again. Live refresh rereads the

@@ -149,20 +149,31 @@ async fn run_stream(
     }
     let mut pending = BytesMut::new();
     let mut produced = 0usize;
+    // Output dropped while the client's socket was behind. One snapshot replaces all of it once
+    // the backlog drains, so a flood over a slow link never queues more than one snapshot.
+    let mut stale = false;
     // Coalescing deadline for buffered output; idle streams have none and do not wake.
     let mut deadline: Option<tokio::time::Instant> = None;
     loop {
         let mut flush_due = false;
         tokio::select! {biased;
             _=cancel.cancelled()=>return Ok(()),
+            drained=owner.context().backlog_at_most(RESUME_BACKLOG_BYTES),if stale=>{
+                drained?;
+                revision=snapshot(terminal,owner,slot,mode.as_deref(),scrollback,wrapped).await?;
+                produced=0;stale=false;
+            },
             event=receiver.recv()=>match event {
-                Ok(TerminalEvent::Output{revision:next,data})=>{if next>revision{produced=produced.saturating_add(data.len());pending.extend_from_slice(&data);}},
-                Ok(TerminalEvent::Exit(code))=>{flush(owner,slot,&mut pending).await?;owner.emit(exit_event(terminal,code)).await?;return Ok(());},
+                Ok(TerminalEvent::Output{revision:next,data})=>{if next>revision&&!stale{produced=produced.saturating_add(data.len());pending.extend_from_slice(&data);}},
+                Ok(TerminalEvent::Exit(code))=>{
+                    resync_or_flush(terminal,owner,slot,&mut pending,stale,mode.as_deref(),scrollback,wrapped).await?;
+                    owner.emit(exit_event(terminal,code)).await?;return Ok(());
+                },
                 Ok(TerminalEvent::Error(error))=>return Err(anyhow!(error)),
                 Ok(_)=>{},
                 Err(broadcast::error::RecvError::Lagged(_))=>{
-                    pending.clear();if mode.as_deref()==Some("live"){mode=Some("visible-snapshot".into());}
-                    revision=snapshot(terminal,owner,slot,mode.as_deref(),scrollback,wrapped).await?;produced=0;
+                    pending.clear();stale=true;
+                    if mode.as_deref()==Some("live"){mode=Some("visible-snapshot".into());}
                 },
                 Err(broadcast::error::RecvError::Closed)=>return Err(anyhow!("Terminal event owner closed")),
             },
@@ -171,15 +182,13 @@ async fn run_stream(
         if !pending.is_empty() {
             if produced > 256 * 1024
                 && (owner.context().is_routed()
-                    || owner.context().buffered_amount() > 4 * 1024 * 1024)
+                    || owner.context().buffered_amount() > MAX_BACKLOG_BYTES)
             {
                 pending.clear();
+                stale = true;
                 if mode.as_deref() == Some("live") {
                     mode = Some("visible-snapshot".into());
                 }
-                revision =
-                    snapshot(terminal, owner, slot, mode.as_deref(), scrollback, wrapped).await?;
-                produced = 0;
             } else if pending.len() >= 16 * 1024 || flush_due {
                 flush(owner, slot, &mut pending).await?;
             }
@@ -190,11 +199,48 @@ async fn run_stream(
             deadline = Some(tokio::time::Instant::now() + Duration::from_millis(8));
         }
         if terminal.is_exited() && receiver.is_empty() {
-            flush(owner, slot, &mut pending).await?;
+            resync_or_flush(
+                terminal,
+                owner,
+                slot,
+                &mut pending,
+                stale,
+                mode.as_deref(),
+                scrollback,
+                wrapped,
+            )
+            .await?;
             let code = terminal.wait().await?;
             owner.emit(exit_event(terminal, code)).await?;
             return Ok(());
         }
+    }
+}
+/// Terminal output stops flowing raw above this many bytes queued for the client's socket.
+const MAX_BACKLOG_BYTES: usize = 4 * 1024 * 1024;
+/// A stream that fell behind sends its replacement snapshot once the backlog is this small.
+const RESUME_BACKLOG_BYTES: usize = 1024 * 1024;
+/// The final output before an exit: a snapshot if output was dropped, else what is pending.
+#[allow(clippy::too_many_arguments)]
+async fn resync_or_flush(
+    terminal: &Terminal,
+    owner: &OwnedSubscription,
+    slot: u8,
+    pending: &mut BytesMut,
+    stale: bool,
+    mode: Option<&str>,
+    scrollback: usize,
+    wrapped: bool,
+) -> Result<()> {
+    if stale {
+        owner
+            .context()
+            .backlog_at_most(RESUME_BACKLOG_BYTES)
+            .await?;
+        snapshot(terminal, owner, slot, mode, scrollback, wrapped).await?;
+        Ok(())
+    } else {
+        flush(owner, slot, pending).await
     }
 }
 /// The stream's end: the process exited with `exitCode` (additive; older clients ignore it).

@@ -12,7 +12,15 @@
 //! - every accepted frame is also delivered, in wire order, to the core (`Inbound`), which owns
 //!   request correlation, observations and directory synchronization;
 //! - envelope `ping`/`pong` drive the liveness heartbeat.
-use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use paseo_client::{
@@ -78,12 +86,22 @@ pub(crate) struct Liveness {
     pub failures: Cell<u32>,
     /// Counts every daemon frame; a count that moves proves the socket is alive.
     pub received: Cell<u64>,
+    /// Frames the transport has written. Beyond the socket's buffer this moves only while
+    /// the peer acknowledges data, so an upload with no replies still shows a live socket.
+    written: Arc<AtomicU64>,
 }
 
 impl Liveness {
     fn heard(&self) {
         self.failures.set(0);
         self.received.set(self.received.get().wrapping_add(1));
+    }
+
+    /// Traffic in either direction; it stops moving when the socket is dead.
+    pub fn progress(&self) -> u64 {
+        self.received
+            .get()
+            .wrapping_add(self.written.load(Ordering::Relaxed))
     }
 }
 
@@ -146,6 +164,7 @@ enum Raw {
         incoming: mpsc::Receiver<anyhow::Result<HostFrame>>,
         cancel: CancellationToken,
         task: Option<tokio::task::JoinHandle<()>>,
+        written: Arc<AtomicU64>,
     },
     Routed {
         parent: Arc<DaemonClient>,
@@ -192,6 +211,21 @@ impl Raw {
                 }
                 HostFrame::Close { .. } => Ok(()),
             },
+        }
+    }
+
+    /// A small control frame written ahead of queued data where the transport allows it.
+    async fn send_urgent(&self, frame: HostFrame) -> anyhow::Result<()> {
+        match self {
+            Self::Direct { sender, .. } => sender.send_urgent(frame).await,
+            Self::Routed { .. } => self.send(frame).await,
+        }
+    }
+
+    fn written(&self) -> Arc<AtomicU64> {
+        match self {
+            Self::Direct { written, .. } => written.clone(),
+            Self::Routed { .. } => Arc::default(),
         }
     }
 
@@ -290,10 +324,13 @@ struct Pump {
 impl Pump {
     async fn run(mut self) {
         let mut awaiting_info = true;
-        let mut ping: Option<oneshot::Sender<()>> = None;
+        // Every probe waiting for the next pong; one pong answers them all.
+        let mut pings: Vec<oneshot::Sender<()>> = Vec::new();
         let mut control_open = true;
+        // Unbiased: a steady stream in one direction (an upload, a download) must not starve
+        // the other or the liveness probes.
         let result: Result<(), CoreError> = loop {
-            tokio::select! { biased;
+            tokio::select! {
                 _ = self.cancel.cancelled() => break Ok(()),
                 frame = self.outgoing.recv() => {
                     let Some(frame) = frame else { break Ok(()) };
@@ -312,9 +349,9 @@ impl Pump {
                 control = self.control.recv(), if control_open => {
                     match control {
                         Some(Control::Ping(reply)) => {
-                            // One probe at a time; a newer probe replaces an abandoned one.
-                            ping = Some(reply);
-                            if let Err(error) = self.raw.send(HostFrame::Text("{\"type\":\"ping\"}".into())).await {
+                            pings.retain(|waiting| !waiting.is_closed());
+                            pings.push(reply);
+                            if let Err(error) = self.raw.send_urgent(HostFrame::Text("{\"type\":\"ping\"}".into())).await {
                                 break Err(transport_error(&error));
                             }
                         }
@@ -350,7 +387,7 @@ impl Pump {
                             match root["type"].as_str() {
                                 Some("pong") => {
                                     self.liveness.heard();
-                                    if let Some(reply) = ping.take() {
+                                    for reply in pings.drain(..) {
                                         let _ = reply.send(());
                                     }
                                     continue;
@@ -408,7 +445,10 @@ async fn admit(
     let (client_in, client_rx) = mpsc::channel(256);
     let (core_tx, inbound) = mpsc::unbounded_channel();
     let (control_tx, control) = mpsc::unbounded_channel();
-    let liveness = Rc::new(Liveness::default());
+    let liveness = Rc::new(Liveness {
+        written: raw.written(),
+        ..Liveness::default()
+    });
     let security = relay.and_then(|(mode, _)| mode);
     let pump = Pump {
         raw,
@@ -497,6 +537,7 @@ pub(crate) async fn open_direct(
             incoming: connection.incoming,
             cancel: connection.cancel,
             task: Some(connection.task),
+            written: connection.written,
         };
         let request = OpenRequest {
             expected_server_id: request.expected_server_id.or(resolved.expected_server_id),

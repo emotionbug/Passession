@@ -8,7 +8,13 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
@@ -43,12 +49,22 @@ struct Queued {
 #[derive(Clone)]
 pub struct Sender {
     tx: mpsc::Sender<Queued>,
+    /// Small control frames (envelope pings) written before queued data.
+    urgent: mpsc::Sender<Queued>,
     global: Arc<Semaphore>,
     local: Arc<Semaphore>,
     cancel: CancellationToken,
 }
 impl Sender {
     pub async fn send(&self, frame: HostFrame) -> Result<()> {
+        self.enqueue(frame, false).await
+    }
+    /// Sends a small control frame ahead of queued data, so a liveness probe is not stuck
+    /// behind an upload on a slow link.
+    pub async fn send_urgent(&self, frame: HostFrame) -> Result<()> {
+        self.enqueue(frame, true).await
+    }
+    async fn enqueue(&self, frame: HostFrame, urgent: bool) -> Result<()> {
         let size = frame
             .len()
             .try_into()
@@ -58,12 +74,20 @@ impl Sender {
             .clone()
             .try_acquire_many_owned(size)
             .map_err(|_| HostError::new("resource_limit", "Connected host buffer limit reached"))?;
-        self.send_reserved(frame, global).await
+        self.reserve_into(frame, global, urgent).await
     }
     pub async fn send_reserved(
         &self,
         frame: HostFrame,
+        global: OwnedSemaphorePermit,
+    ) -> Result<()> {
+        self.reserve_into(frame, global, false).await
+    }
+    async fn reserve_into(
+        &self,
+        frame: HostFrame,
         mut global: OwnedSemaphorePermit,
+        urgent: bool,
     ) -> Result<()> {
         let size: u32 = frame
             .len()
@@ -87,7 +111,8 @@ impl Sender {
             .clone()
             .try_acquire_many_owned(size)
             .map_err(|_| HostError::new("resource_limit", "Host socket buffer limit reached"))?;
-        tokio::select! { _=self.cancel.cancelled()=>bail!("Host transport closed"), result=self.tx.send(Queued{frame,_global:global,_local:local})=>result.map_err(|_|anyhow!("Host transport closed")) }
+        let queue = if urgent { &self.urgent } else { &self.tx };
+        tokio::select! { _=self.cancel.cancelled()=>bail!("Host transport closed"), result=queue.send(Queued{frame,_global:global,_local:local})=>result.map_err(|_|anyhow!("Host transport closed")) }
     }
     pub async fn json(&self, message: serde_json::Value) -> Result<()> {
         self.send(HostFrame::Text(serde_json::to_string(&message)?))
@@ -100,6 +125,9 @@ pub struct Connection {
     pub cancel: CancellationToken,
     pub task: tokio::task::JoinHandle<()>,
     pub security: Option<SecurityMode>,
+    /// Queued (non-urgent) frames written to the socket so far. Past the socket's buffer it
+    /// moves only while the peer keeps accepting data.
+    pub written: Arc<AtomicU64>,
 }
 impl Connection {
     pub async fn connect(
@@ -208,67 +236,177 @@ impl Connection {
         }
         let security = crypto.as_ref().and_then(SecureChannel::security_mode);
         let (tx, mut rx) = mpsc::channel::<Queued>(256);
+        let (urgent, mut urgent_rx) = mpsc::channel::<Queued>(8);
         let (incoming_tx, incoming) = mpsc::channel(1);
         let sender = Sender {
             tx,
+            urgent,
             global,
             local: Arc::new(Semaphore::new(128 * 1024 * 1024)),
             cancel: cancel.clone(),
         };
+        let written = Arc::new(AtomicU64::new(0));
+        let counted = written.clone();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
+            // Reading and writing run independently: a slow upload must not stop pongs and
+            // replies from being read, and a slow reader must not stop queued writes.
+            let crypto = std::sync::Mutex::new(crypto);
+            let (replies_tx, mut replies) = mpsc::unbounded_channel::<Message>();
             let run = async {
-                loop {
-                    tokio::select! {biased;
-                        _=task_cancel.cancelled()=>break,
-                        item=rx.recv()=>{
-                            let Some(item)=item else{break};
-                            if let HostFrame::Close{code,reason}=&item.frame {socket.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame{code:(*code).into(),reason:reason.clone().into()}))).await?;break;}
-                            let size=item.frame.len();
-                            let Queued{frame,_global,_local}=item;
-                            if let HostFrame::Flush(ack)=frame {
-                                let result=socket.flush().await.map_err(anyhow::Error::from);
-                                let failure=result.as_ref().err().map(ToString::to_string);
-                                let _=ack.send(result);
-                                if let Some(failure)=failure{return Err(anyhow!(failure));}
+                let (mut sink, mut stream) = socket.split();
+                let writing = async {
+                    let mut urgent_open = true;
+                    loop {
+                        let (item, urgent) = tokio::select! {biased;
+                            reply = replies.recv() => {
+                                // Protocol replies from the reader (pong, key exchange).
+                                if let Some(reply) = reply {
+                                    sink.send(reply).await?;
+                                }
                                 continue;
+                            },
+                            item = urgent_rx.recv(), if urgent_open => match item {
+                                Some(item) => (item, true),
+                                None => { urgent_open = false; continue; }
+                            },
+                            item = rx.recv() => match item { Some(item) => (item, false), None => break },
+                        };
+                        if let HostFrame::Close { code, reason } = &item.frame {
+                            sink.send(Message::Close(Some(
+                                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                    code: (*code).into(),
+                                    reason: reason.clone().into(),
+                                },
+                            )))
+                            .await?;
+                            break;
+                        }
+                        let size = item.frame.len();
+                        let Queued {
+                            frame,
+                            _global,
+                            _local,
+                        } = item;
+                        if let HostFrame::Flush(ack) = frame {
+                            let result = sink.flush().await.map_err(anyhow::Error::from);
+                            let failure = result.as_ref().err().map(ToString::to_string);
+                            let _ = ack.send(result);
+                            if let Some(failure) = failure {
+                                return Err(anyhow!(failure));
                             }
-                            let wire=if let Some(channel)=crypto.as_mut(){
-                                let plain=match frame{HostFrame::Text(text)=>Frame::Text(text),HostFrame::Binary(bytes)=>Frame::Binary(bytes.into()),HostFrame::Close{..}|HostFrame::Flush(_)=>unreachable!()};
-                                to_message(channel.encode(plain)?)
-                            }else{match frame{HostFrame::Text(text)=>Message::Text(text.into()),HostFrame::Binary(bytes)=>Message::Binary(bytes),HostFrame::Close{..}|HostFrame::Flush(_)=>unreachable!()}};
-                            // Cipher expansion is reserved too, until the write completes.
-                            let extra=wire.len().saturating_sub(size);
-                            let extra_global=if extra>0{Some(_global.semaphore().clone().try_acquire_many_owned(extra.try_into()?).map_err(|_|HostError::new("resource_limit","Connected host buffer limit reached"))?)}else{None};
-                            let extra_local=if extra>0{Some(_local.semaphore().clone().try_acquire_many_owned(extra.try_into()?).map_err(|_|HostError::new("resource_limit","Host socket buffer limit reached"))?)}else{None};
-                            socket.send(wire).await?;drop((_global,_local,extra_global,extra_local));
-                        },
-                        message=socket.next()=>{
-                            let message=message.ok_or_else(||anyhow!("Host transport closed"))??;
-                            let wire=match message {
-                                Message::Text(text)=>Some(HostFrame::Text(text.to_string())),Message::Binary(bytes)=>Some(HostFrame::Binary(bytes)),
-                                Message::Ping(bytes)=>{socket.send(Message::Pong(bytes)).await?;None},
-                                Message::Close(close)=>{if close.is_some_and(|c|c.code==tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4401)){return Err(HostError::new("authentication_failed","Host rejected the credentials. Replace the connection credentials.").into());}bail!("Host transport closed")},_=>None
+                            continue;
+                        }
+                        let wire = if let Some(channel) = crypto.lock().unwrap().as_mut() {
+                            let plain = match frame {
+                                HostFrame::Text(text) => Frame::Text(text),
+                                HostFrame::Binary(bytes) => Frame::Binary(bytes.into()),
+                                HostFrame::Close { .. } | HostFrame::Flush(_) => unreachable!(),
                             };
-                            if let Some(wire)=wire {
-                                let plain=if let Some(channel)=crypto.as_mut(){
-                                    let encrypted=match wire{HostFrame::Text(text)=>Frame::Text(text),HostFrame::Binary(bytes)=>Frame::Binary(bytes.into()),HostFrame::Close{..}|HostFrame::Flush(_)=>unreachable!()};
-                                    let update=channel.receive(encrypted)?;if let Some(reply)=update.outbound{socket.send(to_message(reply)).await?;}
-                                    update.message.map(|frame|match frame{Frame::Text(text)=>HostFrame::Text(text),Frame::Binary(bytes)=>HostFrame::Binary(bytes.into())})
-                                }else{Some(wire)};
-                                if let Some(frame)=plain {tokio::select!{_=task_cancel.cancelled()=>break,result=incoming_tx.send(Ok(frame))=>{result.map_err(|_|anyhow!("Host consumer closed"))?;}}}
+                            to_message(channel.encode(plain)?)
+                        } else {
+                            match frame {
+                                HostFrame::Text(text) => Message::Text(text.into()),
+                                HostFrame::Binary(bytes) => Message::Binary(bytes),
+                                HostFrame::Close { .. } | HostFrame::Flush(_) => unreachable!(),
                             }
+                        };
+                        // Cipher expansion is reserved too, until the write completes.
+                        let extra = wire.len().saturating_sub(size);
+                        let extra_global = if extra > 0 {
+                            Some(
+                                _global
+                                    .semaphore()
+                                    .clone()
+                                    .try_acquire_many_owned(extra.try_into()?)
+                                    .map_err(|_| {
+                                        HostError::new(
+                                            "resource_limit",
+                                            "Connected host buffer limit reached",
+                                        )
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
+                        let extra_local = if extra > 0 {
+                            Some(
+                                _local
+                                    .semaphore()
+                                    .clone()
+                                    .try_acquire_many_owned(extra.try_into()?)
+                                    .map_err(|_| {
+                                        HostError::new(
+                                            "resource_limit",
+                                            "Host socket buffer limit reached",
+                                        )
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
+                        sink.send(wire).await?;
+                        drop((_global, _local, extra_global, extra_local));
+                        // Probes do not count: progress means the peer accepted queued data.
+                        if !urgent {
+                            counted.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                }
-                Ok(())
+                    Ok::<(), anyhow::Error>(())
+                };
+                let reading = async {
+                    loop {
+                        let message = stream
+                            .next()
+                            .await
+                            .ok_or_else(|| anyhow!("Host transport closed"))??;
+                        let wire = match message {
+                            Message::Text(text) => Some(HostFrame::Text(text.to_string())),
+                            Message::Binary(bytes) => Some(HostFrame::Binary(bytes)),
+                            Message::Ping(bytes) => {
+                                let _ = replies_tx.send(Message::Pong(bytes));
+                                None
+                            }
+                            Message::Close(close) => {
+                                if close.is_some_and(|c|c.code==tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4401)){return Err(HostError::new("authentication_failed","Host rejected the credentials. Replace the connection credentials.").into());}
+                                bail!("Host transport closed")
+                            }
+                            _ => None,
+                        };
+                        let Some(wire) = wire else { continue };
+                        let plain = if let Some(channel) = crypto.lock().unwrap().as_mut() {
+                            let encrypted = match wire {
+                                HostFrame::Text(text) => Frame::Text(text),
+                                HostFrame::Binary(bytes) => Frame::Binary(bytes.into()),
+                                HostFrame::Close { .. } | HostFrame::Flush(_) => unreachable!(),
+                            };
+                            let update = channel.receive(encrypted)?;
+                            if let Some(reply) = update.outbound {
+                                let _ = replies_tx.send(to_message(reply));
+                            }
+                            update.message.map(|frame| match frame {
+                                Frame::Text(text) => HostFrame::Text(text),
+                                Frame::Binary(bytes) => HostFrame::Binary(bytes.into()),
+                            })
+                        } else {
+                            Some(wire)
+                        };
+                        if let Some(frame) = plain {
+                            incoming_tx
+                                .send(Ok(frame))
+                                .await
+                                .map_err(|_| anyhow!("Host consumer closed"))?;
+                        }
+                    }
+                };
+                tokio::select! { result = writing => result, result = reading => result }
             };
             let result: Result<()> = tokio::select! { biased;
                 _ = task_cancel.cancelled() => Ok(()),
                 _ = proxy_invalidated(proxy.as_ref()) => Err(anyhow!("Embedded Tailscale connection invalidated")),
                 result = run => result,
             };
-            if let Some(channel) = crypto.as_mut() {
+            if let Some(channel) = crypto.lock().unwrap().as_mut() {
                 channel.close();
             }
             if let Some(process) = child {
@@ -285,6 +423,7 @@ impl Connection {
             cancel,
             task,
             security,
+            written,
         })
     }
 }
@@ -442,5 +581,68 @@ async fn proxy_invalidated(proxy: Option<&paseo_tailnet::Proxy>) {
     match proxy {
         Some(proxy) => proxy.invalidated().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn a_slow_upload_neither_hides_replies_nor_delays_probes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // A slow link: the daemon reads one frame every 10 ms and greets the client first.
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            socket.send(Message::Text("hello".into())).await.unwrap();
+            let mut uploaded = 0;
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Binary(_) => uploaded += 1,
+                    Message::Text(text) if text == "ping" => return uploaded,
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the probe never arrived");
+        });
+        let target = Target::parse(&format!("ws://{address}/ws")).unwrap();
+        let global = Arc::new(Semaphore::new(1 << 30));
+        let mut connection = Connection::connect(
+            &target,
+            SecurityMode::Legacy,
+            global,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // 200 frames take the daemon two seconds to read.
+        for _ in 0..200 {
+            let chunk = bytes::Bytes::from(vec![7u8; 128 * 1024]);
+            connection
+                .sender
+                .send(HostFrame::Binary(chunk))
+                .await
+                .unwrap();
+        }
+        connection
+            .sender
+            .send_urgent(HostFrame::Text("ping".into()))
+            .await
+            .unwrap();
+        let greeting = tokio::time::timeout(Duration::from_millis(500), connection.incoming.recv())
+            .await
+            .expect("a reply was hidden behind the upload");
+        assert!(matches!(greeting, Some(Ok(HostFrame::Text(text))) if text == "hello"));
+        let ahead = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        // Only frames already handed to the socket go first.
+        assert!(ahead < 100, "the probe waited behind {ahead} queued frames");
+        assert!(connection.written.load(Ordering::Relaxed) >= ahead as u64);
     }
 }

@@ -26,7 +26,7 @@ impl DaemonClient {
         options: RequestOptions,
     ) -> Result<DownloadedFile> {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut binary = self.subscribe_binary();
+        let mut frames = self.file_transfer_frames(&id);
         let request = self.request_cancellable(json!({"type":"file_explorer_request","cwd":cwd,"path":path,"mode":"file","acceptBinary":true,"maxBytes":max_bytes,"requestId":id}), "file_explorer_response", options.timeout, options.cancel.clone());
         tokio::pin!(request);
         let mut metadata: Option<FileBeginMetadata> = None;
@@ -42,10 +42,8 @@ impl DaemonClient {
                     ensure!(bytes.len() <= max_bytes, "File exceeds byte ceiling");
                     return Ok(DownloadedFile { metadata: FileBeginMetadata { mime: file["mimeType"].as_str().unwrap_or("application/octet-stream").into(), size: bytes.len() as u64, encoding: if file["encoding"] == "base64" { FileEncoding::Binary } else { FileEncoding::Utf8 }, modified_at: file["modifiedAt"].as_str().unwrap_or("").into(), revision: file["revision"].as_str().map(str::to_owned), file_name: None }, bytes: bytes.into() });
                 },
-                frame = binary.recv() => {
-                    let frame = frame?;
-                    // Other binary channels share this broadcast.
-                    if frame.first().is_none_or(|byte| !matches!(*byte, 0x10..=0x12)) { continue; }
+                frame = frames.recv() => {
+                    let frame = frame.ok_or_else(|| ClientError::new("DAEMON_CONNECTION_LOST", "Connection closed during file download"))?;
                     match decode_file_transfer_frame(&frame)? {
                         FileTransferFrame::Begin {request_id, metadata: next} if request_id == id => {
                             ensure!(metadata.is_none(), "Duplicate file begin");

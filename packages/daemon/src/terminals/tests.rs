@@ -303,6 +303,69 @@ async fn physical_source_slots_cannot_write_each_others_pty() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn an_output_flood_waits_for_a_slow_socket_instead_of_disconnecting_it() {
+    use crate::transport::OutboundFrame;
+    use std::collections::HashSet;
+    let home = tempfile::tempdir().unwrap();
+    // Enough output to fill the scrollback, so each snapshot is several MB.
+    let terminal = shell(
+        &home,
+        vec![
+            "-c".into(),
+            "sleep 0.3; yes 0123456789abcdef | head -c 12000000".into(),
+        ],
+    )
+    .await;
+    let service = TerminalService::new(Weak::new());
+    service
+        .terminals
+        .write()
+        .unwrap()
+        .insert(terminal.id.clone(), terminal.clone());
+    let (source, mut frames) = RequestContext::attach(crate::transport::SourceConfig {
+        id: "slow-link".into(),
+        session_id: "session".into(),
+        client_id: "client".into(),
+        capabilities: json!({"owned_subscriptions":true}),
+        principal: json!({"kind":"owner"}),
+        permissions: Arc::new(RwLock::new(HashSet::from(["workspace.read".to_owned()]))),
+        routed: false,
+        app_version: None,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    });
+    let message =
+        json!({"type":"subscribe_terminal_request","terminalId":terminal.id,"requestId":"flood"});
+    streams::subscribe(&service, &source.for_request(message.clone()), &message)
+        .await
+        .unwrap();
+    // A slow socket: the writer keeps each batch reserved until the link has taken all of it.
+    let (mut batch, mut peak, mut exited) = (Vec::new(), 0, false);
+    let finished = tokio::time::timeout(Duration::from_secs(120), async {
+        while !exited && source.is_live() {
+            match tokio::time::timeout(Duration::from_millis(50), frames.recv()).await {
+                Ok(Some(frame)) => {
+                    exited = matches!(&frame.frame, OutboundFrame::Text(text) if text.contains("terminal_stream_exit"));
+                    batch.push(frame);
+                    peak = peak.max(source.buffered_amount());
+                }
+                Ok(None) => break,
+                Err(_) => batch.clear(),
+            }
+        }
+    })
+    .await;
+    assert!(
+        source.is_live(),
+        "the client was disconnected ({peak} bytes queued)"
+    );
+    assert!(finished.is_ok(), "the stream never finished");
+    assert!(exited, "the stream ended without its exit event");
+    assert!(peak < 32 * 1024 * 1024, "{peak} bytes queued");
+    source.cancellation().cancel();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn update_without_claim_does_not_take_terminal_size() {
     let home = tempfile::tempdir().unwrap();
     let terminal = shell(&home, vec![]).await;

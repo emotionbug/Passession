@@ -85,7 +85,7 @@ SSH 使用本机 `ssh` 可执行文件、非交互批量认证及指向远端回
 
 `create_terminal`、`list_terminals`、`rename_terminal`、`capture_terminal`、`kill_terminal` 管理 daemon PTY。传入会话的内部 `workspaceId` 和实际 `cwd`，明确归属。`observe_terminal(id, restore, options)` 返回 `TerminalStream`；`recv` 产生 `TerminalEvent::{Frame,Exit}`，`input` 发送字节，`resize` 接受 `paseo_protocol::binary_frames::TerminalResize`。显式释放 `stream.subscription`。原生客户端的 **Terminal** 标签页使用的也是这些 daemon 终端。
 
-`read_file(cwd, path, max_bytes, options)` 返回有字节上限的 `DownloadedFile { metadata, bytes }`。`upload_file(file_name, mime, modified_at, bytes, options)` 使用有限大小二进制帧。`list_directory`、`write_file`、`create_file_entry`、`rename_file_entry`、`duplicate_file_entry`、`delete_file_entry` 提供文件操作；破坏性调用前确认准确 schema。上传取消不保证回滚或自动重试。
+`read_file(cwd, path, max_bytes, options)` 返回有字节上限的 `DownloadedFile { metadata, bytes }`。自定义下载读取方在发送 `file_explorer_request` 之前调用 `file_transfer_frames(request_id)`：它按顺序收到该请求的每个文件帧，而 `subscribe_binary` 会为跟不上的读取方丢弃帧。`upload_file(file_name, mime, modified_at, bytes, options)` 使用有限大小二进制帧。`list_directory`、`write_file`、`create_file_entry`、`rename_file_entry`、`duplicate_file_entry`、`delete_file_entry` 提供文件操作；破坏性调用前确认准确 schema。上传取消不保证回滚或自动重试。
 
 ## Provider、配置与连接主机
 

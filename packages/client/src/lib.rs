@@ -220,6 +220,9 @@ struct Shared {
     pending: Mutex<HashMap<String, Pending>>,
     events: broadcast::Sender<Value>,
     binary: broadcast::Sender<bytes::Bytes>,
+    /// File frames of downloads in progress, by request ID. They bypass `binary`, whose
+    /// readers lose frames when they fall behind (a burst of buffered chunks).
+    transfers: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
     info: RwLock<Value>,
     cancel: CancellationToken,
 }
@@ -284,6 +287,48 @@ impl<T: Clone> ClientEvents<T> {
             result => result,
         }
     }
+}
+/// Every file-transfer frame (`0x10`..`0x12`) the daemon sends for one download request, in
+/// order and without loss. Dropping it stops the routing.
+pub struct FileTransferFrames {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
+    request_id: String,
+    shared: Arc<Shared>,
+}
+impl FileTransferFrames {
+    /// The next frame, or `None` once the connection closed and earlier frames were read.
+    pub async fn recv(&mut self) -> Option<bytes::Bytes> {
+        tokio::select! {biased;
+            frame = self.receiver.recv() => frame,
+            _ = self.shared.cancel.cancelled() => self.receiver.try_recv().ok(),
+        }
+    }
+}
+impl Drop for FileTransferFrames {
+    fn drop(&mut self) {
+        self.shared
+            .transfers
+            .lock()
+            .unwrap()
+            .remove(&self.request_id);
+    }
+}
+/// The request ID of a file-transfer frame: `[opcode, id length, id…]`.
+fn file_transfer_request_id(bytes: &[u8]) -> Option<&str> {
+    if !matches!(bytes.first(), Some(0x10..=0x12)) {
+        return None;
+    }
+    let length = *bytes.get(1)? as usize;
+    std::str::from_utf8(bytes.get(2..2 + length)?).ok()
+}
+fn deliver_binary(state: &Shared, bytes: bytes::Bytes) {
+    if let Some(id) = file_transfer_request_id(&bytes)
+        && let Some(route) = state.transfers.lock().unwrap().get(id)
+        && route.send(bytes.clone()).is_ok()
+    {
+        return;
+    }
+    let _ = state.binary.send(bytes);
 }
 impl DaemonClient {
     pub async fn connect(options: ConnectOptions, cancel: CancellationToken) -> Result<Self> {
@@ -380,6 +425,7 @@ impl DaemonClient {
             pending: Mutex::new(HashMap::new()),
             events,
             binary,
+            transfers: Mutex::new(HashMap::new()),
             info: RwLock::new(Value::Null),
             cancel,
         });
@@ -392,7 +438,7 @@ impl DaemonClient {
                     let mut wire = match frame.into() {
                         IncomingFrame::Json(wire) => wire,
                         IncomingFrame::Raw(HostFrame::Text(text)) => serde_json::from_str::<Value>(&text)?,
-                        IncomingFrame::Raw(HostFrame::Binary(bytes)) => { let _ = state.binary.send(bytes); continue; }
+                        IncomingFrame::Raw(HostFrame::Binary(bytes)) => { deliver_binary(&state, bytes); continue; }
                         IncomingFrame::Raw(HostFrame::Close { reason, .. }) => bail!("Daemon connection closed: {reason}"),
                         IncomingFrame::Raw(HostFrame::Flush(reply)) => { let _ = reply.send(Err(anyhow!("Invalid inbound flush barrier"))); continue; }
                     };
@@ -418,6 +464,8 @@ impl DaemonClient {
                 let _=pending.reply.send(Err(ClientError::new("DAEMON_CONNECTION_LOST","Daemon connection closed before the response; the operation may already have completed").into()));
             }
             state.cancel.cancel();
+            // Downloads read what already arrived, then end.
+            state.transfers.lock().unwrap().clear();
         });
         let client = Self {
             sender,
@@ -562,6 +610,23 @@ impl DaemonClient {
         ClientEvents {
             receiver: self.shared.binary.subscribe(),
             cancel: self.shared.cancel.clone(),
+        }
+    }
+    /// Routes the file frames of download `request_id` to the returned receiver. Register
+    /// before sending the request.
+    pub fn file_transfer_frames(&self, request_id: &str) -> FileTransferFrames {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        if !self.shared.cancel.is_cancelled() {
+            self.shared
+                .transfers
+                .lock()
+                .unwrap()
+                .insert(request_id.to_owned(), sender);
+        }
+        FileTransferFrames {
+            receiver,
+            request_id: request_id.to_owned(),
+            shared: self.shared.clone(),
         }
     }
     pub fn cancellation(&self) -> CancellationToken {
@@ -916,6 +981,7 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             events,
             binary,
+            transfers: Mutex::new(HashMap::new()),
             info: RwLock::new(Value::Null),
             cancel: CancellationToken::new(),
         };
@@ -1003,6 +1069,7 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             events,
             binary,
+            transfers: Mutex::new(HashMap::new()),
             info: RwLock::new(Value::Null),
             cancel: cancel.clone(),
         });
@@ -1161,5 +1228,80 @@ mod tests {
             events.recv().await,
             Err(broadcast::error::RecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_fast_download_is_not_lost_behind_its_own_frames() {
+        use paseo_protocol::binary_frames::{
+            FileBeginMetadata, FileEncoding, FileTransferFrame, encode_file_transfer_frame,
+        };
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let (outgoing, mut outbound) = tokio::sync::mpsc::channel(8);
+        // The socket already holds the whole file when the consumer starts reading.
+        let (inbound, incoming) = tokio::sync::mpsc::channel::<Result<IncomingFrame>>(1024);
+        let chunks = 400;
+        let task = tokio::spawn(async move {
+            assert!(matches!(outbound.recv().await, Some(HostFrame::Text(_))));
+            inbound.send(Ok(HostFrame::Text(r#"{"type":"session","message":{"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":"srv"}}}"#.into()).into())).await.unwrap();
+            let Some(HostFrame::Text(request)) = outbound.recv().await else {
+                panic!()
+            };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            let id = request["message"]["requestId"].as_str().unwrap().to_owned();
+            let frame = |frame: FileTransferFrame<'_>| {
+                Ok(HostFrame::Binary(encode_file_transfer_frame(&frame).unwrap().into()).into())
+            };
+            let metadata = FileBeginMetadata {
+                mime: "application/octet-stream".into(),
+                size: chunks * 1024,
+                encoding: FileEncoding::Binary,
+                modified_at: "2026-11-23T00:00:00.000Z".into(),
+                revision: None,
+                file_name: None,
+            };
+            inbound
+                .send(frame(FileTransferFrame::Begin {
+                    request_id: &id,
+                    metadata,
+                }))
+                .await
+                .unwrap();
+            let payload = [7u8; 1024];
+            for _ in 0..chunks {
+                inbound
+                    .send(frame(FileTransferFrame::Chunk {
+                        request_id: &id,
+                        payload: &payload,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            inbound
+                .send(frame(FileTransferFrame::End { request_id: &id }))
+                .await
+                .unwrap();
+            stop.cancelled().await;
+        });
+        let client = DaemonClient::from_transport(
+            outgoing,
+            incoming,
+            cancel,
+            task,
+            "test",
+            "cli",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let file = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_file("/", "file", 1 << 20, RequestOptions::default()),
+        )
+        .await
+        .expect("download stalled")
+        .expect("download failed");
+        assert_eq!(file.bytes.len() as u64, chunks * 1024);
+        client.close().await;
     }
 }
