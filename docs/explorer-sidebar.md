@@ -14,7 +14,7 @@ Serialize writes for an editor. A save acknowledgement belongs to the submitted 
 
 The main navigation tree remains host → directory → session, including existing sessions, empty directories, status, search and collapse state. The file Explorer is a supporting surface, not another session grouping layer. Add Project uses `features/files/picker.rs` (`RemoteFolderPicker`) to list/select a directory on the chosen host; an OS picker on the client cannot select a remote checkout.
 
-Files are read/written through the daemon. Markdown and source editing share the same remote identity and revision. Git Log opens historical commit details and lazy patch bodies. The working-tree Changes view and session added/deleted-line badge are removed.
+Files are read/written through the daemon. Markdown and source editing share the same remote identity and revision. Git Log opens historical commit details and lazy patch bodies. The working-tree Changes view and session added/deleted-line badge are removed. A download keeps at most 2 MiB queued on its connection and waits for the link to take it, so a file larger than the connection's 64 MiB output buffer reaches a slow client instead of disconnecting it, and replies queued behind the download wait about a second rather than minutes.
 
 On mobile, Download copies a photo to the photo library or opens a document saver for other files. Share opens the system share sheet instead. Cancelling either picker does not count as saving a copy.
 

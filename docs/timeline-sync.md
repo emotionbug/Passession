@@ -231,8 +231,10 @@ obligation too, so a reopened chat starts from authoritative state instead of a 
 one; disconnect and backgrounding keep it.
 
 Foregrounding probes a nominally connected session immediately. A healthy response preserves the
-socket; a failed three-second probe starts reconnecting without waiting for the background heartbeat
-or retry backoff. This cannot keep a mobile socket alive after the operating system suspends it.
+socket; a probe that hears nothing from the daemon for three seconds starts reconnecting without
+waiting for the background heartbeat or retry backoff. Frames that keep arriving count as a healthy
+socket: a download over a slow link queues the reply behind it. This cannot keep a mobile socket
+alive after the operating system suspends it.
 
 - The same epoch and `window.maxSeq` is an exact display no-op. The app advances synchronization
   bookkeeping without replacing timeline arrays, preserving an upward-scrolled viewport.

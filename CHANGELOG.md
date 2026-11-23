@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Downloading a file larger than about 64 MB over a connection slower than the daemon's disk (Wi-Fi, the relay, Tailscale or a phone network) no longer drops the app's connection. Before this, the app disconnected a few seconds into the download, the download failed, and the app reconnected shortly after. The download now runs at the connection's speed, and the daemon log records when it has to disconnect a client that cannot keep up.
+- Switching back to the app window on desktop, reopening the app on a phone, or a phone changing networks during a download no longer drops and reopens the connection. The app's quick connection check waited only three seconds for the daemon's reply, which can queue behind the download on a slow link; data that keeps arriving now counts as a working connection.
+
 ## 0.13.47 - 2026-11-22
 
 ### Added

@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::permissions;
@@ -16,6 +16,11 @@ use super::permissions;
 pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 100 * 1024 * 1024;
 const WRITE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Bulk binary transfers (file downloads) wait while this much output is queued on their
+/// physical source. A disk is faster than most links, so an unpaced download over Wi-Fi, a
+/// relay or a phone network reached MAX_BUFFERED_BYTES and disconnected the client. The
+/// window also bounds how long replies and live updates wait behind a download.
+const BULK_WINDOW_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PRIMING_FRAMES: usize = 4096;
 const MAX_DRAINING_UPLOADS: usize = 32;
 const UPLOAD_DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(30);
@@ -70,6 +75,8 @@ pub(crate) struct Source {
     pub legacy_hub: AtomicBool,
     pub sender: mpsc::Sender<QueuedFrame>,
     pub queued: Arc<AtomicUsize>,
+    /// Signalled whenever queued bytes are released (a writer batch reached the socket).
+    drained: Arc<Notify>,
     handshake_pending: AtomicBool,
     subscriptions: Mutex<HashMap<String, Arc<SubscriptionState>>>,
     operations: Mutex<HashMap<String, CancellationToken>>,
@@ -83,10 +90,12 @@ pub(crate) struct QueuedFrame {
     pub frame: OutboundFrame,
     bytes: usize,
     queue: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
 }
 impl Drop for QueuedFrame {
     fn drop(&mut self) {
         self.queue.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.drained.notify_waiters();
     }
 }
 
@@ -170,6 +179,7 @@ impl RequestContext {
             activity: RwLock::new(Value::Null),
             sender,
             queued: Arc::new(AtomicUsize::new(0)),
+            drained: Arc::new(Notify::new()),
             handshake_pending: AtomicBool::new(true),
             subscriptions: Mutex::new(HashMap::new()),
             operations: Mutex::new(HashMap::new()),
@@ -364,7 +374,28 @@ impl RequestContext {
                 bail!("Binary frame lacks live source ownership");
             }
         }
+        self.bulk_room(bytes.len()).await?;
         self.queue(OutboundFrame::Binary(bytes)).await
+    }
+    /// Waits until a bulk frame of `bytes` fits within BULK_WINDOW_BYTES of queued output, or
+    /// nothing is queued, so the transfer runs at the link's pace instead of overflowing it.
+    async fn bulk_room(&self, bytes: usize) -> Result<()> {
+        let owner_cancel = self.cancellation();
+        loop {
+            let drained = self.source.drained.notified();
+            tokio::pin!(drained);
+            // Register before reading the count, so a release in between still wakes us.
+            drained.as_mut().enable();
+            let queued = self.source.queued.load(Ordering::Acquire);
+            if queued == 0 || queued.saturating_add(bytes) <= BULK_WINDOW_BYTES {
+                return Ok(());
+            }
+            tokio::select! { biased;
+                _ = self.source.cancel.cancelled() => bail!("Physical source is closed"),
+                _ = owner_cancel.cancelled() => bail!("Delivery owner is closed"),
+                _ = drained => {}
+            }
+        }
     }
     fn ensure_outbound(&self, message: &Value) -> Result<()> {
         if !self.is_live() {
@@ -392,6 +423,11 @@ impl RequestContext {
                         .filter(|n| *n <= MAX_BUFFERED_BYTES)
                 });
         if reserved.is_err() {
+            tracing::warn!(
+                source = %self.source.id,
+                frame_bytes = bytes,
+                "Disconnecting a client whose queued output exceeded the backpressure limit"
+            );
             self.detach();
             bail!("Physical source backpressure limit exceeded");
         }
@@ -399,6 +435,7 @@ impl RequestContext {
             frame,
             bytes,
             queue: self.source.queued.clone(),
+            drained: self.source.drained.clone(),
         })
     }
     async fn queue_reserved(&self, item: QueuedFrame) -> Result<()> {
@@ -411,6 +448,11 @@ impl RequestContext {
                 Err(_) => {
                     // A slow socket must not retain an agent commit/barrier or
                     // block delivery to other clients. Reconnect resumes cursors.
+                    tracing::warn!(
+                        source = %self.source.id,
+                        "Disconnecting a client whose socket accepted no frame for {}s",
+                        WRITE_ADMISSION_TIMEOUT.as_secs()
+                    );
                     self.detach();
                     bail!("Physical source frame queue stalled");
                 }

@@ -76,6 +76,15 @@ pub(crate) enum Control {
 #[derive(Default)]
 pub(crate) struct Liveness {
     pub failures: Cell<u32>,
+    /// Counts every daemon frame; a count that moves proves the socket is alive.
+    pub received: Cell<u64>,
+}
+
+impl Liveness {
+    fn heard(&self) {
+        self.failures.set(0);
+        self.received.set(self.received.get().wrapping_add(1));
+    }
 }
 
 pub(crate) struct Opened {
@@ -329,7 +338,7 @@ impl Pump {
                             if bytes.first() == Some(&0x30) && decode_frame(&bytes).is_err() {
                                 break Err(CoreError::new("DAEMON_CONNECTION_LOST", "Invalid host routing frame", true));
                             }
-                            self.liveness.failures.set(0);
+                            self.liveness.heard();
                             let _ = self.core.send(Inbound::Binary(bytes.clone()));
                             if self.client_in.send(Ok(HostFrame::Binary(bytes).into())).await.is_err() {
                                 break Ok(());
@@ -340,7 +349,7 @@ impl Pump {
                             let Ok(root) = serde_json::from_str::<Value>(&text) else { continue };
                             match root["type"].as_str() {
                                 Some("pong") => {
-                                    self.liveness.failures.set(0);
+                                    self.liveness.heard();
                                     if let Some(reply) = ping.take() {
                                         let _ = reply.send(());
                                     }
@@ -364,7 +373,7 @@ impl Pump {
                                 }
                                 _ => continue,
                             }
-                            self.liveness.failures.set(0);
+                            self.liveness.heard();
                             if self.client_in.send(Ok(IncomingFrame::Json(root))).await.is_err() {
                                 break Ok(());
                             }

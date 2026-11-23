@@ -408,6 +408,40 @@ async fn modern_subscription_ids_are_host_assigned_and_snapshot_budget_is_shared
     assert!(!source.is_live());
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_download_larger_than_the_buffer_waits_for_a_slow_link_instead_of_disconnecting() {
+    let (source, mut output) = make_source("slow-link", true);
+    let request = make_request(&source, "file_explorer_request", "download");
+    let mut frame = vec![0x11, 8];
+    frame.extend_from_slice(b"download");
+    frame.resize(frame.len() + 256 * 1024, 7);
+    let chunk = Bytes::from(frame);
+    let frames = MAX_BUFFERED_BYTES / chunk.len() + 64;
+    let producer = tokio::spawn(async move {
+        for _ in 0..frames {
+            request.send_binary(chunk.clone()).await?;
+        }
+        anyhow::Ok(())
+    });
+    // A slow socket: the writer keeps each batch reserved until the link has taken all of it.
+    let (mut batch, mut received, mut peak) = (Vec::new(), 0, 0);
+    while received < frames && !(producer.is_finished() && output.is_empty()) {
+        match tokio::time::timeout(Duration::from_millis(50), output.recv()).await {
+            Ok(Some(frame)) => {
+                batch.push(frame);
+                received += 1;
+                peak = peak.max(source.buffered_amount());
+            }
+            Ok(None) => break,
+            Err(_) => batch.clear(),
+        }
+    }
+    producer.await.unwrap().unwrap();
+    assert_eq!(received, frames);
+    assert!(source.is_live());
+    assert!(peak < MAX_BUFFERED_BYTES / 4, "{peak} bytes queued");
+}
+
 #[test]
 fn file_upload_frames_require_source_registration_and_exact_end_length() {
     let (source, _) = make_source("a", true);

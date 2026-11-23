@@ -917,15 +917,14 @@ fn verify_connection(core: &Rc<Core>, host: &Rc<Host>) {
     let host = host.clone();
     tokio::task::spawn_local(async move {
         let sent = chrono::Utc::now().timestamp_millis();
-        let result = conn
-            .request(
-                json!({"type":"ping","clientSentAt":sent}),
-                "pong",
-                Some(Duration::from_secs(3)),
-                None,
-                None,
-            )
-            .await;
+        let pong = conn.request(
+            json!({"type":"ping","clientSentAt":sent}),
+            "pong",
+            None,
+            None,
+            None,
+        );
+        let result = while_heard(pong, || conn.liveness.received.get()).await;
         if let Err(error) = result
             && host.conn_generation() == Some(conn.generation)
         {
@@ -939,6 +938,34 @@ fn verify_connection(core: &Rc<Core>, host: &Rc<Host>) {
             link.verifying = None;
         }
     });
+}
+
+/// How long a verifying probe waits without hearing any daemon frame.
+const VERIFY_SILENCE: Duration = Duration::from_secs(3);
+
+/// Waits for `reply`, failing only after VERIFY_SILENCE in which `heard` did not move. Frames
+/// that keep arriving prove the socket survived; the reply is just queued behind them, for
+/// example behind a download over a slow link. Data the OS buffered before a suspension is
+/// read at once, so a dead socket still fails one window later.
+async fn while_heard<T>(
+    reply: impl std::future::Future<Output = Result<T, CoreError>>,
+    heard: impl Fn() -> u64,
+) -> Result<T, CoreError> {
+    tokio::pin!(reply);
+    loop {
+        let before = heard();
+        match tokio::time::timeout(VERIFY_SILENCE, &mut reply).await {
+            Ok(result) => return result,
+            Err(_) if heard() != before => continue,
+            Err(_) => {
+                return Err(CoreError::new(
+                    "DAEMON_REQUEST_TIMEOUT",
+                    "Daemon request timed out",
+                    true,
+                ));
+            }
+        }
+    }
 }
 
 pub(crate) fn set_app_visible(core: &Rc<Core>, visible: bool) {
@@ -1722,6 +1749,49 @@ mod tests {
         assert_eq!(reconnect_delay(4), Duration::from_millis(24_000));
         assert_eq!(reconnect_delay(5), Duration::from_millis(30_000));
         assert_eq!(reconnect_delay(40), Duration::from_millis(30_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verification_waits_while_frames_arrive_and_fails_after_silence() {
+        // A download keeps frames arriving; the pong is queued behind 10 s of them.
+        let heard = std::cell::Cell::new(0u64);
+        let pong = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<_, CoreError>(())
+        };
+        let download = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                heard.set(heard.get() + 1);
+            }
+        };
+        let started = tokio::time::Instant::now();
+        tokio::select! {
+            result = while_heard(pong, || heard.get()) => result.unwrap(),
+            () = download => unreachable!(),
+        }
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+
+        // A dead socket: nothing arrives.
+        let started = tokio::time::Instant::now();
+        let silent = while_heard(std::future::pending::<Result<(), CoreError>>(), || 0).await;
+        assert_eq!(silent.unwrap_err().code, "DAEMON_REQUEST_TIMEOUT");
+        assert_eq!(started.elapsed(), VERIFY_SILENCE);
+
+        // Frames buffered before a suspension are read at once; then the socket is silent.
+        let buffered = std::cell::Cell::new(0u64);
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            buffered.set(7);
+            std::future::pending::<()>().await
+        };
+        let started = tokio::time::Instant::now();
+        let stale = tokio::select! {
+            result = while_heard(std::future::pending::<Result<(), CoreError>>(), || buffered.get()) => result,
+            () = drain => unreachable!(),
+        };
+        assert!(stale.is_err());
+        assert_eq!(started.elapsed(), VERIFY_SILENCE * 2);
     }
 
     #[tokio::test]
