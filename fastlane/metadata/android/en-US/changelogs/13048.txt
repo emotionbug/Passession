@@ -1,0 +1,7 @@
+Fixed
+- Large downloads and uploads on a slow connection no longer drop the connection.
+- Returning to the app or changing networks during a transfer keeps the connection.
+- Heavy terminal output on a slow connection no longer disconnects the app.
+- Downloads no longer fail with "Connection lost" when data arrives in a burst.
+
+Full notes: https://github.com/emotionbug/Passession/releases/tag/v0.13.48
