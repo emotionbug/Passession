@@ -608,7 +608,7 @@ fn record_shows_what_was_asked_with_or_without_an_answer() {
 
 /// Card answers for the forms in `omp_rpc_dialogs.json`: the form card's response, then the
 /// answers to any step-by-step cards.
-fn recorded_cases() -> [(&'static str, Value, Vec<Value>); 3] {
+fn recorded_cases() -> [(&'static str, Value, Vec<Value>); 4] {
     [
         (
             "cleanup",
@@ -632,6 +632,13 @@ fn recorded_cases() -> [(&'static str, Value, Vec<Value>); 3] {
             }}}),
             vec![json!({"behavior":"allow","updatedInput":{"answers":{"Response":"Kim"}}})],
         ),
+        (
+            "context",
+            json!({"behavior":"allow","updatedInput":{"answers":{},"selections":{
+                "Owner":{"options":[],"other":""},"Channel":{"options":[],"other":"Nightly"}
+            }}}),
+            vec![json!({"behavior":"allow","updatedInput":{"answers":{"Response":"Kim"}}})],
+        ),
     ]
 }
 
@@ -639,46 +646,60 @@ fn recordings() -> Value {
     serde_json::from_str(include_str!("omp_rpc_dialogs.json")).unwrap()
 }
 
-/// The dialogs a real `omp --mode rpc-ui` sent for these forms (version in the file), with
-/// its accepted answers. Paseo must send every recorded answer itself.
+/// The dialogs a real `omp --mode rpc-ui` sent for these forms, per OMP version, with its
+/// accepted answers, in the order OMP sends them: the assistant message with the `ask` call,
+/// the first dialog, then the tool's start. Paseo must send every recorded answer itself.
 #[test]
 fn replay_matches_dialogs_recorded_from_omp() {
     let recordings = recordings();
     for (name, form, steps) in recorded_cases() {
         let recording = &recordings[name];
-        let mut mapper = Mapper::new("omp", "omp");
-        mapper.map(&json!({"type":"tool_execution_start","toolCallId":"ask-1","toolName":"ask","args":{"html":recording["html"]}}));
-        let mut steps = steps.into_iter();
-        for entry in recording["transcript"].as_array().unwrap() {
-            let dialog = &entry["dialog"];
-            let events = mapper.map(dialog);
-            let reply = match events.iter().find(|e| e["type"] == "permission_requested") {
-                Some(event) => {
-                    let card = &event["request"];
-                    let response = if card["metadata"]["ompAskForm"] == true {
-                        form.clone()
-                    } else {
-                        steps.next().expect("a step answer")
-                    };
-                    mapper
-                        .permission_response(card["id"].as_str().unwrap(), &response)
-                        .unwrap()
-                }
-                None => mapper.drain_responses().pop().expect("an automatic answer"),
-            };
-            assert_eq!(
-                reply["value"], entry["response"]["value"],
-                "{name}: {}",
-                dialog["title"]
+        let html = &recording["html"];
+        for (omp, transcript) in recording["transcripts"].as_object().unwrap() {
+            let mut mapper = Mapper::new("omp", "omp");
+            mapper.map(
+                &json!({"type":"message_end","message":{"role":"assistant","content":[
+                {"type":"toolCall","id":"ask-1","name":"ask","arguments":{"html":html}}]}}),
             );
+            let mut steps = steps.clone().into_iter();
+            let mut form_cards = 0;
+            for (index, entry) in transcript.as_array().unwrap().iter().enumerate() {
+                let dialog = &entry["dialog"];
+                let events = mapper.map(dialog);
+                if index == 0 {
+                    mapper.map(&json!({"type":"tool_execution_start","toolCallId":"ask-1","toolName":"ask","args":{"html":html}}));
+                }
+                let reply = match events.iter().find(|e| e["type"] == "permission_requested") {
+                    Some(event) => {
+                        let card = &event["request"];
+                        let response = if card["metadata"]["ompAskForm"] == true {
+                            form_cards += 1;
+                            form.clone()
+                        } else {
+                            steps.next().expect("a step answer")
+                        };
+                        mapper
+                            .permission_response(card["id"].as_str().unwrap(), &response)
+                            .unwrap()
+                    }
+                    None => mapper.drain_responses().pop().expect("an automatic answer"),
+                };
+                assert_eq!(
+                    reply["value"], entry["response"]["value"],
+                    "{name} on {omp}: {}",
+                    dialog["title"]
+                );
+            }
+            assert_eq!(form_cards, 1, "{name} on {omp}");
+            assert!(steps.next().is_none(), "{name} on {omp}");
+            assert!(mapper.pending_permissions().is_empty(), "{name} on {omp}");
         }
-        assert!(mapper.pending_permissions().is_empty(), "{name}");
     }
 }
 
 /// The same forms against the installed `omp` and its configured model, through Paseo's
-/// mapper. Run after an OMP upgrade with `--ignored`; when OMP changes its dialogs, refresh
-/// `omp_rpc_dialogs.json` from that run.
+/// mapper. Run after an OMP upgrade with `--ignored`; when OMP changes its dialogs, add that
+/// run's dialogs to `omp_rpc_dialogs.json` under the new version.
 #[test]
 #[ignore = "drives the installed omp and its configured model"]
 fn installed_omp_accepts_paseo_answers() {

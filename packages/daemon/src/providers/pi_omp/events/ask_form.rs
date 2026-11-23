@@ -439,7 +439,7 @@ impl Expected<'_> {
     fn check(&self, event: &Value) -> Result<Option<String>, String> {
         let method = event["method"].as_str().unwrap_or("");
         let title = event["title"].as_str().unwrap_or("");
-        if method != self.method || title != self.title {
+        if method != self.method || prompt_line(title) != self.title {
             return Err(format!(
                 "expected {} “{}”, got {method} “{title}”",
                 self.method, self.title
@@ -555,7 +555,7 @@ impl Replay {
         let done = match checked {
             Some(Ok(done)) => done,
             mismatch => {
-                let title = event["title"].as_str().unwrap_or("");
+                let title = prompt_line(event["title"].as_str().unwrap_or(""));
                 if let Some(previous) = self.last_text
                     && matches!(event["method"].as_str(), Some("input" | "editor"))
                     && title
@@ -628,6 +628,12 @@ impl Replay {
             _ => Step::Abandon(format!("no answer for “{}”", plan.title)),
         }
     }
+}
+
+/// The line of an OMP dialog title that names the step. OMP 19 puts the field's form text
+/// before it, after a blank line (`tools/ask.ts` `promptTitle`); the line itself is one line.
+fn prompt_line(title: &str) -> &str {
+    title.rsplit("\n\n").next().unwrap_or(title)
 }
 
 fn unique(base: &str, taken: &[String]) -> String {

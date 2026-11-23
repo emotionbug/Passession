@@ -1,85 +1,6 @@
 {
   "cleanup": {
-    "omp": "omp/18.18.8",
     "html": "<form><p>현재 여유 공간은 <strong>3.1GiB</strong>입니다.</p><fieldset><legend>Passession Wine 범위</legend><label><input type=\"radio\" name=\"wine\" value=\"all\" checked> <code>~/.cache/passession-wine</code> 전체 약 15GiB</label><label><input type=\"radio\" name=\"wine\" value=\"target\"> 빌드 결과 <code>target</code>만</label></fieldset><fieldset><legend>추가 정리 항목</legend><label><input type=\"checkbox\" name=\"items\" value=\"codex_old\" checked> Codex 구버전</label><label><input type=\"checkbox\" name=\"items\" value=\"pkg_caches\" checked> 캐시: <code>~/.npm/_npx</code>, <code>~/.cache/zig</code></label><label><input type=\"checkbox\" name=\"items\" value=\"old_daemon\" checked> 과거 데몬 기록</label><label><input type=\"checkbox\" name=\"items\" value=\"review\" checked> 리뷰 산출물</label><label><input type=\"checkbox\" name=\"items\" value=\"latest_backup\"> 최신 롤백 백업</label></fieldset><p>예상 확보량: 약 27GiB.</p></form>",
-    "transcript": [
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e49b917a8f9",
-          "method": "select",
-          "title": "Passession Wine 범위",
-          "options": [
-            "~/.cache/passession-wine 전체 약 15GiB",
-            "빌드 결과 target만",
-            "Other (type your own)"
-          ]
-        },
-        "response": {
-          "value": "빌드 결과 target만"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e49b957a8fa",
-          "method": "select",
-          "title": "(4 selected) 추가 정리 항목",
-          "options": [
-            "Codex 구버전",
-            "캐시: ~/.npm/_npx, ~/.cache/zig",
-            "과거 데몬 기록",
-            "리뷰 산출물",
-            "최신 롤백 백업",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "Codex 구버전"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e49b997a8fb",
-          "method": "select",
-          "title": "(3 selected) 추가 정리 항목",
-          "options": [
-            "Codex 구버전",
-            "캐시: ~/.npm/_npx, ~/.cache/zig",
-            "과거 데몬 기록",
-            "리뷰 산출물",
-            "최신 롤백 백업",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "최신 롤백 백업"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e49b997a8fc",
-          "method": "select",
-          "title": "(4 selected) 추가 정리 항목",
-          "options": [
-            "Codex 구버전",
-            "캐시: ~/.npm/_npx, ~/.cache/zig",
-            "과거 데몬 기록",
-            "리뷰 산출물",
-            "최신 롤백 백업",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "✔ Done selecting"
-        }
-      }
-    ],
     "answers": [
       {
         "name": "wine",
@@ -91,132 +12,196 @@
         "question": "추가 정리 항목",
         "answer": "캐시: ~/.npm/_npx, ~/.cache/zig, 과거 데몬 기록, 리뷰 산출물, 최신 롤백 백업"
       }
-    ]
+    ],
+    "transcripts": {
+      "omp/18.18.8": [
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e49b917a8f9",
+            "method": "select",
+            "title": "Passession Wine 범위",
+            "options": [
+              "~/.cache/passession-wine 전체 약 15GiB",
+              "빌드 결과 target만",
+              "Other (type your own)"
+            ]
+          },
+          "response": {
+            "value": "빌드 결과 target만"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e49b957a8fa",
+            "method": "select",
+            "title": "(4 selected) 추가 정리 항목",
+            "options": [
+              "Codex 구버전",
+              "캐시: ~/.npm/_npx, ~/.cache/zig",
+              "과거 데몬 기록",
+              "리뷰 산출물",
+              "최신 롤백 백업",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "Codex 구버전"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e49b997a8fb",
+            "method": "select",
+            "title": "(3 selected) 추가 정리 항목",
+            "options": [
+              "Codex 구버전",
+              "캐시: ~/.npm/_npx, ~/.cache/zig",
+              "과거 데몬 기록",
+              "리뷰 산출물",
+              "최신 롤백 백업",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "최신 롤백 백업"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e49b997a8fc",
+            "method": "select",
+            "title": "(4 selected) 추가 정리 항목",
+            "options": [
+              "Codex 구버전",
+              "캐시: ~/.npm/_npx, ~/.cache/zig",
+              "과거 데몬 기록",
+              "리뷰 산출물",
+              "최신 롤백 백업",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "✔ Done selecting"
+          }
+        }
+      ],
+      "omp/19.0.1": [
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1b05d2b8ae",
+            "method": "select",
+            "title": "현재 여유 공간은 3.1GiB입니다.\n\nPassession Wine 범위",
+            "options": [
+              "~/.cache/passession-wine 전체 약 15GiB",
+              "빌드 결과 target만",
+              "Other (type your own)"
+            ],
+            "initialIndex": 0,
+            "selectionMarker": "radio"
+          },
+          "response": {
+            "value": "빌드 결과 target만"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1b0612b8af",
+            "method": "select",
+            "title": "예상 확보량: 약 27GiB.\n\n(4 selected) 추가 정리 항목",
+            "options": [
+              "Codex 구버전",
+              "캐시: ~/.npm/_npx, ~/.cache/zig",
+              "과거 데몬 기록",
+              "리뷰 산출물",
+              "최신 롤백 백업",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 0,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "markableCount": 6
+          },
+          "response": {
+            "value": "Codex 구버전"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1b0652b8b0",
+            "method": "select",
+            "title": "예상 확보량: 약 27GiB.\n\n(3 selected) 추가 정리 항목",
+            "options": [
+              "Codex 구버전",
+              "캐시: ~/.npm/_npx, ~/.cache/zig",
+              "과거 데몬 기록",
+              "리뷰 산출물",
+              "최신 롤백 백업",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 0,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              1,
+              2,
+              3
+            ],
+            "markableCount": 6
+          },
+          "response": {
+            "value": "최신 롤백 백업"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1b0652b8b1",
+            "method": "select",
+            "title": "예상 확보량: 약 27GiB.\n\n(4 selected) 추가 정리 항목",
+            "options": [
+              "Codex 구버전",
+              "캐시: ~/.npm/_npx, ~/.cache/zig",
+              "과거 데몬 기록",
+              "리뷰 산출물",
+              "최신 롤백 백업",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 4,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "markableCount": 6
+          },
+          "response": {
+            "value": "✔ Done selecting"
+          }
+        }
+      ]
+    }
   },
   "joined": {
-    "omp": "omp/18.18.8",
     "html": "<form>\n        <fieldset><legend>Store</legend>\n          <label><input type=\"radio\" name=\"store\" value=\"sqlite\" checked> SQLite: one file, no service</label>\n          <label><input type=\"radio\" name=\"store\" value=\"redis\"> Redis</label></fieldset>\n        <fieldset><legend>Extras</legend>\n          <label><input type=\"checkbox\" name=\"extras\" value=\"ab\"> A, B</label>\n          <label><input type=\"checkbox\" name=\"extras\" value=\"c\" checked> C</label></fieldset>\n        <label>Days <input type=\"number\" name=\"days\" value=\"30\"></label>\n    </form>",
-    "transcript": [
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617b27909f",
-          "method": "select",
-          "title": "Store",
-          "options": [
-            "SQLite: one file, no service",
-            "Redis",
-            "Other (type your own)"
-          ]
-        },
-        "response": {
-          "value": "Other (type your own)"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617ba790a0",
-          "method": "input",
-          "title": "Store"
-        },
-        "response": {
-          "value": "Postgres, managed"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617ba790a1",
-          "method": "select",
-          "title": "(1 selected) Extras",
-          "options": [
-            "A, B",
-            "C",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "A, B"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617ba790a2",
-          "method": "select",
-          "title": "(2 selected) Extras",
-          "options": [
-            "A, B",
-            "C",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "C"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617ba790a3",
-          "method": "select",
-          "title": "(1 selected) Extras",
-          "options": [
-            "A, B",
-            "C",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "Other (type your own)"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617be790a4",
-          "method": "input",
-          "title": "Extras"
-        },
-        "response": {
-          "value": "extra, text"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617be790a5",
-          "method": "select",
-          "title": "(2 selected) Extras",
-          "options": [
-            "A, B",
-            "C",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "✔ Done selecting"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e617be790a6",
-          "method": "editor",
-          "title": "Days",
-          "prefill": "30",
-          "promptStyle": true
-        },
-        "response": {
-          "value": "45"
-        }
-      }
-    ],
     "answers": [
       {
         "name": "store",
@@ -233,69 +218,282 @@
         "question": "Days",
         "answer": "45"
       }
-    ]
+    ],
+    "transcripts": {
+      "omp/18.18.8": [
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617b27909f",
+            "method": "select",
+            "title": "Store",
+            "options": [
+              "SQLite: one file, no service",
+              "Redis",
+              "Other (type your own)"
+            ]
+          },
+          "response": {
+            "value": "Other (type your own)"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617ba790a0",
+            "method": "input",
+            "title": "Store"
+          },
+          "response": {
+            "value": "Postgres, managed"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617ba790a1",
+            "method": "select",
+            "title": "(1 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "A, B"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617ba790a2",
+            "method": "select",
+            "title": "(2 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "C"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617ba790a3",
+            "method": "select",
+            "title": "(1 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "Other (type your own)"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617be790a4",
+            "method": "input",
+            "title": "Extras"
+          },
+          "response": {
+            "value": "extra, text"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617be790a5",
+            "method": "select",
+            "title": "(2 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "✔ Done selecting"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e617be790a6",
+            "method": "editor",
+            "title": "Days",
+            "prefill": "30",
+            "promptStyle": true
+          },
+          "response": {
+            "value": "45"
+          }
+        }
+      ],
+      "omp/19.0.1": [
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdecd4b16",
+            "method": "select",
+            "title": "Store",
+            "options": [
+              "SQLite: one file, no service",
+              "Redis",
+              "Other (type your own)"
+            ],
+            "initialIndex": 0,
+            "selectionMarker": "radio"
+          },
+          "response": {
+            "value": "Other (type your own)"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdf0d4b17",
+            "method": "input",
+            "title": "Store"
+          },
+          "response": {
+            "value": "Postgres, managed"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdf4d4b18",
+            "method": "select",
+            "title": "(1 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 1,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              1
+            ],
+            "markableCount": 3
+          },
+          "response": {
+            "value": "A, B"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdf8d4b19",
+            "method": "select",
+            "title": "(2 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 0,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              0,
+              1
+            ],
+            "markableCount": 3
+          },
+          "response": {
+            "value": "C"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdf8d4b1a",
+            "method": "select",
+            "title": "(1 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 1,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              0
+            ],
+            "markableCount": 3
+          },
+          "response": {
+            "value": "Other (type your own)"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdf8d4b1b",
+            "method": "input",
+            "title": "Extras"
+          },
+          "response": {
+            "value": "extra, text"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdfcd4b1c",
+            "method": "select",
+            "title": "(2 selected) Extras",
+            "options": [
+              "A, B",
+              "C",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 2,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              0,
+              2
+            ],
+            "markableCount": 3
+          },
+          "response": {
+            "value": "✔ Done selecting"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1bdfcd4b1d",
+            "method": "editor",
+            "title": "Days",
+            "prefill": "30",
+            "promptStyle": true
+          },
+          "response": {
+            "value": "45"
+          }
+        }
+      ]
+    }
   },
   "reprompt": {
-    "omp": "omp/18.18.8",
     "html": "<form><label>Who <input type=\"text\" name=\"who\" required></label>\n        <fieldset><legend>Ping</legend>\n          <label><input type=\"checkbox\" name=\"ping\" value=\"a\"> A</label>\n          <label><input type=\"checkbox\" name=\"ping\" value=\"b\"> B</label></fieldset></form>",
-    "transcript": [
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e660450e841",
-          "method": "input",
-          "title": "Who"
-        },
-        "response": {
-          "value": ""
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e6604d0e842",
-          "method": "input",
-          "title": "Who (Required)"
-        },
-        "response": {
-          "value": "Kim"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e660550e843",
-          "method": "select",
-          "title": "Ping",
-          "options": [
-            "A",
-            "B",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "B"
-        }
-      },
-      {
-        "dialog": {
-          "type": "extension_ui_request",
-          "id": "15cf4e660550e844",
-          "method": "select",
-          "title": "(1 selected) Ping",
-          "options": [
-            "A",
-            "B",
-            "Other (type your own)",
-            "✔ Done selecting"
-          ]
-        },
-        "response": {
-          "value": "✔ Done selecting"
-        }
-      }
-    ],
     "answers": [
       {
         "name": "who",
@@ -307,6 +505,204 @@
         "question": "Ping",
         "answer": "B"
       }
-    ]
+    ],
+    "transcripts": {
+      "omp/18.18.8": [
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e660450e841",
+            "method": "input",
+            "title": "Who"
+          },
+          "response": {
+            "value": ""
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e6604d0e842",
+            "method": "input",
+            "title": "Who (Required)"
+          },
+          "response": {
+            "value": "Kim"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e660550e843",
+            "method": "select",
+            "title": "Ping",
+            "options": [
+              "A",
+              "B",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "B"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15cf4e660550e844",
+            "method": "select",
+            "title": "(1 selected) Ping",
+            "options": [
+              "A",
+              "B",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ]
+          },
+          "response": {
+            "value": "✔ Done selecting"
+          }
+        }
+      ],
+      "omp/19.0.1": [
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1cc165109c",
+            "method": "input",
+            "title": "Who"
+          },
+          "response": {
+            "value": ""
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1cc1a5109d",
+            "method": "input",
+            "title": "Who (Required)"
+          },
+          "response": {
+            "value": "Kim"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1cc1e5109e",
+            "method": "select",
+            "title": "Ping",
+            "options": [
+              "A",
+              "B",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 0,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [],
+            "markableCount": 3
+          },
+          "response": {
+            "value": "B"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1cc225109f",
+            "method": "select",
+            "title": "(1 selected) Ping",
+            "options": [
+              "A",
+              "B",
+              "Other (type your own)",
+              "✔ Done selecting"
+            ],
+            "initialIndex": 1,
+            "selectionMarker": "checkbox",
+            "checkedIndices": [
+              1
+            ],
+            "markableCount": 3
+          },
+          "response": {
+            "value": "✔ Done selecting"
+          }
+        }
+      ]
+    }
+  },
+  "context": {
+    "html": "<form><p>Release checklist.</p><label>Owner <input type=\"text\" name=\"owner\" required></label><fieldset><legend>Channel</legend><label><input type=\"radio\" name=\"channel\" value=\"stable\" checked> Stable</label><label><input type=\"radio\" name=\"channel\" value=\"beta\"> Beta</label></fieldset><p>Answers go to the release notes.</p></form>",
+    "answers": [
+      {
+        "name": "owner",
+        "question": "Owner",
+        "answer": "Kim"
+      },
+      {
+        "name": "channel",
+        "question": "Channel",
+        "answer": "Other: Nightly"
+      }
+    ],
+    "transcripts": {
+      "omp/19.0.1": [
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1d9d0fe2f1",
+            "method": "input",
+            "title": "Release checklist.\n\nOwner"
+          },
+          "response": {
+            "value": ""
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1d9d4fe2f2",
+            "method": "input",
+            "title": "Release checklist.\n\nOwner (Required)"
+          },
+          "response": {
+            "value": "Kim"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1d9d8fe2f3",
+            "method": "select",
+            "title": "Answers go to the release notes.\n\nChannel",
+            "options": [
+              "Stable",
+              "Beta",
+              "Other (type your own)"
+            ],
+            "initialIndex": 0,
+            "selectionMarker": "radio"
+          },
+          "response": {
+            "value": "Other (type your own)"
+          }
+        },
+        {
+          "dialog": {
+            "type": "extension_ui_request",
+            "id": "15d98b1d9dcfe2f4",
+            "method": "input",
+            "title": "Answers go to the release notes.\n\nChannel"
+          },
+          "response": {
+            "value": "Nightly"
+          }
+        }
+      ]
+    }
   }
 }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- OMP 19: a question form from OMP's `ask` tool shows as one card with every question again. OMP 19 puts the form's text in front of each question it asks, which Passession did not recognize, so the form fell apart into separate "OMP select" cards, one per question, starting with a note that Passession "could not match this OMP form step".
+
 ## 0.13.48 - 2026-11-23
 
 ### Fixed
