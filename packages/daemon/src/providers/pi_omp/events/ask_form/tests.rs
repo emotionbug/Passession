@@ -402,21 +402,118 @@ fn unpredicted_dialog_is_asked_step_by_step_without_an_automatic_answer() {
 
 #[test]
 fn agent_cancel_withdraws_the_form_card() {
+    for first in [omp_first_dialog(CLEANUP), form_dialog(CLEANUP)] {
+        let mut mapper = Mapper::new("omp", "omp");
+        mapper.map(&json!({"type":"tool_execution_start","toolCallId":"ask-1","toolName":"ask","args":{"html":CLEANUP}}));
+        let events = mapper.map(&first);
+        assert_eq!(events[0]["request"]["metadata"]["ompAskForm"], true);
+        let events = mapper.map(
+            &json!({"type":"extension_ui_request","id":"c1","method":"cancel","targetId":first["id"]}),
+        );
+        assert_eq!(events[0]["type"], "permission_resolved");
+        assert_eq!(events[0]["requestId"], first["id"]);
+        assert!(mapper.pending_permissions().is_empty());
+        assert!(
+            mapper
+                .permission_response(first["id"].as_str().unwrap(), &json!({"behavior":"allow"}))
+                .is_err()
+        );
+    }
+}
+
+/// OMP 19.1+ (`rpc-mode.ts` `requestRpcFormDialog`) sends the whole form as one dialog.
+fn form_dialog(html: &str) -> Value {
+    json!({"type":"extension_ui_request","id":"form-1","method":"form","html":html,"timeout":300000})
+}
+
+/// The card Paseo shows for OMP's `form` dialog.
+fn form_card(mapper: &mut Mapper, html: &str) -> Value {
+    mapper.map(&json!({"type":"tool_execution_start","toolCallId":"ask-1","toolName":"ask","args":{"html":html}}));
+    let events = mapper.map(&form_dialog(html));
+    let card = events
+        .iter()
+        .find(|e| e["type"] == "permission_requested")
+        .map(|e| e["request"].clone())
+        .expect("the form dialog shows a card");
+    assert_eq!(card["metadata"]["ompAskForm"], true);
+    assert_eq!(mapper.pending_permissions(), vec![card.clone()]);
+    card
+}
+
+#[test]
+fn form_dialog_answers_with_the_data_the_replay_submits() {
+    let recordings = recordings();
+    for (name, response, steps) in recorded_cases() {
+        if !steps.is_empty() {
+            continue;
+        }
+        let html = recordings[name]["html"].as_str().unwrap();
+        let replay_response = response.clone();
+        let mut harness = Harness::new(html, move |_| replay_response.clone());
+        let replayed = omp(html, |dialog| harness.answer(dialog)).unwrap();
+
+        let mut mapper = Mapper::new("omp", "omp");
+        let card = form_card(&mut mapper, html);
+        let reply = mapper
+            .permission_response(card["id"].as_str().unwrap(), &response)
+            .unwrap();
+        assert_eq!(
+            reply,
+            json!({"type":"extension_ui_response","id":"form-1","data":replayed}),
+            "{name}"
+        );
+        assert!(mapper.pending_permissions().is_empty(), "{name}");
+        assert!(mapper.drain_responses().is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn form_dialog_data_follows_html_form_submission() {
+    const HTML: &str = r#"<form>
+        <label><input type="checkbox" name="agree" value="yes"> I agree</label>
+        <label><input type="checkbox" name="lone"> Lone</label>
+        <label>Size <select name="size"><option value="s">Small</option><option value="l" selected>Large</option></select></label>
+        <fieldset><legend>Tags</legend>
+          <label><input type="checkbox" name="tags" value="x" checked disabled> Locked</label>
+          <label><input type="checkbox" name="tags" value="y"> Y</label></fieldset>
+        <label>Who <input type="text" name="who" required></label>
+    </form>"#;
     let mut mapper = Mapper::new("omp", "omp");
-    mapper.map(&json!({"type":"tool_execution_start","toolCallId":"ask-1","toolName":"ask","args":{"html":CLEANUP}}));
-    let first = omp_first_dialog(CLEANUP);
-    let events = mapper.map(&first);
-    assert_eq!(events[0]["request"]["metadata"]["ompAskForm"], true);
-    let events = mapper.map(
-        &json!({"type":"extension_ui_request","id":"c1","method":"cancel","targetId":first["id"]}),
+    let card = form_card(&mut mapper, HTML);
+    let id = card["id"].as_str().unwrap();
+    let response = |who: &str| {
+        let selections = json!({
+            header(&card, 0): {"options":["I agree"]},
+            header(&card, 1): {"options":[]},
+            header(&card, 3): {"options":["Y"]}
+        });
+        json!({"behavior":"allow","updatedInput":{"answers":{header(&card, 4): who},"selections":selections}})
+    };
+    assert!(mapper.permission_response(id, &response("")).is_err());
+    assert_eq!(
+        mapper.pending_permissions().len(),
+        1,
+        "an empty required field keeps the card"
     );
-    assert_eq!(events[0]["type"], "permission_resolved");
-    assert_eq!(events[0]["requestId"], first["id"]);
-    assert!(mapper.pending_permissions().is_empty());
-    assert!(
-        mapper
-            .permission_response(first["id"].as_str().unwrap(), &json!({"behavior":"allow"}))
-            .is_err()
+
+    let reply = mapper.permission_response(id, &response("Kim")).unwrap();
+    // The unchecked lone checkbox submits nothing; the disabled option never submits.
+    assert_eq!(
+        reply["data"],
+        json!({"agree":"yes","size":"l","tags":["y"],"who":"Kim"})
+    );
+
+    let mut mapper = Mapper::new("omp", "omp");
+    let card = form_card(&mut mapper, HTML);
+    let reply = mapper
+        .permission_response(
+            card["id"].as_str().unwrap(),
+            &json!({"behavior":"deny","message":"Dismissed by user"}),
+        )
+        .unwrap();
+    assert_eq!(
+        reply,
+        json!({"type":"extension_ui_response","id":"form-1","cancelled":true})
     );
 }
 

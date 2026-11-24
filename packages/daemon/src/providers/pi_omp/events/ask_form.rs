@@ -1,8 +1,10 @@
-//! OMP's `ask` tool takes one HTML form. OMP's RPC host has no form dialog, so OMP asks one
-//! dialog per field; a checkbox group becomes a `select` repeated once per toggled option,
-//! without its checked state. Paseo shows the whole form as one question card, then answers
-//! those dialogs itself, checking each one against the dialog OMP's own rules predict. A dialog
-//! that does not match stops the replay and is shown to the user, with every later one.
+//! OMP's `ask` tool takes one HTML form, and Paseo shows the whole form as one question card.
+//! OMP 19.1 and later send the form as one `form` dialog, which the card answers with the
+//! form's data. Earlier OMP has no RPC form dialog and asks one dialog per field; a checkbox
+//! group becomes a `select` repeated once per toggled option, without its checked state.
+//! Paseo answers those dialogs itself, checking each one against the dialog OMP's own rules
+//! predict. A dialog that does not match stops the replay and is shown to the user, with
+//! every later one.
 
 mod dom;
 mod parse;
@@ -11,7 +13,7 @@ mod tests;
 
 use crate::providers::question_answers;
 use parse::{Block, Kind};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
 /// OMP's automatic free-text option of a radio or checkbox group.
@@ -29,12 +31,16 @@ pub(super) struct AskForm {
 }
 
 enum Stage {
-    /// Waiting for OMP's first dialog.
+    /// Waiting for OMP's first dialog: a `form` dialog, or the first per-field one.
     Waiting,
     /// The card is shown in place of this first dialog.
     Shown {
         request: String,
         held: Value,
+    },
+    /// The card answers OMP's `form` dialog, this request, whole.
+    Form {
+        request: String,
     },
     Replaying(Replay),
 }
@@ -55,6 +61,10 @@ enum PlanKind {
         required: bool,
         /// Dialog labels of the enabled options.
         labels: Vec<String>,
+        /// The enabled options' submitted values, in the order of `labels`.
+        values: Vec<String>,
+        /// The form data holds an array: a checkbox group or multi-select of several options.
+        array: bool,
         defaults: BTreeSet<usize>,
         /// Checked disabled options: OMP counts them but never offers them.
         locked: usize,
@@ -98,7 +108,10 @@ pub(super) enum Step {
 }
 
 pub(super) enum Submitted {
+    /// Answer the held first per-field dialog with this body; the replay continues.
     Reply(Value),
+    /// Answer the `form` dialog with this body; the form is complete.
+    Data(Value),
     Cancelled,
 }
 
@@ -199,6 +212,7 @@ impl AskForm {
                     ..
                 } => {
                     let mut labels: Vec<String> = Vec::new();
+                    let mut values: Vec<String> = Vec::new();
                     let mut defaults = BTreeSet::new();
                     for option in options.iter().filter(|o| !o.disabled) {
                         let label = parse::collapse(&option.label);
@@ -211,6 +225,7 @@ impl AskForm {
                             defaults.insert(labels.len());
                         }
                         labels.push(unique(&label, &labels));
+                        values.push(option.value.clone());
                     }
                     PlanKind::Choice {
                         multi: *multi,
@@ -218,6 +233,8 @@ impl AskForm {
                         locked: options.iter().filter(|o| o.disabled && o.checked).count(),
                         other: other.then(|| unique(OTHER, &labels)),
                         labels,
+                        values,
+                        array: *multi && options.len() > 1,
                         defaults,
                     }
                 }
@@ -258,7 +275,18 @@ impl AskForm {
     }
 
     pub(super) fn shows(&self, request: &str) -> bool {
-        matches!(&self.stage, Stage::Shown { request: id, .. } if id == request)
+        match &self.stage {
+            Stage::Shown { request: id, .. } | Stage::Form { request: id } => id == request,
+            Stage::Waiting | Stage::Replaying(_) => false,
+        }
+    }
+
+    /// The card for OMP's `form` dialog `id`, which the card's answer settles whole.
+    pub(super) fn show(&mut self, provider: &str, id: &str) -> Value {
+        self.stage = Stage::Form {
+            request: id.to_owned(),
+        };
+        self.request(provider, id)
     }
 
     pub(super) fn dialog(&mut self, provider: &str, event: &Value) -> Step {
@@ -276,23 +304,30 @@ impl AskForm {
                 };
                 Step::Show(request)
             }
-            Stage::Shown { .. } => {
+            Stage::Shown { .. } | Stage::Form { .. } => {
                 Step::Abandon("OMP asked again before the form was answered".into())
             }
             Stage::Replaying(replay) => replay.next(&self.plans, event),
         }
     }
 
-    /// Answers the held first dialog from the card's response.
+    /// Answers the `form` dialog, or the held first per-field dialog, from the card's response.
     pub(super) fn submit(&mut self, response: &Value) -> Result<Submitted, String> {
-        let Stage::Shown { held, .. } = &self.stage else {
-            return Err("The form is not waiting for an answer".into());
+        let held = match &self.stage {
+            Stage::Shown { held, .. } => Some(held.clone()),
+            Stage::Form { .. } => None,
+            Stage::Waiting | Stage::Replaying(_) => {
+                return Err("The form is not waiting for an answer".into());
+            }
         };
         if response["behavior"] != "allow" {
             return Ok(Submitted::Cancelled);
         }
-        let held = held.clone();
-        let mut replay = Replay::new(&self.plans, self.targets(response)?);
+        let targets = self.targets(response)?;
+        let Some(held) = held else {
+            return Ok(Submitted::Data(json!({ "data": self.data(&targets)? })));
+        };
+        let mut replay = Replay::new(&self.plans, targets);
         match replay.next(&self.plans, &held) {
             Step::Reply(body) => {
                 self.stage = Stage::Replaying(replay);
@@ -410,6 +445,58 @@ impl AskForm {
                 )),
             })
             .collect()
+    }
+
+    /// The form data the answers submit, in the shape OMP's `form` dialog validates: each
+    /// field's value under its name, an array for a checkbox group or multi-select of several
+    /// options, and nothing for a lone checkbox left unchecked. A required field left empty is
+    /// refused, so the card stays open instead of OMP failing the ask.
+    fn data(&self, targets: &[Target]) -> Result<Map<String, Value>, String> {
+        let mut data = Map::new();
+        for (plan, target) in self.plans.iter().zip(targets) {
+            let value = match (&plan.kind, target) {
+                (PlanKind::Choice { values, .. }, Target::Single(Pick::Option(index))) => {
+                    Some(json!(values[*index]))
+                }
+                (PlanKind::Choice { .. }, Target::Single(Pick::Other(text))) => Some(json!(text)),
+                (
+                    PlanKind::Choice {
+                        values,
+                        array,
+                        required,
+                        ..
+                    },
+                    Target::Multi { picks, other },
+                ) => {
+                    // OMP refuses an entry twice: an option value repeated, or Other text equal to one.
+                    let mut chosen: Vec<&str> = Vec::new();
+                    for entry in picks.iter().map(|&i| values[i].as_str()).chain(other.as_deref()) {
+                        if !chosen.contains(&entry) {
+                            chosen.push(entry);
+                        }
+                    }
+                    if *required && chosen.is_empty() {
+                        return Err(format!("Answer “{}”", plan.title));
+                    }
+                    if *array {
+                        Some(json!(chosen))
+                    } else {
+                        chosen.first().map(|value| json!(value))
+                    }
+                }
+                (PlanKind::Text { required, .. }, Target::Text(text)) => {
+                    if *required && text.trim().is_empty() {
+                        return Err(format!("Answer “{}”", plan.title));
+                    }
+                    Some(json!(text))
+                }
+                _ => unreachable!("targets follow the plans"),
+            };
+            if let Some(value) = value {
+                data.insert(plan.name.clone(), value);
+            }
+        }
+        Ok(data)
     }
 }
 

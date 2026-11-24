@@ -125,10 +125,13 @@ impl Permissions {
     pub fn dialog(&mut self, family: &str, provider: &str, event: &Value) -> Option<Value> {
         let method = string(&event["method"]);
         // Status/widget updates share this channel but must not advance or discard a form.
-        if !matches!(method, "select" | "input" | "editor" | "confirm") {
+        if !matches!(method, "select" | "input" | "editor" | "confirm" | "form") {
             return None;
         }
         let id = string(&event["id"]);
+        if method == "form" {
+            return self.form_dialog(family, provider, event);
+        }
         let mut stray = false;
         if family == "omp"
             && let Some(form) = self.form.as_mut()
@@ -253,6 +256,24 @@ impl Permissions {
         self.requests.push(req.clone());
         Some(req)
     }
+    /// OMP 19.1+ sends an `ask` form whole as one `form` dialog, answered with the form's data.
+    fn form_dialog(&mut self, family: &str, provider: &str, event: &Value) -> Option<Value> {
+        let id = string(&event["id"]);
+        let tool = self.form.take().map(|form| form.tool).unwrap_or_default();
+        let form = (family == "omp")
+            .then(|| AskForm::new(&tool, string(&event["html"])))
+            .flatten();
+        let Some(mut form) = form else {
+            // OMP waits for an answer to every dialog; one Paseo cannot show is cancelled.
+            tracing::warn!(family, "cancelling a form dialog Paseo cannot show");
+            self.responses.push(frame(id, json!({"cancelled":true})));
+            return None;
+        };
+        let request = form.show(provider, id);
+        self.form = Some(form);
+        self.requests.push(request.clone());
+        Some(request)
+    }
     fn ask_dialog(&self, event: &Value, provider: &str) -> Option<Value> {
         if event["method"] != "select" || !array(&event["options"]).iter().any(|o| o == OTHER) {
             return None;
@@ -301,6 +322,10 @@ impl Permissions {
             };
             return match submitted {
                 Ok(Submitted::Reply(body)) => Ok(frame(id, body)),
+                Ok(Submitted::Data(body)) => {
+                    self.form = None;
+                    Ok(frame(id, body))
+                }
                 Ok(Submitted::Cancelled) => {
                     self.form = None;
                     Ok(frame(id, json!({"cancelled":true})))
