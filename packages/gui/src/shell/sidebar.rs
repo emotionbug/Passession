@@ -364,7 +364,9 @@ impl HostGroup {
 
 pub struct SessionRow {
     row: Arc<Value>,
-    updated_at: i64,
+    /// When the user last sent the session a message, else when it was created. Agent output
+    /// moves `updatedAt`, so running sessions sorted by it would keep trading places.
+    prompted_at: i64,
     created_at: i64,
     waiting: bool,
 }
@@ -555,7 +557,10 @@ fn session_tree(
                 .or_default()
                 .push(SessionRow {
                     row: Arc::clone(row),
-                    updated_at: time_ms(agent, "updatedAt"),
+                    prompted_at: match time_ms(agent, "lastUserMessageAt") {
+                        0 => time_ms(agent, "createdAt"),
+                        prompted => prompted,
+                    },
                     created_at: time_ms(agent, "createdAt"),
                     waiting: needs_input(agent),
                 });
@@ -593,10 +598,11 @@ fn session_tree(
                 .to_lowercase()
                 .contains(query)
             });
+            // Waiting sessions first, then the latest prompt (upstream `lastPrompt` sort).
             rows.sort_by(|a, b| {
                 b.waiting
                     .cmp(&a.waiting)
-                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+                    .then_with(|| b.prompted_at.cmp(&a.prompted_at))
                     .then_with(|| b.created_at.cmp(&a.created_at))
                     .then_with(|| j::text(a.agent(), "id").cmp(j::text(b.agent(), "id")))
             });
@@ -2534,9 +2540,10 @@ mod tests {
     }
 
     fn tree_state(navigation: Value) -> paseo_gui_core::CoreState {
-        let agent = |id: &str, ws: &str, updated: &str, extra: Value| {
-            let mut a =
-                json!({"id": id, "workspaceId": ws, "updatedAt": updated, "status": "idle"});
+        // Every session last produced output at the same time, so only the prompt orders them.
+        let agent = |id: &str, ws: &str, prompted: &str, extra: Value| {
+            let mut a = json!({"id": id, "workspaceId": ws, "lastUserMessageAt": prompted,
+                "updatedAt": "2026-06-01T00:00:00Z", "status": "idle"});
             a.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().cloned().unwrap_or_default());
@@ -2588,7 +2595,7 @@ mod tests {
             .map(|(index, row)| {
                 let mut row = row.clone();
                 if index == 0 {
-                    Arc::make_mut(&mut row)["updatedAt"] = "2027-01-01T00:00:00Z".into();
+                    Arc::make_mut(&mut row)["lastUserMessageAt"] = "2027-01-01T00:00:00Z".into();
                 }
                 row
             })
@@ -2670,6 +2677,40 @@ mod tests {
             .filter(|id| ["old", "new", "asks"].contains(id))
             .collect();
         assert_eq!(p, ["new", "old", "asks"]);
+    }
+
+    #[test]
+    fn running_sessions_keep_their_order_while_they_produce_output() {
+        let order = |agents: Value| {
+            let state = published(json!({
+                "hosts": [{"serverId": "h", "status": "connected",
+                    "projects": [{"projectId": "p", "projectDisplayName": "P"}],
+                    "workspaces": [{"id": "w", "projectId": "p"}],
+                    "agents": agents}],
+                "preferences": {"navigation": {}},
+            }));
+            ids(&navigation_sessions(&state, "", None, false))
+        };
+        let agent = |id: &str, prompted: Value, output: &str| {
+            json!({"id": id, "workspaceId": "w", "status": "running",
+                "createdAt": "2026-01-01T00:00:00Z", "lastUserMessageAt": prompted,
+                "updatedAt": output})
+        };
+        let mut agents = json!([
+            agent("a", json!("2026-02-01T00:00:00Z"), "2026-02-01T00:00:05Z"),
+            agent("b", json!("2026-02-01T00:01:00Z"), "2026-02-01T00:01:05Z"),
+        ]);
+        assert_eq!(order(agents.clone()), ["b", "a"]);
+        // `a` streams output: it stays below the session prompted after it.
+        agents[0]["updatedAt"] = json!("2026-02-01T00:09:00Z");
+        assert_eq!(order(agents.clone()), ["b", "a"]);
+        // A new prompt to `a` moves it up.
+        agents[0]["lastUserMessageAt"] = json!("2026-02-01T00:10:00Z");
+        assert_eq!(order(agents.clone()), ["a", "b"]);
+        // A session never prompted sorts by when it was created.
+        agents[1]["lastUserMessageAt"] = Value::Null;
+        agents[1]["createdAt"] = json!("2026-02-01T00:11:00Z");
+        assert_eq!(order(agents), ["b", "a"]);
     }
 
     #[test]

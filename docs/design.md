@@ -18,6 +18,8 @@ Use sentence case and concrete action names. A destructive consequence needs an 
 
 The sidebar is **host → directory → session**. With one host that is connected without error, its directories take the top level and the host row is not shown; with more hosts, or when the only one is connecting, disconnected or failing, each host has a visible expandable row with its status. Preserve empty directories, and scope equal paths to their host. The session filter opens from the search icon in the Sessions header and closes with Escape or the icon, which clears it; search reveals matching ancestors temporarily. A directory row shows a folder glyph that becomes its collapse chevron under the pointer and while collapsed. Sessions are direct Command Center targets; do not reintroduce workspace screens, grouping controls or nested session tabs. Existing internal owner IDs remain a persistence detail.
 
+A directory lists its sessions waiting on the user first, then by the user's latest message to each (`lastUserMessageAt`, else creation time), newest first; Ctrl+1–9 follow the same order. Agent output does not reorder rows: sorting by `updatedAt` made sessions running side by side trade places with every update. While the pointer rests on the tree, rows keep the order they were drawn in.
+
 Host, directory and session rows have distinct actions. A directory's create action must use that exact host/path. Closing a session tab does not archive it. Add Project uses a remote folder picker, not a local OS path dialog for remote data.
 
 ## Responsive interaction

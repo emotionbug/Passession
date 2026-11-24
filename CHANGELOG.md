@@ -18,6 +18,7 @@
 
 - OMP 19: a question form from OMP's `ask` tool shows as one card with every question again. OMP 19 puts the form's text in front of each question it asks, which Passession did not recognize, so the form fell apart into separate "OMP select" cards, one per question, starting with a note that Passession "could not match this OMP form step".
 - Changing the theme or language in Settings now updates every screen. Before this, a screen that was hidden at the time (the page under Settings, another tab) could keep the old colors until the app restarted, such as an almost invisible "New session" title after switching to the light theme.
+- Sessions in the sidebar no longer jump around while they run. Two sessions running at once traded places with every reply, because the list followed each session's latest activity. A project now lists sessions waiting on you first, then by your latest message to each (or when the session was created), so a session moves up when you write to it, not when the agent writes.
 
 ## 0.13.48 - 2026-11-23
 
