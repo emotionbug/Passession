@@ -152,9 +152,11 @@ pub fn overview_summary(summary: &OverviewSummary) -> String {
     if parts.is_empty() {
         return String::new();
     }
+    // A language without a list conjunction (Korean) joins every part with commas.
     let and = t("toolCallGroup.and");
     let joined = match parts.len() {
         1 => parts[0].clone(),
+        _ if and.is_empty() => parts.join(", "),
         2 => format!("{} {and} {}", parts[0], parts[1]),
         n => format!("{}, {and} {}", parts[..n - 1].join(", "), parts[n - 1]),
     };

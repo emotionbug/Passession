@@ -716,6 +716,7 @@ impl Cx {
                 pass.damage_epoch = pass.damage_epoch.wrapping_add(1);
             }
         }
+        self.redraw_all_generation = self.redraw_all_generation.wrapping_add(1);
         self.new_draw_event.redraw_all = true;
     }
 

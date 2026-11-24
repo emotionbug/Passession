@@ -72,6 +72,10 @@ pub struct Cx {
     pub draw_shaders: CxDrawShaders,
     
     pub new_draw_event: DrawEvent,
+    /// Counts `redraw_all` calls. A cached draw list that was not drawn in that
+    /// frame (hidden behind a page, a background tab) compares it to redraw
+    /// when it is next drawn.
+    pub redraw_all_generation: u64,
     
     pub redraw_id: u64,
     
@@ -286,6 +290,7 @@ impl Cx {
             draw_shaders: Default::default(),
             
             new_draw_event: Default::default(),
+            redraw_all_generation: 0,
             new_actions: Default::default(),
             
             redraw_id: 1,

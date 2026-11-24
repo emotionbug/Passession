@@ -2440,6 +2440,7 @@ pub fn click(
         }
         "nav:close" => shell.data.layout.show_sidebar(compact, false),
         "side:display" => display_menu(shell, cx, ui, anchor_of(shell, id)),
+        "side:search" => sidebar::toggle_search(shell, cx),
         "side:addhost" => host_dialog::open_flow(shell, cx, None, None, None),
         // Empty sidebar search: the same query over the whole History (archived included).
         "side:searchhistory" => {

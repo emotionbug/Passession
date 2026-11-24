@@ -476,6 +476,7 @@
   },
   "agentStream": {
     "thinking": "생각중",
+    "turnSummary": { "details": "세부 정보" },
     "empty": "이 에이전트와 대화를 시작하세요...",
     "scrollToBottom": "맨 아래로 스크롤",
     "historyLoadFailed": "에이전트 기록을 로드할 수 없습니다.",
@@ -2569,22 +2570,16 @@
     "output": "출력"
   },
   "toolCallGroup": {
-    "editedFiles": {
-      "one": "{{count}} 파일을 편집했습니다.",
-      "other": "{{count}} 파일을 편집했습니다."
-    },
-    "commands": {
-      "one": "{{count}} 명령을 실행했습니다.",
-      "other": "{{count}} 명령을 실행했습니다."
-    },
+    "editedFiles": { "one": "파일 {{count}}개 편집함", "other": "파일 {{count}}개 편집함" },
+    "commands": { "one": "명령 {{count}}개 실행함", "other": "명령 {{count}}개 실행함" },
     "readFiles": { "one": "파일 {{count}}개 읽음", "other": "파일 {{count}}개 읽음" },
     "searches": { "one": "{{count}}회 검색함", "other": "{{count}}회 검색함" },
     "otherTools": {
       "one": "기타 도구 {{count}}개 사용함",
       "other": "기타 도구 {{count}}개 사용함"
     },
-    "paseoCalls": { "one": "Paseo를 {{count}}회 호출함", "other": "Paseo를 {{count}}회 호출함" },
-    "and": "그리고"
+    "paseoCalls": { "one": "Paseo {{count}}회 호출함", "other": "Paseo {{count}}회 호출함" },
+    "and": ""
   },
   "renameModal": { "rename": "이름 변경", "saving": "저장하는 중..." },
   "sidebarCallout": { "dismiss": "닫기" },
@@ -2899,9 +2894,13 @@
         "description": "에이전트의 추론 블록을 기본적으로 모두 펼쳐 표시합니다."
       },
       "toolCallDetail": {
-        "label": "도구 호출 표시",
-        "description": "타임라인에 도구 호출이 표시되는 방식",
-        "options": { "overview": "요약", "detailed": "전체 세부정보" }
+        "label": "채팅 표시",
+        "description": "타임라인에 에이전트의 작업이 표시되는 방식. 끝난 턴 접기는 각 턴의 작업을 답변 위 한 줄로 보여줍니다.",
+        "options": {
+          "turns": "끝난 턴 접기",
+          "overview": "도구 호출 묶기",
+          "detailed": "전체 세부정보"
+        }
       },
       "language": {
         "label": "언어",

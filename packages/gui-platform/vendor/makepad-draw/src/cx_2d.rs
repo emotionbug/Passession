@@ -43,21 +43,31 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     pub fn will_redraw(&self, draw_list_2d: &mut DrawList2d, walk: Walk) -> bool {
         // ok so we need to check if our turtle position has changed since last time.
         // if it did, we redraw
+        let missed = self.missed_redraw_all(draw_list_2d);
         let rect = self.peek_walk_turtle(walk);
         if draw_list_2d.dirty_check_rect != rect {
             draw_list_2d.dirty_check_rect = rect;
             return true;
         }
-        self.draw_event.draw_list_will_redraw(self, draw_list_2d.draw_list.id())
+        missed || self.draw_event.draw_list_will_redraw(self, draw_list_2d.draw_list.id())
     }
         
     pub fn will_redraw_check_axis(&self, draw_list_2d: &mut DrawList2d, size:f64, axis:Vec2Index) -> bool {
         // ok so we need to check if our turtle position has changed since last time.
         // if it did, we redraw
+        let missed = self.missed_redraw_all(draw_list_2d);
         if draw_list_2d.dirty_check_rect.size.index(axis) != size {
             draw_list_2d.dirty_check_rect.size.set_index(axis, size);
             return true;
         }
-        self.draw_event.draw_list_will_redraw(self, draw_list_2d.draw_list.id())
+        missed || self.draw_event.draw_list_will_redraw(self, draw_list_2d.draw_list.id())
+    }
+
+    /// A `redraw_all` happened since the list was last checked: it was not drawn in
+    /// that frame (hidden behind a page or in a background tab) and its retained
+    /// content may predate a theme, font or language change.
+    fn missed_redraw_all(&self, draw_list_2d: &mut DrawList2d) -> bool {
+        let generation = self.redraw_all_generation;
+        std::mem::replace(&mut draw_list_2d.redraw_all_generation, generation) != generation
     }
 }

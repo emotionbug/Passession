@@ -341,12 +341,13 @@ fn draw_chat(ui: &mut Ui, v: &View) {
             Some(t("settings.general.autoExpandReasoning.description")),
             false,
         );
-        let detail = if str_of(&v.prefs, "toolCallDetailLevel") == "overview" {
-            "overview"
-        } else {
-            "detailed"
+        // Finished turns fold unless the reader chose another display.
+        let detail = match str_of(&v.prefs, "toolCallDetailLevel") {
+            "overview" => "overview",
+            "detailed" => "detailed",
+            _ => "turns",
         };
-        let options = ["detailed", "overview"]
+        let options = ["turns", "overview", "detailed"]
             .iter()
             .map(|o| {
                 (

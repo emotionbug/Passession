@@ -805,6 +805,8 @@ pub enum ToolGlyph {
     CircleDot,
     Check,
     CheckSquare,
+    /// A folded turn's summary row.
+    Summary,
 }
 
 fn icon_by_name(name: &str) -> ToolGlyph {

@@ -320,6 +320,19 @@ fn same_stream_row(a: &StreamRow, b: &StreamRow) -> bool {
             (None, None) => true,
             _ => false,
         }
+        && match (&a.fold, &b.fold) {
+            (Some(a), Some(b)) => {
+                a.key == b.key
+                    && a.open == b.open
+                    && a.entries.len() == b.entries.len()
+                    && a.entries
+                        .iter()
+                        .zip(&b.entries)
+                        .all(|(a, b)| same_value(a, b))
+            }
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 fn same_response(a: &[StreamRow], ah: usize, b: &[StreamRow], bh: usize) -> bool {
@@ -343,10 +356,7 @@ fn response_sources(rows: &[StreamRow], host: usize) -> impl Iterator<Item = &Rc
     {
         first -= 1;
     }
-    rows[first..=host]
-        .iter()
-        .filter(|row| row.kind() == "assistant_message")
-        .map(|row| &row.entry)
+    super::layout::response_messages(&rows[first..=host])
 }
 
 fn glyph_icon(glyph: ToolGlyph) -> &'static str {
@@ -365,6 +375,7 @@ fn glyph_icon(glyph: ToolGlyph) -> &'static str {
         ToolGlyph::CircleDot => "circle-dot",
         ToolGlyph::Check => "check",
         ToolGlyph::CheckSquare => "square-check",
+        ToolGlyph::Summary => "list-tree",
     }
 }
 
@@ -573,6 +584,7 @@ fn entry(
                 image: None,
                 borderless: false,
                 sheet: format!("thinking:{id}"),
+                tap: None,
             };
             draw_badge(cx, d, ctx, &badge, cx0, y, cw, |cx, d, x, y, w| {
                 let detail = json!({"type": "unknown", "input": visible, "output": null});
@@ -604,6 +616,13 @@ fn entry(
                 y,
                 cw,
             ) + gap_below
+        }
+        "turn_summary" => {
+            let Some(fold) = row.fold.as_deref() else {
+                return gap_below;
+            };
+            let (cx0, cw) = content_box(&look, x, w, true);
+            turn_summary(cx, d, ctx, fold, cx0, y, cw) + gap_below
         }
         "tool_call" => {
             let target_title =
@@ -681,6 +700,7 @@ fn entry(
                 ),
                 borderless: false,
                 sheet: format!("tool:{id}"),
+                tap: None,
             };
             let tool_name = presentation.tool_name.clone();
             let error = presentation.error_text.clone();
@@ -1367,6 +1387,7 @@ fn todo(
             image: None,
             borderless: false,
             sheet: String::new(),
+            tap: None,
         };
         let tasks = tasks.clone();
         cy += draw_badge(cx, d, ctx, &badge, x, cy, w, |cx, d, x, y, w| {
@@ -1411,6 +1432,9 @@ pub struct Badge {
     pub borderless: bool,
     /// Sheet id opened on compact layouts.
     pub sheet: String,
+    /// What a tap on the row does instead of expanding it; the row then stays
+    /// expanded as `initially_expanded` says.
+    pub tap: Option<HitTarget>,
     /// An image the call read, shown below the row.
     pub image: Option<BadgeImage>,
 }
@@ -1492,8 +1516,13 @@ pub fn draw_badge(
     let p = look.palette;
     let inline = badge.force_inline || !look.compact;
     let interactive = badge.can_open;
-    let expanded =
-        interactive && inline && d.state.is_expanded(&badge.key, badge.initially_expanded);
+    let expanded = interactive
+        && inline
+        && if badge.tap.is_some() {
+            badge.initially_expanded
+        } else {
+            d.state.is_expanded(&badge.key, badge.initially_expanded)
+        };
     // Hovering the open-file glyph still hovers its badge.
     let file_key = badge
         .open_file
@@ -1668,7 +1697,9 @@ pub fn draw_badge(
         d.canvas.add_hit(r, HitTarget::OpenFile(path.clone()));
     }
     if interactive {
-        let target = if inline {
+        let target = if let Some(tap) = &badge.tap {
+            tap.clone()
+        } else if inline {
             HitTarget::Toggle(badge.key.clone())
         } else {
             HitTarget::OpenSheet(badge.sheet.clone())
@@ -1695,6 +1726,54 @@ pub fn draw_badge(
         );
     }
     height
+}
+
+// ---- Turn summaries ----
+
+/// turn-collapse/summary-line.tsx TurnSummaryLine: a folded turn's row,
+/// styled like a tool-call group and labelled with what its calls did.
+/// Tapping it shows or folds the turn's rows below it.
+fn turn_summary(
+    cx: &mut Cx2d,
+    d: &mut Draw,
+    ctx: &RowContext,
+    fold: &super::layout::TurnFold,
+    x: f64,
+    y: f64,
+    w: f64,
+) -> f64 {
+    let calls: Vec<Rc<Value>> = fold
+        .entries
+        .iter()
+        .filter(|entry| super::layout::stream_kind(Some(entry)) == "tool_call")
+        .cloned()
+        .collect();
+    let (summary, _) = tools::build_overview_summary(&calls);
+    let label = format::overview_summary(&summary);
+    let label = if label.is_empty() {
+        t("agentStream.turnSummary.details")
+    } else {
+        label
+    };
+    let tap = HitTarget::FoldTurn(fold.key.clone());
+    let badge = Badge {
+        // The hover test matches the badge key inside the hovered hit's key.
+        key: super::permission::hit_key(&tap),
+        glyph: ToolGlyph::Summary,
+        label,
+        secondary: None,
+        loading: false,
+        error: false,
+        can_open: true,
+        initially_expanded: fold.open,
+        force_inline: true,
+        open_file: None,
+        image: None,
+        borderless: true,
+        sheet: String::new(),
+        tap: Some(tap),
+    };
+    draw_badge(cx, d, ctx, &badge, x, y, w, |_, _, _, _, _| 0.0)
 }
 
 // ---- Overview groups ----
@@ -1730,6 +1809,7 @@ fn overview_group(
         image: None,
         borderless: true,
         sheet: format!("group:{id}"),
+        tap: None,
     };
     let calls: Vec<Rc<Value>> = calls.to_vec();
     draw_badge(cx, d, ctx, &badge, x, y, w, |cx, d, x, y, w| {
@@ -1823,6 +1903,7 @@ pub fn embedded_calls(
             }),
             borderless: false,
             sheet: String::new(),
+            tap: None,
         };
         let detail = presentation.detail.clone();
         let tool = presentation.tool_name.clone();
@@ -2240,6 +2321,7 @@ mod cache_input_tests {
                 "item": {"type": kind, "text": text}
             })),
             group: None,
+            fold: None,
         }
     }
 
@@ -2317,6 +2399,7 @@ mod cache_input_tests {
         let grouped = StreamRow {
             entry: latest.clone(),
             group: Some(vec![earlier.clone(), latest.clone()]),
+            fold: None,
         };
         let original = entry(Rc::new(vec![grouped.clone()]), 0);
         let mut changed = grouped.clone();
@@ -2331,6 +2414,7 @@ mod cache_input_tests {
                 Rc::new((*earlier).clone()),
                 Rc::new((*latest).clone()),
             ]),
+            fold: None,
         };
         assert!(original.same_content(&entry(Rc::new(vec![reconstructed]), 0)));
 

@@ -478,6 +478,7 @@
   },
   "agentStream": {
     "thinking": "Thinking",
+    "turnSummary": { "details": "Details" },
     "empty": "Start chatting with this agent...",
     "scrollToBottom": "Scroll to bottom",
     "historyLoadFailed": "Couldn't load agent history",
@@ -2888,9 +2889,13 @@
         "description": "Show agent thinking and chain-of-thought blocks fully expanded by default"
       },
       "toolCallDetail": {
-        "label": "Tool call display",
-        "description": "How tool calls appear in the timeline",
-        "options": { "overview": "Summary", "detailed": "Full detail" }
+        "label": "Chat display",
+        "description": "How the agent's work appears in the timeline. Folded turns show each finished turn's work as one row above its reply.",
+        "options": {
+          "turns": "Fold finished turns",
+          "overview": "Group tool calls",
+          "detailed": "Full detail"
+        }
       },
       "language": {
         "label": "Language",

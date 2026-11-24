@@ -4,17 +4,55 @@
 use super::json::*;
 use makepad_widgets::makepad_draw::text::substr::Substr;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
-/// One rendered stream row: a timeline entry, or (overview detail level) a
-/// run of consecutive tool calls hosted by its latest call.
+/// One rendered stream row: a timeline entry, (overview detail level) a run of
+/// consecutive tool calls hosted by its latest call, or (turns level) the
+/// summary of a finished turn's work.
 #[derive(Clone, Debug)]
 pub struct StreamRow {
-    /// The rendered entry; for a group, the run's latest call.
+    /// The rendered entry; for a group, the run's latest call; for a turn
+    /// summary, a `turn_summary` item in the turn.
     pub entry: Rc<Value>,
     /// Overview group: every call of the run, oldest first.
     pub group: Option<Vec<Rc<Value>>>,
+    /// Turn summary: the work it stands for.
+    pub fold: Option<Rc<TurnFold>>,
+}
+
+/// A finished turn's work before its last reply, folded behind one row under
+/// the prompt (agent-stream/turn-collapse/model.ts collapseTurns).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurnFold {
+    /// The prompt's identity, which keeps the turn open or closed.
+    pub key: String,
+    /// The folded entries, oldest first: messages, reasoning and tool calls.
+    pub entries: Vec<Rc<Value>>,
+    /// The folded rows show below the summary.
+    pub open: bool,
+}
+
+/// How the timeline shows the agent's work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailLevel {
+    /// Every entry on its own row.
+    Detailed,
+    /// Consecutive tool calls share one row.
+    Overview,
+    /// A finished turn shows its prompt, one summary row and its last reply.
+    Turns,
+}
+
+impl DetailLevel {
+    /// The `toolCallDetailLevel` preference; finished turns fold unless set.
+    pub fn from_preference(value: &Value) -> Self {
+        match value.as_str() {
+            Some("detailed") => Self::Detailed,
+            Some("overview") => Self::Overview,
+            _ => Self::Turns,
+        }
+    }
 }
 
 impl StreamRow {
@@ -121,8 +159,18 @@ fn todo_write_as_todo(entry: &Rc<Value>, fallback_provider: &str) -> Option<Rc<V
 }
 
 /// Detailed level: visible entries one per row. Overview level: every run of
-/// consecutive groupable calls collapses into one summary row.
-pub fn build_stream_rows(entries: &[Rc<Value>], overview: bool, provider: &str) -> Vec<StreamRow> {
+/// consecutive groupable calls collapses into one summary row. Turns level:
+/// detailed rows, with each finished turn folded (`fold_turns`); `open` holds
+/// the keys of turns shown unfolded and `turn_active` keeps the latest turn
+/// unfolded while it runs.
+pub fn build_stream_rows(
+    entries: &[Rc<Value>],
+    level: DetailLevel,
+    provider: &str,
+    open: &HashSet<String>,
+    turn_active: bool,
+) -> Vec<StreamRow> {
+    let overview = level == DetailLevel::Overview;
     let mut rows = Vec::new();
     let mut pending: Vec<Rc<Value>> = Vec::new();
     let flush = |rows: &mut Vec<StreamRow>, pending: &mut Vec<Rc<Value>>| {
@@ -133,6 +181,7 @@ pub fn build_stream_rows(entries: &[Rc<Value>], overview: bool, provider: &str) 
         rows.push(StreamRow {
             entry: group.last().expect("non-empty").clone(),
             group: Some(group),
+            fold: None,
         });
     };
     for source in entries {
@@ -147,14 +196,127 @@ pub fn build_stream_rows(entries: &[Rc<Value>], overview: bool, provider: &str) 
             continue;
         }
         flush(&mut rows, &mut pending);
-        rows.push(StreamRow { entry, group: None });
+        rows.push(StreamRow {
+            entry,
+            group: None,
+            fold: None,
+        });
     }
     flush(&mut rows, &mut pending);
-    rows
+    if level == DetailLevel::Turns {
+        fold_turns(rows, open, turn_active)
+    } else {
+        rows
+    }
+}
+
+/// The identity a turn's fold is kept under: its prompt's sequence, else its
+/// client message id.
+pub fn turn_key(prompt: &Value) -> Option<String> {
+    if let Some(seq) = get(prompt, "seqStart").as_i64() {
+        return Some(format!("seq:{seq}"));
+    }
+    get(get(prompt, "item"), "clientMessageId")
+        .as_str()
+        .map(|client| format!("client:{client}"))
+}
+
+/// agent-stream/turn-collapse/model.ts collapseTurns: everything a finished
+/// turn did before its last message folds into a summary row under its
+/// prompt, and the last message stays. A turn folds once it is finished and
+/// did something before its reply. Compaction markers and messages the user
+/// sent into the running turn stay visible. While the agent runs, the turn of
+/// the latest prompt the timeline recorded is unfinished, even with queued
+/// messages after it.
+fn fold_turns(rows: Vec<StreamRow>, open: &HashSet<String>, turn_active: bool) -> Vec<StreamRow> {
+    let prompts: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|&(index, row)| {
+            row.kind() == "user_message"
+                && (index == 0 || !continues_turn(Some(&rows[index - 1].entry), Some(&row.entry)))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let Some(&first) = prompts.first() else {
+        return rows;
+    };
+    let active_from = if turn_active {
+        prompts
+            .iter()
+            .rev()
+            .find(|&&prompt| get(&rows[prompt].entry, "seqStart").is_i64())
+            .or(prompts.last())
+            .copied()
+            .unwrap_or(first)
+    } else {
+        rows.len()
+    };
+    let stays = |row: &StreamRow| matches!(row.kind(), "compaction" | "user_message");
+    let mut out = Vec::with_capacity(rows.len());
+    out.extend(rows[..first].iter().cloned());
+    for (n, &prompt) in prompts.iter().enumerate() {
+        out.push(rows[prompt].clone());
+        let end = prompts.get(n + 1).copied().unwrap_or(rows.len());
+        let run = &rows[prompt + 1..end];
+        let finished = prompt < active_from;
+        let reply = run
+            .iter()
+            .rposition(|row| row.kind() == "assistant_message");
+        let key = turn_key(&rows[prompt].entry);
+        let (Some(reply), Some(key), true) = (reply.filter(|&r| r > 0), key, finished) else {
+            out.extend(run.iter().cloned());
+            continue;
+        };
+        let folded = &run[..reply];
+        let entries: Vec<Rc<Value>> = folded
+            .iter()
+            .filter(|row| !stays(row))
+            .map(|row| row.entry.clone())
+            .collect();
+        let Some(last) = entries.last() else {
+            out.extend(run.iter().cloned());
+            continue;
+        };
+        let mut summary = json!({"item": {"type": "turn_summary"}});
+        for field in ["turnId", "timestamp"] {
+            let source = if field == "turnId" { &entries[0] } else { last };
+            if !get(source, field).is_null() {
+                summary[field] = get(source, field).clone();
+            }
+        }
+        let open = open.contains(&key);
+        out.push(StreamRow {
+            entry: Rc::new(summary),
+            group: None,
+            fold: Some(Rc::new(TurnFold { key, entries, open })),
+        });
+        out.extend(folded.iter().filter(|row| open || stays(row)).cloned());
+        out.extend(run[reply..].iter().cloned());
+    }
+    out
+}
+
+/// The assistant messages of `rows`, oldest first, including those a closed
+/// turn summary folds away.
+pub fn response_messages(rows: &[StreamRow]) -> impl Iterator<Item = &Rc<Value>> + Clone {
+    rows.iter()
+        .flat_map(|row| {
+            let folded = row
+                .fold
+                .as_deref()
+                .filter(|fold| !fold.open)
+                .map_or(&[][..], |fold| fold.entries.as_slice());
+            folded.iter().chain(std::iter::once(&row.entry))
+        })
+        .filter(|entry| stream_kind(Some(entry)) == "assistant_message")
 }
 
 pub fn is_tool_sequence_entry(entry: Option<&Value>) -> bool {
-    matches!(stream_kind(entry), "tool_call" | "reasoning" | "todo")
+    matches!(
+        stream_kind(entry),
+        "tool_call" | "reasoning" | "todo" | "turn_summary"
+    )
 }
 
 /// turn-membership.ts continuesTurn.
@@ -252,10 +414,7 @@ impl ResponseCopyCache {
         } else {
             &rows[..0]
         };
-        let entries = response
-            .iter()
-            .filter(|row| row.kind() == "assistant_message")
-            .map(|row| &row.entry);
+        let entries = response_messages(response);
         let mut previous = self.sources.iter();
         let unchanged = entries
             .clone()
@@ -391,6 +550,7 @@ mod response_copy_tests {
         StreamRow {
             entry: Rc::new(json!({"turnId": turn, "item": {"type": kind, "text": text}})),
             group: None,
+            fold: None,
         }
     }
 
@@ -417,5 +577,127 @@ mod response_copy_tests {
         assert_eq!(&*cache.text(&changed, 3), "앞부분\n\n수정된 끝");
         assert_eq!(&*cache.text(&changed, 0), "다른 응답");
         assert_eq!(&*cache.text(&changed, changed.len()), "");
+    }
+}
+
+#[cfg(test)]
+mod turn_fold_tests {
+    use super::*;
+
+    fn entry(seq: Option<i64>, turn: &str, kind: &str, text: &str) -> Rc<Value> {
+        let mut value = json!({"turnId": turn, "item": {"type": kind, "text": text}});
+        if let Some(seq) = seq {
+            value["seqStart"] = json!(seq);
+        }
+        Rc::new(value)
+    }
+
+    /// Each row as `kind:text`, a summary as `fold:<key>:<folded count>`.
+    fn shape(rows: &[StreamRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match &row.fold {
+                Some(fold) => format!("fold:{}:{}", fold.key, fold.entries.len()),
+                None => format!(
+                    "{}:{}",
+                    row.kind(),
+                    str_of(get(get(&row.entry, "item"), "text"))
+                ),
+            })
+            .collect()
+    }
+
+    fn build(entries: &[Rc<Value>], open: &[&str], running: bool) -> Vec<StreamRow> {
+        let open = open.iter().map(|key| key.to_string()).collect();
+        build_stream_rows(entries, DetailLevel::Turns, "omp", &open, running)
+    }
+
+    fn finished_turn() -> Vec<Rc<Value>> {
+        vec![
+            entry(Some(1), "a", "user_message", "ask"),
+            entry(Some(2), "a", "assistant_message", "looking"),
+            entry(Some(3), "a", "tool_call", "read"),
+            entry(Some(4), "a", "compaction", ""),
+            entry(Some(5), "a", "user_message", "steer"),
+            entry(Some(6), "a", "tool_call", "edit"),
+            entry(Some(7), "a", "assistant_message", "done"),
+        ]
+    }
+
+    #[test]
+    fn a_finished_turn_folds_its_work_but_keeps_markers_steering_and_the_reply() {
+        assert_eq!(
+            shape(&build(&finished_turn(), &[], false)),
+            [
+                "user_message:ask",
+                "fold:seq:1:3",
+                "compaction:",
+                "user_message:steer",
+                "assistant_message:done"
+            ]
+        );
+        // Opened, the folded rows follow the summary in order.
+        assert_eq!(
+            shape(&build(&finished_turn(), &["seq:1"], false)),
+            [
+                "user_message:ask",
+                "fold:seq:1:3",
+                "assistant_message:looking",
+                "tool_call:read",
+                "compaction:",
+                "user_message:steer",
+                "tool_call:edit",
+                "assistant_message:done"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_running_turn_stays_unfolded_even_behind_a_queued_message() {
+        let mut entries = finished_turn();
+        entries.push(entry(None, "", "user_message", "queued"));
+        let rows = build(&entries, &[], true);
+        assert!(
+            rows.iter().all(|row| row.fold.is_none()),
+            "{:?}",
+            shape(&rows)
+        );
+        // The next recorded prompt finishes the turn before it.
+        let mut entries = finished_turn();
+        entries.push(entry(Some(8), "b", "user_message", "next"));
+        entries.push(entry(Some(9), "b", "tool_call", "bash"));
+        entries.push(entry(Some(10), "b", "assistant_message", "partial"));
+        let rows = build(&entries, &[], true);
+        assert_eq!(
+            shape(&rows)[..3],
+            ["user_message:ask", "fold:seq:1:3", "compaction:"]
+        );
+        assert!(rows[rows.len() - 3..].iter().all(|row| row.fold.is_none()));
+    }
+
+    #[test]
+    fn a_turn_without_work_before_its_reply_or_without_a_reply_stays_as_is() {
+        let entries = [
+            entry(Some(1), "a", "user_message", "hi"),
+            entry(Some(2), "a", "assistant_message", "hello"),
+            entry(Some(3), "b", "user_message", "go"),
+            entry(Some(4), "b", "tool_call", "bash"),
+        ];
+        assert_eq!(
+            shape(&build(&entries, &[], false)),
+            [
+                "user_message:hi",
+                "assistant_message:hello",
+                "user_message:go",
+                "tool_call:bash"
+            ]
+        );
+    }
+
+    #[test]
+    fn copying_a_folded_response_includes_its_folded_messages() {
+        let rows = Rc::new(build(&finished_turn(), &[], false));
+        let reply = rows.len() - 1;
+        let mut cache = ResponseCopyCache::default();
+        assert_eq!(&*cache.text(&rows, reply), "looking\n\ndone");
     }
 }

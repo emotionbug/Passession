@@ -890,17 +890,19 @@ fn build_inlines(
                 }
             }
             Inline::Code { text, style } => {
-                let start = rich.text.len();
                 let color = if link.is_some() {
                     p.accent_bright
                 } else {
                     para.color
                 };
+                rich.push(CHIP_PADDING, Font::Regular, para.size, color);
+                let start = rich.text.len();
                 rich.push(text, Font::Mono, d.look.code(), color);
                 rich.codes.push((start, rich.text.len()));
                 if style.strike {
                     rich.strikes.push((start, rich.text.len()));
                 }
+                rich.push(CHIP_PADDING, Font::Regular, para.size, color);
             }
             Inline::Link {
                 href,
@@ -987,7 +989,7 @@ fn prepare_legacy(
                 e,
                 Arc::<str>::from(href),
                 kind,
-                Arc::<str>::from(&rich.text[s..e]),
+                Arc::<str>::from(rich.text[s..e].trim_matches(|c| CHIP_PADDING.contains(c))),
             )
         })
         .collect();
@@ -1352,18 +1354,21 @@ enum Marker {
 /// item's text edge): the marker's right edge and the item text's left edge.
 /// Nesting level d reserves its marker column d × marginLeft (20) from the root
 /// list, and the text starts gapWidth (7) after the item's own column,
-/// truncated like the span's Int leading margin. The app's pinned nightly
-/// indented nested text a fixed 20 from its parent's text instead, which drew
-/// a marker wider than the parent's (a number under a bullet) over the text.
+/// truncated like the span's Int leading margin. A root list's text starts
+/// marginLeft from the paragraph edge, or later when its marker column is wider.
+/// The app's pinned nightly indented nested text a fixed 20 from its parent's
+/// text instead, which drew a marker wider than the parent's (a number under a
+/// bullet) over the text.
 /// `parent` is the enclosing item's column width and `marker` this item's,
 /// both without `extra`: the whole pixels an ordered list adds to fit numbers
 /// wider than "99.".
 fn list_columns(parent: Option<f64>, marker: f64, extra: f64) -> (f64, f64) {
-    let origin = parent.map_or(0.0, |parent| 20.0 - (parent + 7.0).floor());
-    (
-        origin + marker + extra,
-        origin + (marker + 7.0).floor() + extra,
-    )
+    let text = (marker + 7.0).floor();
+    let origin = match parent {
+        Some(parent) => 20.0 - (parent + 7.0).floor(),
+        None => (20.0 - text).max(0.0),
+    };
+    (origin + marker + extra, origin + text + extra)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1603,7 +1608,8 @@ fn list(
                 }
             }
             Marker::Bullet => {
-                let r = rect_xywh(x + anchor - 3.0, center - 3.0, 6.0, 6.0);
+                // Centred 13px before the item text, like a disc marker hanging in its margin.
+                let r = rect_xywh(x + column - 16.0, center - 3.0, 6.0, 6.0);
                 match depth {
                     0 => d.kit.rect(cx, r, p.muted, 3.0),
                     1 => d.kit.bordered(cx, r, TRANSPARENT, 3.0, p.muted, 0.9),
@@ -1714,6 +1720,15 @@ fn table(
     }
     for width in &mut widths {
         *width = width.min(324.0);
+    }
+    // A narrower table fills the column on desktop, its columns widened in
+    // proportion; phones keep content-sized columns.
+    let natural: f64 = widths.iter().sum();
+    if !d.look.mobile && natural > 0.0 && natural < w {
+        let scale = w / natural;
+        for width in &mut widths {
+            *width *= scale;
+        }
     }
     let total: f64 = widths.iter().sum();
     let max_scroll = (total - w).max(0.0);
@@ -2252,7 +2267,11 @@ mod list_column_tests {
     fn every_nesting_keeps_the_marker_left_of_the_item_text() {
         for marker in KINDS {
             let (anchor, text) = list_columns(None, marker, 0.0);
-            assert_eq!((anchor, text), (marker, (marker + 7.0).floor()));
+            // A root item's text is indented like a nested one, and its marker stays
+            // inside the paragraph.
+            assert_eq!(text, 20.0f64.max((marker + 7.0).floor()));
+            assert_eq!(text - anchor, (marker + 7.0).floor() - marker);
+            assert!(anchor - marker >= 0.0);
             for parent in KINDS {
                 let (anchor, text) = list_columns(Some(parent), marker, 0.0);
                 // A bullet is centred on its column edge, so its 3px radius hangs into the gap.

@@ -860,3 +860,10 @@ full drawable copy would read and write 6.12 MB per frame (367 MB/s at
 runtime measurement supporting that cost.
 
 See the development guide for the Linux same-frame pixel oracle.
+
+## Full-redraw generation
+
+`src/cx.rs` adds `Cx::redraw_all_generation`, which `redraw_all` in
+`src/cx_api.rs` increments. The vendored makepad-draw compares it in its cached
+draw-list check so a list that was off screen during a full redraw (a theme or
+language change) redraws when it is next drawn; see its `VENDORED.md`.

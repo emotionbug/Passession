@@ -217,3 +217,14 @@ Each atlas page accumulates a bounding box beginning at the first glyph added
 since the last upload, not at `(0, 0)`. Taking that box resets it to empty.
 Later uploads of a single glyph touch only its region, even on a partially
 filled page; texture creation still initializes the full page.
+
+## Cached lists that missed a full redraw
+
+`Cx::redraw_all` (vendored makepad-platform) increments
+`Cx::redraw_all_generation` besides flagging the next draw event. Each
+`DrawList2d` remembers the generation it was last checked under, and
+`Cx2d::will_redraw`/`will_redraw_check_axis` redraw a cached list whose
+generation is older. Upstream, a list that was not drawn in the frame carrying
+the flag (a view hidden behind a page or in a background tab) kept its retained
+content, so it showed the previous theme's colors, font sizes or language when it
+was next shown.

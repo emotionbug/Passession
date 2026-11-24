@@ -436,19 +436,23 @@ fn draw_chrome(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect
     let mut y = body.pos.y;
     let show_header =
         !(page_shown || (compact && sidebar_destination) || (compact && host_count == 0));
+    // On wide windows the sidebar and the Explorer run the window's full height; the header and
+    // a banner belong to the main column between them.
+    let (lead, trail) = if compact || host_count == 0 {
+        (0.0, 0.0)
+    } else {
+        let side = |w: f64| if w > 0.0 { w + DIVIDER } else { 0.0 };
+        (side(columns.sidebar), side(columns.explorer))
+    };
+    let main_x = body.pos.x + lead;
+    let main_w = (body.size.x - lead - trail).max(0.0);
     if show_header {
         let h = if compact {
             28.0 + text_line_height(20.0, 14.0) + text_line_height(16.0, 12.0)
         } else {
             12.0 + text_line_height(24.0, 16.0)
         };
-        draw_header(
-            shell,
-            cx,
-            scope,
-            &state,
-            rect(body.pos.x, y, body.size.x, h),
-        );
+        draw_header(shell, cx, scope, &state, rect(main_x, y, main_w, h));
         y += h;
     }
     if let Some(error) = crate::shell::startup_error().or_else(|| {
@@ -457,7 +461,7 @@ fn draw_chrome(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect
             .and_then(Value::as_str)
             .map(str::to_string)
     }) {
-        y += draw_banner(shell, cx, rect(body.pos.x, y, body.size.x, 0.0), &error);
+        y += draw_banner(shell, cx, rect(main_x, y, main_w, 0.0), &error);
     }
     let content = rect(body.pos.x, y, body.size.x, body.pos.y + body.size.y - y);
     shell.data.chrome.content_rect = content;
@@ -469,7 +473,16 @@ fn draw_chrome(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect
     if compact {
         draw_compact(shell, cx, &state, content, page_shown);
     } else {
-        draw_wide(shell, cx, &state, content, page_shown, columns, &split_minima);
+        draw_wide(
+            shell,
+            cx,
+            &state,
+            content,
+            body.pos.y,
+            page_shown,
+            columns,
+            &split_minima,
+        );
     }
     shell.data.chrome.split_minima = split_minima;
 }
@@ -819,46 +832,51 @@ fn draw_header(
                 ui.icon(cx, scripts, "play", 16.0, p.muted);
                 right -= slot;
             }
-            let menu = island(
-                &mut ui,
-                cx,
-                dvec2(right - slot * 0.5, mid),
-                "hdr:menu",
-                &tr("shell.menu.sessionActions"),
-                compact,
-            );
-            ui.icon(cx, menu, "ellipsis", 16.0, p.muted);
-            right -= slot;
-            // Title group.
-            right -= 8.0;
+            // Title group: on a phone the title (with its project · host subtitle) fills the row
+            // and the menu ends it; on wide windows the project follows the title, muted, then
+            // the menu.
             let title_text = target
                 .as_ref()
                 .map(|t| header_title(state, t))
                 .unwrap_or_else(|| "Passession".to_string());
+            let project = target
+                .as_ref()
+                .map(|target| {
+                    let name = workspace
+                        .as_ref()
+                        .map(|w| j::text(w, "projectDisplayName").to_string())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        target
+                            .cwd
+                            .split('/')
+                            .rfind(|p| !p.is_empty())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        name
+                    }
+                })
+                .unwrap_or_default();
             let subtitle = compact && host.is_some();
-            let w = (right - x).max(0.0);
             if subtitle {
+                let menu = island(
+                    &mut ui,
+                    cx,
+                    dvec2(right - slot * 0.5, mid),
+                    "hdr:menu",
+                    &tr("shell.menu.sessionActions"),
+                    compact,
+                );
+                ui.icon(cx, menu, "ellipsis", 16.0, p.muted);
+                right -= slot + 8.0;
+                let w = (right - x).max(0.0);
                 let spec = ui.spec(Font::Medium, 14.0, p.foreground);
                 let title_h = text_line_height(20.0, 14.0);
                 let subtitle_h = text_line_height(16.0, 12.0);
                 let title_y = mid - (title_h + subtitle_h) * 0.5;
                 ui.text(cx, rect(x, title_y, w, title_h), spec, &title_text);
-                if let (Some(host), Some(target)) = (host, target.as_ref()) {
-                    let project = workspace
-                        .as_ref()
-                        .map(|w| j::text(w, "projectDisplayName").to_string())
-                        .unwrap_or_default();
-                    let directory = target
-                        .cwd
-                        .split('/')
-                        .rfind(|p| !p.is_empty())
-                        .unwrap_or("")
-                        .to_string();
-                    let project = if project.is_empty() {
-                        directory
-                    } else {
-                        project
-                    };
+                if let Some(host) = host {
                     header_subtitle(
                         &mut ui,
                         cx,
@@ -870,10 +888,32 @@ fn draw_header(
             } else {
                 let spec = ui.spec(
                     Font::Medium,
-                    if compact { 14.0 } else { 16.0 },
+                    if compact { 14.0 } else { 15.0 },
                     p.foreground,
                 );
-                ui.text(cx, rect(x, row.pos.y, w, row.size.y), spec, &title_text);
+                let w = (right - x - 4.0 - slot).max(0.0);
+                let drawn = ui.text(cx, rect(x, row.pos.y, w, row.size.y), spec, &title_text);
+                let mut end = drawn.pos.x + drawn.size.x;
+                let project_w = right - end - 10.0 - 4.0 - slot;
+                if !compact && !project.is_empty() && project_w >= 40.0 {
+                    let muted = ui.spec(Font::Regular, 14.0, p.muted);
+                    let drawn = ui.text(
+                        cx,
+                        rect(end + 10.0, row.pos.y, project_w, row.size.y),
+                        muted,
+                        &project,
+                    );
+                    end = drawn.pos.x + drawn.size.x;
+                }
+                let menu = island(
+                    &mut ui,
+                    cx,
+                    dvec2(end + 4.0 + slot * 0.5, mid),
+                    "hdr:menu",
+                    &tr("shell.menu.sessionActions"),
+                    compact,
+                );
+                ui.icon(cx, menu, "ellipsis", 16.0, p.muted);
             }
             x = right;
         }
@@ -1064,11 +1104,15 @@ fn measure_split_minima(node: &Node, minima: &mut Vec<[DVec2; 2]>) -> DVec2 {
     }
 }
 
+/// `columns_top` is where the sidebar and the Explorer start: the window's top, above the
+/// header and banner that `content` starts below.
+#[allow(clippy::too_many_arguments)]
 fn draw_wide(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
     state: &paseo_gui_core::CoreState,
     content: Rect,
+    columns_top: f64,
     page_shown: bool,
     columns: SideWidths,
     minima: &[[DVec2; 2]],
@@ -1077,13 +1121,15 @@ fn draw_wide(
     let SideWidths {
         sidebar, explorer, ..
     } = columns;
+    let bottom = content.pos.y + content.size.y;
+    let column_h = (bottom - columns_top).max(0.0);
     let mut x = content.pos.x;
     if sidebar > 0.0 {
-        let side = rect(x, content.pos.y, sidebar, content.size.y);
+        let side = rect(x, columns_top, sidebar, column_h);
         shell.data.chrome.sidebar_rect = side;
         shell.data.chrome.slots.push(Slot::Sidebar(side));
         x += sidebar;
-        let handle = rect(x, content.pos.y, DIVIDER, content.size.y);
+        let handle = rect(x, columns_top, DIVIDER, column_h);
         shell.painter.fill(cx, handle, p.border, 0.0);
         shell.data.hits.push(handle, "resize:sidebar".into());
         x += DIVIDER;
@@ -1115,10 +1161,10 @@ fn draw_wide(
         draw_node(shell, cx, state, &tree, main, &mut minima.iter());
     }
     if explorer > 0.0 {
-        let handle = rect(main_right, content.pos.y, DIVIDER, content.size.y);
+        let handle = rect(main_right, columns_top, DIVIDER, column_h);
         shell.painter.fill(cx, handle, p.border, 0.0);
         shell.data.hits.push(handle, "resize:explorer".into());
-        let ex = rect(main_right + DIVIDER, content.pos.y, explorer, content.size.y);
+        let ex = rect(main_right + DIVIDER, columns_top, explorer, column_h);
         shell.data.chrome.explorer_rect = ex;
         let (keys, selected) = explorer_keys(shell);
         draw_pane(

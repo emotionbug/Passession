@@ -6,9 +6,18 @@
 
 - When an agent reads an image file (a screenshot, a photo, a diagram), the conversation shows the image under the "Read" row, up to 200 px tall. Tap it to open it full size. Before this, the row showed only the file path. The image is read from the host when shown, so a file that was changed or deleted since shows its current version or nothing.
 
+### Changed
+
+- A finished turn now shows as its prompt, one summary row ("Ran 2 commands, read 1 file, …") and the agent's last message. Everything the agent did before that message is folded behind the row; tap it to show it. The running turn stays unfolded, and searching the chat unfolds a turn when a match is inside it. To see every tool call as before, choose Settings → Chat → Chat display → Full detail, or "Group tool calls" for the previous summary groups.
+- On desktop, the sidebar runs the full height of the window, and the header (sidebar toggle, session title, project, session menu) sits above the conversation only. The session menu follows the title instead of floating in the middle of the header, and the session's project shows next to the title.
+- The sidebar is simpler: with a single connected computer, its projects are listed directly, without the computer's row (it still appears when the computer is disconnected or has an error). A project shows one folder icon, which turns into the collapse arrow when pointed at, and its name is no longer bold. The session search field opens from the search icon next to "Sessions" and closes with Escape.
+- Chat formatting: list items are indented and their bullets sit apart from the text, inline code has room around it, code blocks no longer end with an empty line, and a table fills the width of the conversation on desktop.
+- Korean: tool summaries read "명령 2개 실행함, 파일 1개 읽음" instead of "2 명령을 실행했습니다., 파일 1개 읽음, 그리고 …".
+
 ### Fixed
 
 - OMP 19: a question form from OMP's `ask` tool shows as one card with every question again. OMP 19 puts the form's text in front of each question it asks, which Passession did not recognize, so the form fell apart into separate "OMP select" cards, one per question, starting with a note that Passession "could not match this OMP form step".
+- Changing the theme or language in Settings now updates every screen. Before this, a screen that was hidden at the time (the page under Settings, another tab) could keep the old colors until the app restarted, such as an almost invisible "New session" title after switching to the light theme.
 
 ## 0.13.48 - 2026-11-23
 

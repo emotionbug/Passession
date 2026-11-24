@@ -207,7 +207,8 @@ impl ChatTarget {
 struct ModelSig {
     timeline: usize,
     outgoing: u64,
-    overview: bool,
+    level: DetailLevel,
+    open_turns: u64,
     provider: String,
     running: bool,
     permissions: usize,
@@ -738,6 +739,12 @@ pub struct ChatPanel {
     items: Vec<RowItem>,
     #[rust]
     model_sig: Option<ModelSig>,
+    /// Finished turns the reader unfolded, by `turn_key`; `open_turns_revision`
+    /// counts changes so the stream model rebuilds.
+    #[rust]
+    open_turns: HashSet<String>,
+    #[rust]
+    open_turns_revision: u64,
     #[rust]
     stream_rows: Rc<Vec<StreamRow>>,
     #[rust]
@@ -1055,6 +1062,7 @@ impl ChatPanel {
         self.providers_requested = false;
         self.items.clear();
         self.model_sig = None;
+        self.open_turns.clear();
         self.row_states.clear();
         self.sticky = true;
         self.at_bottom = true;
@@ -1632,7 +1640,7 @@ impl ChatPanel {
         let Some(target) = self.target.clone() else {
             return;
         };
-        let overview = get(&self.host.preferences, "toolCallDetailLevel") == "overview";
+        let level = DetailLevel::from_preference(get(&self.host.preferences, "toolCallDetailLevel"));
         let provider = str_of(get(&snap.agent, "provider")).to_owned();
         let outgoing = if target.is_subagent() {
             0
@@ -1653,7 +1661,8 @@ impl ChatPanel {
         let sig = ModelSig {
             timeline: Rc::as_ptr(&snap.timeline) as usize,
             outgoing,
-            overview,
+            level,
+            open_turns: self.open_turns_revision,
             provider: provider.clone(),
             running: snap.running,
             permissions: permission_count,
@@ -1684,7 +1693,13 @@ impl ChatPanel {
                 entries.push(Rc::new(row));
             }
         }
-        let rows = Rc::new(build_stream_rows(&entries, overview, &provider));
+        let rows = Rc::new(build_stream_rows(
+            &entries,
+            level,
+            &provider,
+            &self.open_turns,
+            snap.running,
+        ));
         let running = snap.running;
         let auxiliary = auxiliary_footer_host(&rows, running);
         let has_auxiliary = running || auxiliary.is_some();
@@ -1704,6 +1719,8 @@ impl ChatPanel {
             let client = get(get(&row.entry, "item"), "clientMessageId");
             let id = if row.group.is_some() {
                 format!("group:{}", row.group_id())
+            } else if let Some(fold) = &row.fold {
+                format!("turn:{}", fold.key)
             } else if let Some(seq) = seq.as_i64() {
                 format!("seq:{seq}")
             } else if let Some(client) = client.as_str() {
@@ -2081,10 +2098,36 @@ impl ChatPanel {
             }
             None => {
                 self.pending_jump = Some((seq, offset, find));
+                self.reveal_folded(seq);
                 self.model_sig = None;
                 self.redraw_timeline(cx);
             }
         }
+    }
+
+    /// Unfolds the finished turn whose summary hides the entry starting at `seq`.
+    fn reveal_folded(&mut self, seq: i64) {
+        let key = self.stream_rows.iter().find_map(|row| {
+            let fold = row.fold.as_deref().filter(|fold| !fold.open)?;
+            fold.entries
+                .iter()
+                .any(|entry| get(entry, "seqStart").as_i64() == Some(seq))
+                .then(|| fold.key.clone())
+        });
+        if let Some(key) = key {
+            self.open_turns.insert(key);
+            self.open_turns_revision += 1;
+        }
+    }
+
+    /// Shows or folds a finished turn's work below its summary row.
+    fn toggle_turn(&mut self, cx: &mut Cx, key: String) {
+        if !self.open_turns.remove(&key) {
+            self.open_turns.insert(key);
+        }
+        self.open_turns_revision += 1;
+        self.model_sig = None;
+        self.redraw_timeline(cx);
     }
 
     // ── find ────────────────────────────────────────────────────────────
@@ -3517,6 +3560,7 @@ impl ChatPanel {
                         self.open_lightbox(ui, LightboxSource::User { entry, index });
                     }
                 }
+                HitTarget::FoldTurn(key) => self.toggle_turn(cx, key),
                 HitTarget::OpenSheet(sheet) => {
                     let (kind, _) = sheet.split_once(':').unwrap_or((sheet.as_str(), ""));
                     self.modal = Some(Modal::Sheet {
@@ -7165,6 +7209,7 @@ mod reading_hold_tests {
             let stream = StreamRow {
                 entry: entries.last().unwrap().clone(),
                 group: Some(entries),
+                fold: None,
             };
             RowItem {
                 id: id.to_owned(),

@@ -3,6 +3,7 @@
 //! captured, parsed and flattened again. Unsafe context uses a full parse.
 //! A captured revision finishes before newer demand replaces it.
 
+use super::super::canvas::CHIP_PADDING;
 use super::super::links::FileLinkSourceType;
 use super::super::reveal::{
     TEXT_REVEAL_FRAME_INTERVAL_S, clamp_to_safe_reveal_boundary, compute_reveal_step,
@@ -765,7 +766,12 @@ fn flatten(inlines: &[Inline]) -> SemanticParagraph {
         for inline in inlines {
             match inline {
                 Inline::Text { text: value, style } => push(text, rich, value, *style, false, link),
-                Inline::Code { text: value, style } => push(text, rich, value, *style, true, link),
+                Inline::Code { text: value, style } => {
+                    let pad = Style::default();
+                    push(text, rich, CHIP_PADDING, pad, false, link);
+                    push(text, rich, value, *style, true, link);
+                    push(text, rich, CHIP_PADDING, pad, false, link);
+                }
                 Inline::Link {
                     href,
                     kind,
@@ -779,7 +785,7 @@ fn flatten(inlines: &[Inline]) -> SemanticParagraph {
                             text.len(),
                             Arc::from(href.as_str()),
                             *kind,
-                            Arc::from(&text[start..]),
+                            Arc::from(text[start..].trim_matches(|c| CHIP_PADDING.contains(c))),
                         ));
                     }
                 }
@@ -915,18 +921,24 @@ mod tests {
             },
         ];
         let rich = flatten(&inlines);
-        assert_eq!(&*rich.text, "é 👩🏽‍💻\n終");
+        let pad = CHIP_PADDING;
+        assert_eq!(&*rich.text, format!("é {pad}👩🏽‍💻{pad}\n終"));
         assert_eq!(
             rich.spans.iter().map(|span| span.len).sum::<usize>(),
             rich.text.len()
         );
-        let start = "é ".len();
-        let end = "é 👩🏽‍💻".len();
+        let start = "é ".len() + pad.len();
+        let end = start + "👩🏽‍💻".len();
         assert_eq!(&*rich.codes, &[(start, end)]);
         assert_eq!(&*rich.strikes, &[(start, end)]);
-        assert_eq!((rich.links[0].0, rich.links[0].1), (start, end));
+        // The link covers the chip's padding; its text does not.
+        assert_eq!(
+            (rich.links[0].0, rich.links[0].1),
+            ("é ".len(), end + pad.len())
+        );
+        assert_eq!(&*rich.links[0].4, "👩🏽‍💻");
         assert_eq!(&*rich.links[0].2, "file.rs");
-        assert!(rich.spans[1].code && rich.spans[1].link && rich.spans[1].style.strike);
+        assert!(rich.spans[2].code && rich.spans[2].link && rich.spans[2].style.strike);
     }
 
     #[test]
@@ -1054,7 +1066,8 @@ mod tests {
         let mut codes = HashMap::new();
         collect_blocks(&blocks, &mut HashMap::new(), &mut codes);
         let code = codes.values().next().unwrap();
-        assert_eq!(&code.text[..code.copy_end], "é漢 \n\n");
+        // The fence's last line break ends the code; its blank last line stays.
+        assert_eq!(&code.text[..code.copy_end], "é漢 \n");
     }
 
     const OWNER: (&str, &str, &str) = ("row", "host", "agent");

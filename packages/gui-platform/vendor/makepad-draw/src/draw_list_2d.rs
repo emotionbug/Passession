@@ -130,6 +130,8 @@ impl DrawListExt for DrawList{
 pub struct DrawList2d { // draw info per UI element
     pub (crate) draw_list: DrawList,
     pub (crate) dirty_check_rect: Rect,
+    /// The `Cx::redraw_all_generation` this list was last checked under.
+    pub (crate) redraw_all_generation: u64,
 }
 
 impl Deref for DrawList2d{type Target = DrawList; fn deref(&self) -> &Self::Target {&self.draw_list}}
@@ -142,6 +144,7 @@ impl LiveNew for DrawList2d {
         let draw_list = cx.draw_lists.alloc();
         Self {
             dirty_check_rect: Default::default(),
+            redraw_all_generation: 0,
             draw_list,
         }
     }

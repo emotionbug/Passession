@@ -198,6 +198,18 @@ impl Builder {
     }
 }
 
+/// A fenced or indented block's code without the line break that ends its
+/// last line, which would otherwise lay out as an empty last row.
+fn code_block(lang: String, mut text: String) -> Block {
+    if text.ends_with('\n') {
+        text.pop();
+        if text.ends_with('\r') {
+            text.pop();
+        }
+    }
+    Block::Code { lang, text }
+}
+
 fn alert_kind(kind: BlockQuoteKind) -> AlertKind {
     match kind {
         BlockQuoteKind::Note => AlertKind::Note,
@@ -352,7 +364,7 @@ pub fn parse(source: &str, workspace_root: Option<&str>, linkify_files: bool) ->
                 }
                 TagEnd::CodeBlock => {
                     if let Some(Frame::Code(lang, text)) = b.stack.pop() {
-                        b.push_block(Block::Code { lang, text });
+                        b.push_block(code_block(lang, text));
                     }
                 }
                 TagEnd::List(_) => {
@@ -482,7 +494,7 @@ pub fn parse(source: &str, workspace_root: Option<&str>, linkify_files: bool) ->
         // Unterminated containers (streaming text) close in order.
         match b.stack.pop() {
             Some(Frame::Paragraph(inlines)) => b.push_block(Block::Paragraph(inlines)),
-            Some(Frame::Code(lang, text)) => b.push_block(Block::Code { lang, text }),
+            Some(Frame::Code(lang, text)) => b.push_block(code_block(lang, text)),
             _ => {}
         }
     }

@@ -25,6 +25,10 @@ use crate::theme::{self, ControlSize};
 #[derive(Default)]
 pub struct SidebarState {
     pub query: String,
+    /// The session filter field shows below the section header; a query keeps it open.
+    pub search_open: bool,
+    /// The filter takes key focus once it is drawn.
+    focus_search: bool,
     pub scroll: f64,
     pub content_height: f64,
     pub viewport: Rect,
@@ -1170,12 +1174,13 @@ fn draw_header(
         y += 1.0;
     }
 
-    // Section header: muted small title + display menu trigger.
+    // Section header: muted small title, search toggle and display menu trigger.
     let header_h = small_h + if compact { 28.0 } else { 20.0 };
+    let search_shown = shell.data.sidebar.search_open || !shell.data.sidebar.query.is_empty();
     {
         let mut ui = make_ui(shell);
         let spec = ui.small_muted();
-        let heading = rect(r.pos.x + 8.0, y, r.size.x - 48.0, header_h);
+        let heading = rect(r.pos.x + 8.0, y, r.size.x - 76.0, header_h);
         let label = tr("sessionNavigation.sessions");
         ui.text(cx, heading, spec, &label);
         ui.semantic_text(
@@ -1185,30 +1190,55 @@ fn draw_header(
             &label,
             AccessibilityRole::Header,
         );
-        let trigger = rect(
+        let display = rect(
             r.pos.x + r.size.x - 4.0 - 28.0,
             y + (header_h - 28.0) * 0.5,
             28.0,
             28.0,
         );
-        if ui.is_hover("side:display") {
-            let hover = ui.p.sidebar_hover;
-            ui.fill(cx, trigger, hover, 6.0);
+        let search = Rect {
+            pos: display.pos - dvec2(30.0, 0.0),
+            ..display
+        };
+        for (trigger, id, icon, tip, active) in [
+            (
+                search,
+                "side:search",
+                "search",
+                tr("sessionNavigation.search"),
+                search_shown,
+            ),
+            (
+                display,
+                "side:display",
+                "settings-2",
+                tr("sidebar.display.trigger"),
+                false,
+            ),
+        ] {
+            if active || ui.is_hover(id) {
+                let hover = ui.p.sidebar_hover;
+                ui.fill(cx, trigger, hover, 6.0);
+            }
+            let color = if active { ui.p.foreground } else { ui.p.muted };
+            ui.icon(cx, trigger, icon, 14.0, color);
+            ui.hit_tip(cx, trigger, id, &tip);
         }
-        let muted = ui.p.muted;
-        ui.icon(cx, trigger, "settings-2", 14.0, muted);
-        ui.hit_tip(cx, trigger, "side:display", &tr("sidebar.display.trigger"));
         if compact {
-            // Phone: the filter trigger takes a 44px square over the full header height.
+            // Phone: each trigger takes a 44px square over the full header height.
             ui.hit(
                 rect(r.pos.x + r.size.x - 44.0, y, 44.0, header_h),
                 "side:display",
+            );
+            ui.hit(
+                rect(r.pos.x + r.size.x - 88.0, y, 44.0, header_h),
+                "side:search",
             );
         }
     }
     y += header_h;
 
-    // Search field (bare input, 6px radius divider border).
+    // Session filter (bare input, 6px radius divider border), shown on demand.
     if shell.data.search.is_none() {
         let field = WidgetRef::new_from_ptr(cx, shell.search_field);
         field
@@ -1216,7 +1246,7 @@ fn draw_header(
             .set_placeholder(cx, &tr("sessionNavigation.search"));
         shell.data.search = Some(field);
     }
-    if let Some(field) = shell.data.search.clone() {
+    if search_shown && let Some(field) = shell.data.search.clone() {
         // The input owns its font metrics and padding; a fixed-height clip cuts
         // off its bottom border when native text is taller.
         let walk = Walk {
@@ -1227,9 +1257,12 @@ fn draw_header(
         };
         cx.begin_turtle(walk, Layout::flow_down());
         field.draw_all(cx, scope);
-        y += cx.end_turtle().size.y;
+        y += cx.end_turtle().size.y + 4.0;
+        if std::mem::take(&mut shell.data.sidebar.focus_search) {
+            field.as_ptext_field().set_key_focus(cx);
+        }
     }
-    y += 8.0;
+    y += 4.0;
     if shell.data.sidebar.busy > 0 {
         shell
             .painter
@@ -1237,6 +1270,28 @@ fn draw_header(
     }
 
     y
+}
+
+/// Shows or hides the session filter. Hiding it clears the filter; showing it focuses it.
+pub fn toggle_search(shell: &mut PaseoShell, cx: &mut Cx) {
+    let sidebar = &mut shell.data.sidebar;
+    let open = !sidebar.search_open && sidebar.query.is_empty();
+    sidebar.search_open = open;
+    if let Some(field) = shell.data.search.clone() {
+        if open {
+            shell.data.sidebar.focus_search = true;
+        } else {
+            field.set_text(cx, "");
+            field.as_ptext_field().release_focus(cx);
+        }
+    }
+    if !open && !shell.data.sidebar.query.is_empty() {
+        shell.data.sidebar.query.clear();
+        shell.data.sidebar.scroll = 0.0;
+        shell.data.sidebar.place_tree(cx);
+        shell.data.sidebar.tree_layer.invalidate(cx);
+    }
+    shell.data.sidebar.header_layer.invalidate(cx);
 }
 
 pub fn draw(
@@ -1456,6 +1511,9 @@ fn draw_tree(
     let button_h = theme::control_height(ControlSize::Sm);
     let mut any = false;
     let session_x = if w < NARROW_SIDEBAR { 28.0 } else { 48.0 };
+    // The only host, connected without error, needs no row of its own: its projects take the
+    // host level and its sessions move up with them.
+    let lone_host = host_count == 1;
     // Position in the session-switch order (Ctrl+1–9), counted like `navigation_sessions`.
     let mut nav_index = 0usize;
     for host_group in &tree.hosts {
@@ -1464,7 +1522,14 @@ fn draw_tree(
         let sid = host.server_id();
         let label = host.display_label();
         let host_matches = host_group.matches;
-        let host_collapsed = host_group.collapsed;
+        let flat = lone_host && host.connected() && host.error().is_none();
+        let host_collapsed = host_group.collapsed && !flat;
+        let indent = if flat { 16.0 } else { 0.0 };
+        let session_x = if flat {
+            (session_x - 24.0).max(8.0)
+        } else {
+            session_x
+        };
         // Visible project blocks first (search may hide the host); live terminals follow the
         // directory's sessions and search matches their label.
         let workspaces = workspaces_by_project(host.workspaces().iter().map(Arc::as_ref));
@@ -1504,61 +1569,64 @@ fn draw_tree(
         if reveal.as_deref() == Some(sid) {
             reveal_offset = Some((y - 8.0 - list.pos.y).max(0.0));
         }
-        let row = rect(x0 + 8.0, y, w - 16.0, group_h);
-        // A collapsed host still says how many of its sessions wait on the user.
-        let waiting = if host_collapsed {
-            host_group.waiting()
-        } else {
-            0
-        };
-        let badge_w = if waiting > 0 {
-            waiting_badge_width(&mut ui, cx, waiting) + 4.0
-        } else {
-            0.0
-        };
-        let slots = group_metrics.layout(row, 0.0, 26.0, 20.0 + badge_w, 4.0);
-        let mid = row.pos.y + row.size.y * 0.5;
-        let plus_x = slots.trailing.pos.x + slots.trailing.size.x - 20.0;
-        ui.icon(
-            cx,
-            rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0),
-            if host_collapsed {
-                "chevron-right"
+        if !flat {
+            let row = rect(x0 + 8.0, y, w - 16.0, group_h);
+            // A collapsed host still says how many of its sessions wait on the user.
+            let waiting = if host_collapsed {
+                host_group.waiting()
             } else {
-                "chevron-down"
-            },
-            14.0,
-            p.muted,
-        );
-        ui.dot(
-            cx,
-            dvec2(slots.leading.pos.x + 22.0, mid),
-            8.0,
-            status_color(&p, host),
-        );
-        ui.text(cx, slots.title, group, &label);
-        if waiting > 0 {
-            waiting_badge(&mut ui, cx, plus_x - 4.0, mid, waiting);
+                0
+            };
+            let badge_w = if waiting > 0 {
+                waiting_badge_width(&mut ui, cx, waiting) + 4.0
+            } else {
+                0.0
+            };
+            let slots = group_metrics.layout(row, 0.0, 26.0, 20.0 + badge_w, 4.0);
+            let mid = row.pos.y + row.size.y * 0.5;
+            let plus_x = slots.trailing.pos.x + slots.trailing.size.x - 20.0;
+            ui.icon(
+                cx,
+                rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0),
+                if host_collapsed {
+                    "chevron-right"
+                } else {
+                    "chevron-down"
+                },
+                14.0,
+                p.muted,
+            );
+            ui.dot(
+                cx,
+                dvec2(slots.leading.pos.x + 22.0, mid),
+                8.0,
+                status_color(&p, host),
+            );
+            ui.text(cx, slots.title, group, &label);
+            if waiting > 0 {
+                waiting_badge(&mut ui, cx, plus_x - 4.0, mid, waiting);
+            }
+            // The whole row toggles; the trailing button, registered after it, wins its own
+            // square.
+            ui.control(
+                cx,
+                row,
+                &format!("host:{sid}"),
+                &label,
+                AccessibilityRole::ListItem,
+                AccessibilityState::default(),
+            );
+            toolbar_button(
+                &mut ui,
+                cx,
+                plus_x,
+                mid - 10.0,
+                &format!("hostplus:{sid}"),
+                "plus",
+                &tr("sessionNavigation.newSession"),
+            );
+            y += group_h;
         }
-        // The whole row toggles; the trailing button, registered after it, wins its own square.
-        ui.control(
-            cx,
-            row,
-            &format!("host:{sid}"),
-            &label,
-            AccessibilityRole::ListItem,
-            AccessibilityState::default(),
-        );
-        toolbar_button(
-            &mut ui,
-            cx,
-            plus_x,
-            mid - 10.0,
-            &format!("hostplus:{sid}"),
-            "plus",
-            &tr("sessionNavigation.newSession"),
-        );
-        y += group_h;
         if host_collapsed {
             continue;
         }
@@ -1658,7 +1726,7 @@ fn draw_tree(
             } else {
                 name
             };
-            let row = rect(x0 + 24.0, y, w - 32.0, group_h);
+            let row = rect(x0 + 24.0 - indent, y, w - 32.0 + indent, group_h);
             let waiting = if project.collapsed {
                 project.waiting
             } else {
@@ -1669,35 +1737,36 @@ fn draw_tree(
             } else {
                 0.0
             };
-            let slots = group_metrics.layout(row, 0.0, 32.0, 20.0 + badge_w, 4.0);
+            let slots = group_metrics.layout(row, 8.0, 14.0, 20.0 + badge_w, 8.0);
             let mid = row.pos.y + row.size.y * 0.5;
             let plus_x = slots.trailing.pos.x + slots.trailing.size.x - 20.0;
+            // The folder turns into the collapse chevron under the pointer, and stays one while
+            // the project is collapsed.
+            let row_id = format!("project:{key}");
+            let pointed = ui.is_hover(&row_id) || ui.is_hover(&format!("projplus:{key}"));
+            let glyph = if project.collapsed {
+                "chevron-right"
+            } else if pointed {
+                "chevron-down"
+            } else {
+                "folder"
+            };
             ui.icon(
                 cx,
                 rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0),
-                if project.collapsed {
-                    "chevron-right"
-                } else {
-                    "chevron-down"
-                },
+                glyph,
                 14.0,
                 p.muted,
             );
-            ui.icon(
-                cx,
-                rect(slots.leading.pos.x + 18.0, mid - 7.0, 14.0, 14.0),
-                "folder",
-                14.0,
-                p.muted,
-            );
-            ui.text(cx, slots.title, group, name);
+            let project_spec = ui.spec(Font::Regular, 14.0, p.foreground);
+            ui.text(cx, slots.title, project_spec, name);
             if waiting > 0 {
                 waiting_badge(&mut ui, cx, plus_x - 4.0, mid, waiting);
             }
             ui.control(
                 cx,
                 row,
-                &format!("project:{key}"),
+                &row_id,
                 name,
                 AccessibilityRole::ListItem,
                 AccessibilityState::default(),
@@ -1906,12 +1975,12 @@ fn draw_tree(
             || loading.contains(&"project")
             || errors.iter().any(|(k, _)| *k == "project");
         if !host_group.has_projects && !project_list_loading && query.is_empty() {
-            let row = rect(x0 + 24.0, y, w - 32.0, group_h);
-            let slots = group_metrics.layout(row, 0.0, 32.0, 0.0, 4.0);
+            let row = rect(x0 + 24.0 - indent, y, w - 32.0 + indent, group_h);
+            let slots = group_metrics.layout(row, 8.0, 14.0, 0.0, 8.0);
             let mid = row.pos.y + row.size.y * 0.5;
             ui.icon(
                 cx,
-                rect(slots.leading.pos.x + 18.0, mid - 7.0, 14.0, 14.0),
+                rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0),
                 "folder-plus",
                 14.0,
                 p.muted,
@@ -2099,6 +2168,9 @@ pub fn handle_actions(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, _ui: &
         shell.data.sidebar.scroll = 0.0;
         shell.data.sidebar.place_tree(cx);
         shell.data.sidebar.tree_layer.invalidate(cx);
+    }
+    if field.as_ptext_field().escaped(actions) && shell.data.sidebar.search_open {
+        toggle_search(shell, cx);
     }
 }
 

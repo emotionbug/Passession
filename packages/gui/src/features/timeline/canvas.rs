@@ -225,6 +225,10 @@ pub fn with_alpha(color: Vec4, alpha: f32) -> Vec4 {
     vec4(color.x, color.y, color.z, color.w * alpha)
 }
 
+/// A four-per-em space laid out on each side of an inline code chip so the chip
+/// has room inside the line; copied text leaves it out.
+pub const CHIP_PADDING: &str = "\u{2005}";
+
 pub const TRANSPARENT: Vec4 = Vec4 {
     x: 0.0,
     y: 0.0,
@@ -783,6 +787,8 @@ pub enum HitTarget {
         index: usize,
     },
     Toggle(String),
+    /// Show or fold the work of the finished turn under the prompt with this key.
+    FoldTurn(String),
     /// Export the exact currently rendered Mermaid revision.
     MermaidExport {
         key: String,
@@ -1126,7 +1132,9 @@ impl Canvas {
 
     pub fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selected_range()?;
-        Some(self.source_slice(start, end))
+        let mut text = self.source_slice(start, end);
+        text.retain(|c| !CHIP_PADDING.contains(c));
+        Some(text)
     }
 
     /// Detect replacements before the selected endpoint, while allowing a streamed
