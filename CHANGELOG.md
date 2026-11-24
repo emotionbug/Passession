@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.50 - 2026-11-25
+
 ### Fixed
 
 - OMP 19.1: a question form from OMP's `ask` tool shows as a card again. OMP 19.1 sends the whole form to Passession in one request, which Passession did not recognize, so no card appeared and the agent waited for an answer that could not be given, until the turn was stopped. Earlier OMP versions, which ask one question at a time, still work as before.

@@ -1,0 +1,4 @@
+Fixed
+- OMP 19.1 ask forms show as a card again. Before this, no card appeared and the agent waited for an answer that could not be given.
+
+Full notes: https://github.com/emotionbug/Passession/releases/tag/v0.13.50
