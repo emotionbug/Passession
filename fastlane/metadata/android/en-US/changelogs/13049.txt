@@ -1,0 +1,11 @@
+New
+- Images an agent reads show under the "Read" row; tap to open full size.
+- Finished turns fold into one summary row above the reply; tap to expand.
+- Cleaner sidebar, header and chat formatting.
+
+Fixed
+- Running sessions no longer swap places in the sidebar.
+- OMP 19 ask forms show as one card again.
+- Theme changes update every screen.
+
+Full notes: https://github.com/emotionbug/Passession/releases/tag/v0.13.49

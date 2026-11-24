@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.49 - 2026-11-24
+
 ### Added
 
 - When an agent reads an image file (a screenshot, a photo, a diagram), the conversation shows the image under the "Read" row, up to 200 px tall. Tap it to open it full size. Before this, the row showed only the file path. The image is read from the host when shown, so a file that was changed or deleted since shows its current version or nothing.
