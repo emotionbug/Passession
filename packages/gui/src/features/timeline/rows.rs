@@ -9,6 +9,7 @@ use super::canvas::*;
 use super::details::draw_details;
 use super::format;
 use super::i18n::{t, ta};
+use super::images::{self, ImageState};
 use super::indicator::Indicator;
 use super::json::*;
 use super::layout::{StreamRow, TurnTiming, parse_time};
@@ -569,6 +570,7 @@ fn entry(
                 initially_expanded: ctx.auto_expand_reasoning,
                 force_inline: ctx.auto_expand_reasoning,
                 open_file: None,
+                image: None,
                 borderless: false,
                 sheet: format!("thinking:{id}"),
             };
@@ -671,6 +673,12 @@ fn entry(
                 initially_expanded: ctx.expanded_tools,
                 force_inline: false,
                 open_file: presentation.open_file_path.clone(),
+                image: tools::read_image_path(&presentation.detail, &presentation.status).map(
+                    |path| BadgeImage {
+                        path,
+                        row: id.to_owned(),
+                    },
+                ),
                 borderless: false,
                 sheet: format!("tool:{id}"),
             };
@@ -1356,6 +1364,7 @@ fn todo(
             initially_expanded: false,
             force_inline: true,
             open_file: None,
+            image: None,
             borderless: false,
             sheet: String::new(),
         };
@@ -1402,6 +1411,67 @@ pub struct Badge {
     pub borderless: bool,
     /// Sheet id opened on compact layouts.
     pub sheet: String,
+    /// An image the call read, shown below the row.
+    pub image: Option<BadgeImage>,
+}
+
+/// An image file shown under a badge; `row` is the timeline row the lightbox
+/// opens it from.
+pub struct BadgeImage {
+    pub path: String,
+    pub row: String,
+}
+
+/// Most a badge's image is tall.
+const BADGE_IMAGE_MAX_HEIGHT: f64 = 200.0;
+
+/// [`BadgeImage`] fit in the badge's text column: loading reserves the full
+/// height, an image that cannot be read or decoded takes no space (the row
+/// still opens the file), and tapping one opens the lightbox.
+#[allow(clippy::too_many_arguments)]
+fn badge_image(
+    cx: &mut Cx2d,
+    d: &mut Draw,
+    ctx: &RowContext,
+    image: &BadgeImage,
+    x: f64,
+    y: f64,
+    w: f64,
+) -> f64 {
+    const TOP: f64 = 2.0;
+    const BOTTOM: f64 = 6.0;
+    let owner = d.result_owner(cx);
+    let state = images::fitted_image(
+        cx,
+        Some(&ctx.core),
+        &ctx.host_id,
+        ctx.cwd.as_deref(),
+        &image.path,
+        &image.row,
+        owner,
+        w,
+    );
+    match state {
+        ImageState::Loading => TOP + BADGE_IMAGE_MAX_HEIGHT + BOTTOM,
+        ImageState::Ready {
+            texture,
+            width,
+            height,
+        } => {
+            let aspect = width as f64 / height.max(1) as f64;
+            let h = BADGE_IMAGE_MAX_HEIGHT.min(w / aspect);
+            let r = rect_xywh(x, y + TOP, h * aspect, h);
+            d.kit.texture(cx, r, &texture, 6.0);
+            d.canvas.add_hit(
+                r,
+                HitTarget::Image {
+                    key: image.path.clone(),
+                },
+            );
+            TOP + h + BOTTOM
+        }
+        ImageState::Failed | ImageState::Error(_) => 0.0,
+    }
 }
 
 /// message.tsx ExpandableBadge: muted single-line row (22px rail, 12px glyph,
@@ -1607,12 +1677,24 @@ pub fn draw_badge(
         let header = rect_xywh(x, y, w, header_h);
         d.canvas.add_hit_under(header, target);
     }
-    if expanded {
+    let mut height = if expanded {
         let h = details(cx, d, x + 1.0, y + header_h, w - 2.0);
         header_h + h.max(body_h)
     } else {
         header_h
+    };
+    if let Some(image) = &badge.image {
+        height += badge_image(
+            cx,
+            d,
+            ctx,
+            image,
+            lx,
+            y + height,
+            (x + w - 8.0 - lx).max(1.0),
+        );
     }
+    height
 }
 
 // ---- Overview groups ----
@@ -1645,6 +1727,7 @@ fn overview_group(
         initially_expanded: false,
         force_inline: false,
         open_file: None,
+        image: None,
         borderless: true,
         sheet: format!("group:{id}"),
     };
@@ -1732,6 +1815,12 @@ pub fn embedded_calls(
             initially_expanded: false,
             force_inline: true,
             open_file: presentation.open_file_path.clone(),
+            image: tools::read_image_path(&presentation.detail, &presentation.status).map(|path| {
+                BadgeImage {
+                    path,
+                    row: id.to_owned(),
+                }
+            }),
             borderless: false,
             sheet: String::new(),
         };

@@ -10,6 +10,8 @@ Use native theme/text styles and preserve copy/selection, code formatting, lists
 
 Inline images are acquired through `timeline::images::fitted_image` at the available width × 320 px × DPI scale; a larger box re-decodes in the background while the current texture stays visible. The lightbox and avatars use `image()` at full quality (4096 px cap). The cache holds at most 500 acquisitions and 100 MiB of decoded pixels, evicting the least recently used ready image first. At most four acquisitions fetch or decode at once, and decodes share the two Files image workers.
 
+A tool row for a completed read of an image file (`png`, `jpg`/`jpeg`, `gif`, `webp`, `bmp`, `tif`/`tiff`, `svg`; `rows.rs` `badge_image`) shows that file below the row through the same `fitted_image` acquisition, at most 200 px tall, and opens the lightbox when tapped. The row reads the file as it is on the host now, not a copy of what the agent saw. While the image loads, the row keeps the full 200 px; a file that cannot be read or decoded takes no space.
+
 ## Streaming work
 
 Assistant messages retain grapheme-safe paced reveal rather than waiting to

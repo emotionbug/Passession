@@ -923,6 +923,25 @@ pub fn extract_tool_call_file_path(detail: &Value) -> Option<String> {
     }
 }
 
+/// The image file a completed read showed the agent, by its extension; the
+/// timeline shows it under the call's row. OMP reads `image.png?q=…` to ask a
+/// vision model about the image; like Markdown image sources, the file path
+/// ends before `?` or `#`.
+pub fn read_image_path(detail: &Value, status: &str) -> Option<String> {
+    if str_of(get(detail, "type")) != "read" || status != "completed" {
+        return None;
+    }
+    let path = read_string(get(detail, "filePath"))?;
+    let file = path.split(['?', '#']).next()?;
+    let name = file.rsplit(['/', '\\']).next()?;
+    let (_, extension) = name.rsplit_once('.')?;
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "svg"
+    )
+    .then_some(path)
+}
+
 // ---- tool-call-detail-state.ts ----
 
 fn meaningful_value(value: &Value) -> bool {
@@ -1717,6 +1736,34 @@ mod copy_tests {
             Some("toolCallDetails.input\n\nin\n\ntoolCallDetails.output\n\nout")
         );
         assert_eq!(copy(json!({"type":"plain_text","text":" "}), None), None);
+    }
+}
+
+#[cfg(test)]
+mod read_image_tests {
+    use super::*;
+
+    #[test]
+    fn completed_reads_of_image_files_show_the_image() {
+        let path = |file: &str, status: &str| {
+            read_image_path(&json!({"type":"read","filePath":file}), status)
+        };
+        assert_eq!(
+            path("/tmp/a.PNG", "completed").as_deref(),
+            Some("/tmp/a.PNG")
+        );
+        assert_eq!(
+            path("shots/a.png?q=what is shown", "completed").as_deref(),
+            Some("shots/a.png?q=what is shown")
+        );
+        assert_eq!(path("/tmp/a.png", "running"), None);
+        assert_eq!(path("/tmp/a.png", "failed"), None);
+        assert_eq!(path("/tmp/png", "completed"), None);
+        assert_eq!(path("/tmp/a.png.txt", "completed"), None);
+        assert_eq!(
+            read_image_path(&json!({"type":"write","filePath":"a.png"}), "completed"),
+            None
+        );
     }
 }
 

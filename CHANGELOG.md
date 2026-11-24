@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- When an agent reads an image file (a screenshot, a photo, a diagram), the conversation shows the image under the "Read" row, up to 200 px tall. Tap it to open it full size. Before this, the row showed only the file path. The image is read from the host when shown, so a file that was changed or deleted since shows its current version or nothing.
+
 ### Fixed
 
 - OMP 19: a question form from OMP's `ask` tool shows as one card with every question again. OMP 19 puts the form's text in front of each question it asks, which Passession did not recognize, so the form fell apart into separate "OMP select" cards, one per question, starting with a note that Passession "could not match this OMP form step".
