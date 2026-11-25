@@ -103,6 +103,8 @@ The static bundle is public on allowed hosts. All browser control goes through t
 
 The browser build is the same Makepad client compiled for `wasm32-wasip1` with WebGL rendering. The page has one thread: the client core, Markdown parsing, highlighting, text layout and image decoding run as queued work on the page thread instead of worker threads. Browser APIs (WebSocket, local storage, file picker, downloads, clipboard) are reached through `packages/browser`. Client state and host settings, including a saved password, live in the page's local storage, as the native app keeps them in its state file. Features that need the local machine are not shown: dropping files by path, local HTML previews, project-icon picking, local daemon management, app updates, OS notifications and embedded Tailscale. Attachments come from the browser's file picker, and exports download through the browser.
 
+Composer images live in memory for the page session; local storage is too small for image bytes. The daemon echoes a sent prompt without its images, so after a reload, messages sent from that page show their text only, as they do on another device. The native app keeps sent images in its blob directory.
+
 ## Terminals and excluded surfaces
 
 Daemon PTYs back interactive terminals and project scripts. The client opens interactive shells as Terminal tabs on every platform and presents script output as read-only logs; see [terminal activity](terminal-activity.md). Native CLI chat remains available outside the application.
