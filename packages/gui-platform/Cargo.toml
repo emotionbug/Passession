@@ -29,6 +29,8 @@ paseo-browser = { path = "../browser" }
 paseo-tailnet = { path = "../tailnet" }
 getrandom = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util", "process", "net"] }
+# Desktop updates and mobile push-token registration (`mobile/expo.rs`).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
@@ -38,7 +40,6 @@ arboard = { version = "3.7", default-features = false, features = ["image-data"]
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # The portal backend stays; `wayland` only resolves `set_parent` Wayland handles,
 # and no dialog sets a parent window.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
