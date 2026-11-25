@@ -661,6 +661,41 @@ async fn web_ui_serves_assets_after_a_live_config_patch_without_changing_daemon_
             "{accept}"
         );
     }
+    // `cargo xtask build-web` stores large assets only gzipped; a client that refuses
+    // gzip still gets the decoded file.
+    let script = b"console.log('boot');\n".repeat(64);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    std::io::Write::write_all(&mut encoder, &script).unwrap();
+    let compressed = encoder.finish().unwrap();
+    std::fs::write(web.join("boot.js.gz"), &compressed).unwrap();
+    for (accept, encoding, body) in [
+        ("gzip", Some("gzip"), compressed.as_slice()),
+        ("identity", None, script.as_slice()),
+    ] {
+        let mut asset = request(Method::GET, "/boot.js");
+        asset
+            .headers_mut()
+            .insert("accept-encoding", accept.parse().unwrap());
+        let response = sender.send_request(asset).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{accept}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().unwrap()),
+            encoding,
+            "{accept}"
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            body,
+            "{accept}"
+        );
+    }
 
     for (path, status) in [
         ("/missing", StatusCode::NOT_FOUND),

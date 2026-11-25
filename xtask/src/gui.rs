@@ -19,7 +19,9 @@ pub const MACOS_BUNDLE: &str = "Passession.app";
 const IOS_BUNDLE: &str = "Passession.app";
 const IOS_EXECUTABLE: &str = "paseo-sessions";
 const CARGO_BIN: &str = "paseo-sessions";
-const WEB_PACKAGE: &str = "paseo-gui-web";
+/// The browser client's crate and Rust target; the daemon component ships its bundle.
+pub(crate) const WEB_PACKAGE: &str = "paseo-gui-web";
+pub(crate) const WEB_TARGET: &str = "wasm32-wasip1";
 /// Supported Android floor (Android 7.0), the same as the Flutter client.
 /// The NDK linker for this API level has no stubs for newer system libraries.
 const ANDROID_API: u32 = 24;
@@ -293,7 +295,9 @@ fn stage_notices(
 
 pub fn build_web(args: &[String]) -> Result<()> {
     ensure!(args.is_empty(), "Usage: cargo xtask build-web");
-    const TARGET: &str = "wasm32-wasip1";
+    // A failed build must not leave the previous bundle's provenance behind.
+    remove_if_exists(&web_build_identity()?)?;
+    let mut identity = build::web_identity()?;
     let mut cargo = command(cargo())?;
     crate::cross_tools::configure_web(&mut cargo)?;
     run(cargo.args([
@@ -301,12 +305,12 @@ pub fn build_web(args: &[String]) -> Result<()> {
         "--locked",
         "--release",
         "--target",
-        TARGET,
+        WEB_TARGET,
         "-p",
         WEB_PACKAGE,
         "--lib",
     ]))?;
-    let metadata = notices::cargo_metadata(TARGET)?;
+    let metadata = notices::cargo_metadata(WEB_TARGET)?;
     let dependencies = notices::dependency_closure(&metadata, WEB_PACKAGE)?;
     let bridge = dependencies
         .iter()
@@ -328,7 +332,7 @@ pub fn build_web(args: &[String]) -> Result<()> {
     let platform = workspace.join("packages/gui-platform/vendor/makepad-platform/src/os/web");
     copy_tree(
         &target_root()?
-            .join(TARGET)
+            .join(WEB_TARGET)
             .join("release/paseo_gui_web.wasm"),
         &stage.join("app.wasm"),
     )?;
@@ -355,12 +359,16 @@ pub fn build_web(args: &[String]) -> Result<()> {
     precompress_web(&stage)?;
     remove_if_exists(&output)?;
     fs::rename(stage, &output)?;
+    identity["bundleSha256"] = json!(tree_digest(&output)?);
+    write_json(&web_build_identity()?, &identity)?;
     println!("{}", output.display());
     Ok(())
 }
 
-/// Writes `<file>.gz` beside each compressible bundle file of at least 16 KiB; the daemon
-/// serves it to clients that accept gzip (the module alone is tens of megabytes).
+/// Replaces each compressible bundle file of at least 16 KiB with `<file>.gz`. The daemon
+/// serves it to clients that accept gzip and decodes it for the rest; storing one copy keeps
+/// release runtimes small (the module alone is tens of megabytes). License and notice texts
+/// (`.txt`) stay readable as shipped.
 fn precompress_web(stage: &Path) -> Result<()> {
     use flate2::{Compression, write::GzEncoder};
     for entry in WalkDir::new(stage).sort_by_file_name() {
@@ -368,7 +376,7 @@ fn precompress_web(stage: &Path) -> Result<()> {
         let path = entry.path();
         let compressible = matches!(
             path.extension().and_then(|extension| extension.to_str()),
-            Some("wasm" | "js" | "css" | "html" | "json" | "ttf" | "otf" | "svg" | "txt")
+            Some("wasm" | "js" | "css" | "html" | "json" | "ttf" | "otf" | "svg")
         );
         if !entry.file_type().is_file() || !compressible || entry.metadata()?.len() < 16 * 1024 {
             continue;
@@ -382,6 +390,7 @@ fn precompress_web(stage: &Path) -> Result<()> {
         std::io::copy(&mut fs::File::open(path)?, &mut encoder)?;
         encoder.finish()?;
         chmod(Path::new(&gzip), 0o644)?;
+        fs::remove_file(path)?;
     }
     Ok(())
 }

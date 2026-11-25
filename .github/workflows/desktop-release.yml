@@ -82,6 +82,7 @@ jobs:
       create_release: ${{ steps.plan.outputs.createRelease }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
       no_changes: ${{ steps.plan.outputs.noChanges }}
+      web: ${{ steps.plan.outputs.web }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -126,9 +127,79 @@ jobs:
           RECOVERY_TARGETS: ${{ steps.plan.outputs.recovery }}
         run: cargo xtask release recovery
 
-  native:
+  # Every daemon component ships the browser client. It is one WebAssembly bundle for
+  # all platforms, so it is built once here from the planned source.
+  web:
     needs: source
-    if: github.event.inputs.mode != 'publish-only' && needs.source.outputs.no_changes != 'true' && needs.source.outputs.matrix != '{"include":[]}'
+    if: github.event.inputs.mode != 'publish-only' && needs.source.outputs.web == 'true'
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    env:
+      PASEO_NATIVE_RELEASE: "1"
+      PASEO_RELEASE_CHANNEL: ${{ needs.source.outputs.channel }}
+      PASEO_UPDATE_REPOSITORY: emotionbug/Passession
+      PASEO_BUILD_SOURCE_SHA: ${{ needs.source.outputs.sha }}
+    steps:
+      - name: Keep checkout bytes identical to the planned fingerprints
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+      - name: Apply explicitly pinned packaging notice corrections
+        if: env.NOTICE_SUPPLEMENT_SHA != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$NOTICE_SUPPLEMENT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin "$NOTICE_SUPPLEMENT_SHA"
+          git show "$NOTICE_SUPPLEMENT_SHA:packaging/cargo-notice-supplements.json" > packaging/cargo-notice-supplements.json
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          targets: wasm32-wasip1
+      # The native job's pinned Zig archive for this runner (Linux x64).
+      - name: Install Zig 0.15.2
+        shell: bash
+        env:
+          ZIG_VERSION: 0.15.2
+        run: |
+          set -euo pipefail
+          name="zig-x86_64-linux-$ZIG_VERSION"
+          archive="$RUNNER_TEMP/$name.tar.xz"
+          curl -fsSL --retry 3 -o "$archive" "https://ziglang.org/download/$ZIG_VERSION/$name.tar.xz"
+          echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  $archive" | sha256sum -c -
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          rm "$archive"
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+          echo "GHOSTTY_CACHE_DIR=$RUNNER_TEMP/ghostty-cache" >> "$GITHUB_ENV"
+      - name: Restore Ghostty source cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/ghostty-cache/ghostty-src
+          key: ghostty-src-${{ runner.os }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: native-release-web
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      - name: Build the browser client bundle
+        run: cargo xtask build-web
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-web-bundle
+          # The bundle and its provenance live under the hidden `.dev` directory.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            .dev/build/web
+            .dev/build/web-build.json
+
+  native:
+    needs: [source, web]
+    # `web` is skipped when no planned target compiles a daemon.
+    if: ${{ !cancelled() && needs.source.result == 'success' && (needs.web.result == 'success' || needs.web.result == 'skipped') && github.event.inputs.mode != 'publish-only' && needs.source.outputs.no_changes != 'true' && needs.source.outputs.matrix != '{"include":[]}' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -165,6 +236,14 @@ jobs:
         with:
           name: native-component-plan
           path: artifacts
+      - name: Download the browser client bundle the daemon ships
+        if: contains(matrix.components, 'daemon')
+        uses: actions/download-artifact@v8
+        env:
+          NODE_OPTIONS: --no-deprecation
+        with:
+          name: native-web-bundle
+          path: .dev/build
       - name: Apply explicitly pinned packaging notice corrections
         if: env.NOTICE_SUPPLEMENT_SHA != ''
         shell: bash
@@ -505,7 +584,8 @@ jobs:
 
   finalize:
     needs: [source, native]
-    if: github.event.inputs.mode != 'publish-only' && needs.native.result == 'success' && needs.source.outputs.finalize != '{"include":[]}'
+    # An explicit status check: a skipped `web` job upstream would skip this job otherwise.
+    if: ${{ !cancelled() && github.event.inputs.mode != 'publish-only' && needs.native.result == 'success' && needs.source.outputs.finalize != '{"include":[]}' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false

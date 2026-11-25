@@ -63,6 +63,43 @@ pub fn release_identity() -> Result<Value> {
     )
 }
 
+/// Provenance `cargo xtask build-web` records beside its bundle. Under `PASEO_NATIVE_RELEASE=1`
+/// it carries the release identity, which release runtimes require of the bundle they ship.
+pub fn web_identity() -> Result<Value> {
+    let source = capture(command("git")?.args(["rev-parse", "HEAD"]))?;
+    let release = native_release_env();
+    let mut identity = json!({"schemaVersion":1,"version":version()?,"sourceSha":source,"release":release,"channel":null,"repository":null});
+    if release {
+        let expected = release_identity()?;
+        ensure!(
+            expected["sourceSha"] == source,
+            "PASEO_BUILD_SOURCE_SHA must identify the checked-out release source"
+        );
+        identity["channel"] = expected["channel"].clone();
+        identity["repository"] = expected["repository"].clone();
+    }
+    Ok(identity)
+}
+
+/// Release runtimes serve the web client, so they need the bundle built from their own source.
+fn verify_release_web(web: &Path, native: &Value) -> Result<()> {
+    let identity = read_json(&web_build_identity()?).context(
+        "Release runtimes include the web client: run cargo xtask build-web with the release environment first",
+    )?;
+    ensure!(
+        web.is_dir()
+            && identity["schemaVersion"] == 1
+            && identity["release"] == true
+            && ["version", "sourceSha", "channel", "repository"]
+                .iter()
+                .all(|key| identity[key] == native[key])
+            && identity["bundleSha256"] == tree_digest(web)?,
+        "The web client bundle in {} was not built from this release source; rebuild it with cargo xtask build-web",
+        web.display()
+    );
+    Ok(())
+}
+
 pub fn directory(profile: &str) -> Result<PathBuf> {
     ensure!(
         matches!(profile, "debug" | "dev-fast" | "release"),
@@ -375,6 +412,10 @@ pub fn bundle_raw_runtime(destination: &Path, profile: &str, kind: &str) -> Resu
     chmod(&destination.join(executable()), 0o755)?;
     copy_tree(&build.directory.join("skills"), &destination.join("skills"))?;
     let web = web_output()?;
+    // Container images ship no web client.
+    if build.identity["release"] == true && kind != "container" {
+        verify_release_web(&web, &build.identity)?;
+    }
     if web.is_dir() {
         copy_tree(&web, &destination.join("web"))?;
     }

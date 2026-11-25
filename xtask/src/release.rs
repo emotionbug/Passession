@@ -422,6 +422,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 })
                 .collect::<Result<_>>()?;
             p["finalize"] = finalize_matrix(&matrix);
+            // One job builds the browser client bundle that every daemon component ships.
+            p["web"] = json!(matrix.iter().any(|entry: &Value| {
+                let daemon = paseo_protocol::components::ComponentId::Daemon.as_str();
+                entry["components"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id == daemon))
+            }));
             p["matrix"] = json!({"include":matrix});
             p["expected"] = json!(changed);
             p["recovery"] = json!(

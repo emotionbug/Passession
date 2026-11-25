@@ -97,7 +97,7 @@ A notification click or agent link raises the app and routes into the first wind
 
 Host Overview → Host Configuration → **Enable web UI** sets `daemon.web.enabled` (off by default). The daemon applies changes without restarting. `PASEO_WEB_ENABLED` overrides the persisted setting for the lifetime of the process.
 
-The daemon serves the Makepad WebAssembly client at `/` on its existing HTTP listener. `cargo xtask build-web` builds the release bundle in `.dev/build/web`; daemon runtime staging copies it to `web/` beside the executable when present. Set `PASEO_WEB_DIR` to an absolute bundle path for development. A daemon-only runtime without those assets still works; its web entry point returns 404 even if enabled.
+The daemon serves the Makepad WebAssembly client at `/` on its existing HTTP listener. `cargo xtask build-web` builds the release bundle in `.dev/build/web` and records its version, source commit and digest in `.dev/build/web-build.json`; daemon runtime staging copies the bundle to `web/` beside the executable. Release runtimes (the desktop apps' bundled daemon and the standalone daemon packages) accept only a bundle built from their own release source; the Docker image ships none. Set `PASEO_WEB_DIR` to an absolute bundle path for development. A daemon runtime without those assets still works; its web entry point returns 404 even if enabled.
 
 The static bundle is public on allowed hosts. All browser control goes through the same-origin `/ws` connection with the existing `hello` authentication. For password-protected access, use TLS or a trusted network. See the [security policy](../SECURITY.md#browser-ui).
 

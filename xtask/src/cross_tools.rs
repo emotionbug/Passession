@@ -7,7 +7,6 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -15,7 +14,6 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use walkdir::WalkDir;
 
 #[cfg(unix)]
 use macos::extract_sdk as extract_apple_sdk;
@@ -274,30 +272,6 @@ fn legacy() -> Result<PathBuf> {
         .join(".cache/passession-tools/cross"))
 }
 
-fn tree_digest(path: &Path) -> Result<String> {
-    let mut hash = Sha256::new();
-    for entry in WalkDir::new(path).follow_links(false).sort_by_file_name() {
-        let entry = entry?;
-        let relative = entry
-            .path()
-            .strip_prefix(path)?
-            .to_str()
-            .context("SDK path is not UTF-8")?;
-        hash.update((relative.len() as u64).to_le_bytes());
-        hash.update(relative);
-        if entry.file_type().is_symlink() {
-            hash.update(b"link");
-            hash.update(fs::read_link(entry.path())?.as_os_str().as_encoded_bytes());
-        } else if entry.file_type().is_file() {
-            hash.update(b"file");
-            hash.update(sha256_file(entry.path())?);
-        } else {
-            ensure!(entry.file_type().is_dir(), "Unsupported SDK file");
-            hash.update(b"dir");
-        }
-    }
-    Ok(hex::encode(hash.finalize()))
-}
 fn prepared(directory: &Path, input: &str) -> Result<bool> {
     let state = directory.with_extension("verified.json");
     if !directory.is_dir() || !state.is_file() {

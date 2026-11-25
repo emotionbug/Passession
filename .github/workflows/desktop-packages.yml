@@ -29,6 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          # The daemon component ships the browser client (`cargo xtask build-web`).
+          targets: wasm32-wasip1
       # rust-cache prunes and restores target/; Go's read-only module tree there
       # broke both restores. setup-go caches these paths and xtask builds with them.
       - name: Keep Go caches outside the Cargo target directory
@@ -71,6 +74,11 @@ jobs:
         run: cargo xtask appimage-tools
         env:
           GH_TOKEN: ${{ github.token }}
+      - name: Build the browser client bundle the daemon ships
+        if: contains(fromJSON(steps.plan.outputs.build), 'daemon')
+        run: cargo xtask build-web
+        env:
+          PASEO_BUILD_SOURCE_SHA: ${{ github.sha }}
       - name: Build only planned components and bootstrap packages
         if: steps.plan.outputs.no_changes != 'true'
         run: cargo xtask components build --plan artifacts/component-plan.json --target linux-x64

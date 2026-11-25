@@ -258,6 +258,9 @@ fn within(path: &str, directory: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 fn metadata(root: &Path, target: &str) -> Result<Value> {
+    triple_metadata(root, triple(target)?)
+}
+fn triple_metadata(root: &Path, triple: &str) -> Result<Value> {
     let out = common::command(common::cargo())?
         .args([
             "metadata",
@@ -265,7 +268,7 @@ fn metadata(root: &Path, target: &str) -> Result<Value> {
             "--format-version",
             "1",
             "--filter-platform",
-            triple(target)?,
+            triple,
         ])
         .current_dir(root)
         .output()?;
@@ -292,6 +295,13 @@ fn compilation_features(
         ComponentId::Daemon => "paseo-daemon",
         _ => return Ok(None),
     };
+    cargo_features(root, metadata, package).map(Some)
+}
+fn cargo_features(
+    root: &Path,
+    metadata: &Value,
+    package: &str,
+) -> Result<BTreeMap<String, Value>> {
     let output = common::command(common::cargo())?
         .args([
             "tree",
@@ -354,95 +364,144 @@ fn compilation_features(
         );
     }
     ensure!(!resolved.is_empty(), "Empty standalone Cargo closure");
-    Ok(Some(
-        resolved
-            .into_iter()
-            .map(|(id, features)| (id, json!(features)))
-            .collect(),
-    ))
+    Ok(resolved
+        .into_iter()
+        .map(|(id, features)| (id, json!(features)))
+        .collect())
+}
+/// The browser client's Cargo graph. The daemon component ships its bundle
+/// (`cargo xtask build-web`), so the daemon's fingerprint covers this closure too.
+pub(crate) struct WebGraph {
+    metadata: Value,
+    resolved: Option<BTreeMap<String, Value>>,
+}
+impl WebGraph {
+    fn load(root: &Path, resolve: bool) -> Result<Self> {
+        let metadata = triple_metadata(root, crate::gui::WEB_TARGET)?;
+        let resolved = if resolve {
+            Some(cargo_features(root, &metadata, crate::gui::WEB_PACKAGE)?)
+        } else {
+            None
+        };
+        Ok(Self { metadata, resolved })
+    }
+}
+/// Source files and locked dependency identities of one Cargo root's closure.
+fn crate_inputs(
+    root: &Path,
+    all: &[String],
+    lock: &toml::Value,
+    metadata: &Value,
+    root_name: &str,
+    resolved: Option<&BTreeMap<String, Value>>,
+    selected: &mut BTreeSet<String>,
+) -> Result<Vec<Value>> {
+    let mut dependencies = Vec::new();
+    for (package, node) in closure(metadata, root_name, false)? {
+        let package_id = package["id"].as_str().context("Missing package ID")?;
+        if resolved.is_some_and(|features| !features.contains_key(package_id)) {
+            continue;
+        }
+        let features = resolved
+            .and_then(|features| features.get(package_id))
+            .unwrap_or(&node["features"]);
+        if package["source"].is_null() {
+            // Windows canonical paths carry a verbatim prefix that Cargo
+            // metadata omits; compare both in canonical form.
+            let directory = Path::new(
+                package["manifest_path"]
+                    .as_str()
+                    .context("Missing manifest path")?,
+            )
+            .parent()
+            .context("Missing crate directory")?
+            .canonicalize()?;
+            let relative = directory
+                .strip_prefix(root)
+                .context("Path dependency outside repository")?
+                .to_str()
+                .context("Non-UTF8 crate path")?
+                .replace('\\', "/");
+            selected.extend(
+                all.iter()
+                    .filter(|p| {
+                        within(p, &relative)
+                            && !documentation(p)
+                            && !within(p, "packages/tailnet/native")
+                    })
+                    .cloned(),
+            );
+            dependencies.push(json!({"path":relative,"name":package["name"],"features":features}));
+        } else {
+            let entry = lock["package"]
+                .as_array()
+                .context("Missing lockfile packages")?
+                .iter()
+                .find(|p| {
+                    p.get("name").and_then(toml::Value::as_str) == package["name"].as_str()
+                        && p.get("version").and_then(toml::Value::as_str)
+                            == package["version"].as_str()
+                        && p.get("source").and_then(toml::Value::as_str)
+                            == package["source"].as_str()
+                })
+                .context("Resolved dependency missing from lockfile")?;
+            if package["source"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("registry+")
+            {
+                ensure!(
+                    entry
+                        .get("checksum")
+                        .and_then(toml::Value::as_str)
+                        .is_some(),
+                    "Registry dependency has no checksum"
+                );
+            }
+            dependencies.push(json!({"name":package["name"],"version":package["version"],"source":package["source"],"checksum":entry.get("checksum"),"features":features}));
+        }
+    }
+    Ok(dependencies)
 }
 fn component_inputs(
     root: &Path,
     all: &[String],
     metadata: &Value,
+    web: &WebGraph,
     target: &str,
     id: ComponentId,
     resolved: Option<&BTreeMap<String, Value>>,
 ) -> Result<(BTreeSet<String>, Value)> {
     let mut selected = BTreeSet::new();
     let mut dependencies = Vec::new();
+    let mut web_dependencies = Vec::new();
     let rust_component = matches!(id, ComponentId::App | ComponentId::Daemon);
-    if matches!(id, ComponentId::App | ComponentId::Daemon) {
+    if rust_component {
         let root_name = if id == ComponentId::App {
             "paseo-gui"
         } else {
             "paseo-daemon"
         };
         let lock: toml::Value = toml::from_str(&fs::read_to_string(root.join("Cargo.lock"))?)?;
-        for (package, node) in closure(metadata, root_name, false)? {
-            let package_id = package["id"].as_str().context("Missing package ID")?;
-            if resolved.is_some_and(|features| !features.contains_key(package_id)) {
-                continue;
-            }
-            let features = resolved
-                .and_then(|features| features.get(package_id))
-                .unwrap_or(&node["features"]);
-            if package["source"].is_null() {
-                // Windows canonical paths carry a verbatim prefix that Cargo
-                // metadata omits; compare both in canonical form.
-                let directory = Path::new(
-                    package["manifest_path"]
-                        .as_str()
-                        .context("Missing manifest path")?,
-                )
-                .parent()
-                .context("Missing crate directory")?
-                .canonicalize()?;
-                let relative = directory
-                    .strip_prefix(root)
-                    .context("Path dependency outside repository")?
-                    .to_str()
-                    .context("Non-UTF8 crate path")?
-                    .replace('\\', "/");
-                selected.extend(
-                    all.iter()
-                        .filter(|p| {
-                            within(p, &relative)
-                                && !documentation(p)
-                                && !within(p, "packages/tailnet/native")
-                        })
-                        .cloned(),
-                );
-                dependencies
-                    .push(json!({"path":relative,"name":package["name"],"features":features}));
-            } else {
-                let entry = lock["package"]
-                    .as_array()
-                    .context("Missing lockfile packages")?
-                    .iter()
-                    .find(|p| {
-                        p.get("name").and_then(toml::Value::as_str) == package["name"].as_str()
-                            && p.get("version").and_then(toml::Value::as_str)
-                                == package["version"].as_str()
-                            && p.get("source").and_then(toml::Value::as_str)
-                                == package["source"].as_str()
-                    })
-                    .context("Resolved dependency missing from lockfile")?;
-                if package["source"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .starts_with("registry+")
-                {
-                    ensure!(
-                        entry
-                            .get("checksum")
-                            .and_then(toml::Value::as_str)
-                            .is_some(),
-                        "Registry dependency has no checksum"
-                    );
-                }
-                dependencies.push(json!({"name":package["name"],"version":package["version"],"source":package["source"],"checksum":entry.get("checksum"),"features":features}));
-            }
+        dependencies = crate_inputs(
+            root,
+            all,
+            &lock,
+            metadata,
+            root_name,
+            resolved,
+            &mut selected,
+        )?;
+        if id == ComponentId::Daemon {
+            web_dependencies = crate_inputs(
+                root,
+                all,
+                &lock,
+                &web.metadata,
+                crate::gui::WEB_PACKAGE,
+                web.resolved.as_ref(),
+                &mut selected,
+            )?;
         }
     }
     for path in all {
@@ -500,6 +559,8 @@ fn component_inputs(
             ComponentId::Daemon => {
                 path == "xtask/src/build.rs"
                     || path == "xtask/src/libraries.rs"
+                    // `cargo xtask build-web` recipe for the bundled browser client.
+                    || path == "xtask/src/gui.rs"
                     || path.starts_with("skills/")
                     || path.starts_with("packaging/cargo-notice-")
             }
@@ -560,10 +621,12 @@ fn component_inputs(
                     || (name.starts_with("CARGO_TARGET_") && name.ends_with("_LINKER")))
         })
         .collect();
-    Ok((
-        selected,
-        json!({"target":target,"triple":triple(target)?,"component":id,"abi":id.initial_abi_version(),"profile":"release","dependencies":dependencies,"environment":environment,"nativeRelease":true,"channel":release::channel(&release::version(&common::version()?)?),"repository":release::REPOSITORY}),
-    ))
+    let mut context = json!({"target":target,"triple":triple(target)?,"component":id,"abi":id.initial_abi_version(),"profile":"release","dependencies":dependencies,"environment":environment,"nativeRelease":true,"channel":release::channel(&release::version(&common::version()?)?),"repository":release::REPOSITORY});
+    if id == ComponentId::Daemon {
+        context["web"] =
+            json!({"triple":crate::gui::WEB_TARGET,"dependencies":web_dependencies});
+    }
+    Ok((selected, context))
 }
 fn package_path(platform: &str, path: &str) -> bool {
     let Some(relative) = path.strip_prefix("packaging/") else {
@@ -677,13 +740,14 @@ pub(crate) fn create(
         String::from_utf8(command(&root, &["rev-parse", "HEAD"])?)?.trim(),
     );
     let mut plans = Vec::new();
+    let web = WebGraph::load(&root, true)?;
     for target in targets {
         let graph = metadata(&root, target)?;
         let mut inputs = BTreeMap::new();
         for id in supported(target) {
             let resolved = compilation_features(&root, &graph, id)?;
             let (paths, context) =
-                component_inputs(&root, &all, &graph, target, id, resolved.as_ref())?;
+                component_inputs(&root, &all, &graph, &web, target, id, resolved.as_ref())?;
             inputs.insert(id, fingerprint(&root, &paths, &context)?);
         }
         plans.push(decide(
@@ -728,11 +792,19 @@ pub(crate) fn validate_inputs(plan: &Plan, target: &TargetPlan) -> Result<()> {
         "Plan checkout/collection mismatch"
     );
     let graph = metadata(&root, &target.target)?;
+    let web = WebGraph::load(&root, true)?;
     let all = files(&root)?;
     for id in supported(&target.target) {
         let resolved = compilation_features(&root, &graph, id)?;
-        let (paths, context) =
-            component_inputs(&root, &all, &graph, &target.target, id, resolved.as_ref())?;
+        let (paths, context) = component_inputs(
+            &root,
+            &all,
+            &graph,
+            &web,
+            &target.target,
+            id,
+            resolved.as_ref(),
+        )?;
         ensure!(
             target.inputs.get(&id) == Some(&fingerprint(&root, &paths, &context)?),
             "Component build inputs changed: {id}"
@@ -847,19 +919,21 @@ fn ci_decisions(root: &Path, changed: &BTreeSet<String>) -> Result<Value> {
         );
     }
     let graph = metadata(root, "linux-x64")?;
+    let web = WebGraph::load(root, false)?;
     let all: Vec<_> = files(root)?
         .into_iter()
         .chain(effective.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    ci_decisions_for_inputs(root, &effective, &graph, &all)
+    ci_decisions_for_inputs(root, &effective, &graph, &web, &all)
 }
 
 fn ci_decisions_for_inputs(
     root: &Path,
     effective: &BTreeSet<String>,
     graph: &Value,
+    web: &WebGraph,
     all: &[String],
 ) -> Result<Value> {
     let global = effective.iter().any(|p| {
@@ -908,7 +982,7 @@ fn ci_decisions_for_inputs(
         }
     }
     let affects = |id| -> Result<bool> {
-        let (paths, _) = component_inputs(root, all, graph, "linux-x64", id, None)?;
+        let (paths, _) = component_inputs(root, all, graph, web, "linux-x64", id, None)?;
         Ok(
             (global && matches!(id, ComponentId::App | ComponentId::Daemon))
                 || !paths.is_disjoint(effective),
@@ -1117,6 +1191,7 @@ mod tests {
             "packages/daemon/src/main.rs",
             "packages/client/src/lib.rs",
             "packages/tailnet/src/lib.rs",
+            "packages/gui-web/src/lib.rs",
             "packages/gui-platform/ios/Info.plist",
             "xtask/src/gui.rs",
             "packages/tailnet/native/engine.go",
@@ -1155,12 +1230,22 @@ mod tests {
             {"id":"tailnet","features":[],"deps":[]},
             {"id":"platform","features":[],"deps":[]}
         ]}});
+        // The browser client's own graph: `paseo-gui-web` links the GUI only on wasm32.
+        let mut web = graph.clone();
+        web["packages"].as_array_mut().unwrap().push(json!({"id":"web","name":"paseo-gui-web","source":null,"manifest_path":root.join("packages/gui-web/Cargo.toml")}));
+        web["resolve"]["nodes"].as_array_mut().unwrap().push(
+            json!({"id":"web","features":[],"deps":[{"pkg":"gui","dep_kinds":[{"kind":null}]}]}),
+        );
+        let web = WebGraph {
+            metadata: web,
+            resolved: None,
+        };
         let hashes = |target: &str| {
             supported(target)
                 .into_iter()
                 .map(|id| {
                     let (paths, context) =
-                        component_inputs(root, &all, &graph, target, id, None).unwrap();
+                        component_inputs(root, &all, &graph, &web, target, id, None).unwrap();
                     (id, fingerprint(root, &paths, &context).unwrap())
                 })
                 .collect::<BTreeMap<_, _>>()
@@ -1180,7 +1265,12 @@ mod tests {
                 vec![ComponentId::UpdateHelper],
             ),
             ("packages/app-updater/main_test.go", vec![]),
-            ("packages/gui/src/main.rs", vec![ComponentId::App]),
+            // The daemon ships the browser client built from the GUI.
+            (
+                "packages/gui/src/main.rs",
+                vec![ComponentId::App, ComponentId::Daemon],
+            ),
+            ("packages/gui-web/src/lib.rs", vec![ComponentId::Daemon]),
             ("packages/daemon/src/main.rs", vec![ComponentId::Daemon]),
             (
                 "packages/client/src/lib.rs",
@@ -1217,6 +1307,8 @@ mod tests {
                     || (target.starts_with("android-") && path == "xtask/src/gui.rs");
                 let expected = if tailnet {
                     vec![ComponentId::App, ComponentId::Tailnet]
+                } else if target == "linux-x64" {
+                    vec![ComponentId::App, ComponentId::Daemon]
                 } else {
                     vec![ComponentId::App]
                 };
@@ -1231,7 +1323,7 @@ mod tests {
             ("packages/app-updater/main_test.go", false, true, false),
         ] {
             let changed = BTreeSet::from([path.to_owned()]);
-            let plan = ci_decisions_for_inputs(root, &changed, &graph, &all).unwrap();
+            let plan = ci_decisions_for_inputs(root, &changed, &graph, &web, &all).unwrap();
             assert_eq!(plan["packages"], json!([]), "{path}");
             assert_eq!(plan["rust"], false, "{path}");
             assert_eq!(plan["gui"], false, "{path}");
@@ -1241,7 +1333,7 @@ mod tests {
             assert_eq!(plan["native"], native, "{path}");
         }
         let changed = BTreeSet::from(["packages/tailnet/src/lib.rs".to_owned()]);
-        let plan = ci_decisions_for_inputs(root, &changed, &graph, &all).unwrap();
+        let plan = ci_decisions_for_inputs(root, &changed, &graph, &web, &all).unwrap();
         assert_eq!(
             plan["packages"],
             json!(["paseo-client", "paseo-daemon", "paseo-gui", "paseo-tailnet"])

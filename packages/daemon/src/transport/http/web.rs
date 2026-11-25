@@ -1,9 +1,12 @@
 use super::{Body, HeaderValue, Method, Response, StatusCode, plain};
+use bytes::Bytes;
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tokio::fs;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 
 pub(super) fn reserved_path(path: &str) -> bool {
@@ -105,7 +108,13 @@ async fn open_asset(
 ) -> Option<Response<Body>> {
     let relative = asset_path(path)?;
     let root = fs::canonicalize(root?).await.ok()?;
-    let (file, metadata) = contained_file(&root, &root.join(&relative)).await?;
+    let file = root.join(&relative);
+    // `cargo xtask build-web` stores large compressible assets only as `<file>.gz`.
+    let mut sibling = file.clone().into_os_string();
+    sibling.push(".gz");
+    let raw = contained_file(&root, &file).await;
+    let gzip = contained_file(&root, Path::new(&sibling)).await;
+    let tag = entity_tag(&raw.as_ref().or(gzip.as_ref())?.1);
     let mime = match relative
         .extension()
         .and_then(|extension| extension.to_str())
@@ -119,7 +128,6 @@ async fn open_asset(
             .first_raw()
             .unwrap_or("application/octet-stream"),
     };
-    let tag = entity_tag(&metadata);
     let unchanged = header(headers, "if-none-match")
         .split(',')
         .map(str::trim)
@@ -134,25 +142,55 @@ async fn open_asset(
             .body(Body::empty())
             .ok();
     }
-    // `cargo xtask build-web` writes `<file>.gz` next to large assets.
-    let mut compressed = None;
-    if accepts_gzip(headers) {
-        let mut sibling = file.clone().into_os_string();
-        sibling.push(".gz");
-        compressed = contained_file(&root, Path::new(&sibling)).await;
-    }
-    let (served, length, response) = match compressed {
-        Some((gzip, gzip_metadata)) => (
+    // `None` length: a gzip-only asset decoded while it streams.
+    let (served, length, response) = match (raw, gzip) {
+        (_, Some((gzip, metadata))) if accepts_gzip(headers) => (
             gzip,
-            gzip_metadata.len(),
+            Some(metadata.len()),
             response.header("content-encoding", "gzip"),
         ),
-        None => (file, metadata.len(), response),
+        (Some((file, metadata)), _) => (file, Some(metadata.len()), response),
+        (None, Some((gzip, _))) => (gzip, None, response),
+        (None, None) => return None,
     };
     let body = if method == Method::HEAD {
         Body::empty()
     } else {
-        Body::from_stream(ReaderStream::new(fs::File::open(&served).await.ok()?))
+        let opened = fs::File::open(&served).await.ok()?;
+        match length {
+            Some(_) => Body::from_stream(ReaderStream::new(opened)),
+            None => gunzip(opened.into_std().await),
+        }
     };
-    response.header("content-length", length).body(body).ok()
+    match length {
+        Some(length) => response.header("content-length", length),
+        None => response,
+    }
+    .body(body)
+    .ok()
+}
+
+/// Decodes a gzip-only asset for a client that refuses gzip. A corrupt file ends the body
+/// with an error, so the transfer fails instead of delivering a truncated asset.
+fn gunzip(file: std::fs::File) -> Body {
+    let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+    tokio::task::spawn_blocking(move || {
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        loop {
+            let mut chunk = vec![0; 64 * 1024];
+            let item = match decoder.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(read) => {
+                    chunk.truncate(read);
+                    Ok(Bytes::from(chunk))
+                }
+                Err(error) => Err(error),
+            };
+            let failed = item.is_err();
+            if sender.blocking_send(item).is_err() || failed {
+                return;
+            }
+        }
+    });
+    Body::from_stream(ReceiverStream::new(receiver))
 }

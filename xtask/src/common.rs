@@ -61,6 +61,41 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
+/// Digest of a directory tree's names, file contents and symlink targets. Relative paths use
+/// `/` on every host, so a tree hashed on Linux verifies on Windows.
+pub fn tree_digest(path: &Path) -> Result<String> {
+    let mut hash = Sha256::new();
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry?;
+        let relative = entry
+            .path()
+            .strip_prefix(path)?
+            .to_str()
+            .with_context(|| format!("Path is not UTF-8: {}", entry.path().display()))?
+            .replace('\\', "/");
+        hash.update((relative.len() as u64).to_le_bytes());
+        hash.update(&relative);
+        if entry.file_type().is_symlink() {
+            hash.update(b"link");
+            hash.update(fs::read_link(entry.path())?.as_os_str().as_encoded_bytes());
+        } else if entry.file_type().is_file() {
+            hash.update(b"file");
+            hash.update(sha256_file(entry.path())?);
+        } else {
+            ensure!(
+                entry.file_type().is_dir(),
+                "Unsupported file type: {}",
+                entry.path().display()
+            );
+            hash.update(b"dir");
+        }
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
 pub fn version() -> Result<String> {
     let manifest = read_json(&packaging()?.join("release.json"))?;
     let value = manifest["version"]
@@ -178,6 +213,10 @@ pub fn gui_output() -> Result<PathBuf> {
 /// Checkout-local browser bundle shared by daemon runtime staging.
 pub fn web_output() -> Result<PathBuf> {
     Ok(root()?.join(".dev/build/web"))
+}
+/// Provenance of the bundle in `web_output()`, kept outside the directory the daemon serves.
+pub fn web_build_identity() -> Result<PathBuf> {
+    Ok(root()?.join(".dev/build/web-build.json"))
 }
 pub fn release() -> Result<PathBuf> {
     Ok(root()?.join("artifacts/native"))
