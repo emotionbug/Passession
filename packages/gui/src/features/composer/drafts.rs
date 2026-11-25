@@ -307,6 +307,7 @@ impl DraftStore {
         self.save(Some(key), delivery);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn append_images(&mut self, key: &str, images: Vec<Value>) {
         if images.is_empty() {
             return;

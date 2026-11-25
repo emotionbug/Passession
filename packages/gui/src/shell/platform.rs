@@ -108,6 +108,7 @@ pub fn safe_insets() -> paseo_gui_platform::SafeInsets {
         })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn pick_image_file() -> Option<PlatformRequestId> {
     handle().map(|h| {
         h.pick_files(paseo_gui_platform::PickFilesOptions {

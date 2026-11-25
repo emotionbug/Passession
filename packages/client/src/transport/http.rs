@@ -1,9 +1,14 @@
-//! Bounded auxiliary host resources over the same authenticated stream/TLS connector.
+//! Bounded auxiliary host resources.
 use anyhow::{Result, bail, ensure};
+#[cfg(not(target_arch = "wasm32"))]
 use bytes::Bytes;
+#[cfg(not(target_arch = "wasm32"))]
 use http_body_util::{BodyExt, Empty};
+#[cfg(not(target_arch = "wasm32"))]
 use hyper::{Request, header};
+#[cfg(not(target_arch = "wasm32"))]
 use hyper_util::rt::TokioIo;
+#[cfg(not(target_arch = "wasm32"))]
 use paseo_tailnet::Proxy;
 use tokio_util::sync::CancellationToken;
 
@@ -19,14 +24,18 @@ pub enum HttpOutcome {
 }
 
 /// GET without automatic redirects, proxy discovery, cookies or ambient credentials.
+///
+/// A browser cannot read the redirect target from a manual Fetch response, so it
+/// refuses redirects even when `allow_redirect` is set.
 /// A supplied proxy is exclusive: failure can never select a normal-network connection.
 pub async fn get(
     url: &str,
-    proxy: Option<Proxy>,
+    #[cfg(not(target_arch = "wasm32"))] proxy: Option<Proxy>,
     password: Option<&str>,
     max_bytes: usize,
     cancel: CancellationToken,
-    allow_redirect: bool,
+    #[cfg(not(target_arch = "wasm32"))] allow_redirect: bool,
+    #[cfg(target_arch = "wasm32")] _allow_redirect: bool,
 ) -> Result<HttpOutcome> {
     let url = url::Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid resource URL"))?;
     ensure!(
@@ -41,6 +50,21 @@ pub async fn get(
         max_bytes > 0 && max_bytes <= 32 * 1024 * 1024,
         "Invalid resource byte limit"
     );
+    #[cfg(target_arch = "wasm32")]
+    return browser_get(&url, password, max_bytes, cancel).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    native_get(url, proxy, password, max_bytes, cancel, allow_redirect).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn native_get(
+    url: url::Url,
+    proxy: Option<Proxy>,
+    password: Option<&str>,
+    max_bytes: usize,
+    cancel: CancellationToken,
+    allow_redirect: bool,
+) -> Result<HttpOutcome> {
     let work = async {
         let stream = super::network::connect(&url, proxy.as_ref()).await?;
         let (mut sender, connection) =
@@ -125,7 +149,50 @@ pub async fn get(
     }
 }
 
-#[cfg(test)]
+#[cfg(target_arch = "wasm32")]
+async fn browser_get(
+    url: &url::Url,
+    password: Option<&str>,
+    max_bytes: usize,
+    cancel: CancellationToken,
+) -> Result<HttpOutcome> {
+    let work = async {
+        let authorization;
+        let header;
+        let headers: &[(&str, &str)] = if let Some(password) = password {
+            ensure!(
+                password.bytes().all(|b| (0x21..=0x7e).contains(&b)),
+                "Invalid resource authentication"
+            );
+            authorization = format!("Bearer {password}");
+            header = [("Authorization", authorization.as_str())];
+            &header
+        } else {
+            &[]
+        };
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let _fetch = paseo_browser::fetch(url.as_str(), headers, max_bytes, move |response| {
+            let _ = reply.send(response);
+        });
+        let response = received.await??;
+        ensure!(
+            (200..300).contains(&response.status),
+            "Resource returned HTTP {}; redirects are not followed",
+            response.status
+        );
+        Ok(HttpOutcome::Body(HostHttpResponse {
+            bytes: response.body,
+            content_type: (!response.content_type.is_empty()).then_some(response.content_type),
+        }))
+    };
+    tokio::select! { biased;
+        _ = cancel.cancelled() => bail!("Resource request cancelled"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(30), work) =>
+            result.map_err(|_| anyhow::anyhow!("Resource request timed out"))?,
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use tokio::{

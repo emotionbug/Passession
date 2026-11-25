@@ -4,13 +4,16 @@ use serde_json::{Value, json};
 
 use crate::features::settings::host::Status;
 use crate::features::settings::i18n::{t, ta};
-use crate::features::settings::json::{get, scalar_text, str_of};
+use crate::features::settings::json::get;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::features::settings::json::{scalar_text, str_of};
 use crate::features::settings::platform::{self, DESKTOP};
 use crate::features::settings::rpc::{Env, ReqError, handler};
 use crate::features::settings::state::Settings;
 use crate::features::settings::ui::draw::Icon;
 use crate::features::settings::ui::kit::{Ctl, Ui, Variant, button, row, switch};
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct LocalDaemonState {
     pub settings: Value,
@@ -48,6 +51,7 @@ pub struct DiagnosticsState {
 
 // ------------------------------------------------------------ local daemon
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn ensure_local_daemon(s: &mut Settings, env: &mut Env) {
     if s.local_daemon.loaded || s.local_daemon.loading || !DESKTOP {
         return;
@@ -55,6 +59,7 @@ pub fn ensure_local_daemon(s: &mut Settings, env: &mut Env) {
     load_local_daemon(s, env);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_local_daemon(s: &mut Settings, env: &mut Env) {
     let state = &mut s.local_daemon;
     state.loading = true;
@@ -67,6 +72,7 @@ fn load_local_daemon(s: &mut Settings, env: &mut Env) {
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn refresh_local_daemon(s: &mut Settings, env: &mut Env) {
     s.desktop(env, "desktop_daemon_status", json!({}), |s, _, result| {
         let state = &mut s.local_daemon;
@@ -79,6 +85,7 @@ pub(crate) fn refresh_local_daemon(s: &mut Settings, env: &mut Env) {
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn set_local_autostart(s: &mut Settings, env: &mut Env, enabled: bool) {
     let state = &mut s.local_daemon;
     if !state.settings.is_object() || state.saving {
@@ -106,6 +113,7 @@ fn set_local_autostart(s: &mut Settings, env: &mut Env, enabled: bool) {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn start_local_daemon(s: &mut Settings, env: &mut Env) {
     let state = &mut s.local_daemon;
     if state.starting || matches!(str_of(&state.daemon, "status"), "starting" | "running") {
@@ -124,6 +132,7 @@ fn start_local_daemon(s: &mut Settings, env: &mut Env) {
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn draw_local_daemon(ui: &mut Ui, s: &Settings, has_local_host: bool) {
     let state = &s.local_daemon;
     ui.section_title(&t("desktop.daemon.title"), None, None);
@@ -524,6 +533,7 @@ fn run_diagnostic(s: &mut Settings, env: &mut Env) {
             entry
         }).collect::<Vec<_>>(),
     });
+    #[cfg(not(target_arch = "wasm32"))]
     let desktop_steps: Vec<(&'static str, &'static str)> =
         if DESKTOP && platform::desktop_available() {
             vec![
@@ -540,9 +550,13 @@ fn run_diagnostic(s: &mut Settings, env: &mut Env) {
         .filter(|h| h.status == Status::Connected)
         .map(|h| h.server_id.clone())
         .collect();
+    #[cfg(not(target_arch = "wasm32"))]
     diagnostic_desktop_step(s, env, report, desktop_steps, connected);
+    #[cfg(target_arch = "wasm32")]
+    diagnostic_host_step(s, env, report, connected);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn diagnostic_desktop_step(
     s: &mut Settings,
     env: &mut Env,
@@ -642,7 +656,7 @@ pub fn draw_diagnostics(ui: &mut Ui, s: &Settings) {
     ui.gap(24.0);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use makepad_widgets::{Cx, Event};

@@ -5,23 +5,31 @@
 //! failed or cancelled transfer never replaces a saved file and its staging directory is removed.
 //! An unsaved modified buffer is written as the current bytes instead of downloading. Mobile
 //! always shares.
+//! In the browser the completed bytes go directly to the download API.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use makepad_widgets::*;
 use paseo_gui_core::{CoreHandle, RequestId};
-use serde_json::{Value, json};
+#[cfg(not(target_arch = "wasm32"))]
+use serde_json::Value;
+use serde_json::json;
 
-use super::path::{remote_basename, safe_local_name};
+use super::path::remote_basename;
+#[cfg(not(target_arch = "wasm32"))]
+use super::path::safe_local_name;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferMode {
     Save,
     Share,
+    #[cfg(not(target_arch = "wasm32"))]
     Open,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 pub enum TransferStage {
     /// Waiting for the platform save dialog.
@@ -37,16 +45,24 @@ pub struct Transfer {
     pub cwd: String,
     pub path: String,
     pub name: String,
+    #[cfg(not(target_arch = "wasm32"))]
     pub mode: TransferMode,
     pub mime: Option<String>,
     pub current_bytes: Option<Arc<Vec<u8>>>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub destination: Option<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub staging: PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
     pub stage: TransferStage,
+    #[cfg(target_arch = "wasm32")]
+    pub download: Option<std::sync::mpsc::Receiver<Arc<Vec<u8>>>>,
     pub received: u64,
     pub total: u64,
     pub request: Option<RequestId>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub platform_request: Option<u64>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub cancelled: bool,
 }
 
@@ -65,11 +81,13 @@ impl Transfer {
         host_id: &str,
         cwd: &str,
         path: &str,
-        mode: TransferMode,
+        #[cfg(not(target_arch = "wasm32"))] mode: TransferMode,
+        #[cfg(target_arch = "wasm32")] _mode: TransferMode,
         mime: Option<String>,
         current_bytes: Option<Arc<Vec<u8>>>,
     ) -> Transfer {
         let name = remote_basename(path, Some(cwd));
+        #[cfg(not(target_arch = "wasm32"))]
         let staging = staging_path(&name);
         Transfer {
             id,
@@ -78,22 +96,31 @@ impl Transfer {
             cwd: cwd.to_owned(),
             path: path.to_owned(),
             name,
+            #[cfg(not(target_arch = "wasm32"))]
             mode,
             mime,
             current_bytes,
+            #[cfg(not(target_arch = "wasm32"))]
             destination: None,
+            #[cfg(not(target_arch = "wasm32"))]
             staging,
+            #[cfg(not(target_arch = "wasm32"))]
             stage: TransferStage::Running,
+            #[cfg(target_arch = "wasm32")]
+            download: None,
             received: 0,
             total: 0,
             request: None,
+            #[cfg(not(target_arch = "wasm32"))]
             platform_request: None,
+            #[cfg(not(target_arch = "wasm32"))]
             cancelled: false,
         }
     }
 
     /// Starts the download (or the current-bytes write) as one core operation; progress
     /// arrives through `progress`. The response is `{"path", "mime", "saved"}`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn run(&mut self, core: &CoreHandle, progress: ToUISender<Progress>) {
         self.stage = TransferStage::Running;
         let id = self.id;
@@ -154,8 +181,52 @@ impl Transfer {
             Ok(json!({ "path": staging.to_string_lossy(), "mime": mime, "saved": false }))
         }));
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn run(&mut self, core: &CoreHandle, progress: ToUISender<Progress>) {
+        let id = self.id;
+        let (cwd, path) = (self.cwd.clone(), self.path.clone());
+        let current = self.current_bytes.take();
+        let mime = self.mime.clone();
+        let (send, recv) = std::sync::mpsc::channel();
+        self.download = Some(recv);
+        self.request = Some(core.operation(&self.host_id, move |client| async move {
+            let report = |received, total| {
+                let _ = progress.send(Progress {
+                    id,
+                    received,
+                    total,
+                });
+            };
+            let (bytes, mime) = match current {
+                Some(bytes) => {
+                    let size = bytes.len() as u64;
+                    report(size, size);
+                    (bytes, mime)
+                }
+                None => {
+                    let mut bytes = Vec::new();
+                    let metadata =
+                        super::service::download_to(&client, &cwd, &path, &mut bytes, report)
+                            .await?;
+                    let mime = mime.or_else(|| metadata["mime"].as_str().map(str::to_owned));
+                    (Arc::new(bytes), mime)
+                }
+            };
+            send.send(bytes)?;
+            Ok(json!({ "mime": mime }))
+        }));
+    }
+
+    pub fn is_running(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return matches!(self.stage, TransferStage::Running);
+        #[cfg(target_arch = "wasm32")]
+        true
+    }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn staging_path(name: &str) -> PathBuf {
     paseo_gui_platform::paths::app_paths()
         .temp_dir
@@ -165,6 +236,7 @@ fn staging_path(name: &str) -> PathBuf {
 }
 
 /// Removes a staging file's `transfer-*` directory.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn remove_staging(staging: &Path) {
     if let Some(directory) = staging.parent() {
         let _ = std::fs::remove_dir_all(directory);
@@ -172,6 +244,7 @@ pub fn remove_staging(staging: &Path) {
 }
 
 /// Removes staging off the GUI thread (cancel/failure cleanup).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn remove_staging_later(staging: PathBuf) {
     std::thread::Builder::new()
         .name("paseo-files-cleanup".into())

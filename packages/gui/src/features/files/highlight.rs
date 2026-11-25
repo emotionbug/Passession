@@ -1,4 +1,4 @@
-//! Syntax highlighting of source views on a native worker (`paseo-highlight`), replacing the
+//! Syntax highlighting of source views in background jobs (`paseo-highlight`), replacing the
 //! Flutter `SourceController` highlight pass. A document is parsed whole (never line by line);
 //! results carry each line's fingerprint so a row edited since the parse draws plain until the
 //! next result lands. One job per document runs at a time; the newest text is parsed next.
@@ -60,33 +60,30 @@ thread_local! {
 }
 
 fn spawn(sender: ToUISender<Done>, key: String, revision: u64, text: Arc<str>, filename: String) {
-    std::thread::Builder::new()
-        .name("paseo-files-highlight".into())
-        .spawn(move || {
-            let result = paseo_highlight::highlight_code(&text, &filename)
-                .map(|lines| {
-                    let raw: Vec<&str> = text.split('\n').collect();
-                    lines
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, tokens)| {
-                            let line = raw.get(index).copied().unwrap_or("");
-                            let runs = tokens
-                                .iter()
-                                .map(|token| (token.text.len(), token.style))
-                                .collect();
-                            (line_fingerprint(line), runs)
-                        })
-                        .collect()
-                })
-                .map_err(|error| error.to_string());
-            let _ = sender.send(Done {
-                key,
-                revision,
-                result,
-            });
-        })
-        .ok();
+    let _ = crate::common::background::spawn("paseo-files-highlight", move || {
+        let result = paseo_highlight::highlight_code(&text, &filename)
+            .map(|lines| {
+                let raw: Vec<&str> = text.split('\n').collect();
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, tokens)| {
+                        let line = raw.get(index).copied().unwrap_or("");
+                        let runs = tokens
+                            .iter()
+                            .map(|token| (token.text.len(), token.style))
+                            .collect();
+                        (line_fingerprint(line), runs)
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string());
+        let _ = sender.send(Done {
+            key,
+            revision,
+            result,
+        });
+    });
 }
 
 /// Asks for tokens of `text` at `revision` (no-op when that revision is parsed or queued).

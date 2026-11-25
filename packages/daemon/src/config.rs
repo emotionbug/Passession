@@ -187,6 +187,17 @@ impl ConfigService {
                 "Relay is controlled by a daemon launch override. Remove PASEO_RELAY_ENABLED or the relay CLI flag before changing it here."
             );
         }
+        if get(&patch, "web.enabled").is_some()
+            && before
+                .resolved
+                .pointer("/configReload/overrideControlledPaths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| paths.iter().any(|path| path == "daemon.web.enabled"))
+        {
+            bail!(
+                "Web UI is controlled by PASEO_WEB_ENABLED. Remove the launch override before changing this setting."
+            );
+        }
         let removed = transactions::removed(&patch);
         let next_mutable = transactions::next_mutable(&before.mutable, &patch, &removed);
         if next_mutable == before.mutable && removed.is_empty() {

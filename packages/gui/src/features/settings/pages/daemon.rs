@@ -667,6 +667,25 @@ pub fn draw_host_config(ui: &mut Ui, s: &Settings, host: &HostView) {
             Some(t("settingsNative.requireProtectedRelayHint")),
         );
     }
+    if let Some(on) = d.config["web"]["enabled"].as_bool() {
+        let hint = on.then(|| match host.server_info["webUiUrl"].as_str() {
+            Some(url) => ta("settings.host.daemon.webUi.listenUrl", &[("url", url)]),
+            None => t("settings.host.daemon.webUi.noHttpListener"),
+        });
+        toggle(
+            ui,
+            s,
+            host,
+            ConfigSwitch {
+                group: Some("web"),
+                key: "enabled",
+                fallback: false,
+                confirm: None,
+            },
+            t("settings.host.daemon.webUi.enable"),
+            hint,
+        );
+    }
     let limits_id = id.clone();
     let limits =
         (manage && !busy).then(|| handler(move |s, env| edit_network_limits(s, env, &limits_id)));

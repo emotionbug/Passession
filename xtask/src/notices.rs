@@ -134,7 +134,7 @@ fn package_notices(directory: &Path, license_file: Option<&str>) -> Result<Vec<N
         .collect()
 }
 
-fn dependency_closure<'a>(metadata: &'a Value, root: &str) -> Result<Vec<&'a Value>> {
+pub(crate) fn dependency_closure<'a>(metadata: &'a Value, root: &str) -> Result<Vec<&'a Value>> {
     let mut packages = BTreeMap::new();
     for pkg in array(metadata, "packages")? {
         ensure!(
@@ -752,13 +752,13 @@ pub struct ResourceDirectory {
 
 /// Only Makepad-aware packages register live files, so only their resource
 /// directories are reachable through `crate://` dependencies.
-pub fn gui_resource_directories(metadata: &Value) -> Result<Vec<ResourceDirectory>> {
+pub fn gui_resource_directories(metadata: &Value, root: &str) -> Result<Vec<ResourceDirectory>> {
     let root_package = array(metadata, "packages")?
         .iter()
-        .find(|pkg| pkg["name"] == "paseo-gui" && pkg["source"].is_null())
-        .context("Cargo metadata lacks workspace package paseo-gui")?;
+        .find(|pkg| pkg["name"] == root && pkg["source"].is_null())
+        .with_context(|| format!("Cargo metadata lacks workspace package {root}"))?;
     let mut result = Vec::new();
-    for pkg in std::iter::once(root_package).chain(dependency_closure(metadata, "paseo-gui")?) {
+    for pkg in std::iter::once(root_package).chain(dependency_closure(metadata, root)?) {
         let name = string(pkg, "name")?;
         let makepad = name.starts_with("makepad-")
             || array(pkg, "dependencies")?.iter().any(|dep| {
@@ -1030,16 +1030,13 @@ pub fn ensure_references_staged(packaged: &[PackagedResource]) -> Result<()> {
 /// packaged fonts and vendored platform components.
 pub fn render_app(
     metadata: &Value,
+    package: &str,
     packaged: &[PackagedResource],
     platform: &str,
 ) -> Result<String> {
     let root = root()?;
-    let gui = collect_document(metadata, "paseo-gui", GUI_BOUNDARY, &supplements(&root)?)?;
-    let native = native_document(
-        metadata,
-        "paseo-gui",
-        &read_json(&root.join(NATIVE_NOTICES))?,
-    )?;
+    let gui = collect_document(metadata, package, GUI_BOUNDARY, &supplements(&root)?)?;
+    let native = native_document(metadata, package, &read_json(&root.join(NATIVE_NOTICES))?)?;
     let resources = resource_document(
         &read_json(&root.join(RESOURCE_NOTICES))?,
         packaged,

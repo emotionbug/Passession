@@ -2,6 +2,37 @@ use super::{storage, transactions};
 use serde_json::json;
 
 #[test]
+fn web_ui_defaults_off_and_resolves_persisted_and_environment_settings() {
+    use super::{resolve, schema};
+    use std::{collections::BTreeMap, path::Path};
+
+    assert_eq!(schema::defaults()["daemon"]["web"]["enabled"], false);
+    let home = Path::new("/unused");
+    let resolve = |persisted: &_, env: &_| resolve::resolve(home, home, persisted, env).unwrap();
+    let defaults = resolve(&json!({}), &BTreeMap::new());
+    assert_eq!(resolve::mutable(&defaults)["web"], json!({"enabled":false}));
+
+    let patch = transactions::supported_patch(json!({"web":{"enabled":true}}), false).unwrap();
+    let mutable = transactions::next_mutable(&resolve::mutable(&defaults), &patch, &[]);
+    assert_eq!(
+        resolve::apply_mutable(&defaults, &mutable)["webEnabled"],
+        true
+    );
+    let persisted = transactions::persist_patch(&json!({}), &patch, &[]).unwrap();
+    assert_eq!(persisted["daemon"]["web"]["enabled"], true);
+    assert_eq!(resolve(&persisted, &BTreeMap::new())["webEnabled"], true);
+
+    let env = BTreeMap::from([("PASEO_WEB_ENABLED".into(), "off".into())]);
+    let overridden = resolve(&persisted, &env);
+    assert_eq!(overridden["webEnabled"], false);
+    assert_eq!(
+        overridden["configReload"]["overrideControlledPaths"],
+        json!(["daemon.web.enabled"])
+    );
+    assert!(transactions::supported_patch(json!({"web":{"enabled":"true"}}), false).is_err());
+}
+
+#[test]
 fn malformed_persisted_configuration_is_not_replaced() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("config.json");

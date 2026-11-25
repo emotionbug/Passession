@@ -2,13 +2,19 @@
 
 `libghostty-vt-sys/` is the published `libghostty-vt-sys` 0.2.2 crate
 (libghostty-rs commit `c9876b2902d5bb3e1f3d61b6395059f1e5e7b721`), patched into
-the workspace through `[patch.crates-io]`. `src/` and `LICENSE` are unmodified;
-the generated bindings still target Ghostty commit
+the workspace through `[patch.crates-io]`. The declarations and `LICENSE` are
+unmodified. The layout assertions use bindgen 0.72.1 values for both native and
+`wasm32-wasip1`, generated from Ghostty commit
 `a887df42c56f6de86c0fe6da9c4eeca37931e083`, which builds with Zig 0.15.2.
 
 `build.rs` changes:
 
 - `ZIG` selects the Zig executable when it is not on `PATH`.
+- Zig uses Cargo's job limit. For `wasm32-wasip1`, build Ghostty's freestanding
+  static WebAssembly archive. Its C ABI matches Rust's WASI target; Ghostty's
+  `wasm32-wasi` build instead reaches unsupported `std.posix.getenv` and
+  `realpath` calls in Zig 0.15.2. The build script copies headers from the
+  pinned source because Ghostty's Wasm install omits them.
 - Android slices pass `.24` as Zig's Android API level. Zig otherwise defaults
   bionic targets to API 29, above the client's minimum SDK.
 - iOS targets build through Ghostty's `-Demit-xcframework` path on a macOS host
@@ -49,5 +55,6 @@ The build clones Ghostty into Cargo's `OUT_DIR` (or `GHOSTTY_CACHE_DIR`) unless
 Ghostty's package dependencies unless `GHOSTTY_ZIG_SYSTEM_DIR` provides them.
 Both require network access on a cold build.
 
-To update, replace `src/` with the newer published crate, re-apply the build
-changes above and confirm the Zig version Ghostty's `build.zig.zon` requires.
+To update, replace `src/` with the newer published crate, regenerate layout
+assertions with bindgen for `--target=wasm32-wasip1`, re-apply the build changes
+above and confirm the Zig version Ghostty's `build.zig.zon` requires.

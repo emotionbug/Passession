@@ -38,6 +38,7 @@ const CONFIG_ENV: &[&str] = &[
     "PASEO_SERVICE_PROXY_LISTEN",
     "PASEO_SERVICE_PROXY_PUBLIC_BASE_URL",
     "PASEO_TRUSTED_PROXIES",
+    "PASEO_WEB_ENABLED",
     "PORT",
     "PASEO_NODE_ENV",
 ];
@@ -275,6 +276,7 @@ pub fn resolve_with_options(
         "trustedProxies": trusted_proxies(env).unwrap_or_else(|| defaulted(persisted, "/daemon/trustedProxies", json!(["loopback"]))),
         "mcpEnabled": present(cli, "/mcpEnabled").cloned().unwrap_or_else(|| defaulted(persisted, "/daemon/mcp/enabled", json!(true))),
         "mcpInjectIntoAgents": present(cli, "/mcpInjectIntoAgents").cloned().unwrap_or_else(|| defaulted(persisted, "/daemon/mcp/injectIntoAgents", json!(false))),
+        "webEnabled": boolean(ev(env, "PASEO_WEB_ENABLED")).map(Value::Bool).unwrap_or_else(|| defaulted(persisted, "/daemon/web/enabled", json!(false))),
         "git": git,
         "autoArchiveAfterMerge": defaulted(persisted, "/daemon/autoArchiveAfterMerge", json!(false)),
         "enableTerminalAgentHooks": defaulted(persisted, "/daemon/enableTerminalAgentHooks", json!(false)),
@@ -540,6 +542,10 @@ fn override_paths_for(env: &BTreeMap<String, String>) -> Vec<String> {
         boolean(ev(env, "PASEO_RELAY_ENABLED")).is_some(),
         "daemon.relay.enabled",
     );
+    add(
+        boolean(ev(env, "PASEO_WEB_ENABLED")).is_some(),
+        "daemon.web.enabled",
+    );
     let proxy = boolean(ev(env, "PASEO_SERVICE_PROXY_ENABLED"));
     add(proxy.is_some(), "daemon.serviceProxy.enabled");
     add(
@@ -560,6 +566,7 @@ pub fn mutable(resolved: &Value) -> Value {
     let mut value = json!({
         "relay": {"enabled":defaulted(resolved,"/relayEnabled",json!(true)),"requireProtectedSecurity":defaulted(resolved,"/relayRequireProtectedSecurity",json!(false))},
         "mcp": {"enabled":defaulted(resolved,"/mcpEnabled",json!(true)),"injectIntoAgents":defaulted(resolved,"/mcpInjectIntoAgents",json!(true))},
+        "web": {"enabled":defaulted(resolved,"/webEnabled",json!(false))},
         "cors": {},
         "trustedProxies":defaulted(resolved,"/trustedProxies",json!(["loopback"])),
         "git":defaulted(resolved,"/git",json!({"maxProcessesPerSecond":64,"maxProcessConcurrency":8})),
@@ -612,6 +619,7 @@ pub fn apply_mutable(resolved: &Value, mutable: &Value) -> Value {
         ),
         ("mcpEnabled", "/mcp/enabled"),
         ("mcpInjectIntoAgents", "/mcp/injectIntoAgents"),
+        ("webEnabled", "/web/enabled"),
         ("hostnames", "/hostnames"),
         ("corsAllowedOrigins", "/cors/allowedOrigins"),
         ("trustedProxies", "/trustedProxies"),

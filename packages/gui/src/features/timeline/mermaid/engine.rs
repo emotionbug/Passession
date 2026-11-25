@@ -1,12 +1,15 @@
 //! Worker-only, offline Mermaid rendering. Never export the renderer's raw SVG:
-//! usvg resolves OS fonts, shapes text and serializes a canonical, path-only SVG.
+//! usvg resolves outline fonts, shapes text and serializes a canonical, path-only SVG.
 //! The same tree supplies preview/PNG pixels. Diagram-controlled resource loading
 //! is disabled even though usvg normally permits local image paths.
 
 use std::sync::{Arc, Mutex};
+#[cfg(target_arch = "wasm32")]
+use std::{cell::OnceCell, rc::Rc};
 
 use image::ImageEncoder;
 use mermaid_rs_renderer::{self as mermaid, DiagramKind, LayoutConfig, Theme};
+#[cfg(not(target_arch = "wasm32"))]
 use paseo_gui_platform::appearance::{self as fonts, FontFace, FontRequest, Role};
 use resvg::{tiny_skia, usvg};
 
@@ -47,7 +50,7 @@ pub struct Rendered {
     pub rgba: Vec<u8>,
 }
 
-/// Blocking parse, native font resolution, shaping and rasterization. Call only
+/// Blocking parse, font resolution, shaping and rasterization. Call only
 /// from a worker. No network, browser, JavaScript or source-directed file reads.
 pub fn render(source: &str, dark: bool) -> Result<Rendered, Failure> {
     validate_source(source)?;
@@ -272,6 +275,7 @@ fn svg_document(svg: &str, outlined: bool) -> Result<usvg::roxmltree::Document<'
     Ok(doc)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn install_face(db: &mut usvg::fontdb::Database, face: &FontFace) -> Option<usvg::fontdb::ID> {
     if let Some(existing) = db.faces().find(|info| {
         info.index == face.index
@@ -285,6 +289,7 @@ fn install_face(db: &mut usvg::fontdb::Database, face: &FontFace) -> Option<usvg
         .find(|id| db.face(*id).is_some_and(|info| info.index == face.index))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn font_options(missing: Arc<Mutex<Option<char>>>) -> Result<usvg::Options<'static>, Failure> {
     let request = FontRequest {
         locale: sys_locale::get_locale().unwrap_or_default(),
@@ -321,15 +326,7 @@ fn font_options(missing: Arc<Mutex<Option<char>>>) -> Result<usvg::Options<'stat
     db.set_sans_serif_family(&family);
     db.set_serif_family(&family);
     let fallback = usvg::FontResolver::default_fallback_selector();
-    let mut options = usvg::Options {
-        font_family: family,
-        fontdb: Arc::new(db),
-        image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: Box::new(|_, _, _| None),
-            resolve_string: Box::new(|_, _| None),
-        },
-        ..Default::default()
-    };
+    let mut options = render_options(family, Arc::new(db));
     options.font_resolver.select_fallback = Box::new(move |character, excluded, db| {
         if let Some(id) = fallback(character, excluded, db) {
             return Some(id);
@@ -365,6 +362,100 @@ fn font_options(missing: Arc<Mutex<Option<char>>>) -> Result<usvg::Options<'stat
         None
     });
     Ok(options)
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static BUNDLED_FILES: OnceCell<Result<Vec<Rc<Vec<u8>>>, Failure>> = const { OnceCell::new() };
+    static BUNDLED_FONTS: OnceCell<Result<(String, Arc<usvg::fontdb::Database>), Failure>> =
+        const { OnceCell::new() };
+}
+
+/// Capture dependencies that Makepad loaded for the bundled theme. The queued renderer
+/// builds and caches its outline-font database, rather than parsing fonts during drawing.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn load_bundled_fonts(cx: &makepad_widgets::Cx) {
+    BUNDLED_FILES.with(|files| {
+        files.get_or_init(|| {
+            let registry = cx.live_registry.borrow();
+            let dependency = |crate_name, name| {
+                let directory = registry
+                    .crate_name_to_cargo_manifest_path(crate_name)
+                    .ok_or_else(|| font(format!("Missing bundled font: {name}")))?;
+                cx.get_dependency(&format!("{directory}/resources/{name}"))
+                    .map_err(font)
+            };
+            [
+                ("makepad_widgets", "IBMPlexSans-Text.ttf"),
+                ("makepad_widgets", "IBMPlexSans-SemiBold.ttf"),
+                ("makepad_widgets", "IBMPlexSans-Italic.ttf"),
+                ("makepad_widgets", "IBMPlexSans-BoldItalic.ttf"),
+                ("paseo_gui", "fonts/NotoSansKR-Regular.otf"),
+                ("paseo_gui", "fonts/NotoSansKR-Bold.otf"),
+                ("paseo_gui", "fonts/Jetendard-Regular.ttf"),
+            ]
+            .into_iter()
+            .map(|(crate_name, name)| dependency(crate_name, name))
+            .collect()
+        });
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bundled_database() -> Result<(String, Arc<usvg::fontdb::Database>), Failure> {
+    BUNDLED_FILES.with(|files| {
+        let files = files
+            .get()
+            .ok_or_else(|| font("Bundled diagram fonts are unavailable"))?
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let mut db = usvg::fontdb::Database::new();
+        for data in files {
+            db.load_font_data(data.as_ref().clone());
+        }
+        let family = db
+            .faces()
+            .next()
+            .and_then(|face| face.families.first())
+            .map(|(family, _)| family.clone())
+            .ok_or_else(|| font("No usable bundled outline font is available"))?;
+        db.set_sans_serif_family(&family);
+        db.set_serif_family(&family);
+        Ok((family, Arc::new(db)))
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn font_options(missing: Arc<Mutex<Option<char>>>) -> Result<usvg::Options<'static>, Failure> {
+    BUNDLED_FONTS.with(|fonts| {
+        let (family, db) = fonts
+            .get_or_init(bundled_database)
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let fallback = usvg::FontResolver::default_fallback_selector();
+        let mut options = render_options(family.clone(), db.clone());
+        options.font_resolver.select_fallback = Box::new(move |character, excluded, db| {
+            fallback(character, excluded, db).or_else(|| {
+                if let Ok(mut missing) = missing.lock() {
+                    missing.get_or_insert(character);
+                }
+                None
+            })
+        });
+        Ok(options)
+    })
+}
+
+fn render_options(family: String, fontdb: Arc<usvg::fontdb::Database>) -> usvg::Options<'static> {
+    usvg::Options {
+        font_family: family,
+        fontdb,
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    }
 }
 
 fn canonicalize(raw: &str) -> Result<Rendered, Failure> {
@@ -448,6 +539,17 @@ end
 B-->>A: Result
 end
 deactivate B";
+
+    #[cfg(target_arch = "wasm32")]
+    fn load_test_fonts() {
+        let plex = include_bytes!(
+            "../../../../../gui-platform/vendor/makepad-widgets/resources/IBMPlexSans-Text.ttf"
+        );
+        let korean = include_bytes!("../../../../resources/fonts/NotoSansKR-Regular.otf");
+        BUNDLED_FILES.with(|files| {
+            files.get_or_init(|| Ok(vec![Rc::new(plex.to_vec()), Rc::new(korean.to_vec())]));
+        });
+    }
 
     fn sequence_layout(source: &str, dark: bool) -> mermaid::Layout {
         let parsed = mermaid::parse_mermaid_strict(source).unwrap();
@@ -777,6 +879,8 @@ A->>A: Outside";
 
     #[test]
     fn exported_vectors_are_portable_and_png_is_the_preview() {
+        #[cfg(target_arch = "wasm32")]
+        load_test_fonts();
         let rendered = render(SEQUENCE, false).unwrap();
         let doc = svg_document(&rendered.svg, true).unwrap();
         assert!(doc.descendants().filter(|n| n.has_tag_name("path")).count() > 30);
@@ -813,6 +917,7 @@ A->>A: Outside";
         assert_ne!(dark.rgba, rendered.rgba);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn multilingual_labels_are_outlined_or_report_missing_os_fonts() {
         let source = "sequenceDiagram\nA->>B: 한글 العربية Ελληνικά";
@@ -857,5 +962,14 @@ A->>A: Outside";
                 );
             }
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn bundled_korean_labels_are_outlined() {
+        load_test_fonts();
+        let source = "sequenceDiagram\nA->>B: 한글";
+        let rendered = render(source, false).unwrap();
+        svg_document(&rendered.svg, true).unwrap();
     }
 }

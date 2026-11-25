@@ -867,3 +867,15 @@ See the development guide for the Linux same-frame pixel oracle.
 `src/cx_api.rs` increments. The vendored makepad-draw compares it in its cached
 draw-list check so a list that was off screen during a full redraw (a theme or
 language change) redraws when it is next drawn; see its `VENDORED.md`.
+
+## Web: wasm32-wasip1 and app time
+
+`Cargo.toml` selects `makepad-wasm-bridge` for every `wasm32` target
+(`cfg(target_arch = "wasm32")`) instead of only the `wasm32-unknown-unknown`
+triple: the Passession web client is built for `wasm32-wasip1`, and the web
+backend's own modules are already selected by `target_arch = "wasm32"`.
+
+`src/os/web/web.rs` returned a constant `0.0` from `seconds_since_app_start`.
+It now reports the page time elapsed since `init_cx_os` (`Cx::time_now`, the
+bridge's `Date.now()`), as the native backends do with their start `Instant`;
+the GUI's overlays time their transitions with it.

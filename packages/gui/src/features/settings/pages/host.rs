@@ -365,6 +365,7 @@ pub fn draw_overview_page(ui: &mut Ui, s: &Settings, _v: &View, host: &HostView)
     ui.card_end();
     ui.gap(24.0);
 
+    #[cfg(not(target_arch = "wasm32"))]
     if DESKTOP && host.local && platform::desktop_available() {
         super::system::draw_local_daemon(ui, s, true);
     }

@@ -1,23 +1,30 @@
-//! Retained composer images. Pasted, picked and dropped images become immutable,
-//! content-addressed files (`<blob_dir>/<sha256>`); drafts keep only
-//! `{blobId, mimeType, byteSize}` and an optional original filename. The worker handles
-//! retained-blob IO, hashing and decoding. Legacy inline drafts fingerprint each attachment
-//! at admission. Decoded pixels arrive through a `ToUIReceiver` and become cached textures
+//! Retained composer images are immutable and content-addressed. Drafts retain
+//! only `{blobId, mimeType, byteSize}` and an optional original filename. The
+//! desktop keeps blobs in files; the browser retains them for the page session.
+//! Decoded pixels arrive through a `ToUIReceiver` and become cached textures
 //! on the GUI thread.
 
+#[cfg(not(target_arch = "wasm32"))]
+use super::attachments::raster_image_mime_type;
 use super::attachments::{
-    ImageImportError, clipboard_image_mime, raster_image_mime_type, read_image_file,
+    ImageBytes, ImageImportError, SelectedFile, clipboard_image_mime, read_image_file,
 };
 use makepad_widgets::image_cache::ImageBuffer;
 use makepad_widgets::*;
+use paseo_gui_platform::ClipboardImage;
+#[cfg(not(target_arch = "wasm32"))]
+use paseo_gui_platform::PickedFile;
+#[cfg(not(target_arch = "wasm32"))]
 use paseo_gui_platform::image::sniff_image_header;
-use paseo_gui_platform::{ClipboardImage, PickedFile};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{Sender, channel};
 
 /// Thumbnails are decoded at 2x the 48px pill for high-DPI displays.
@@ -33,19 +40,21 @@ pub enum BlobJob {
         token: u64,
         image: ClipboardImage,
     },
-    /// Read image files from disk and store them (picker/drop).
+    /// Validate and retain images from the platform picker (or desktop drop).
     ImportImages {
         token: u64,
-        files: Vec<PickedFile>,
+        files: Vec<SelectedFile>,
     },
     /// Import a user-accepted inbound share for an exact draft. The source lease
     /// moves with the job, including if its requester closes before IO finishes.
+    #[cfg(not(target_arch = "wasm32"))]
     ImportSharedImages {
         share: Arc<paseo_gui_platform::SharedImages>,
         inline: bool,
         reply: ToUISender<Result<Vec<Value>, String>>,
     },
     /// Inspect dropped paths before routing them to the image tray or file upload.
+    #[cfg(not(target_arch = "wasm32"))]
     Stat { token: u64, paths: Vec<PathBuf> },
     Decode {
         key: String,
@@ -139,6 +148,7 @@ pub enum BlobResult {
         token: u64,
         images: Result<Vec<Value>, ImageImportError>,
     },
+    #[cfg(not(target_arch = "wasm32"))]
     Stat {
         token: u64,
         files: Result<Vec<StatFile>, String>,
@@ -149,12 +159,14 @@ pub enum BlobResult {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 pub struct StatFile {
     pub file: PickedFile,
     pub is_image: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl StatFile {
     pub(crate) fn inspect(path: PathBuf) -> Result<Self, String> {
         let name = path
@@ -186,18 +198,36 @@ impl StatFile {
     }
 }
 
-fn blob_path(dir: &Path, id: &str) -> Option<PathBuf> {
-    // Ids are lowercase sha256 hex; anything else never reaches the filesystem.
-    (id.len() == 64
+fn valid_blob_id(id: &str) -> bool {
+    id.len() == 64
         && id
             .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
-    .then(|| dir.join(id))
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn store(dir: &Path, bytes: &[u8], mime: &str) -> Result<Value, String> {
-    let id = format!("{:x}", Sha256::digest(bytes));
-    let path = blob_path(dir, &id).ok_or("invalid blob id")?;
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static BLOBS: std::cell::RefCell<HashMap<String, ImageBytes>> = Default::default();
+}
+
+fn store(
+    dir: &Path,
+    #[cfg(not(target_arch = "wasm32"))] bytes: &[u8],
+    #[cfg(target_arch = "wasm32")] bytes: ImageBytes,
+    mime: &str,
+) -> Result<Value, String> {
+    let id = format!("{:x}", Sha256::digest(&bytes[..]));
+    let image = json!({"blobId": id, "mimeType": mime, "byteSize": bytes.len()});
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = dir;
+        BLOBS.with_borrow_mut(|blobs| {
+            blobs.entry(id).or_insert(bytes);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let path = dir.join(&id);
+    #[cfg(not(target_arch = "wasm32"))]
     if !path.exists() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         // Write to a temporary sibling and rename, so a crash never leaves a torn blob under
@@ -209,19 +239,21 @@ fn store(dir: &Path, bytes: &[u8], mime: &str) -> Result<Value, String> {
         drop(file);
         std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
     }
-    Ok(json!({"blobId": id, "mimeType": mime, "byteSize": bytes.len()}))
+    Ok(image)
 }
 
 /// Retain a validated image with its original bytes. The caller owns the source file.
-pub(crate) fn import_image(dir: &Path, file: &PickedFile) -> Result<Value, ImageImportError> {
+pub(crate) fn import_image(dir: &Path, file: &SelectedFile) -> Result<Value, ImageImportError> {
     let (bytes, mime) = read_image_file(file)?;
-    let mut image = store(dir, &bytes, mime).map_err(ImageImportError::Io)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let bytes = bytes.as_slice();
+    let mut image = store(dir, bytes, mime).map_err(ImageImportError::Io)?;
     set_image_file_name(&mut image, &file.name);
     Ok(image)
 }
 
 /// The New Session form keeps inline images until its creation request is saved.
-pub(crate) fn encode_picked_image(file: &PickedFile) -> Result<Value, ImageImportError> {
+pub(crate) fn encode_picked_image(file: &SelectedFile) -> Result<Value, ImageImportError> {
     let (bytes, mime) = read_image_file(file)?;
     let mut image = encode_image(&bytes, mime);
     set_image_file_name(&mut image, &file.name);
@@ -243,9 +275,20 @@ pub(crate) fn encode_image(bytes: &[u8], mime: &str) -> Value {
 }
 
 /// Read a retained blob (also used by send operations on the core runtime).
-pub fn read_blob(dir: &Path, id: &str) -> Result<Vec<u8>, String> {
-    let path = blob_path(dir, id).ok_or_else(|| format!("Invalid image reference {id}"))?;
-    std::fs::read(&path).map_err(|e| format!("Attached image is no longer available: {e}"))
+pub fn read_blob(dir: &Path, id: &str) -> Result<ImageBytes, String> {
+    if !valid_blob_id(id) {
+        return Err(format!("Invalid image reference {id}"));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    return std::fs::read(dir.join(id))
+        .map_err(|e| format!("Attached image is no longer available: {e}"));
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = dir;
+        BLOBS
+            .with_borrow(|blobs| blobs.get(id).cloned())
+            .ok_or_else(|| crate::common::tr("message.attachments.imageUnavailable"))
+    }
 }
 
 fn decode_inline(data: &str) -> Result<Vec<u8>, String> {
@@ -264,11 +307,11 @@ fn decode_inline(data: &str) -> Result<Vec<u8>, String> {
 }
 
 fn decode(dir: &Path, source: &ImageSource, max: u32) -> Result<DecodedImage, String> {
-    let bytes = match source {
-        ImageSource::Blob(id) => read_blob(dir, id)?,
-        ImageSource::Inline(data) => decode_inline(data)?,
-    };
-    let image = ::image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let image = match source {
+        ImageSource::Blob(id) => ::image::load_from_memory(&read_blob(dir, id)?),
+        ImageSource::Inline(data) => ::image::load_from_memory(&decode_inline(data)?),
+    }
+    .map_err(|e| e.to_string())?;
     let image = if image.width() > max || image.height() > max {
         image.thumbnail(max, max)
     } else {
@@ -290,64 +333,83 @@ fn decode(dir: &Path, source: &ImageSource, max: u32) -> Result<DecodedImage, St
     })
 }
 
+fn run_job(dir: &Path, job: BlobJob) -> Option<BlobResult> {
+    let result = match job {
+        BlobJob::StoreBytes { token, image } => BlobResult::Stored {
+            token,
+            images: clipboard_image_mime(&image)
+                .and_then(|mime| {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let bytes = image.bytes.as_slice();
+                    #[cfg(target_arch = "wasm32")]
+                    let bytes = image.bytes;
+                    store(dir, bytes, mime).map_err(ImageImportError::Io)
+                })
+                .map(|image| vec![image]),
+        },
+        BlobJob::ImportImages { token, files } => {
+            let images = files.iter().map(|file| import_image(dir, file)).collect();
+            BlobResult::Stored { token, images }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        BlobJob::ImportSharedImages {
+            share,
+            inline,
+            reply,
+        } => {
+            let images = share
+                .files()
+                .iter()
+                .map(|file| {
+                    if inline {
+                        encode_picked_image(file)
+                    } else {
+                        import_image(dir, file)
+                    }
+                })
+                .collect::<Result<_, ImageImportError>>()
+                .map_err(|error| format!("{error:?}"));
+            drop(share);
+            let _ = reply.send(images);
+            return None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        BlobJob::Stat { token, paths } => {
+            let files = paths.into_iter().map(StatFile::inspect).collect();
+            BlobResult::Stat { token, files }
+        }
+        BlobJob::Decode { key, source, max } => BlobResult::Decoded {
+            key,
+            result: decode(dir, &source, max),
+        },
+        BlobJob::Collect { keep } => {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if valid_blob_id(&name) && !keep.contains(&name) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            BLOBS.with_borrow_mut(|blobs| blobs.retain(|id, _| keep.contains(id)));
+            return None;
+        }
+    };
+    Some(result)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn run_worker(
     dir: PathBuf,
     jobs: std::sync::mpsc::Receiver<BlobJob>,
     results: ToUISender<BlobResult>,
 ) {
     while let Ok(job) = jobs.recv() {
-        let result = match job {
-            BlobJob::StoreBytes { token, image } => BlobResult::Stored {
-                token,
-                images: clipboard_image_mime(&image)
-                    .and_then(|mime| store(&dir, &image.bytes, mime).map_err(ImageImportError::Io))
-                    .map(|image| vec![image]),
-            },
-            BlobJob::ImportImages { token, files } => {
-                let images = files
-                    .iter()
-                    .map(|file| import_image(&dir, file))
-                    .collect();
-                BlobResult::Stored { token, images }
-            }
-            BlobJob::ImportSharedImages { share, inline, reply } => {
-                let images = share
-                    .files()
-                    .iter()
-                    .map(|file| {
-                        if inline {
-                            encode_picked_image(file)
-                        } else {
-                            import_image(&dir, file)
-                        }
-                    })
-                    .collect::<Result<_, ImageImportError>>()
-                    .map_err(|error| format!("{error:?}"));
-                drop(share);
-                let _ = reply.send(images);
-                continue;
-            }
-            BlobJob::Stat { token, paths } => {
-                let files = paths.into_iter().map(StatFile::inspect).collect();
-                BlobResult::Stat { token, files }
-            }
-            BlobJob::Decode { key, source, max } => BlobResult::Decoded {
-                key,
-                result: decode(&dir, &source, max),
-            },
-            BlobJob::Collect { keep } => {
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        if blob_path(&dir, &name).is_some() && !keep.contains(&name) {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
-                    }
-                }
-                continue;
-            }
-        };
-        if results.send(result).is_err() {
+        if let Some(result) = run_job(&dir, job)
+            && results.send(result).is_err()
+        {
             break;
         }
     }
@@ -366,6 +428,7 @@ struct TextureEntry {
 /// GUI-thread side: job submission and the texture cache.
 pub struct BlobStore {
     dir: PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
     jobs: Option<Sender<BlobJob>>,
     results: ToUIReceiver<BlobResult>,
     textures: HashMap<String, TextureEntry>,
@@ -380,6 +443,7 @@ impl BlobStore {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
+            #[cfg(not(target_arch = "wasm32"))]
             jobs: None,
             results: ToUIReceiver::default(),
             textures: HashMap::new(),
@@ -400,6 +464,7 @@ impl BlobStore {
         self.next_token
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn submit(&mut self, job: BlobJob) -> bool {
         if self.jobs.is_none() {
             let (sender, receiver) = channel();
@@ -414,6 +479,18 @@ impl BlobStore {
             self.jobs = Some(sender);
         }
         self.jobs.as_ref().is_some_and(|jobs| jobs.send(job).is_ok())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn submit(&mut self, job: BlobJob) -> bool {
+        let dir = self.dir.clone();
+        let results = self.results.sender();
+        crate::common::background::spawn("paseo-composer-blobs", move || {
+            if let Some(result) = run_job(&dir, job) {
+                let _ = results.send(result);
+            }
+        })
+        .is_ok()
     }
 
     pub fn try_recv(&mut self) -> Option<BlobResult> {
@@ -509,7 +586,7 @@ impl BlobStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

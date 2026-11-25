@@ -1,9 +1,8 @@
 //! Application storage locations, with mobile paths supplied by the OS.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::LazyLock,
-};
+use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::LazyLock;
 
 /// Desktop application identity used by path_provider and the OS integrations.
 pub const DESKTOP_APP_ID: &str = "sh.paseo.sessions.desktop";
@@ -20,10 +19,11 @@ pub struct AppPaths {
     pub cache_dir: PathBuf,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 static PATHS: LazyLock<AppPaths> = LazyLock::new(|| {
     let paths = resolve();
     // `cargo xtask dev app` isolates development runs from the installed app.
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let paths = match std::env::var_os("PASEO_GUI_STATE_DIR").filter(|v| !v.is_empty()) {
         Some(dev) => AppPaths {
             support_dir: PathBuf::from(dev),
@@ -34,7 +34,8 @@ static PATHS: LazyLock<AppPaths> = LazyLock::new(|| {
     paths
 });
 
-/// Application directories for this platform (mobile values come from the OS).
+/// Native application directories (mobile values come from the OS).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn app_paths() -> &'static AppPaths {
     &PATHS
 }
@@ -96,7 +97,7 @@ fn resolve() -> AppPaths {
     crate::native::os_app_paths()
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn home_dir() -> PathBuf {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE");
@@ -108,6 +109,7 @@ fn home_dir() -> PathBuf {
 
 /// original native_file_actions.dart `_temporaryFile`: a unique
 /// `paseo-files/transfer-*` directory holding the sanitized name.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn transfer_staging_file(name: &str) -> std::io::Result<PathBuf> {
     let root = app_paths().temp_dir.join("paseo-files");
     std::fs::create_dir_all(&root)?;
@@ -135,7 +137,15 @@ pub fn transfer_staging_file(name: &str) -> std::io::Result<PathBuf> {
     }))
 }
 
+/// The browser has no transfer staging directory. Use
+/// [`crate::PlatformHandle::download_file`] for generated or downloaded bytes.
+#[cfg(target_arch = "wasm32")]
+pub fn transfer_staging_file(_name: &str) -> std::io::Result<PathBuf> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// Removes a staging directory created by [`transfer_staging_file`].
+#[cfg(not(target_arch = "wasm32"))]
 pub fn remove_transfer_staging(file: &Path) -> std::io::Result<()> {
     match file.parent() {
         Some(parent)
@@ -149,10 +159,17 @@ pub fn remove_transfer_staging(file: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn remove_transfer_staging(_file: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(any(not(target_arch = "wasm32"), test))]
 fn remote_basename(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn mime_for_name(name: &str) -> Option<String> {
     let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
     Some(

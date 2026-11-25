@@ -6,10 +6,13 @@
 //! here parses at its index with the parser Makepad itself uses, has outlines
 //! and maps the role's probe character, so defining it can never panic.
 
+#[cfg(any(not(target_arch = "wasm32"), test))]
 use makepad_widgets::makepad_draw::text::{
     font_face::FontFace as ParsedFace, glyph_outline::Builder,
 };
-use std::{collections::HashMap, sync::Arc};
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// What to resolve. Families are unquoted, in CSS order.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -61,11 +64,18 @@ pub struct SystemFonts {
 
 /// Blocking (fontconfig/DirectWrite/CoreText/AFontMatcher); call off the UI thread.
 /// Each call reads current OS settings; the GUI deduplicates unchanged requests.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn system_fonts(request: &FontRequest) -> SystemFonts {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         backend::system_fonts(request)
     }))
     .unwrap_or_default()
+}
+
+/// Browsers do not expose installed font bytes to Makepad.
+#[cfg(target_arch = "wasm32")]
+pub fn system_fonts(_request: &FontRequest) -> SystemFonts {
+    SystemFonts::default()
 }
 
 /// Splits a CSS `font-family` list: `'Pretendard', system-ui, "Noto Sans"`.
@@ -112,6 +122,7 @@ pub enum Role {
     BoldItalic,
 }
 
+#[cfg(any(not(target_arch = "wasm32"), test))]
 impl Role {
     /// OpenType `usWeightClass`.
     pub(crate) fn weight(self) -> u16 {
@@ -127,9 +138,11 @@ impl Role {
 }
 
 /// Latin probe for UI and mono faces.
+#[cfg(any(not(target_arch = "wasm32"), test))]
 pub(crate) const LATIN_PROBE: char = 'A';
 
 /// A CSS family name, classified.
+#[cfg(any(not(target_arch = "wasm32"), test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Family<'a> {
     /// `system-ui`, `sans-serif`, `-apple-system`, …: the OS UI font.
@@ -140,6 +153,7 @@ pub(crate) enum Family<'a> {
     Named(&'a str),
 }
 
+#[cfg(any(not(target_arch = "wasm32"), test))]
 impl<'a> Family<'a> {
     pub(crate) fn classify(name: &'a str) -> Self {
         const UI: [&str; 5] = [
@@ -162,6 +176,7 @@ impl<'a> Family<'a> {
 }
 
 /// One OS font source. `resolve` drives the shared order of lookups.
+#[cfg(any(not(target_arch = "wasm32"), test))]
 pub(crate) trait Backend {
     /// The face for `family` at `role`, with the family name the OS reports.
     /// `None` when the family is not installed (no substitution).
@@ -173,6 +188,7 @@ pub(crate) trait Backend {
 /// The shared resolution order: the first UI family that resolves (empty list =
 /// the OS UI font), the OS Hangul font, and the first mono family that resolves.
 /// Other missing glyphs are discovered lazily through `fallback_fonts`.
+#[cfg(any(not(target_arch = "wasm32"), test))]
 pub(crate) fn resolve(backend: &mut dyn Backend, request: &FontRequest) -> SystemFonts {
     let mut fonts = SystemFonts::default();
     let system_ui = ["system-ui".to_owned()];
@@ -212,10 +228,18 @@ pub(crate) fn resolve(backend: &mut dyn Backend, request: &FontRequest) -> Syste
 
 /// Resolves only requested missing glyphs. Call on a worker, never during draw.
 /// Results retain input order; `None` means no eligible installed face resolved.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn fallback_fonts(request: &FontRequest, probes: &[(Role, char)]) -> Vec<Option<FontFace>> {
     backend::fallback_fonts(request, probes)
 }
 
+/// Use bundled fallback fonts on the web; installed font bytes are unavailable.
+#[cfg(target_arch = "wasm32")]
+pub fn fallback_fonts(_request: &FontRequest, probes: &[(Role, char)]) -> Vec<Option<FontFace>> {
+    vec![None; probes.len()]
+}
+
+#[cfg(any(not(target_arch = "wasm32"), test))]
 pub(crate) fn resolve_fallbacks(
     backend: &mut dyn Backend,
     request: &FontRequest,
@@ -254,6 +278,7 @@ pub(crate) fn resolve_fallbacks(
 /// `probe`. Supplied variations are kept only for axes the font has, clamped to
 /// their ranges; a missing `wght` axis value is set to `weight`, and `ital` to 1
 /// for italic roles.
+#[cfg(any(not(target_arch = "wasm32"), test))]
 pub(crate) fn finish_face(
     data: Arc<Vec<u8>>,
     index: u32,
@@ -304,6 +329,7 @@ pub(crate) fn finish_face(
 }
 
 /// Shares file bytes within one resolution, with a bounded working-set cache.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 #[cfg_attr(
     not(any(target_os = "linux", windows, target_os = "android")),
@@ -311,6 +337,7 @@ pub(crate) fn finish_face(
 )]
 pub(crate) struct FileCache(HashMap<String, Option<Arc<Vec<u8>>>>);
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(
     not(any(target_os = "linux", windows, target_os = "android")),
     allow(dead_code)

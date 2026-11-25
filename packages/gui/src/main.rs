@@ -3,7 +3,7 @@
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     if let Err(error) = paseo_gui_platform::desktop::component_store::bootstrap_process(&argv) {
         if argv
             .get(1)

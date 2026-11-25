@@ -4,6 +4,8 @@
 //! file sits on. Anywhere else the host cannot read the client's disk, so the bytes upload
 //! and the host path is pasted instead.
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,14 +149,23 @@ pub async fn upload_dropped_file(
     let error = |code: &str, message: String| -> anyhow::Result<Value> {
         Ok(json!({"ok": false, "error": {"code": code, "message": message}}))
     };
-    match size {
+    let size = match size {
         Ok(Ok(size)) if size > FILE_UPLOAD_MAX_BYTES => return error(FILE_TOO_LARGE, name),
-        Ok(Ok(_)) => {}
+        Ok(Ok(size)) => size,
         Ok(Err(io)) => return error("LOCAL_ERROR", format!("{name}: {io}")),
         Err(join) => return error("LOCAL_ERROR", join.to_string()),
-    }
+    };
     let mime = mime_type_for_path(&name).to_owned();
-    ops::upload_files(client, vec![(path, shell_safe_file_name(&name), mime)]).await
+    ops::upload_files(
+        client,
+        vec![ops::UploadFile::from_path(
+            path,
+            shell_safe_file_name(&name),
+            mime,
+            size,
+        )],
+    )
+    .await
 }
 
 #[cfg(test)]

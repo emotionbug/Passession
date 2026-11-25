@@ -1,37 +1,43 @@
-use super::{
-    HostError, HostFrame,
-    target::{Endpoint, Target, ssh_args},
-};
+#[cfg(not(target_arch = "wasm32"))]
+use super::target::{Endpoint, Target, ssh_args};
+use super::{HostError, HostFrame};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::{
-    crypto::{Frame, SecureChannel, SecurityMode},
+    crypto::{Frame, SecureChannel},
     process::{CommandSpec, ManagedProcess},
 };
 use anyhow::{Result, anyhow, bail};
+#[cfg(not(target_arch = "wasm32"))]
 use futures_util::{SinkExt, StreamExt};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-};
+use paseo_protocol::crypto::SecurityMode;
+use std::sync::{Arc, atomic::AtomicU64};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{sync::atomic::Ordering, time::Duration};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, protocol::WebSocketConfig,
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_arch = "wasm32")]
+#[path = "browser.rs"]
+mod browser;
+
+#[cfg(not(target_arch = "wasm32"))]
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+#[cfg(not(target_arch = "wasm32"))]
 trait SocketIo: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
     + futures_util::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
     + Unpin
     + Send
 {
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl<T> SocketIo for T where
     T: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
         + futures_util::Stream<
@@ -40,6 +46,7 @@ impl<T> SocketIo for T where
         + Send
 {
 }
+#[cfg(not(target_arch = "wasm32"))]
 type Socket = Box<dyn SocketIo>;
 struct Queued {
     frame: HostFrame,
@@ -129,6 +136,7 @@ pub struct Connection {
     /// moves only while the peer keeps accepting data.
     pub written: Arc<AtomicU64>,
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl Connection {
     pub async fn connect(
         target: &Target,
@@ -427,12 +435,14 @@ impl Connection {
         })
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn to_message(frame: Frame) -> Message {
     match frame {
         Frame::Text(text) => Message::Text(text.into()),
         Frame::Binary(bytes) => Message::Binary(bytes.into()),
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn ssh_auth_failure(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     [
@@ -444,6 +454,7 @@ fn ssh_auth_failure(text: &str) -> bool {
     .iter()
     .any(|needle| text.contains(needle))
 }
+#[cfg(not(target_arch = "wasm32"))]
 async fn open(
     target: &Target,
     cancel: &CancellationToken,
@@ -561,6 +572,7 @@ async fn open(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn websocket_request(
     target: &Target,
     url: &str,
@@ -577,6 +589,7 @@ fn websocket_request(
     Ok(request)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn proxy_invalidated(proxy: Option<&paseo_tailnet::Proxy>) {
     match proxy {
         Some(proxy) => proxy.invalidated().await,
@@ -584,7 +597,7 @@ async fn proxy_invalidated(proxy: Option<&paseo_tailnet::Proxy>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use tokio::net::TcpListener;

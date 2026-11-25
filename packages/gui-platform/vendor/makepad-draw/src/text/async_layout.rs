@@ -200,23 +200,58 @@ fn apply_catalog_families(
     }
 }
 
+/// The CPU layouter that turns jobs into transfers: its own font loader and the
+/// font catalog it was last given.
 #[derive(Debug)]
-pub(super) struct Service {
-    state: Arc<(Mutex<Queue>, Condvar)>,
+struct Worker {
+    layouter: Layouter,
+    // The family lists this worker's layouter was given, to notice
+    // `Fonts::redefine_font_family` in a newer catalog.
+    applied_families: HashMap<FontFamilyId, FontFamilyDefinition>,
 }
 
-impl Service {
-    fn new(mut settings: Settings) -> Arc<Self> {
-        let state = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
-        let worker_state = state.clone();
+impl Worker {
+    fn new(mut settings: Settings) -> Self {
         // CPU layout never rasterizes. Avoid allocating unused UI-sized atlases.
         settings.loader.rasterizer.grayscale_atlas_size = Size::new(1, 1);
         settings.loader.rasterizer.color_atlas_size = Size::new(1, 1);
+        Self { layouter: Layouter::new(settings), applied_families: HashMap::new() }
+    }
+
+    fn run(&mut self, job: Job) {
+        if job.mailbox.cancelled.load(Ordering::Relaxed) { return; }
+        for (&id, definition) in &job.catalog.fonts {
+            if !self.layouter.is_font_known(id) { self.layouter.define_font(id, definition.clone()); }
+        }
+        apply_catalog_families(&mut self.layouter, &mut self.applied_families, &job.catalog);
+        // Finish admitted work even when producers continuously update.
+        // At most one latest waiting request exists for each owner.
+        let text = self.layouter.layout_shared(job.text.into(), &job.spans, job.key.options);
+        let result = Transfer::from_layout(job.key, text);
+        if !job.mailbox.cancelled.load(Ordering::Relaxed) {
+            let old = job.mailbox.result.lock().unwrap().replace(result);
+            drop(old);
+            SignalToUI::set_ui_signal();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct Service {
+    state: Arc<(Mutex<Queue>, Condvar)>,
+    /// Without threads (the web build) the worker lives on the UI thread and
+    /// `AsyncLayout::poll` runs the oldest queued job.
+    #[cfg(target_arch = "wasm32")]
+    worker: RefCell<Worker>,
+}
+
+impl Service {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new(settings: Settings) -> Arc<Self> {
+        let state = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+        let worker_state = state.clone();
         std::thread::Builder::new().name("makepad-exact-layout".into()).spawn(move || {
-            let mut layouter = Layouter::new(settings);
-            // The family lists this worker's layouter was given, to notice
-            // `Fonts::redefine_font_family` in a newer catalog.
-            let mut applied_families: HashMap<FontFamilyId, FontFamilyDefinition> = HashMap::new();
+            let mut worker = Worker::new(settings);
             loop {
                 let (job, garbage) = {
                     let (lock, wake) = &*worker_state;
@@ -232,23 +267,30 @@ impl Service {
                 // Admission capacity just opened, even if this job takes a long
                 // time or belongs to an owner that has since disappeared.
                 SignalToUI::set_ui_signal();
-                if job.mailbox.cancelled.load(Ordering::Relaxed) { continue; }
-                for (&id, definition) in &job.catalog.fonts {
-                    if !layouter.is_font_known(id) { layouter.define_font(id, definition.clone()); }
-                }
-                apply_catalog_families(&mut layouter, &mut applied_families, &job.catalog);
-                // Finish admitted work even when producers continuously update.
-                // At most one latest waiting request exists for each owner.
-                let text = layouter.layout_shared(job.text.into(), &job.spans, job.key.options);
-                let result = Transfer::from_layout(job.key, text);
-                if !job.mailbox.cancelled.load(Ordering::Relaxed) {
-                    let old = job.mailbox.result.lock().unwrap().replace(result);
-                    drop(old);
-                    SignalToUI::set_ui_signal();
-                }
+                worker.run(job);
             }
         }).expect("failed to start exact text layout worker");
         Arc::new(Self { state })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn new(settings: Settings) -> Arc<Self> {
+        Arc::new(Self { state: Arc::default(), worker: RefCell::new(Worker::new(settings)) })
+    }
+
+    /// Runs the oldest queued job on the calling (UI) thread and releases
+    /// retired transfers. Jobs still waiting ask for another UI pass, as the
+    /// thread's completions do.
+    #[cfg(target_arch = "wasm32")]
+    fn run_next(&self) {
+        let (job, garbage, more) = {
+            let mut queue = self.state.0.lock().unwrap();
+            let job = queue.jobs.pop_front();
+            (job, std::mem::take(&mut queue.garbage), !queue.jobs.is_empty())
+        };
+        drop(garbage);
+        if let Some(job) = job { self.worker.borrow_mut().run(job); }
+        if more { SignalToUI::set_ui_signal(); }
     }
 
     fn submit(&self, job: Job) -> Result<(), Job> {
@@ -410,6 +452,8 @@ impl AsyncLayout {
     /// Call during measurement/event processing, not again for painting.
     pub fn poll(&mut self, fonts: &mut Fonts, max_glyphs: usize, max_rows: usize) -> bool {
         self.retry_admission();
+        #[cfg(target_arch = "wasm32")]
+        if let Some(service) = &self.service { service.run_next(); }
         let mut glyphs = max_glyphs;
         let mut rows = max_rows;
         if self.hydration.is_none() {

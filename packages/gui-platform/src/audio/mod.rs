@@ -14,6 +14,7 @@ pub(crate) const OUTPUT_RATE: u32 = 48_000;
 
 /// Blocking settings diagnostics test: stops current output, then plays the
 /// thinking tone to completion. Call from a worker thread.
+/// On the browser, use `PlatformHandle::play_audio` instead of blocking.
 pub fn play_thinking_tone() -> Result<(), String> {
     crate::facade::play_thinking_tone()
 }

@@ -23,7 +23,7 @@ Sessions run in existing local directories on the selected host. There is no sep
 - Native desktop integration and local-daemon lifecycle, with remote-only mobile clients.
 - Generic effect-sound playback; no speech recognition, voice conversation or TTS.
 
-There is **no web client, Electron or Chromium runtime, embedded browser, browser automation, or executable React UI-plugin compatibility**. External links open outside the app. The unused website has been removed; documentation remains in this repository. Paseo's runtime, SDKs and build tools do not require Node or TypeScript. Agent CLIs are external programs and may have their own runtime requirements.
+There is **no Electron or Chromium runtime, embedded browser, browser automation, or executable React UI-plugin compatibility**. External links open outside the app. The same Rust client also runs in a browser as WebAssembly when a daemon enables its web UI (Host settings → **Enable web UI**, off by default); see [architecture](docs/architecture.md#browser-client). The unused website has been removed; documentation remains in this repository. Paseo's runtime, SDKs and build tools do not require Node or TypeScript. Agent CLIs are external programs and may have their own runtime requirements.
 
 Built-in provider and usage integrations execute in Rust. Backend plugins use native executables and the Rust `paseo-plugin` SDK; existing JavaScript/TypeScript plugins must be ported to that contract. See [plugins](docs/plugins.md).
 

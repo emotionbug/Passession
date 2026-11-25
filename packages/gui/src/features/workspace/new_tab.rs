@@ -37,13 +37,15 @@ use crate::common::paint::{Font, Painter, TextSpec, rect};
 use crate::common::provider_icon::ProviderIconWidgetRefExt;
 use crate::common::widgets::{PSegmentedWidgetRefExt, Segment, SurfaceWidgetRefExt};
 use crate::common::{PanelTarget, UiContext, UiEffect};
-use crate::features::composer::blobs::{StatFile, encode_image, encode_picked_image};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::features::composer::blobs::StatFile;
+use crate::features::composer::blobs::{encode_image, encode_picked_image};
 use crate::features::composer::forge::ForgeAutoAttach;
 use crate::features::composer::ui::draw::DrawComposerImage;
 use crate::features::composer::{agent_form, attachments, controls_model, forge, ops};
 use crate::features::files::picker::{RemoteFolderPickerAction, RemoteFolderPickerWidgetExt};
 use crate::theme;
-use paseo_gui_platform::{PickFilesOptions, PickedFile, PlatformAction, PlatformValue, platform};
+use paseo_gui_platform::{PickFilesOptions, PlatformAction, PlatformValue, platform};
 
 live_design! {
     use link::theme::*;
@@ -540,6 +542,7 @@ enum Req {
     Images,
     Upload,
     /// Dropped files were inspected off the GUI thread.
+    #[cfg(not(target_arch = "wasm32"))]
     Dropped,
     /// `create_terminal_request` of a Terminal launch.
     CreateTerminal {
@@ -664,6 +667,7 @@ pub struct WaNewTabView {
     #[live]
     file_drop: FileDropZone,
     /// A drop is being inspected (`Req::Dropped`).
+    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     drop_pending: bool,
     #[rust]
@@ -741,6 +745,7 @@ impl WaNewTabView {
         self.root().area().redraw(cx);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn add_shared_images(&mut self, images: Vec<Value>) {
         self.images.extend(images);
         self.presentation_dirty = true;
@@ -1853,6 +1858,7 @@ impl WaNewTabView {
                 }
                 Err(error) => self.toast_upload_error(ctx, &error.to_string()),
             },
+            #[cfg(not(target_arch = "wasm32"))]
             Req::Dropped => {
                 self.drop_pending = false;
                 match result.map(|v| ops::open_envelope(&v)) {
@@ -2246,22 +2252,31 @@ impl WaNewTabView {
                 continue;
             };
             match (kind, result) {
+                #[cfg(not(target_arch = "wasm32"))]
                 (PlatformReq::PickImages, Ok(PlatformValue::Files(files))) if !files.is_empty() => {
                     self.import_images(ctx, files.clone());
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 (PlatformReq::PickFiles, Ok(PlatformValue::Files(files))) if !files.is_empty() => {
-                    let files = files
-                        .iter()
-                        .map(|f| UploadFile {
-                            path: f.path.clone(),
-                            name: f.name.clone(),
-                            mime: f.mime_type.clone().unwrap_or_else(|| {
-                                attachments::mime_type_for_path(&f.name).to_owned()
-                            }),
-                            size: f.size,
-                        })
-                        .collect();
-                    self.upload_files(ctx, files);
+                    self.upload_files(
+                        ctx,
+                        files.iter().cloned().map(ops::UploadFile::from).collect(),
+                    );
+                }
+                #[cfg(target_arch = "wasm32")]
+                (PlatformReq::PickImages, Ok(PlatformValue::FileBytes(files)))
+                    if !files.is_empty() =>
+                {
+                    self.import_images(ctx, files.clone());
+                }
+                #[cfg(target_arch = "wasm32")]
+                (PlatformReq::PickFiles, Ok(PlatformValue::FileBytes(files)))
+                    if !files.is_empty() =>
+                {
+                    self.upload_files(
+                        ctx,
+                        files.iter().cloned().map(ops::UploadFile::from).collect(),
+                    );
                 }
                 (PlatformReq::Paste, Ok(PlatformValue::Clipboard(content))) => {
                     if content.images.is_empty() {
@@ -2302,7 +2317,7 @@ impl WaNewTabView {
         }
     }
 
-    fn import_images(&mut self, ctx: &UiContext, files: Vec<PickedFile>) {
+    fn import_images(&mut self, ctx: &UiContext, files: Vec<attachments::SelectedFile>) {
         let id = ctx
             .core
             .operation(&self.target.host_id, move |_client| async move {
@@ -2312,7 +2327,7 @@ impl WaNewTabView {
     }
 
     /// actions.ts uploadFileAttachments: every file is size-checked before any upload starts.
-    fn upload_files(&mut self, ctx: &mut UiContext, files: Vec<UploadFile>) {
+    fn upload_files(&mut self, ctx: &mut UiContext, files: Vec<ops::UploadFile>) {
         if let Err(too_large) =
             attachments::check_upload_sizes(files.iter().map(|f| (f.name.as_str(), f.size)))
         {
@@ -2334,18 +2349,15 @@ impl WaNewTabView {
             return;
         }
         self.upload_name = files.last().map(|f| f.name.clone());
-        let list: Vec<_> = files
-            .into_iter()
-            .map(|f| (f.path, f.name, f.mime))
-            .collect();
         let id = ctx.core.operation(&self.target.host_id, move |client| {
-            ops::upload_files(client, list)
+            ops::upload_files(client, files)
         });
         self.pending.track_operation(id, Req::Upload);
     }
 
     /// Whether the composer card can take dropped files now (composer/index.tsx
     /// `useFileDrop` `disabled`): it is shown and neither submitting nor uploading.
+    #[cfg(not(target_arch = "wasm32"))]
     fn accepts_file_drop(&self) -> bool {
         !self.terminal()
             && !self.busy
@@ -2355,6 +2367,7 @@ impl WaNewTabView {
     }
 
     /// Files dropped anywhere on the screen: inspected off the GUI thread, then attached.
+    #[cfg(not(target_arch = "wasm32"))]
     fn drop_files(&mut self, ctx: &mut UiContext, paths: Vec<std::path::PathBuf>) {
         self.drop_pending = true;
         let id = ctx
@@ -2367,6 +2380,7 @@ impl WaNewTabView {
 
     /// `useFileDrop`: raster images join the tray (`onFiles`), every other file uploads
     /// (`onGenericFiles`).
+    #[cfg(not(target_arch = "wasm32"))]
     fn attach_dropped(&mut self, ctx: &mut UiContext, files: &[Value]) {
         let mut images = Vec::new();
         let mut uploads = Vec::new();
@@ -2377,7 +2391,7 @@ impl WaNewTabView {
             );
             let size = file.get("size").and_then(Value::as_u64).unwrap_or(0);
             if file.get("isImage") == Some(&Value::Bool(true)) {
-                images.push(PickedFile {
+                images.push(attachments::SelectedFile {
                     path,
                     name: name.to_owned(),
                     size,
@@ -2385,12 +2399,12 @@ impl WaNewTabView {
                     temporary: false,
                 });
             } else {
-                uploads.push(UploadFile {
+                uploads.push(ops::UploadFile::from_path(
                     path,
-                    name: name.to_owned(),
-                    mime: attachments::mime_type_for_path(name).to_owned(),
+                    name.to_owned(),
+                    attachments::mime_type_for_path(name).to_owned(),
                     size,
-                });
+                ));
             }
         }
         if !images.is_empty() {
@@ -3617,7 +3631,7 @@ impl WaNewTabView {
 }
 
 /// Reads and encodes picked images off the GUI thread (`{"ok", "payload": {"images"}}`).
-fn encode_images(files: &[PickedFile]) -> Value {
+fn encode_images(files: &[attachments::SelectedFile]) -> Value {
     let mut images = Vec::with_capacity(files.len());
     for file in files {
         match encode_picked_image(file) {
@@ -3633,15 +3647,8 @@ fn encode_images(files: &[PickedFile]) -> Value {
     json!({ "ok": true, "payload": { "images": images } })
 }
 
-/// A local file about to upload: its path, name, MIME type and size.
-struct UploadFile {
-    path: std::path::PathBuf,
-    name: String,
-    mime: String,
-    size: u64,
-}
-
 /// Inspects dropped files off the GUI thread before routing them to the image tray or upload.
+#[cfg(not(target_arch = "wasm32"))]
 fn stat_files(paths: Vec<std::path::PathBuf>) -> Value {
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
@@ -3815,10 +3822,13 @@ impl Widget for WaNewTabView {
                 }
             }
             // file-drop-zone.tsx: files dropped anywhere on the screen go to the composer card.
-            let drop_ready = self.accepts_file_drop();
-            if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
-                self.drop_files(ctx, paths);
-                self.presentation_dirty = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let drop_ready = self.accepts_file_drop();
+                if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
+                    self.drop_files(ctx, paths);
+                    self.presentation_dirty = true;
+                }
             }
             if self.directory_timer.is_event(event).is_some() {
                 self.directory_timer = Timer::default();
@@ -3887,8 +3897,8 @@ impl Widget for WaNewTabView {
         }
         self.layout_prompt(cx, alignment_changed);
         // The drop backdrop covers the whole screen.
-        let zone = self.view.area().rect(cx);
-        self.file_drop.draw(cx, zone);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.file_drop.draw(cx, self.view.area().rect(cx));
         step
     }
 }
@@ -4097,7 +4107,7 @@ mod completion_tests {
         let path = h.dir.join("한글 그림");
         let bytes = paseo_gui_platform::image::encode_rgba_png(1, 1, &[255, 0, 0, 255]).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        let picked = PickedFile {
+        let picked = attachments::SelectedFile {
             name: "한글 그림.jpg".into(),
             path: path.clone(),
             mime_type: Some("image/jpeg".into()),
@@ -4123,7 +4133,7 @@ mod completion_tests {
         let stat = stat_files(vec![path]);
         assert_eq!(stat["payload"]["files"][0]["isImage"], true);
 
-        let malformed = PickedFile {
+        let malformed = attachments::SelectedFile {
             path: h.dir.join("opaque.jpg"),
             name: "opaque.jpg".into(),
             mime_type: Some("image/jpeg".into()),

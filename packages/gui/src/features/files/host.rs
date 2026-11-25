@@ -131,6 +131,7 @@ pub fn platform() -> Option<paseo_gui_platform::PlatformHandle> {
 }
 
 /// Desktop chooses a path before downloading; mobile exports the staged file.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn has_save_dialog() -> bool {
     !cfg!(any(target_os = "android", target_os = "ios"))
 }

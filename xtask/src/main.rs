@@ -26,6 +26,7 @@ fn dispatch() -> Result<()> {
     let _build_lease = if matches!(
         command.as_str(),
         "build-relay"
+            | "build-web"
             | "stage-runtime"
             | "container-runtime"
             | "package-desktop"
@@ -39,6 +40,7 @@ fn dispatch() -> Result<()> {
     match command.as_str() {
         "build-daemon" => build::build_daemon(args),
         "build-gui" => gui::build_gui(args),
+        "build-web" => gui::build_web(args),
         "build-relay" => {
             if args.iter().any(|arg| arg != "--release") || args.len() > 1 {
                 bail!("Usage: cargo xtask build-relay [--release]");
@@ -83,6 +85,7 @@ fn help() -> Result<()> {
     println!("  components <plan|build|ci-plan> [options]");
     println!("  build-daemon [--cross TARGET] [--release | --profile dev-fast|debug|release]");
     println!("  build-gui [PLATFORM] --cross TARGET [--profile dev-fast|debug|release]");
+    println!("  build-web");
     println!(
         "  components build --plan PATH --target ID [--stage compile|finalize] [--handoff DIR]"
     );

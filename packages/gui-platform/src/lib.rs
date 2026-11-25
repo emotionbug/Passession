@@ -1,7 +1,6 @@
-//! Desktop and mobile OS integration for the native Passession client.
+//! Desktop, mobile and browser integration for the Passession client.
 //!
-//! See `platform-api.md` in the migration state directory for the contract.
-//! Android and iOS are remote-only; no local daemon or updater code is linked.
+//! Mobile and browser clients do not run a local daemon or updater.
 
 pub mod action;
 pub mod audio;
@@ -15,17 +14,21 @@ mod platform;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub(crate) mod prefs;
 pub mod qr;
+#[cfg(not(target_arch = "wasm32"))]
 mod tailnet_keys;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 pub use facade::{appearance, notifications};
+#[cfg(not(target_arch = "wasm32"))]
 pub use tailnet_keys::tailnet_key_store;
 
 /// Desktop host internals; `available()` / `invoke()` are its public facade.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod desktop;
 
-/// Mobile clients never manage a local daemon.
-#[cfg(any(target_os = "android", target_os = "ios"))]
+/// Clients without a local host only expose its unavailable facade.
+#[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
 pub mod desktop {
     pub use crate::facade::desktop::*;
 }
@@ -46,17 +49,20 @@ pub(crate) mod apple_fonts;
 #[cfg(target_os = "ios")]
 pub(crate) mod ios;
 
-/// The OS backend selected for this target. Every backend implements the same
-/// set of functions; there is no runtime fallback between them.
+/// The backend selected at compile time.
 pub(crate) mod native {
     #[cfg(target_os = "android")]
     pub(crate) use crate::android::native::*;
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) use crate::desktop::native::*;
     #[cfg(target_os = "ios")]
     pub(crate) use crate::ios::native::*;
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) use crate::web::*;
 }
 
+#[cfg(target_arch = "wasm32")]
+pub use action::PickedFileBytes;
 pub use action::{
     ClipboardContent, ClipboardImage, EditorTarget, ImageShareError, PermissionSettings,
     PermissionState, PickedFile, PlatformAction, PlatformError, PlatformEvent, PlatformRequestId,
@@ -77,17 +83,25 @@ pub enum Bootstrap {
     Forwarded {
         exit_code: i32,
     },
+    /// The browser owns the lifetime of each tab.
+    #[cfg(target_arch = "wasm32")]
+    Unavailable,
 }
 
 /// Call before any window is created. A secondary desktop launch forwards its
 /// arguments (deep link, project path) to the running instance and must exit.
 pub fn bootstrap_process(argv: &[String]) -> Bootstrap {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     return desktop::single_instance::bootstrap(argv);
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = argv;
         Bootstrap::Primary
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = argv;
+        Bootstrap::Unavailable
     }
 }
 

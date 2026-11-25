@@ -14,10 +14,13 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, LinkedList};
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, mpsc};
 
 const CAPTURE_BYTES: usize = 64 * 1024;
 pub(super) const INTERACTIVE_SOURCE_BYTES: usize = 16 * 1024;
+const PARSER_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum InlinePreparation {
@@ -300,10 +303,35 @@ impl ParserMailbox {
     }
 }
 
+fn parse_request(request: ParseRequest) {
+    let mut text = String::with_capacity(request.bytes - request.revision.start);
+    for chunk in request.chunks {
+        text.push_str(&chunk);
+    }
+    let document = parse_document(
+        &text,
+        &request.revision,
+        &ParseOptions {
+            root: request.root.as_deref(),
+            linkify: request.linkify,
+            find: request.find.as_ref(),
+        },
+    );
+    // Every owner has only one in-flight job and a one-slot result
+    // mailbox; a deleted row simply drops this completed result.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = request.result.send(document);
+    #[cfg(target_arch = "wasm32")]
+    if request.result.try_send(document).is_ok() {
+        makepad_widgets::SignalToUI::set_ui_signal();
+    }
+}
+
 /// Fixed process-wide CPU concurrency and queue length, independent of how
 /// many historical rows retain their source/layout snapshots.
+#[cfg(not(target_arch = "wasm32"))]
 static PARSER_QUEUE: LazyLock<mpsc::SyncSender<ParseRequest>> = LazyLock::new(|| {
-    let (send, receive) = mpsc::sync_channel::<ParseRequest>(64);
+    let (send, receive) = mpsc::sync_channel::<ParseRequest>(PARSER_QUEUE_CAPACITY);
     let receive = Arc::new(Mutex::new(receive));
     for index in 0..2 {
         let receive = receive.clone();
@@ -315,29 +343,37 @@ static PARSER_QUEUE: LazyLock<mpsc::SyncSender<ParseRequest>> = LazyLock::new(||
                         let receive = receive.lock().expect("Markdown request queue");
                         receive.recv()
                     };
-                    let Ok(mut request) = request else { break };
-                    let mut text = String::with_capacity(request.bytes - request.revision.start);
-                    for chunk in std::mem::take(&mut request.chunks) {
-                        text.push_str(&chunk);
-                    }
-                    let document = parse_document(
-                        &text,
-                        &request.revision,
-                        &ParseOptions {
-                            root: request.root.as_deref(),
-                            linkify: request.linkify,
-                            find: request.find.as_ref(),
-                        },
-                    );
-                    // Every owner has only one in-flight job and a one-slot result
-                    // mailbox; a deleted row simply drops this completed result.
-                    let _ = request.result.send(document);
+                    let Ok(request) = request else { break };
+                    parse_request(request);
                 }
             })
             .expect("spawn Markdown parser");
     }
     send
 });
+
+#[cfg(not(target_arch = "wasm32"))]
+fn submit_parse(request: ParseRequest) -> Result<(), mpsc::TrySendError<ParseRequest>> {
+    PARSER_QUEUE.try_send(request)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn submit_parse(request: ParseRequest) -> Result<(), mpsc::TrySendError<ParseRequest>> {
+    thread_local! {
+        static PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let pending = PENDING.get();
+    if pending >= PARSER_QUEUE_CAPACITY {
+        return Err(mpsc::TrySendError::Full(request));
+    }
+    PENDING.set(pending + 1);
+    crate::common::background::spawn("markdown-parse", move || {
+        PENDING.set(PENDING.get() - 1);
+        parse_request(request);
+    })
+    .expect("queue Markdown parser");
+    Ok(())
+}
 
 /// Parsing settings shared by every revision until the worker's epoch changes.
 pub struct ParseOptions<'a> {
@@ -548,7 +584,7 @@ impl MarkdownWorker {
                     chunks: capture.chunks,
                     bytes: capture.offset,
                 };
-                match PARSER_QUEUE.try_send(request) {
+                match submit_parse(request) {
                     Ok(()) => self.active = Some(capture.demand),
                     Err(mpsc::TrySendError::Full(request)) => {
                         self.capture = Some(Capture {
@@ -1191,7 +1227,10 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "the parser result never arrived"
             );
+            #[cfg(not(target_arch = "wasm32"))]
             std::thread::sleep(std::time::Duration::from_millis(1));
+            #[cfg(target_arch = "wasm32")]
+            crate::common::background::run_queued(std::time::Duration::ZERO);
             // The next frame's preparation pass collects the result; no other event is needed.
             assert!(worker.update(OWNER, complete.clone(), false, OPTIONS, 0.0, |_| false));
         }

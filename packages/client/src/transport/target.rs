@@ -1,7 +1,9 @@
 use super::HostError;
 use anyhow::{Result, ensure};
+#[cfg(not(target_arch = "wasm32"))]
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use paseo_protocol::crypto::SecurityMode;
+#[cfg(not(target_arch = "wasm32"))]
 use serde_json::Value;
 use url::Url;
 
@@ -25,9 +27,25 @@ pub struct Target {
     pub description: String,
 }
 impl Target {
+    #[cfg(target_arch = "wasm32")]
+    pub fn parse(input: &str) -> Result<Self> {
+        let input = input.trim();
+        if !input.starts_with("ws://") && !input.starts_with("wss://") {
+            return Err(HostError::new(
+                "BROWSER_UNSUPPORTED",
+                "Only ws:// and wss:// endpoints are available in the browser",
+            )
+            .into());
+        }
+        Self::websocket(input)
+            .map_err(|_| HostError::new("invalid_connection", "Invalid WebSocket endpoint").into())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn parse(input: &str) -> Result<Self> {
         Self::parse_inner(input.trim()).map_err(|_| HostError::new("invalid_connection", "Invalid host connection. Use host:port, ws(s)://, tcp://, unix://, pipe://, ssh:// or a pairing URL.").into())
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fn parse_inner(input: &str) -> Result<Self> {
         ensure!(!input.is_empty(), "empty connection");
         if input.starts_with("relay://") || input.contains("#connect=") {
@@ -169,36 +187,7 @@ impl Target {
             });
         }
         if input.starts_with("ws://") || input.starts_with("wss://") {
-            let mut url = Url::parse(input)?;
-            ensure!(
-                url.host_str().is_some()
-                    && url.username().is_empty()
-                    && url.password().is_none()
-                    && url.fragment().is_none(),
-                "invalid websocket"
-            );
-            let password = query(&url, "password");
-            let pairs: Vec<(String, String)> = url
-                .query_pairs()
-                .filter(|(k, _)| k != "password")
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect();
-            url.set_query(None);
-            if !pairs.is_empty() {
-                url.query_pairs_mut().extend_pairs(pairs);
-            }
-            if url.path() == "/" {
-                url.set_path("/ws");
-            }
-            return Ok(Self {
-                description: url.origin().ascii_serialization(),
-                endpoint: Endpoint::Socket {
-                    url: url.into(),
-                    ipc: None,
-                },
-                password,
-                security: None,
-            });
+            return Self::websocket(input);
         }
         let (endpoint, tls, password) = if input.starts_with("tcp://") {
             let url = Url::parse(input)?;
@@ -236,6 +225,40 @@ impl Target {
             description: format!("tcp://{endpoint}"),
         })
     }
+    fn websocket(input: &str) -> Result<Self> {
+        let mut url = Url::parse(input)?;
+        ensure!(
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none(),
+            "invalid websocket"
+        );
+        let password = query(&url, "password");
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "password")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.set_query(None);
+        if !pairs.is_empty() {
+            url.query_pairs_mut().extend_pairs(pairs);
+        }
+        if url.path() == "/" {
+            url.set_path("/ws");
+        }
+        Ok(Self {
+            description: url.origin().ascii_serialization(),
+            endpoint: Endpoint::Socket {
+                url: url.into(),
+                ipc: None,
+            },
+            password,
+            security: None,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn relay(
         endpoint: &str,
         server: &str,
@@ -278,12 +301,14 @@ fn query(url: &Url, key: &str) -> Option<String> {
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.into_owned())
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing field"))
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn authority(url: &Url, required_port: bool) -> Result<String> {
     let host = url
         .host_str()
@@ -301,6 +326,7 @@ fn authority(url: &Url, required_port: bool) -> Result<String> {
     ensure!(port > 0, "invalid port");
     Ok(format!("{host}:{port}"))
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn valid_endpoint(input: &str) -> Result<Url> {
     let (host, port) = input
         .rsplit_once(':')
@@ -334,6 +360,7 @@ fn valid_endpoint(input: &str) -> Result<Url> {
     }
     Ok(Url::parse(&format!("http://{input}"))?)
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn ssh_args(host: &str, port: Option<u16>, daemon_port: u16) -> Vec<String> {
     let mut args = vec![
         "-T",
@@ -355,6 +382,7 @@ pub(super) fn ssh_args(host: &str, port: Option<u16>, daemon_port: u16) -> Vec<S
     args.extend(["-W".into(), format!("127.0.0.1:{daemon_port}"), host.into()]);
     args
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_daemon_port(value: &str) -> Result<u16> {
     let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
     let number = if let Some(digits) = value

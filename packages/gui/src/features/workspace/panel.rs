@@ -156,6 +156,7 @@ impl Widget for WorkspacePanel {
 
 impl WorkspacePanelRef {
     /// A share-created tab receives its draft images before the first draw.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn add_shared_images(&self, images: Vec<Value>) -> bool {
         let Some(inner) = self.borrow() else {
             return false;

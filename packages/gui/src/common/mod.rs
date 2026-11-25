@@ -4,6 +4,7 @@
 //! come first; additions follow and never change the frozen shapes.
 
 pub(crate) mod accessibility;
+pub mod background;
 pub mod clock;
 pub mod file_drop;
 pub mod host_http;

@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,13 +25,17 @@ use serde_json::{Value, json};
 use super::explorer::{Entry, ExplorerCmd, ExplorerPreferences, ExplorerState, Listing};
 use super::handle::{FileVersion, HandleCmd};
 use super::host;
-use super::i18n::{l, lf, t};
+#[cfg(not(target_arch = "wasm32"))]
+use super::i18n::lf;
+use super::i18n::{l, t};
 use super::images;
 use super::path::{parent_explorer_path, remote_absolute};
 use super::resolve::editor_platform;
 use super::service;
 use super::session::{AutosaveRequest, FileSession};
-use super::transfer::{self, Progress, Transfer, TransferMode, TransferStage};
+#[cfg(not(target_arch = "wasm32"))]
+use super::transfer::{self, TransferStage};
+use super::transfer::{Progress, Transfer, TransferMode};
 use crate::common::{UiContext, UiEffect};
 
 thread_local! { static STORE: RefCell<Store> = RefCell::new(Store::default()); }
@@ -96,10 +101,12 @@ enum Pending {
 
 /// A platform request awaiting its `PlatformAction::Completed`.
 enum PlatformPending {
+    #[cfg(not(target_arch = "wasm32"))]
     SaveLocation(u64),
-    /// Open/share of a finished download; the transfer card is already gone.
+    /// Platform handoff of a finished download; the transfer card is already gone.
     TransferFinish,
     /// Native save reads the staging copy until its completion, including cancellation.
+    #[cfg(not(target_arch = "wasm32"))]
     SaveCopy(PathBuf),
     Clipboard {
         owner: String,
@@ -893,24 +900,26 @@ impl Store {
             mime,
             current_bytes,
         );
-        let Some(platform) = host::platform() else {
+        let Some(_platform) = host::platform() else {
             host::toast(ui, l("Platform services are not available"), true);
             return;
         };
+        #[cfg(not(target_arch = "wasm32"))]
         if mode == TransferMode::Save && host::has_save_dialog() {
             transfer.stage = TransferStage::Choosing;
-            let request = platform.save_location(&transfer.name);
+            let request = _platform.save_location(&transfer.name);
             transfer.platform_request = Some(request);
             self.platform_pending
                 .insert(request, PlatformPending::SaveLocation(transfer.id));
             self.transfers.push(transfer);
-        } else {
-            transfer.run(&ui.core, self.progress.sender());
-            if let Some(request) = transfer.request.clone() {
-                self.pending.insert(request, Pending::Transfer(transfer.id));
-            }
-            self.transfers.push(transfer);
+            self.bump();
+            return;
         }
+        transfer.run(&ui.core, self.progress.sender());
+        if let Some(request) = transfer.request.clone() {
+            self.pending.insert(request, Pending::Transfer(transfer.id));
+        }
+        self.transfers.push(transfer);
         self.bump();
     }
 
@@ -921,6 +930,7 @@ impl Store {
                 ui.core.cancel_request(request);
                 self.pending.remove(request);
             }
+            #[cfg(not(target_arch = "wasm32"))]
             transfer::remove_staging_later(transfer.staging.clone());
         }
         self.bump();
@@ -929,10 +939,11 @@ impl Store {
     pub fn transfers_of(&self, owner: &str) -> Vec<&Transfer> {
         self.transfers
             .iter()
-            .filter(|t| t.owner == owner && matches!(t.stage, TransferStage::Running))
+            .filter(|t| t.owner == owner && t.is_running())
             .collect()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn on_transfer(&mut self, ui: &mut UiContext, id: u64, result: Result<Value, String>) {
         let Some(index) = self.transfers.iter().position(|t| t.id == id) else {
             return;
@@ -976,6 +987,28 @@ impl Store {
             platform.share_file(&path, mime, &transfer.name)
         };
         self.platform_pending.insert(request, PlatformPending::TransferFinish);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn on_transfer(&mut self, ui: &mut UiContext, id: u64, result: Result<Value, String>) {
+        let Some(index) = self.transfers.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let transfer = self.transfers.remove(index);
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => return host::toast(ui, error, true),
+        };
+        let Some(bytes) = transfer.download.and_then(|recv| recv.try_recv().ok()) else {
+            return host::toast(ui, t("common.states.downloadFailed"), true);
+        };
+        let Some(platform) = host::platform() else {
+            return host::toast(ui, l("Platform services are not available"), true);
+        };
+        let mime = value["mime"].as_str().unwrap_or("application/octet-stream");
+        let request = platform.download_file(&transfer.name, mime, &bytes);
+        self.platform_pending
+            .insert(request, PlatformPending::TransferFinish);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1057,6 +1090,7 @@ impl Store {
             return;
         };
         match pending {
+            #[cfg(not(target_arch = "wasm32"))]
             PlatformPending::SaveLocation(id) => {
                 let Some(index) = self.transfers.iter().position(|t| t.id == id) else {
                     return;
@@ -1088,6 +1122,7 @@ impl Store {
                     host::toast(ui, error.message, true);
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             PlatformPending::SaveCopy(path) => {
                 transfer::remove_staging_later(path);
                 match result {
@@ -1576,6 +1611,7 @@ pub fn parent_of(path: &str) -> String {
 }
 
 /// Raster formats a phone photo library shows; SVG and other images stay documents.
+#[cfg(not(target_arch = "wasm32"))]
 fn is_photo_mime(mime: &str) -> bool {
     matches!(
         mime.split(';')

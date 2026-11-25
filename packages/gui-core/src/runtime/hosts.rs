@@ -12,12 +12,12 @@ use tokio::sync::oneshot;
 use super::{Conn, Core, directory, requests, selector::Selector, store};
 use crate::{
     CoreError, RequestId,
-    connection::{self, Control, Inbound, OpenRequest, Opened, RouteIn},
+    connection::{self, Control, Inbound, OpenRequest, Opened},
     error::host_unknown,
-    host_config, ids,
-    protocol::response_error,
-    storage,
+    host_config, ids, storage,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{connection::RouteIn, protocol::response_error};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Status {
@@ -214,6 +214,7 @@ impl Host {
         self.link.borrow().rtt
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn reconnect_enabled(&self) -> bool {
         self.link.borrow().enabled
     }
@@ -229,6 +230,12 @@ impl Host {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn is_local(&self) -> bool {
+        false
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     /// Native filesystem access stays bound to the active local-credential
     /// connection over IPC or loopback.
     fn is_local(&self) -> bool {
@@ -469,6 +476,9 @@ async fn open(
         protected_known: protected_known(core, &config),
         timeout: CONNECT_TIMEOUT,
     };
+    #[cfg(target_arch = "wasm32")]
+    return connection::open_direct(&config, request, core.buffers.clone(), cancel).await;
+    #[cfg(not(target_arch = "wasm32"))]
     match &host.origin {
         Some(_) if host_config::uses_tailnet(&config) => Err(CoreError::new(
             "invalid_connection",
@@ -488,6 +498,7 @@ async fn open(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Flutter `_HostRouteTransport.open` + `connectHost`.
 async fn open_route(
     core: &Rc<Core>,
@@ -1008,6 +1019,7 @@ pub(crate) fn set_app_visible(core: &Rc<Core>, visible: bool) {
         }
         return;
     }
+    #[cfg(not(target_arch = "wasm32"))]
     super::tailnet::ensure(core);
     wake_network(core, true);
 }
@@ -1048,6 +1060,7 @@ fn wake_network(core: &Rc<Core>, verify: bool) {
 // ---------------------------------------------------------------------------------------------
 // Host management
 
+#[cfg(not(target_arch = "wasm32"))]
 fn new_host_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -1057,6 +1070,47 @@ fn add_to_core(core: &Rc<Core>, host: &Rc<Host>) {
     attach(core, host);
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn connect_host(core: &Rc<Core>, mut value: Value) {
+    if value["connections"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty())
+    {
+        core.error(
+            None,
+            CoreError::new(
+                "BROWSER_UNSUPPORTED",
+                "Additional host connections are not available in the browser",
+                false,
+            ),
+        );
+        return;
+    }
+    let mut config = if value["config"].is_object() {
+        value["config"].take()
+    } else {
+        value
+    };
+    let resolved = match host_config::resolve(&config) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            core.error(None, error);
+            return;
+        }
+    };
+    let host = core.hosts.borrow().first().cloned().expect("serving host");
+    config["id"] = host.config.borrow()["id"].clone();
+    config["endpoint"] = host_config::browser_endpoint()
+        .expect("serving endpoint")
+        .into();
+    config["password"] = resolved.password.into();
+    if !config["label"].is_string() {
+        config["label"] = host.config.borrow()["label"].clone();
+    }
+    update_host(core, &host, config).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn connect_host(core: &Rc<Core>, value: Value) {
     let (config, extra, server_hint) = if value["config"].is_object() {
         (
@@ -1151,6 +1205,7 @@ pub(crate) async fn disconnect_host(core: &Rc<Core>, id: &str) {
     core.touch();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Flutter `removeHost` (tab close guards are the shell's).
 pub(crate) async fn remove_host(core: &Rc<Core>, id: &str) {
     let Some(host) = core.host_for(id) else {
@@ -1175,6 +1230,24 @@ pub(crate) async fn remove_host(core: &Rc<Core>, id: &str) {
     core.touch();
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn remove_host(core: &Rc<Core>, id: &str) {
+    core.error(
+        Some(id),
+        CoreError::new(
+            "BROWSER_UNSUPPORTED",
+            "The serving daemon cannot be removed in the browser",
+            false,
+        ),
+    );
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn remove_connection(core: &Rc<Core>, id: &str, _: &str) {
+    remove_host(core, id).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// Flutter `removeConnection`.
 pub(crate) async fn remove_connection(core: &Rc<Core>, id: &str, connection_id: &str) {
     let Some(host) = core.host_for(id) else {
@@ -1286,6 +1359,7 @@ async fn save(core: &Rc<Core>) {
 
 /// Flutter `refreshHosts`: hosts another window or process saved, then every host.
 pub(crate) async fn refresh_hosts(core: &Rc<Core>) {
+    #[cfg(not(target_arch = "wasm32"))]
     match store::shared_hosts(core).await {
         Ok(loaded) => {
             for row in loaded {
@@ -1325,6 +1399,7 @@ pub(crate) async fn refresh_hosts(core: &Rc<Core>) {
     core.touch();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Flutter `_discoverRoutes`: online connected hosts of an origin become routed hosts.
 pub(crate) async fn discover_routes(core: &Rc<Core>, origin: &Rc<Host>, directory: Value) {
     let rows = directory["hosts"].as_array().cloned().unwrap_or_default();
@@ -1391,6 +1466,7 @@ pub(crate) async fn discover_routes(core: &Rc<Core>, origin: &Rc<Host>, director
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn is_local_connection(config: &Value) -> bool {
     !host_config::uses_tailnet(config)
         && config["localCredentialPath"]
@@ -1398,6 +1474,7 @@ fn is_local_connection(config: &Value) -> bool {
             .is_some_and(|path| !path.is_empty())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn daemon_home(core: &Core) -> Option<std::path::PathBuf> {
     core.config
         .daemon_home
@@ -1410,10 +1487,12 @@ fn daemon_home(core: &Core) -> Option<std::path::PathBuf> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".paseo")))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn local_daemon_route(home: &std::path::Path) -> String {
     format!("local-daemon:{}", home.display())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn suppress_local_daemon(core: &Core) {
     if let Some(home) = daemon_home(core) {
         let route = local_daemon_route(&home);
@@ -1424,6 +1503,7 @@ fn suppress_local_daemon(core: &Core) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Discover the configured daemon home. A removal suppresses automatic
 /// discovery, not auto-start; an explicit reconnect clears that preference.
 pub(crate) async fn discover_local_daemon(core: &Rc<Core>, explicit: bool) {
@@ -1577,6 +1657,31 @@ pub(crate) async fn discover_local_daemon(core: &Rc<Core>, explicit: bool) {
     save(core).await;
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn ensure_default_endpoint(core: &Rc<Core>) {
+    if !core.hosts.borrow().is_empty() {
+        return;
+    }
+    let endpoint = core
+        .config
+        .default_endpoint
+        .as_deref()
+        .expect("serving endpoint");
+    let id = "browser-daemon";
+    let config = json!({"id": id, "label": endpoint, "endpoint": endpoint});
+    let host = Host::new(
+        core.next_key(),
+        config.clone(),
+        id.into(),
+        None,
+        vec![config],
+        None,
+    );
+    add_to_core(core, &host);
+    save(core).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// Adds `CoreConfig::default_endpoint` when no saved connection reaches it.
 async fn ensure_default_endpoint(core: &Rc<Core>) {
     let Some(endpoint) = core
@@ -1626,11 +1731,16 @@ pub(crate) fn probe_host(core: &Rc<Core>, request_id: RequestId, config: Value) 
                 protected_known: protected_known(&core, &config),
                 timeout: host_config::probe_connect_timeout(&config),
             };
-            let (proxy, tailnet_cancel) = super::tailnet::route(&core, &config)?;
-            let opened = tokio::select! { biased;
-                _ = tailnet_cancel.cancelled() => return Err(CoreError::new("TAILNET_CHANGED", "Embedded Tailscale configuration changed", false)),
-                result = connection::open_direct(&config, request, core.buffers.clone(), &tailnet_cancel, proxy) => result?,
+            #[cfg(not(target_arch = "wasm32"))]
+            let opened = {
+                let (proxy, tailnet_cancel) = super::tailnet::route(&core, &config)?;
+                tokio::select! { biased;
+                    _ = tailnet_cancel.cancelled() => return Err(CoreError::new("TAILNET_CHANGED", "Embedded Tailscale configuration changed", false)),
+                    result = connection::open_direct(&config, request, core.buffers.clone(), &tailnet_cancel, proxy) => result?,
+                }
             };
+            #[cfg(target_arch = "wasm32")]
+            let opened = connection::open_direct(&config, request, core.buffers.clone(), &core.cancel).await?;
             let info = opened.client.server_info();
             let client = opened.client.clone();
             tokio::task::spawn_local(async move { client.close().await });
@@ -1650,6 +1760,7 @@ pub(crate) async fn initialize(core: &Rc<Core>) {
     let (mut loaded, prefs) = store::load(paths).await;
     let hosts = std::mem::take(&mut loaded.hosts);
     core.store.borrow_mut().apply_loaded(&mut loaded, prefs);
+    #[cfg(not(target_arch = "wasm32"))]
     super::tailnet::initialize(core);
     let stored_id = core
         .store
@@ -1686,6 +1797,15 @@ pub(crate) async fn initialize(core: &Rc<Core>) {
         }
     };
     *core.client_id.borrow_mut() = client_id;
+    #[cfg(target_arch = "wasm32")]
+    let hosts = hosts
+        .into_iter()
+        .filter(|row| row.origin_server_id.is_none() && host_config::resolve(&row.config).is_ok())
+        .take(1)
+        .map(|mut row| {
+            row.connections = vec![row.config.clone()];
+            row
+        });
     for row in hosts {
         let host = Host::new(
             core.next_key(),
@@ -1704,6 +1824,7 @@ pub(crate) async fn initialize(core: &Rc<Core>) {
         core.error(None, error);
     }
     core.touch();
+    #[cfg(not(target_arch = "wasm32"))]
     discover_local_daemon(core, false).await;
     ensure_default_endpoint(core).await;
     let hosts: Vec<Rc<Host>> = core.hosts.borrow().clone();
@@ -1715,6 +1836,9 @@ pub(crate) async fn initialize(core: &Rc<Core>) {
 
 /// Saves, then closes every connection. A daemon is never stopped.
 pub(crate) async fn shutdown(core: &Rc<Core>) {
+    #[cfg(target_arch = "wasm32")]
+    save(core).await;
+    #[cfg(not(target_arch = "wasm32"))]
     let _ = tokio::time::timeout(Duration::from_secs(2), save(core)).await;
     core.closing.set(true);
     let hosts: Vec<Rc<Host>> = core.hosts.borrow().clone();
@@ -1725,11 +1849,12 @@ pub(crate) async fn shutdown(core: &Rc<Core>) {
         close_link(core, host);
     }
     // Give the spawned client closes a moment to send their close frames.
+    #[cfg(not(target_arch = "wasm32"))]
     tokio::time::sleep(Duration::from_millis(100)).await;
     core.cancel.cancel();
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

@@ -7,25 +7,40 @@
 //! Missing characters in any script resolve through the OS off-thread; completed
 //! faces extend the role's chain and invalidate layout/theme epochs. Latin mono,
 //! bundled emoji and the original last-resort faces keep their existing priority.
+//! The browser keeps the bundled chains without installing system fallbacks.
 //!
 //! System faces get ascender/descender fudges so their line height equals the
 //! bundled face they precede, keeping authored line spacing stable.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(not(target_arch = "wasm32"))]
 use std::hash::{Hash, Hasher};
+#[cfg(not(target_arch = "wasm32"))]
 use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+#[cfg(not(target_arch = "wasm32"))]
 use makepad_widgets::makepad_draw::text::fallback::{FallbackRequests, MissingGlyph};
+#[cfg(not(target_arch = "wasm32"))]
 use makepad_widgets::makepad_draw::text::font::FontId;
+#[cfg(not(target_arch = "wasm32"))]
 use makepad_widgets::makepad_draw::text::font_face::FontFace as ParsedFace;
+#[cfg(not(target_arch = "wasm32"))]
 use makepad_widgets::makepad_draw::text::font_family::FontFamilyId;
+#[cfg(not(target_arch = "wasm32"))]
 use makepad_widgets::makepad_draw::text::fonts::Fonts;
+#[cfg(not(target_arch = "wasm32"))]
 use makepad_widgets::makepad_draw::text::loader::{FontDefinition, FontFamilyDefinition};
 use makepad_widgets::*;
+#[cfg(not(target_arch = "wasm32"))]
 use paseo_gui_platform::appearance::{self, FontFace, FontRequest, Role, SystemFonts};
 use serde_json::Value;
 
@@ -57,6 +72,7 @@ pub struct FontRoles {
     code: DrawText,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FontRoles {
     /// Family ids in [`Role`] order.
     fn family_ids(&self) -> [FontFamilyId; ROLES] {
@@ -71,10 +87,13 @@ impl FontRoles {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const ROLES: usize = 5;
 /// UI primary and eager Hangul fallback; all other scripts resolve on demand.
+#[cfg(not(target_arch = "wasm32"))]
 const SLOTS: usize = 2;
 /// Line metrics in ems, as `Font::{ascender,descender,line_gap}_in_ems` report them.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Metrics {
     pub ascender: f32,
@@ -83,6 +102,7 @@ pub(crate) struct Metrics {
 }
 
 /// A validated system face prepared off the UI thread.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 struct Prepared {
     face: FontFace,
@@ -90,6 +110,7 @@ struct Prepared {
     natural: Metrics,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct Resolved {
     request: FontRequest,
@@ -99,6 +120,7 @@ struct Resolved {
     mono_family_name: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct SystemFontState {
     requested: Option<FontRequest>,
@@ -109,6 +131,7 @@ pub struct SystemFontState {
     fallback_pending: Option<Receiver<Vec<(FontFamilyId, Prepared)>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SystemFontState {
     /// Starts resolving fonts for `preferences` unless that exact request is
     /// already applied or in flight. `refresh` re-resolves anyway (OS change).
@@ -135,14 +158,12 @@ impl SystemFontState {
         self.fallback_pending = None;
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
-        let spawned = std::thread::Builder::new()
-            .name("paseo-system-fonts".into())
-            .spawn(move || {
-                let resolved = prepare(request, appearance::system_fonts);
-                if sender.send(resolved).is_ok() {
-                    SignalToUI::set_ui_signal();
-                }
-            });
+        let spawned = crate::common::background::spawn("paseo-system-fonts", move || {
+            let resolved = prepare(request, appearance::system_fonts);
+            if sender.send(resolved).is_ok() {
+                SignalToUI::set_ui_signal();
+            }
+        });
         if let Err(error) = spawned {
             log!("system fonts: worker did not start ({error}); keeping bundled fonts");
             self.pending = None;
@@ -241,15 +262,12 @@ impl SystemFontState {
         let families = roles.family_ids();
         let (sender, receiver) = mpsc::channel();
         self.fallback_pending = Some(receiver);
-        if let Err(error) = std::thread::Builder::new()
-            .name("paseo-font-fallback".into())
-            .spawn(move || {
-                let resolved = prepare_fallbacks(&request, &families, &missing);
-                if sender.send(resolved).is_ok() {
-                    SignalToUI::set_ui_signal();
-                }
-            })
-        {
+        if let Err(error) = crate::common::background::spawn("paseo-font-fallback", move || {
+            let resolved = prepare_fallbacks(&request, &families, &missing);
+            if sender.send(resolved).is_ok() {
+                SignalToUI::set_ui_signal();
+            }
+        }) {
             self.fallback_pending = None;
             log!("system fonts: fallback worker did not start ({error})");
         }
@@ -350,7 +368,19 @@ impl SystemFontState {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+pub struct SystemFontState {}
+
+#[cfg(target_arch = "wasm32")]
+impl SystemFontState {
+    pub fn request(&mut self, _preferences: &Value, _refresh: bool) {}
+
+    pub fn poll(&mut self, _cx: &mut Cx, _roles: &FontRoles) {}
+}
+
 /// Worker side: resolves, validates metrics and hashes face contents.
+#[cfg(not(target_arch = "wasm32"))]
 fn prepare(request: FontRequest, resolve: impl FnOnce(&FontRequest) -> SystemFonts) -> Resolved {
     let fonts = resolve(&request);
     let mut contents: HashMap<usize, u64> = HashMap::new();
@@ -378,6 +408,7 @@ fn prepare(request: FontRequest, resolve: impl FnOnce(&FontRequest) -> SystemFon
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prepare_face(face: FontFace, contents: &mut HashMap<usize, u64>) -> Option<Prepared> {
     let natural = natural_metrics(&face)?;
     let data_hash = *contents
@@ -401,6 +432,7 @@ fn prepare_face(face: FontFace, contents: &mut HashMap<usize, u64>) -> Option<Pr
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prepare_fallbacks(
     request: &FontRequest,
     families: &[FontFamilyId; ROLES],
@@ -438,6 +470,7 @@ fn prepare_fallbacks(
 }
 
 /// Unfudged line metrics of a face at its variation instance; `None` when it does not parse.
+#[cfg(not(target_arch = "wasm32"))]
 fn natural_metrics(face: &FontFace) -> Option<Metrics> {
     let parsed = ParsedFace::from_data_index_and_variations(
         face.data.clone(),
@@ -454,6 +487,7 @@ fn natural_metrics(face: &FontFace) -> Option<Metrics> {
 }
 
 /// A system face's id: its contents plus the bundled face its fudges were fitted to.
+#[cfg(not(target_arch = "wasm32"))]
 fn system_font_id(content: u64, reference: Option<FontId>) -> FontId {
     let mut hasher = DefaultHasher::new();
     "paseo-system-font".hash(&mut hasher);
@@ -465,6 +499,7 @@ fn system_font_id(content: u64, reference: Option<FontId>) -> FontId {
 /// Ascender/descender fudges (ems) that scale `natural` about the baseline so
 /// ascender − descender + line gap equals `reference`'s. Bounded to half/double
 /// size so a broken metrics table cannot collapse or explode rows.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn line_fudges(natural: Metrics, reference: Metrics) -> (f32, f32) {
     let target = reference.ascender - reference.descender + reference.line_gap;
     let span = natural.ascender - natural.descender;
@@ -480,6 +515,7 @@ pub(crate) fn line_fudges(natural: Metrics, reference: Metrics) -> (f32, f32) {
 
 /// System primary faces precede the bundled chain. Lazy fallback faces are
 /// appended later, so they cannot replace an existing Latin or emoji glyph.
+#[cfg(not(target_arch = "wasm32"))]
 fn compose(system: &[Option<FontId>], bundled: &[FontId]) -> Vec<FontId> {
     let mut ids = Vec::with_capacity(system.len() + bundled.len());
     for id in system.iter().flatten().chain(bundled) {
@@ -490,7 +526,7 @@ fn compose(system: &[Option<FontId>], bundled: &[FontId]) -> Vec<FontId> {
     ids
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

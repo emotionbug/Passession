@@ -540,12 +540,20 @@ impl Selector {
             timeout: host_config::probe_connect_timeout(connection),
         };
         let selector_cancel = self.sockets.borrow().clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let (proxy, tailnet_cancel) = super::tailnet::route(core, connection)?;
+        #[cfg(not(target_arch = "wasm32"))]
         let opened = tokio::select! { biased;
             _ = selector_cancel.cancelled() => return Err(CoreError::new("CONNECTION_CHANGED", "Host connection changed", false)),
             _ = tailnet_cancel.cancelled() => return Err(CoreError::new("TAILNET_CHANGED", "Embedded Tailscale configuration changed", false)),
             result = connection::open_direct(connection, request, core.buffers.clone(), &selector_cancel, proxy) => result?,
         };
+        #[cfg(target_arch = "wasm32")]
+        let opened =
+            connection::open_direct(connection, request, core.buffers.clone(), &selector_cancel)
+                .await?;
+        #[cfg(target_arch = "wasm32")]
+        let tailnet_cancel = &core.cancel;
         let (reply, answered) = oneshot::channel();
         let started = Instant::now();
         let measured = if opened.control.send(Control::Ping(reply)).is_ok() {
@@ -658,7 +666,7 @@ impl Selector {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

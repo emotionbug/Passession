@@ -83,6 +83,7 @@ pub struct Settings {
     pub update_cards: HashMap<String, host_page::UpdateCard>,
     pub restarting: HashMap<String, bool>,
     pub host_busy: HashMap<String, bool>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub local_daemon: system::LocalDaemonState,
     pub notifications: system::NotificationsState,
     pub diagnostics: system::DiagnosticsState,

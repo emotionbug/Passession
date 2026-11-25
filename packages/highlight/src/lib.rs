@@ -5,9 +5,9 @@
 //! retained. All ranges are **UTF-8 byte offsets**, not JavaScript UTF-16 indices;
 //! [`byte_to_utf16`] and [`utf16_to_byte`] are explicit boundary-safe adapters.
 //!
-//! Reuse [`Highlighter`] to cache parsers. [`highlight_code_in_steps`] moves parsing
-//! to a native worker and delivers a preview and bounded line batches without
-//! blocking the caller on parsing. It does not parse each line in isolation.
+//! Reuse [`Highlighter`] to cache parsers. [`highlight_code_in_steps`] delivers a
+//! preview and bounded line batches. Parsing runs on a native worker or on the
+//! caller's thread on WebAssembly. It does not parse each line in isolation.
 //! Unknown extensions are plain text; a supported parser failure is an error,
 //! never a silent plain-text fallback.
 //!

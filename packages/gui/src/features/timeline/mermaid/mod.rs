@@ -1,4 +1,4 @@
-//! Native diagrams: one bounded renderer/export worker, revision-owned results and
+//! Diagrams: one bounded renderer/export worker, revision-owned results and
 //! an LRU of GUI textures. Source remains in the normal Markdown code painter.
 
 pub mod engine;
@@ -13,20 +13,27 @@ use makepad_widgets::*;
 use paseo_gui_platform::{PlatformAction, PlatformValue};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{SyncSender, sync_channel};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, SystemTime};
 
 const MAX_PENDING: usize = 16;
 const MAX_CACHE_ENTRIES: usize = 32;
 const MAX_CACHE_BYTES: usize = 96 << 20;
 const MAX_EXPORTS: usize = 4;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_EXPORT_FILES: usize = 64;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_EXPORT_BYTES: u64 = 128 << 20;
+#[cfg(not(target_arch = "wasm32"))]
 const EXPORT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +91,7 @@ pub enum FailureKind {
     /// The export queue is full.
     ExportBusy,
     /// Too many temporary export files await their save dialogs.
+    #[cfg(not(target_arch = "wasm32"))]
     ExportLimit,
     /// Writing the exported file failed.
     WriteFailed,
@@ -99,6 +107,7 @@ impl FailureKind {
             Self::Worker => "mermaid.errors.worker",
             Self::Platform => "mermaid.errors.platform",
             Self::ExportBusy => "mermaid.errors.exportBusy",
+            #[cfg(not(target_arch = "wasm32"))]
             Self::ExportLimit => "mermaid.errors.exportLimit",
             Self::WriteFailed => "mermaid.errors.writeFailed",
         }
@@ -106,18 +115,27 @@ impl FailureKind {
 
     /// Kinds whose localized summary already says everything the raw detail would.
     fn detail_redundant(self) -> bool {
-        matches!(self, Self::ExportBusy | Self::ExportLimit)
+        match self {
+            Self::ExportBusy => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::ExportLimit => true,
+            _ => false,
+        }
     }
 }
 
 /// The last export outcome of one diagram revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ExportStatus {
+    #[cfg(not(target_arch = "wasm32"))]
     Saved,
+    #[cfg(target_arch = "wasm32")]
+    DownloadSubmitted,
     Cancelled,
     Failed(Failure),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn write_failed(error: impl std::fmt::Display) -> Failure {
     Failure::new(FailureKind::WriteFailed, error.to_string())
 }
@@ -168,6 +186,7 @@ struct PendingRender {
 struct ExportWork {
     rendered: Arc<engine::Rendered>,
     format: ExportFormat,
+    #[cfg(not(target_arch = "wasm32"))]
     destination: Option<PathBuf>,
     revision: u64,
     current: Arc<AtomicU64>,
@@ -182,20 +201,91 @@ enum Work {
     Render(RenderWork),
     Export(ExportWork),
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+type ExportArtifact = PathBuf;
+
+#[cfg(target_arch = "wasm32")]
+enum ExportArtifact {
+    Svg(Arc<engine::Rendered>),
+    Png(Vec<u8>),
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ExportArtifact {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Svg(rendered) => rendered.svg.as_bytes(),
+            Self::Png(bytes) => bytes,
+        }
+    }
+}
+
 enum Finished {
     Render(Result<Option<engine::Rendered>, Failure>),
-    Export(Result<Option<PathBuf>, Failure>),
+    Export(Result<Option<ExportArtifact>, Failure>),
 }
 enum Active {
     Render(Weak<RefCell<Slot>>, u64),
-    Export(Weak<RefCell<Slot>>, u64, ExportFormat, bool),
+    Export {
+        owner: Weak<RefCell<Slot>>,
+        revision: u64,
+        format: ExportFormat,
+        #[cfg(not(target_arch = "wasm32"))]
+        desktop: bool,
+    },
 }
 enum PlatformPending {
+    #[cfg(not(target_arch = "wasm32"))]
     Choose(PendingExport),
+    #[cfg(not(target_arch = "wasm32"))]
     Save(Weak<RefCell<Slot>>, u64, PathBuf),
+    #[cfg(target_arch = "wasm32")]
+    Download(Weak<RefCell<Slot>>, u64),
+}
+
+fn run_work(job: Work, #[cfg(not(target_arch = "wasm32"))] session: &str) -> Finished {
+    match job {
+        Work::Render(job) => {
+            let result = if current(&job.current, job.revision) {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    engine::render(&job.source, job.dark)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Failure::new(
+                        FailureKind::Worker,
+                        "The diagram renderer failed.",
+                    ))
+                })
+                .map(Some)
+            } else {
+                Ok(None)
+            };
+            Finished::Render(result)
+        }
+        Work::Export(job) => Finished::Export(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    export_file(&job, session)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    export_bytes(job)
+                }
+            }))
+            .unwrap_or_else(|_| {
+                Err(Failure::new(
+                    FailureKind::Worker,
+                    "The diagram export worker failed.",
+                ))
+            }),
+        ),
+    }
 }
 
 struct Worker {
+    #[cfg(not(target_arch = "wasm32"))]
     sender: Option<SyncSender<Work>>,
     receiver: ToUIReceiver<Finished>,
     active: Option<Active>,
@@ -212,50 +302,25 @@ struct Worker {
 impl Worker {
     fn new() -> Self {
         let receiver = ToUIReceiver::default();
-        let done = receiver.sender();
-        let (sender, jobs) = sync_channel::<Work>(1);
-        let spawned = std::thread::Builder::new()
-            .name("paseo-mermaid".into())
-            .spawn(move || {
-                let session = uuid::Uuid::new_v4().simple().to_string();
-                while let Ok(job) = jobs.recv() {
-                    let finished = match job {
-                        Work::Render(job) => {
-                            let result = if current(&job.current, job.revision) {
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    engine::render(&job.source, job.dark)
-                                }))
-                                .unwrap_or_else(|_| {
-                                    Err(Failure::new(
-                                        FailureKind::Worker,
-                                        "The diagram renderer failed.",
-                                    ))
-                                })
-                                .map(Some)
-                            } else {
-                                Ok(None)
-                            };
-                            Finished::Render(result)
+        #[cfg(not(target_arch = "wasm32"))]
+        let sender = {
+            let done = receiver.sender();
+            let (sender, jobs) = sync_channel::<Work>(1);
+            let spawned = std::thread::Builder::new()
+                .name("paseo-mermaid".into())
+                .spawn(move || {
+                    let session = uuid::Uuid::new_v4().simple().to_string();
+                    while let Ok(job) = jobs.recv() {
+                        if done.send(run_work(job, &session)).is_err() {
+                            break;
                         }
-                        Work::Export(job) => Finished::Export(
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                export_file(&job, &session)
-                            }))
-                            .unwrap_or_else(|_| {
-                                Err(Failure::new(
-                                    FailureKind::Worker,
-                                    "The diagram export worker failed.",
-                                ))
-                            }),
-                        ),
-                    };
-                    if done.send(finished).is_err() {
-                        break;
                     }
-                }
-            });
+                });
+            spawned.ok().map(|_| sender)
+        };
         Self {
-            sender: spawned.ok().map(|_| sender),
+            #[cfg(not(target_arch = "wasm32"))]
+            sender,
             receiver,
             active: None,
             pending: VecDeque::new(),
@@ -265,6 +330,23 @@ impl Worker {
             cache_bytes: 0,
             epoch: 0,
             redraw: Vec::new(),
+        }
+    }
+
+    fn submit(&self, work: Work) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.sender
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(work).is_ok())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let done = self.receiver.sender();
+            crate::common::background::spawn("paseo-mermaid", move || {
+                let _ = done.send(run_work(work));
+            })
+            .is_ok()
         }
     }
 
@@ -306,17 +388,14 @@ impl Worker {
                 ));
                 continue;
             }
-            let active = Active::Export(
-                job.slot.clone(),
-                job.work.revision,
-                job.work.format,
-                job.work.destination.is_some(),
-            );
-            if self
-                .sender
-                .as_ref()
-                .is_some_and(|sender| sender.try_send(Work::Export(job.work)).is_ok())
-            {
+            let active = Active::Export {
+                owner: job.slot.clone(),
+                revision: job.work.revision,
+                format: job.work.format,
+                #[cfg(not(target_arch = "wasm32"))]
+                desktop: job.work.destination.is_some(),
+            };
+            if self.submit(Work::Export(job.work)) {
                 self.active = Some(active);
                 return;
             }
@@ -337,11 +416,7 @@ impl Worker {
                 continue;
             }
             let revision = job.work.revision;
-            if self
-                .sender
-                .as_ref()
-                .is_some_and(|sender| sender.try_send(Work::Render(job.work)).is_ok())
-            {
+            if self.submit(Work::Render(job.work)) {
                 self.active = Some(Active::Render(job.slot, revision));
                 return;
             }
@@ -416,15 +491,29 @@ impl Worker {
                         }
                     }
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 (
-                    Some(Active::Export(owner, revision, format, desktop)),
+                    Some(Active::Export {
+                        owner,
+                        revision,
+                        desktop: true,
+                        ..
+                    }),
+                    Finished::Export(Ok(Some(_))),
+                ) => self
+                    .redraw
+                    .extend(set_export(&owner, revision, ExportStatus::Saved)),
+                (
+                    Some(Active::Export {
+                        owner,
+                        revision,
+                        format,
+                        ..
+                    }),
                     Finished::Export(result),
                 ) => {
                     match result {
-                        Ok(Some(_)) if desktop => {
-                            self.redraw
-                                .extend(set_export(&owner, revision, ExportStatus::Saved));
-                        }
+                        #[cfg(not(target_arch = "wasm32"))]
                         Ok(Some(path)) => {
                             if export_is_current(&owner, revision) {
                                 if let Some(platform) = paseo_gui_platform::platform() {
@@ -462,6 +551,33 @@ impl Worker {
                             }
                             // The document picker retains its source until actual completion.
                         }
+                        #[cfg(target_arch = "wasm32")]
+                        Ok(Some(artifact)) => {
+                            if !export_is_current(&owner, revision) {
+                                self.redraw.extend(set_export(
+                                    &owner,
+                                    revision,
+                                    ExportStatus::Cancelled,
+                                ));
+                            } else if let Some(platform) = paseo_gui_platform::platform() {
+                                let request = platform.download_file(
+                                    format.name(),
+                                    format.mime(),
+                                    artifact.bytes(),
+                                );
+                                self.platform
+                                    .insert(request, PlatformPending::Download(owner, revision));
+                            } else {
+                                self.redraw.extend(set_export(
+                                    &owner,
+                                    revision,
+                                    ExportStatus::Failed(Failure::new(
+                                        FailureKind::Platform,
+                                        "Platform services are unavailable.",
+                                    )),
+                                ));
+                            }
+                        }
                         Ok(None) => {
                             self.redraw.extend(set_export(
                                 &owner,
@@ -496,6 +612,7 @@ impl Worker {
             return;
         };
         let shown = match pending {
+            #[cfg(not(target_arch = "wasm32"))]
             PlatformPending::Choose(mut job) => match result {
                 Ok(PlatformValue::SaveLocation(Some(destination))) => {
                     if export_is_current(&job.slot, job.work.revision) {
@@ -509,6 +626,7 @@ impl Worker {
                 Ok(_) => set_export(&job.slot, job.work.revision, ExportStatus::Cancelled),
                 Err(error) => set_export(&job.slot, job.work.revision, platform_status(error)),
             },
+            #[cfg(not(target_arch = "wasm32"))]
             PlatformPending::Save(owner, revision, path) => {
                 remove_export_file(path);
                 match result {
@@ -519,6 +637,18 @@ impl Worker {
                     Err(error) => set_export(&owner, revision, platform_status(error)),
                 }
             }
+            #[cfg(target_arch = "wasm32")]
+            PlatformPending::Download(owner, revision) => {
+                let status = match result {
+                    Ok(PlatformValue::Submitted) => ExportStatus::DownloadSubmitted,
+                    Ok(_) => ExportStatus::Failed(Failure::new(
+                        FailureKind::Platform,
+                        "The platform did not submit the diagram download.",
+                    )),
+                    Err(error) => platform_status(error),
+                };
+                set_export(&owner, revision, status)
+            }
         };
         self.redraw.extend(shown);
         self.dispatch();
@@ -526,7 +656,7 @@ impl Worker {
     }
 }
 
-/// A save-dialog or document-picker failure: cancellation is not an error.
+/// Cancellation is not an export error.
 fn platform_status(error: &paseo_gui_platform::PlatformError) -> ExportStatus {
     if error.code == "cancelled" {
         ExportStatus::Cancelled
@@ -540,7 +670,7 @@ fn platform_status(error: &paseo_gui_platform::PlatformError) -> ExportStatus {
 
 fn active_revision(active: &Active) -> u64 {
     match active {
-        Active::Render(_, revision) | Active::Export(_, revision, _, _) => *revision,
+        Active::Render(_, revision) | Active::Export { revision, .. } => *revision,
     }
 }
 
@@ -722,7 +852,7 @@ pub fn tap(state: &mut RowState, target: &HitTarget) -> bool {
         };
         let count = worker.platform.len()
             + worker.exports.len()
-            + usize::from(matches!(worker.active, Some(Active::Export(..))));
+            + usize::from(matches!(worker.active, Some(Active::Export { .. })));
         if count >= MAX_EXPORTS {
             slot.export_status = Some(ExportStatus::Failed(Failure::new(
                 FailureKind::ExportBusy,
@@ -730,6 +860,7 @@ pub fn tap(state: &mut RowState, target: &HitTarget) -> bool {
             )));
             return;
         }
+        #[cfg(not(target_arch = "wasm32"))]
         let Some(platform) = paseo_gui_platform::platform() else {
             slot.export_status = Some(ExportStatus::Failed(Failure::new(
                 FailureKind::Platform,
@@ -744,17 +875,21 @@ pub fn tap(state: &mut RowState, target: &HitTarget) -> bool {
             work: ExportWork {
                 rendered: artifact.rendered.clone(),
                 format: *format,
+                #[cfg(not(target_arch = "wasm32"))]
                 destination: None,
                 revision: *revision,
                 current: slot.revision.clone(),
             },
         };
+        #[cfg(not(target_arch = "wasm32"))]
         if platform.capabilities().save_dialog {
             let id = platform.save_location(format.name());
             worker.platform.insert(id, PlatformPending::Choose(job));
         } else {
             worker.exports.push_back(job);
         }
+        #[cfg(target_arch = "wasm32")]
+        worker.exports.push_back(job);
         drop(slot);
         worker.dispatch();
     });
@@ -781,6 +916,8 @@ pub fn draw(
     let dark = d.look.dark();
     let owner = d.result_owner(cx);
     let req = d.state.mermaid.entry(key.clone()).or_default();
+    #[cfg(target_arch = "wasm32")]
+    engine::load_bundled_fonts(cx);
     let artifact = request(req, owner, source, dark, crate::theme::epoch());
     let (revision, error, exporting, status) = {
         let slot = req.0.borrow();
@@ -966,10 +1103,13 @@ pub fn draw(
             cy += failure(cx, d, &message, &error, font_size, x, cy, width);
         }
         (false, Some(status)) => {
-            let (key, color) = if status == ExportStatus::Saved {
-                ("mermaid.saved", p.success)
-            } else {
-                ("mermaid.cancelled", p.muted)
+            let (key, color) = match status {
+                #[cfg(not(target_arch = "wasm32"))]
+                ExportStatus::Saved => ("mermaid.saved", p.success),
+                #[cfg(target_arch = "wasm32")]
+                ExportStatus::DownloadSubmitted => ("mermaid.downloadSubmitted", p.success),
+                ExportStatus::Cancelled => ("mermaid.cancelled", p.muted),
+                ExportStatus::Failed(_) => unreachable!(),
             };
             let size = d.kit.label(
                 cx,
@@ -1021,18 +1161,30 @@ fn failure(
     h
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn remove_export_file(path: PathBuf) {
-    let _ = std::thread::Builder::new()
-        .name("mermaid-export-cleanup".into())
-        .spawn(move || {
-            if std::fs::remove_file(&path).is_ok()
-                && let Some(directory) = path.parent()
-            {
-                let _ = std::fs::remove_dir(directory);
-            }
-        });
+    let _ = crate::common::background::spawn("mermaid-export-cleanup", move || {
+        if std::fs::remove_file(&path).is_ok()
+            && let Some(directory) = path.parent()
+        {
+            let _ = std::fs::remove_dir(directory);
+        }
+    });
 }
 
+#[cfg(target_arch = "wasm32")]
+fn export_bytes(job: ExportWork) -> Result<Option<ExportArtifact>, Failure> {
+    if !current(&job.current, job.revision) {
+        return Ok(None);
+    }
+    let artifact = match job.format {
+        ExportFormat::Svg => ExportArtifact::Svg(job.rendered),
+        ExportFormat::Png => ExportArtifact::Png(engine::encode_png(&job.rendered)?),
+    };
+    Ok(current(&job.current, job.revision).then_some(artifact))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn export_file(job: &ExportWork, session: &str) -> Result<Option<PathBuf>, Failure> {
     if !current(&job.current, job.revision) {
         return Ok(None);
@@ -1075,6 +1227,7 @@ fn export_file(job: &ExportWork, session: &str) -> Result<Option<PathBuf>, Failu
 
 /// Write beside the destination and replace only after complete encoding and IO.
 /// A failed rename preserves the user's existing file (including on Windows).
+#[cfg(not(target_arch = "wasm32"))]
 fn save_atomic(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = destination
         .parent()
@@ -1101,6 +1254,7 @@ fn save_atomic(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Only private UUID-named prior-session directories are eligible. Completed
 /// document exports are removed immediately; interrupted requests expire later.
+#[cfg(not(target_arch = "wasm32"))]
 fn retained_exports(root: &Path, session: &str) -> std::io::Result<(usize, u64)> {
     let mut count = 0;
     let mut bytes = 0u64;
@@ -1131,6 +1285,7 @@ fn retained_exports(root: &Path, session: &str) -> std::io::Result<(usize, u64)>
     Ok((count, bytes))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn owned_export_directory(name: &str) -> bool {
     name.len() == 65
         && name.as_bytes()[32] == b'-'
@@ -1158,6 +1313,7 @@ mod tests {
             FailureKind::Worker,
             FailureKind::Platform,
             FailureKind::ExportBusy,
+            #[cfg(not(target_arch = "wasm32"))]
             FailureKind::ExportLimit,
             FailureKind::WriteFailed,
         ] {
@@ -1191,16 +1347,21 @@ mod tests {
     fn changed_revision_cannot_finish_old_export() {
         let slot = Rc::new(RefCell::new(Slot::default()));
         slot.borrow().revision.store(2, Ordering::Relaxed);
-        set_export(&Rc::downgrade(&slot), 1, ExportStatus::Saved);
+        #[cfg(not(target_arch = "wasm32"))]
+        let success = ExportStatus::Saved;
+        #[cfg(target_arch = "wasm32")]
+        let success = ExportStatus::DownloadSubmitted;
+        set_export(&Rc::downgrade(&slot), 1, success.clone());
         assert!(slot.borrow().export_status.is_none());
-        set_export(&Rc::downgrade(&slot), 2, ExportStatus::Saved);
-        assert_eq!(slot.borrow().export_status, Some(ExportStatus::Saved));
+        set_export(&Rc::downgrade(&slot), 2, success.clone());
+        assert_eq!(slot.borrow().export_status, Some(success));
         slot.borrow_mut().epoch = crate::theme::epoch();
         assert!(export_is_current(&Rc::downgrade(&slot), 2));
         slot.borrow_mut().epoch = crate::theme::epoch().wrapping_add(1);
         assert!(!export_is_current(&Rc::downgrade(&slot), 2));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn cleanup_only_accepts_owned_uuid_directories() {
         assert!(owned_export_directory(

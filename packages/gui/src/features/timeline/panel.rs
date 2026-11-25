@@ -3786,6 +3786,7 @@ impl ChatPanel {
                 }
             }
             "lightbox:save" => self.export_lightbox(ui, ExportMode::Save),
+            #[cfg(not(target_arch = "wasm32"))]
             "lightbox:share" => self.export_lightbox(ui, ExportMode::Share),
             "lightbox:zoom-in" => self.zoom(1.5),
             "lightbox:zoom-out" => self.zoom(1.0 / 1.5),
@@ -3831,7 +3832,7 @@ impl ChatPanel {
         let Some(target) = &self.target else {
             return;
         };
-        let (export_available, file_route) = if MOBILE {
+        let (export_available, file_route) = if MOBILE || cfg!(target_arch = "wasm32") {
             match source.original(target.cwd.as_deref()) {
                 Some(Original::File { .. }) => {
                     let route = HostRoute::capture(ui, &target.host_id);
@@ -6787,15 +6788,15 @@ fn lightbox(
         }
         if let Some(export) = footer.export {
             let y = top + 38.0;
-            let w = ((area.size.x - 32.0) * 0.5).clamp(0.0, 156.0);
-            let left = area.center().x - w - 4.0;
-            for (i, (id, key)) in [
+            let buttons = [
                 ("lightbox:save", "message.attachments.lightbox.saveImage"),
+                #[cfg(not(target_arch = "wasm32"))]
                 ("lightbox:share", "message.attachments.lightbox.share"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            ];
+            let count = buttons.len() as f64;
+            let w = ((area.size.x - 32.0) / count).clamp(0.0, 156.0);
+            let left = area.center().x - (w * count + 8.0 * (count - 1.0)) * 0.5;
+            for (i, (id, key)) in buttons.into_iter().enumerate() {
                 let button = rect_xywh(left + i as f64 * (w + 8.0), y, w, 44.0);
                 let busy = export.busy();
                 let hovered = d.state.hover_hit.as_deref() == Some(id);

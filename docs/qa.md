@@ -47,7 +47,7 @@ If your change touches a hot path such as script logs, the message list or Git p
 
 ## Every platform it affects
 
-The client targets iOS, Android, macOS, Windows and Linux. The Rust daemon runs on desktop/server operating systems and in a native container. There is no product web client.
+The client targets iOS, Android, macOS, Windows and Linux, and browsers through a daemon's web UI (WebAssembly). The Rust daemon runs on desktop/server operating systems and in a native container.
 
 You aren't expected to own every device. You are expected to say what you covered:
 

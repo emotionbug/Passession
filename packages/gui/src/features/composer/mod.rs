@@ -72,6 +72,7 @@ pub fn flush_drafts(ui: &UiContext) -> Result<(), String> {
 
 /// Append local images to this exact conversation, independently of any mounted
 /// composer. This edits the draft only; it never enters the delivery queue.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn append_shared_images(
     host_id: &str,
     workspace_id: &str,

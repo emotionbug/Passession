@@ -8,6 +8,7 @@ pub mod chrome;
 pub mod commands;
 mod compact;
 pub mod hosts;
+#[cfg(not(target_arch = "wasm32"))]
 mod image_share;
 pub mod layout;
 pub mod overlays;
@@ -333,6 +334,7 @@ pub struct Data {
     pub revoking: Vec<(paseo_gui_platform::PlatformRequestId, String, Timer)>,
     /// A route this window opens once its host is known (New Window with a route).
     pub pending_route: Option<paseo_gui_platform::PlatformRoute>,
+    #[cfg(not(target_arch = "wasm32"))]
     pending_image_share: Option<std::sync::Arc<paseo_gui_platform::SharedImages>>,
     /// A close of this window was requested programmatically; runs the same guarded flow as
     /// the OS close button on the next event.

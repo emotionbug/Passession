@@ -18,6 +18,7 @@ const WINDOWS_STATIC_LIB_FILE: &str = "ghostty-vt-static.lib";
 /// targets to API 29, above the client's minimum SDK (24), and the archive
 /// could reference libc symbols missing from older devices.
 const ANDROID_API_LEVEL: u32 = 24;
+const WASIP1_TARGET: &str = "wasm32-wasip1";
 
 #[derive(Clone, Copy)]
 enum LinkMode {
@@ -145,6 +146,8 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
             host.contains("apple-darwin"),
             "building for {target} requires a macOS host with Xcode and the iOS SDK; host is {host}"
         );
+    }
+    if ios_platform.is_some() || target == WASIP1_TARGET {
         assert!(
             matches!(link_mode, LinkMode::Static),
             "building for {target} supports static linking only; disable the link-dynamic feature"
@@ -217,6 +220,10 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
         .arg(&zig_cache_dir)
         .current_dir(&ghostty_dir);
 
+    if let Ok(jobs) = env::var("NUM_JOBS") {
+        build.arg(format!("-j{jobs}"));
+    }
+
     // Package managers can provide Ghostty's Zig package cache ahead of time
     // and ask Zig to resolve packages from that immutable store path instead
     // of fetching during this Cargo build script.
@@ -250,6 +257,13 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
 
     if let Some(platform) = ios_platform {
         extract_xcframework_lib(&install_prefix, platform);
+    } else if target == WASIP1_TARGET {
+        // Ghostty installs its .wasm module and static archive, but the
+        // header install normally belongs to the shared-library artifact.
+        copy_dir_all(
+            &ghostty_dir.join("include/ghostty"),
+            &install_prefix.join("include/ghostty"),
+        );
     }
     if let Some(cached) = &cached_install {
         store_install(&install_prefix, cached);
@@ -761,6 +775,9 @@ fn zig_target(target: &str) -> String {
         "aarch64-pc-windows-gnullvm" => "aarch64-windows-gnu",
         "x86_64-pc-windows-msvc" => "x86_64-windows-msvc",
         "aarch64-pc-windows-msvc" => "aarch64-windows-msvc",
+        // Ghostty's Wasm build uses its freestanding platform paths. The
+        // static archive shares the Wasm C ABI with Rust's WASI target.
+        WASIP1_TARGET => "wasm32-freestanding",
         // Zig's `abi.version` suffix is the Android API level.
         "aarch64-linux-android" => return format!("aarch64-linux-android.{ANDROID_API_LEVEL}"),
         "x86_64-linux-android" => return format!("x86_64-linux-android.{ANDROID_API_LEVEL}"),

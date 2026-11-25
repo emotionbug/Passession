@@ -4,13 +4,18 @@
 //! connected" state, the stream error row, the neutral exit row (New terminal, Close) and, on
 //! mobile or compact layouts, the virtual key bar.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 use makepad_widgets::*;
 use paseo_gui_platform::{PlatformAction, PlatformValue};
-use serde_json::{Value, json};
+#[cfg(not(target_arch = "wasm32"))]
+use serde_json::Value;
+use serde_json::json;
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::drop::{self, FILE_TOO_LARGE};
 use super::find::{FindCard, FindCommand};
 use super::keybar::{Control, Modifier, WaTerminalKeyBarWidgetExt};
@@ -19,6 +24,7 @@ use super::stream::{HIDDEN_SCREEN_GRACE_SECONDS, Stream};
 use super::view::{WaTerminalViewRef, WaTerminalViewWidgetExt};
 use crate::common::file_drop::FileDropZone;
 use crate::common::{PanelTarget, UiContext, UiEffect};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::features::composer::ops;
 use crate::features::workspace::host;
 use crate::features::workspace::i18n::{t, ta};
@@ -172,9 +178,11 @@ pub struct TerminalPanel {
     file_drop: FileDropZone,
     /// Dropped files still to store on a host that cannot read this machine's disk, in
     /// drop order (`TerminalFilePasteQueue`).
+    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     upload_queue: VecDeque<PathBuf>,
     /// The upload in flight.
+    #[cfg(not(target_arch = "wasm32"))]
     #[rust]
     upload_request: Option<String>,
     #[rust]
@@ -385,6 +393,7 @@ impl TerminalPanel {
     /// terminal-pane.tsx `handleDroppedFiles` (`routeTerminalDrop`): on the host's own
     /// machine the files' paths are pasted as one input; any other host is sent the bytes
     /// and each host path is pasted as its upload finishes.
+    #[cfg(not(target_arch = "wasm32"))]
     fn drop_files(&mut self, cx: &mut Cx, ctx: &mut UiContext, paths: Vec<PathBuf>) {
         let Some(target) = self.target.clone() else {
             return;
@@ -406,6 +415,7 @@ impl TerminalPanel {
     }
 
     /// Starts the next queued upload; one file is stored at a time.
+    #[cfg(not(target_arch = "wasm32"))]
     fn upload_next(&mut self, ctx: &mut UiContext) {
         if self.upload_request.is_some() {
             return;
@@ -426,6 +436,7 @@ impl TerminalPanel {
 
     /// The upload in flight finished: its host path is pasted (`prepareTerminalPath`), a
     /// failure is reported (`reportFilePasteFailure`), and the next file starts.
+    #[cfg(not(target_arch = "wasm32"))]
     fn handle_upload(&mut self, cx: &mut Cx, ctx: &mut UiContext) {
         let Some(result) = self
             .upload_request
@@ -697,11 +708,14 @@ impl TerminalPanel {
             .widget(id!(toolbar.info.title))
             .set_text(cx, &facts.title);
         // `showFileUploading`: a dropped file is on its way to the host.
+        #[cfg(not(target_arch = "wasm32"))]
         let status = if facts.status.is_empty() && self.upload_request.is_some() {
             t("workspace.terminal.uploadingFile")
         } else {
             facts.status.clone()
         };
+        #[cfg(target_arch = "wasm32")]
+        let status = facts.status;
         self.view
             .widget(id!(toolbar.info.status))
             .set_text(cx, &status);
@@ -829,16 +843,19 @@ impl Widget for TerminalPanel {
         }
         if let Some(ctx) = scope.data.get_mut::<UiContext>() {
             self.handle_core(cx, ctx);
-            self.handle_upload(cx, ctx);
-            // terminal-pane.tsx: the output of a connected terminal takes dropped files.
-            let drop_ready = !self.hidden
-                && self.connected
-                && self
-                    .output()
-                    .borrow()
-                    .is_some_and(|view| view.session.is_some());
-            if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
-                self.drop_files(cx, ctx, paths);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.handle_upload(cx, ctx);
+                // terminal-pane.tsx: the output of a connected terminal takes dropped files.
+                let drop_ready = !self.hidden
+                    && self.connected
+                    && self
+                        .output()
+                        .borrow()
+                        .is_some_and(|view| view.session.is_some());
+                if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
+                    self.drop_files(cx, ctx, paths);
+                }
             }
         }
         if self.hidden_screen_timer.is_event(event).is_some() {
@@ -870,8 +887,9 @@ impl Widget for TerminalPanel {
         let step = self.view.draw_walk(cx, scope, walk);
         self.find.take_focus(cx, &self.view.widget(id!(find_wrap)));
         // The drop backdrop covers the output (`styles.outputContainer`).
-        let zone = self.view.widget(id!(body)).area().rect(cx);
-        self.file_drop.draw(cx, zone);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.file_drop
+            .draw(cx, self.view.widget(id!(body)).area().rect(cx));
         step
     }
 }
@@ -897,8 +915,11 @@ impl TerminalPanelRef {
             inner.session_opened = false;
             inner.init_error = None;
             // Files dropped on the previous terminal are not pasted into this one.
-            inner.upload_queue.clear();
-            inner.upload_request = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                inner.upload_queue.clear();
+                inner.upload_request = None;
+            }
             inner.paste_request = None;
             inner.create_pending = Pending::default();
             if let Some(mut view) = inner.output().borrow_mut() {

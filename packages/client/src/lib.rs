@@ -1,23 +1,27 @@
-//! Async native Paseo SDK. Requests are never replayed after uncertain disconnects.
+//! Async Paseo SDK. Requests are never replayed after uncertain disconnects.
 //! Operation methods accept wire-shaped JSON fields so optional provider/plugin extensions
 //! remain lossless. Use owned subscriptions for streaming and explicit cursor pagination.
 pub use paseo_protocol::crypto;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod desktop_app_bridge;
+#[cfg(not(target_arch = "wasm32"))]
 mod discovery;
 mod files;
 mod operations;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod process;
 mod subscriptions;
 pub mod transport;
 #[cfg(windows)]
 pub mod windows_security;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::transport::target::Endpoint;
 use crate::{
     crypto::SecurityMode,
     transport::{
         HostFrame,
         connector::{Connection, Sender},
-        target::{Endpoint, Target},
+        target::Target,
     },
 };
 use anyhow::{Result, anyhow, bail, ensure};
@@ -62,6 +66,9 @@ pub enum DaemonTarget {
 }
 impl DaemonTarget {
     pub fn select(home: Option<&str>, host: Option<&str>, local_only: bool) -> Result<Self> {
+        #[cfg(target_arch = "wasm32")]
+        return Self::select_with_env(home, host, local_only, None, None);
+        #[cfg(not(target_arch = "wasm32"))]
         Self::select_with_env(
             home,
             host,
@@ -144,12 +151,16 @@ impl DaemonTarget {
         }
     }
     pub fn home(&self) -> Result<PathBuf> {
+        #[cfg(target_arch = "wasm32")]
+        return resolve_home(None);
+        #[cfg(not(target_arch = "wasm32"))]
         match self {
             Self::Instance { home } => Ok(home.clone()),
             _ => resolve_home(std::env::var("PASEO_HOME").ok().as_deref()),
         }
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub fn resolve_home(value: Option<&str>) -> Result<PathBuf> {
     let value = value.unwrap_or("~/.paseo");
     let path = if value == "~" {
@@ -177,6 +188,14 @@ pub fn resolve_home(value: Option<&str>) -> Result<PathBuf> {
         }
     }
     Ok(normalized)
+}
+#[cfg(target_arch = "wasm32")]
+pub fn resolve_home(_value: Option<&str>) -> Result<PathBuf> {
+    Err(ClientError::new(
+        "BROWSER_UNSUPPORTED",
+        "Daemon home is not available in the browser",
+    )
+    .into())
 }
 fn is_registration(host: &str) -> bool {
     host.starts_with("hst_") || host.starts_with("srv_")
@@ -332,6 +351,7 @@ fn deliver_binary(state: &Shared, bytes: bytes::Bytes) {
 }
 impl DaemonClient {
     pub async fn connect(options: ConnectOptions, cancel: CancellationToken) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let DaemonTarget::Endpoint { host } = &options.target
             && is_registration(host)
         {
@@ -340,11 +360,29 @@ impl DaemonClient {
         Self::connect_direct(options, cancel).await
     }
     async fn connect_direct(options: ConnectOptions, cancel: CancellationToken) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
         let home = options.home.clone().unwrap_or(options.target.home()?);
+        #[cfg(target_arch = "wasm32")]
+        if options.home.is_some() || options.local_credential.is_some() {
+            return Err(ClientError::new(
+                "BROWSER_UNSUPPORTED",
+                "Local daemon credentials and paths are not available in the browser",
+            )
+            .into());
+        }
         let host = match &options.target {
             DaemonTarget::Endpoint { host } => host.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
             DaemonTarget::Instance { home } => {
                 discovery::listen(home, options.timeout, &cancel).await?
+            }
+            #[cfg(target_arch = "wasm32")]
+            DaemonTarget::Instance { .. } => {
+                return Err(ClientError::new(
+                    "BROWSER_UNSUPPORTED",
+                    "Local daemon discovery is not available in the browser",
+                )
+                .into());
             }
         };
         let mut target = Target::parse(&host)?;
@@ -354,11 +392,13 @@ impl DaemonClient {
         if let Some(password) = options.password {
             target.password = Some(password);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if target.password.is_none() {
             target.password = std::env::var("PASEO_PASSWORD")
                 .ok()
                 .filter(|v| !v.is_empty());
         }
+        #[cfg(not(target_arch = "wasm32"))]
         let auth = if let Some(token) = options.local_credential {
             Some(json!({"kind":"localCredential","token":token}))
         } else if let Some(password) = target.password.as_ref() {
@@ -368,9 +408,23 @@ impl DaemonClient {
                 .await?
                 .map(|token| json!({"kind":"localCredential","token":token}))
         };
+        #[cfg(target_arch = "wasm32")]
+        let auth = target
+            .password
+            .take()
+            .map(|password| json!({"kind":"password","password":password}));
         let identity = match options.client_id {
             Some(id) => id,
+            #[cfg(not(target_arch = "wasm32"))]
             None => client_id(&home).await?,
+            #[cfg(target_arch = "wasm32")]
+            None => {
+                return Err(ClientError::new(
+                    "CLIENT_ID_REQUIRED",
+                    "A client ID is required in the browser",
+                )
+                .into());
+            }
         };
         let connect = Connection::connect(
             &target,
@@ -490,6 +544,7 @@ impl DaemonClient {
         }
         Ok(client)
     }
+    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_registration(
         options: ConnectOptions,
         cancel: CancellationToken,
@@ -859,6 +914,7 @@ fn hello(identity: &str, client_type: &str, auth: Option<Value>) -> Value {
     }
     value
 }
+#[cfg(not(target_arch = "wasm32"))]
 async fn client_id(home: &Path) -> Result<String> {
     let path = home.join("cli-client-id");
     match tokio::fs::read_to_string(&path).await {
@@ -884,6 +940,7 @@ async fn client_id(home: &Path) -> Result<String> {
     file.sync_all().await?;
     Ok(id)
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn read_local_credential_for_target(home: &Path, host: &str) -> Result<Option<String>> {
     let lock = match tokio::fs::read(home.join("paseo.pid")).await {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -912,6 +969,16 @@ pub async fn read_local_credential_for_target(home: &Path, host: &str) -> Result
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
     .then(|| token.to_owned()))
 }
+#[cfg(target_arch = "wasm32")]
+pub async fn read_local_credential_for_target(_home: &Path, _host: &str) -> Result<Option<String>> {
+    Err(ClientError::new(
+        "BROWSER_UNSUPPORTED",
+        "Local daemon credentials are not available in the browser",
+    )
+    .into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn normalized_local_target(host: &str) -> Option<String> {
     let host = host.trim();
     if host.starts_with("unix://") || host.starts_with("pipe://") {
@@ -948,7 +1015,7 @@ fn normalized_local_target(host: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     #[test]
@@ -973,6 +1040,18 @@ mod tests {
             normalized_local_target("localhost:6767")
         );
     }
+
+    #[test]
+    fn websocket_password_is_not_part_of_the_wire_url() {
+        let target = Target::parse("wss://host.example?password=s%40cret&mode=preview").unwrap();
+        assert_eq!(target.password.as_deref(), Some("s@cret"));
+        assert!(matches!(
+            target.endpoint,
+            Endpoint::Socket { url, ipc: None }
+                if url == "wss://host.example/ws?mode=preview"
+        ));
+    }
+
     #[tokio::test]
     async fn request_correlation_ignores_other_response_type() {
         let (events, _) = broadcast::channel(4);

@@ -1,11 +1,8 @@
-//! Non-UI runtime of the native Paseo GUI.
+//! Non-UI runtime of the Paseo GUI.
 //!
-//! [`GuiCore`] owns one dedicated core thread with a single-threaded Tokio runtime. Host
-//! connections (direct, relay, IPC, SSH and connected-host routes), directory hydration,
-//! persistence and request correlation run there; the GUI thread only enqueues commands through
-//! [`CoreHandle`] and stages [`CoreEvent`]s for budgeted GUI dispatch.
-//! `core/client.dart`, the host and persistence parts of `core/app_store.dart`, and
-//! `core/transport/connection_selection.dart`.
+//! The native runtime runs on a dedicated core thread. In the browser it runs on the page
+//! thread, driven by `GuiCore::turn` on GUI signals and timer ticks. In either case
+//! [`CoreHandle`] enqueues commands and [`GuiCore`] stages events for budgeted UI dispatch.
 mod connection;
 mod error;
 mod events;
@@ -16,12 +13,14 @@ mod protocol;
 mod runtime;
 mod storage;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc as std_mpsc;
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Deref,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, mpsc as std_mpsc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -190,13 +189,17 @@ impl FromIterator<Arc<Value>> for DirectoryAgents {
 pub struct CoreConfig {
     /// The Flutter-compatible application-support directory. The core owns
     /// `state_dir/paseo-native/` and `state_dir/shared_preferences.json`.
+    /// In the browser, storage is scoped to the origin and this is not a filesystem path.
     pub state_dir: PathBuf,
     /// Daemon home used for desktop local-daemon discovery. `None` uses `$PASEO_HOME` or
     /// `~/.paseo` on desktop and disables discovery on Android/iOS.
+    #[cfg(not(target_arch = "wasm32"))]
     pub daemon_home: Option<PathBuf>,
     /// An endpoint that must be present as a saved host (development daemons).
+    /// The browser ignores this value and uses the serving page's origin plus `/ws`.
     pub default_endpoint: Option<String>,
     /// Platform-protected encryption key for the embedded node. Normal hosts need no key store.
+    #[cfg(not(target_arch = "wasm32"))]
     pub tailnet_key_store: Option<Arc<dyn paseo_tailnet::KeyStore>>,
 }
 
@@ -514,8 +517,8 @@ impl CoreHandle {
     }
 
     /// Re-evaluate host connections after the OS reports a changed network path.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub fn network_changed(&self) {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         self.send(Command::NetworkChanged);
     }
 
@@ -562,16 +565,25 @@ fn requested_id(message: &Value) -> RequestId {
     }
 }
 
-/// The running core. Dropping it saves pending state, closes every connection (a daemon is
-/// never stopped) and waits up to three seconds for the core thread.
+/// The running core. Dropping it saves pending state and closes connections, without
+/// stopping any daemon. Native drop waits up to three seconds for the core thread.
 pub struct GuiCore {
     handle: CoreHandle,
     queue: Arc<EventQueue>,
+    #[cfg(not(target_arch = "wasm32"))]
     thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(not(target_arch = "wasm32"))]
     done: std_mpsc::Receiver<()>,
+    #[cfg(target_arch = "wasm32")]
+    local: tokio::task::LocalSet,
+    #[cfg(target_arch = "wasm32")]
+    runtime: tokio::runtime::Runtime,
+    #[cfg(target_arch = "wasm32")]
+    done: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl GuiCore {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn start(config: CoreConfig, wake: Arc<dyn Fn() + Send + Sync>) -> anyhow::Result<GuiCore> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -602,6 +614,46 @@ impl GuiCore {
         })
     }
 
+    /// Starts the core on the page thread, connecting only to `/ws` on the page's origin.
+    #[cfg(target_arch = "wasm32")]
+    pub fn start(
+        mut config: CoreConfig,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        config.default_endpoint = Some(host_config::browser_endpoint()?.to_owned());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        let local = tokio::task::LocalSet::new();
+        let state_dir = Arc::new(config.state_dir.clone());
+        let queue = Arc::new(EventQueue::new(wake));
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let (complete, done) = tokio::sync::oneshot::channel();
+        let events = queue.clone();
+        local.spawn_local(async move {
+            runtime::run(config, events, receiver).await;
+            let _ = complete.send(());
+        });
+        Ok(Self {
+            handle: CoreHandle {
+                commands,
+                state_dir,
+            },
+            queue,
+            local,
+            runtime,
+            done,
+        })
+    }
+
+    /// Runs ready tasks and due timers without waiting for I/O. Call on GUI signals and
+    /// a short repeating timer; the timer also drives Tokio deadlines without a browser event.
+    #[cfg(target_arch = "wasm32")]
+    pub fn turn(&self) {
+        self.runtime
+            .block_on(self.local.run_until(tokio::task::yield_now()));
+    }
+
     pub fn handle(&self) -> CoreHandle {
         self.handle.clone()
     }
@@ -622,11 +674,16 @@ impl GuiCore {
 impl Drop for GuiCore {
     fn drop(&mut self) {
         self.handle.send(Command::Shutdown);
+        #[cfg(not(target_arch = "wasm32"))]
         if self.done.recv_timeout(Duration::from_secs(3)).is_ok()
             && let Some(thread) = self.thread.take()
         {
             let _ = thread.join();
         }
+        // FIFO shutdown only drains ready commands and synchronous localStorage writes.
+        // Browser sockets are cancelled, never awaited; there is no I/O or timer to wait for.
+        #[cfg(target_arch = "wasm32")]
+        let _ = self.runtime.block_on(self.local.run_until(&mut self.done));
     }
 }
 

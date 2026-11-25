@@ -34,7 +34,7 @@ struct Action {
 /// pairing link. Desktop: Direct connection (primary), Remote SSH, Paste pairing link.
 fn actions() -> Vec<Action> {
     let scan = MOBILE && paseo_gui_platform::platform().is_some_and(|h| h.capabilities().qr_scan);
-    let desktop = platform::desktop_host() || !MOBILE;
+    let desktop = !cfg!(target_arch = "wasm32") && (platform::desktop_host() || !MOBILE);
     let mut actions = Vec::new();
     if scan {
         actions.push(Action {
@@ -81,6 +81,7 @@ fn version_text() -> String {
 
 /// The daemon can be started here or automatically at launch. Connection
 /// methods remain available regardless of the local daemon's state.
+#[cfg(not(target_arch = "wasm32"))]
 fn local_daemon() -> Option<LocalDaemon> {
     if MOBILE || !platform::desktop_host() {
         return None;
@@ -162,7 +163,10 @@ pub fn handle_event(
 
 pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let actions = actions();
+    #[cfg(not(target_arch = "wasm32"))]
     let daemon = local_daemon();
+    #[cfg(target_arch = "wasm32")]
+    let daemon: Option<LocalDaemon> = None;
     let window = shell.data.window_id.clone();
     let mut ui = make_ui(shell);
     let p = ui.p;
@@ -479,18 +483,21 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     cx.end_turtle();
 }
 
-pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) {
+pub fn click(shell: &mut PaseoShell, cx: &mut Cx, _ui: &mut UiContext, id: &str) {
     match id {
         "website" => {
             platform::open_external("https://paseo.sh");
         }
         "settings" => crate::shell::commands::open_settings(shell, cx, None, ""),
+        #[cfg(not(target_arch = "wasm32"))]
         "daemonstart" => {
             if let Some(handle) = paseo_gui_platform::platform() {
                 handle.desktop_invoke("start_desktop_daemon", serde_json::json!({}));
             }
         }
-        "daemonconnect" => ui.core.connect_local_daemon(),
+        #[cfg(not(target_arch = "wasm32"))]
+        "daemonconnect" => _ui.core.connect_local_daemon(),
+        #[cfg(not(target_arch = "wasm32"))]
         "daemonsettings" => crate::shell::commands::open_settings(shell, cx, None, "local-daemon"),
         "scan" | "direct" | "ssh" | "link" => {
             // One connection flow at a time (Flutter `_busy`).

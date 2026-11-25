@@ -90,6 +90,12 @@ worker. The application owns the UI continuation: an initial signal followed by
 one-shot 60 Hz timers while work remains, independent of drawing or the lifetime
 of the original row/window. Atlas preparation does not drive retirement.
 
+Without threads (the `wasm32` web build) `Service` keeps the same worker
+layouter on the UI thread: `AsyncLayout::poll` runs the oldest queued job before
+reading its mailbox and releases retired transfers, so a request followed by a
+poll completes in that call. Jobs still queued request another UI pass with the
+same signal a worker completion sends.
+
 ## Stable glyph pages and overlay depth
 
 `src/text/{font_atlas,rasterizer,fonts}.rs` retain existing glyph coordinates when

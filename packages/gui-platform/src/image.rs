@@ -192,7 +192,7 @@ pub fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<V
 }
 
 /// Decodes a PNG into straight RGBA8 (used to place images on desktop clipboards).
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn decode_png_rgba(bytes: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -228,7 +228,7 @@ mod tests {
         let pixels = [255u8, 0, 0, 255, 0, 255, 0, 128];
         let png = encode_rgba_png(2, 1, &pixels).unwrap();
         assert_eq!(sniff_image_mime(&png), Some("image/png"));
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         assert_eq!(decode_png_rgba(&png).unwrap(), (2, 1, pixels.to_vec()));
     }
 

@@ -170,11 +170,32 @@ pub fn payload_error(payload: &Value, request_type: &str) -> Option<String> {
 /// accepted), reporting `(received, total)` progress. Returns the file metadata
 /// `{mime, size, modifiedAt, revision}`. A failed transfer removes the partial file; a
 /// cancelled one (future dropped) leaves it for the caller's staging cleanup.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn download_into(
     client: &paseo_client::DaemonClient,
     cwd: &str,
     path: &str,
     destination: &std::path::Path,
+    progress: impl FnMut(u64, u64),
+) -> anyhow::Result<Value> {
+    let mut file = std::fs::File::create(destination)?;
+    let outcome = match download_to(client, cwd, path, &mut file, progress).await {
+        Ok(metadata) => file.sync_all().map(|()| metadata).map_err(Into::into),
+        Err(error) => Err(error),
+    };
+    if outcome.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(destination);
+    }
+    outcome
+}
+
+/// Streams file bytes and metadata into a filesystem or memory writer.
+pub(super) async fn download_to(
+    client: &paseo_client::DaemonClient,
+    cwd: &str,
+    path: &str,
+    writer: &mut (impl Write + Send),
     mut progress: impl FnMut(u64, u64),
 ) -> anyhow::Result<Value> {
     use paseo_protocol::binary_frames::{FileTransferFrame, decode_file_transfer_frame};
@@ -195,77 +216,68 @@ pub async fn download_into(
         cancel,
     );
     tokio::pin!(request);
-    let mut file = std::fs::File::create(destination)?;
-    let outcome: anyhow::Result<Value> = async {
-        let mut metadata: Option<Value> = None;
-        let mut total = 0u64;
-        let mut received = 0u64;
-        loop {
-            tokio::select! { biased;
-                result = &mut request => {
-                    // A legacy host answers with the whole file in JSON.
-                    let payload = result?;
-                    let entry = payload.get("file").cloned().unwrap_or(Value::Null);
-                    let content = entry.get("content").and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("Host did not return file bytes"))?;
-                    let bytes = if entry.get("encoding").and_then(Value::as_str) == Some("base64") {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(content)?
-                    } else {
-                        content.as_bytes().to_vec()
-                    };
-                    file.write_all(&bytes)?;
-                    file.flush()?;
-                    let size = bytes.len() as u64;
-                    progress(size, size);
-                    return Ok(json!({
-                        "mime": entry.get("mimeType").cloned().unwrap_or(json!("application/octet-stream")),
-                        "size": size,
-                        "modifiedAt": entry.get("modifiedAt").cloned().unwrap_or(json!("")),
-                        "revision": entry.get("revision").cloned().unwrap_or(Value::Null),
-                    }));
-                }
-                frame = frames.recv() => {
-                    let frame = frame.ok_or_else(|| anyhow::anyhow!("Connection lost during file download"))?;
-                    match decode_file_transfer_frame(&frame)? {
-                        FileTransferFrame::Begin { request_id, metadata: begin } if request_id == id => {
-                            anyhow::ensure!(metadata.is_none(), "Duplicate file transfer header");
-                            total = begin.size;
-                            metadata = Some(json!({
-                                "mime": begin.mime,
-                                "size": begin.size,
-                                "modifiedAt": begin.modified_at,
-                                "revision": begin.revision,
-                            }));
-                            progress(0, total);
-                        }
-                        FileTransferFrame::Chunk { request_id, payload } if request_id == id => {
-                            anyhow::ensure!(metadata.is_some(), "File data arrived before its header");
-                            received += payload.len() as u64;
-                            anyhow::ensure!(received <= total, "File transfer exceeded declared size");
-                            file.write_all(payload)?;
-                            progress(received, total);
-                        }
-                        FileTransferFrame::End { request_id } if request_id == id => {
-                            let metadata = metadata.take()
-                                .ok_or_else(|| anyhow::anyhow!("Incomplete file transfer ({received} bytes)"))?;
-                            anyhow::ensure!(received == total, "Incomplete file transfer ({received} bytes)");
-                            file.flush()?;
-                            file.sync_all()?;
-                            return Ok(metadata);
-                        }
-                        _ => {}
+    let mut metadata: Option<Value> = None;
+    let mut total = 0u64;
+    let mut received = 0u64;
+    loop {
+        tokio::select! { biased;
+            result = &mut request => {
+                // A legacy host answers with the whole file in JSON.
+                let payload = result?;
+                let entry = &payload["file"];
+                let content = entry.get("content").and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Host did not return file bytes"))?;
+                let size = if entry.get("encoding").and_then(Value::as_str) == Some("base64") {
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(content)?;
+                    writer.write_all(&bytes)?;
+                    bytes.len() as u64
+                } else {
+                    writer.write_all(content.as_bytes())?;
+                    content.len() as u64
+                };
+                writer.flush()?;
+                progress(size, size);
+                return Ok(json!({
+                    "mime": entry.get("mimeType").cloned().unwrap_or(json!("application/octet-stream")),
+                    "size": size,
+                    "modifiedAt": entry.get("modifiedAt").cloned().unwrap_or(json!("")),
+                    "revision": entry.get("revision").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            frame = frames.recv() => {
+                let frame = frame.ok_or_else(|| anyhow::anyhow!("Connection lost during file download"))?;
+                match decode_file_transfer_frame(&frame)? {
+                    FileTransferFrame::Begin { request_id, metadata: begin } if request_id == id => {
+                        anyhow::ensure!(metadata.is_none(), "Duplicate file transfer header");
+                        total = begin.size;
+                        metadata = Some(json!({
+                            "mime": begin.mime,
+                            "size": begin.size,
+                            "modifiedAt": begin.modified_at,
+                            "revision": begin.revision,
+                        }));
+                        progress(0, total);
                     }
+                    FileTransferFrame::Chunk { request_id, payload } if request_id == id => {
+                        anyhow::ensure!(metadata.is_some(), "File data arrived before its header");
+                        received += payload.len() as u64;
+                        anyhow::ensure!(received <= total, "File transfer exceeded declared size");
+                        writer.write_all(payload)?;
+                        progress(received, total);
+                    }
+                    FileTransferFrame::End { request_id } if request_id == id => {
+                        let metadata = metadata.take()
+                            .ok_or_else(|| anyhow::anyhow!("Incomplete file transfer ({received} bytes)"))?;
+                        anyhow::ensure!(received == total, "Incomplete file transfer ({received} bytes)");
+                        writer.flush()?;
+                        return Ok(metadata);
+                    }
+                    _ => {}
                 }
             }
         }
     }
-    .await;
-    if outcome.is_err() {
-        drop(file);
-        let _ = std::fs::remove_file(destination);
-    }
-    outcome
 }
 
 /// Uploads bytes through the framed transfer (Flutter `RemoteFileService.upload`). The

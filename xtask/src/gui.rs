@@ -19,6 +19,7 @@ pub const MACOS_BUNDLE: &str = "Passession.app";
 const IOS_BUNDLE: &str = "Passession.app";
 const IOS_EXECUTABLE: &str = "paseo-sessions";
 const CARGO_BIN: &str = "paseo-sessions";
+const WEB_PACKAGE: &str = "paseo-gui-web";
 /// Supported Android floor (Android 7.0), the same as the Flutter client.
 /// The NDK linker for this API level has no stubs for newer system libraries.
 const ANDROID_API: u32 = 24;
@@ -194,15 +195,18 @@ fn fresh(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy every Makepad-aware resource directory to `<root>/makepad/<crate>/resources`,
+/// Copy every Makepad-aware resource directory to `<root>/<crate>/resources`,
 /// leaving out the reviewed exclusions in `packaging/resource-notices.json`, and
 /// fail if a client source references a resource that was not staged.
-fn stage_resources(metadata: &Value, root: &Path) -> Result<Vec<notices::PackagedResource>> {
+fn stage_resources(
+    metadata: &Value,
+    package: &str,
+    root: &Path,
+) -> Result<Vec<notices::PackagedResource>> {
     let excluded = notices::excluded_resources()?;
     let mut packaged = Vec::new();
-    for directory in notices::gui_resource_directories(metadata)? {
+    for directory in notices::gui_resource_directories(metadata, package)? {
         let destination = root
-            .join("makepad")
             .join(directory.name.replace('-', "_"))
             .join("resources");
         for entry in WalkDir::new(&directory.path)
@@ -252,7 +256,7 @@ fn stage_resources(metadata: &Value, root: &Path) -> Result<Vec<notices::Package
         packaged
             .iter()
             .any(|resource| resource.package == "makepad-widgets"),
-        "makepad-widgets resources were not found in the paseo-gui dependency closure"
+        "makepad-widgets resources were not found in the {package} dependency closure"
     );
     notices::ensure_references_staged(&packaged)?;
     Ok(packaged)
@@ -266,11 +270,16 @@ fn stage_notices(
     root: &Path,
     native_notices: &str,
 ) -> Result<()> {
+    let package = if platform == "web" {
+        WEB_PACKAGE
+    } else {
+        "paseo-gui"
+    };
     text(
         &root.join("THIRD-PARTY-NOTICES.txt"),
         format!(
             "{}{}",
-            notices::render_app(metadata, packaged, platform)?,
+            notices::render_app(metadata, package, packaged, platform)?,
             native_notices
         ),
         0o644,
@@ -280,6 +289,101 @@ fn stage_notices(
         &root.join("LICENSE"),
     )?;
     chmod(&root.join("LICENSE"), 0o644)
+}
+
+pub fn build_web(args: &[String]) -> Result<()> {
+    ensure!(args.is_empty(), "Usage: cargo xtask build-web");
+    const TARGET: &str = "wasm32-wasip1";
+    let mut cargo = command(cargo())?;
+    crate::cross_tools::configure_web(&mut cargo)?;
+    run(cargo.args([
+        "build",
+        "--locked",
+        "--release",
+        "--target",
+        TARGET,
+        "-p",
+        WEB_PACKAGE,
+        "--lib",
+    ]))?;
+    let metadata = notices::cargo_metadata(TARGET)?;
+    let dependencies = notices::dependency_closure(&metadata, WEB_PACKAGE)?;
+    let bridge = dependencies
+        .iter()
+        .find(|package| package["name"] == "makepad-wasm-bridge")
+        .context("Missing makepad-wasm-bridge dependency")?;
+    let bridge = Path::new(
+        bridge["manifest_path"]
+            .as_str()
+            .context("Missing makepad-wasm-bridge manifest path")?,
+    )
+    .parent()
+    .context("makepad-wasm-bridge manifest has no parent")?;
+
+    let output = web_output()?;
+    let temporary = tempfile::tempdir_in(output.parent().context("Missing web build directory")?)?;
+    let stage = temporary.path().join("web");
+    let workspace = root()?;
+    let page = workspace.join("packages/browser/web");
+    let platform = workspace.join("packages/gui-platform/vendor/makepad-platform/src/os/web");
+    copy_tree(
+        &target_root()?
+            .join(TARGET)
+            .join("release/paseo_gui_web.wasm"),
+        &stage.join("app.wasm"),
+    )?;
+    chmod(&stage.join("app.wasm"), 0o644)?;
+    for file in ["index.html", "boot.js"] {
+        copy_tree(&page.join(file), &stage.join(file))?;
+    }
+    for file in ["web.js", "web_gl.js", "web_worker.js"] {
+        copy_tree(
+            &platform.join(file),
+            &stage.join("makepad_platform").join(file),
+        )?;
+    }
+    copy_tree(
+        &platform.join("full_canvas.css"),
+        &stage.join("full_canvas.css"),
+    )?;
+    copy_tree(
+        &bridge.join("src/wasm_bridge.js"),
+        &stage.join("makepad_wasm_bridge/wasm_bridge.js"),
+    )?;
+    let packaged = stage_resources(&metadata, WEB_PACKAGE, &stage)?;
+    stage_notices(&metadata, &packaged, "web", &stage, "")?;
+    precompress_web(&stage)?;
+    remove_if_exists(&output)?;
+    fs::rename(stage, &output)?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+/// Writes `<file>.gz` beside each compressible bundle file of at least 16 KiB; the daemon
+/// serves it to clients that accept gzip (the module alone is tens of megabytes).
+fn precompress_web(stage: &Path) -> Result<()> {
+    use flate2::{Compression, write::GzEncoder};
+    for entry in WalkDir::new(stage).sort_by_file_name() {
+        let entry = entry?;
+        let path = entry.path();
+        let compressible = matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("wasm" | "js" | "css" | "html" | "json" | "ttf" | "otf" | "svg" | "txt")
+        );
+        if !entry.file_type().is_file() || !compressible || entry.metadata()?.len() < 16 * 1024 {
+            continue;
+        }
+        let mut gzip = path.as_os_str().to_owned();
+        gzip.push(".gz");
+        let mut encoder = GzEncoder::new(
+            fs::File::create(&gzip).with_context(|| format!("create {gzip:?}"))?,
+            Compression::best(),
+        );
+        std::io::copy(&mut fs::File::open(path)?, &mut encoder)?;
+        encoder.finish()?;
+        chmod(Path::new(&gzip), 0o644)?;
+    }
+    Ok(())
 }
 
 /// Replace `$(NAME)` placeholders; any unknown placeholder is an error.
@@ -491,7 +595,7 @@ fn build_desktop_app(
         )?;
     }
     let metadata = notices::cargo_metadata(selected.triple)?;
-    let packaged = stage_resources(&metadata, &resources)?;
+    let packaged = stage_resources(&metadata, "paseo-gui", &resources.join("makepad"))?;
     stage_notices(&metadata, &packaged, target, &resources, "")?;
     // A smoke bundle carries a test driver: it gets no build descriptor, so
     // package-desktop can never pick it up.
@@ -881,7 +985,7 @@ fn build_android_native(
     }
     if app {
         let metadata = notices::cargo_metadata(abis[0].triple)?;
-        let packaged = stage_resources(&metadata, &work.join("assets"))?;
+        let packaged = stage_resources(&metadata, "paseo-gui", &work.join("assets/makepad"))?;
         let native_notices = native_notices.into_iter().collect::<Vec<_>>().join("\n");
         stage_notices(
             &metadata,
@@ -1135,7 +1239,7 @@ fn build_ios_native(
         .arg(format!("Merge {}", partial.display()))
         .arg(app.join("Info.plist")))?;
     let metadata = notices::cargo_metadata(triple)?;
-    let packaged = stage_resources(&metadata, &app)?;
+    let packaged = stage_resources(&metadata, "paseo-gui", &app.join("makepad"))?;
     stage_notices(&metadata, &packaged, "ios", &app, &tailnet.notices)?;
     Ok(app)
 }

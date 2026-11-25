@@ -96,8 +96,11 @@ fn storage_failed(core: &Rc<Core>, error: CoreError) {
     core.touch();
 }
 
-/// Loads `state.json`, layouts, replicas and preferences off the core thread.
+/// Loads `state.json`, layouts, replicas and preferences.
 pub(crate) async fn load(paths: Paths) -> (storage::Loaded, prefs::Prefs) {
+    #[cfg(target_arch = "wasm32")]
+    return (storage::load(&paths), prefs::load(&paths));
+    #[cfg(not(target_arch = "wasm32"))]
     tokio::task::spawn_blocking(move || (storage::load(&paths), prefs::load(&paths)))
         .await
         .unwrap_or_else(|error| {
@@ -114,6 +117,17 @@ pub(crate) async fn load(paths: Paths) -> (storage::Loaded, prefs::Prefs) {
                 },
             )
         })
+}
+
+async fn write_storage<T: Send + 'static>(
+    write: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, CoreError> {
+    #[cfg(target_arch = "wasm32")]
+    return Ok(write());
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::task::spawn_blocking(write)
+        .await
+        .map_err(|error| CoreError::new("STORAGE_IO", error.to_string(), false))
 }
 
 /// `CoreHandle::save_state`.
@@ -273,12 +287,9 @@ fn queue_prefs(core: &Rc<Core>, flushed: bool) -> Result<Option<PrefsCompletion>
                     report_error,
                     completed,
                 } = write;
-                // Exactly one replacement is in flight, including its fsync and rename.
-                let result =
-                    tokio::task::spawn_blocking(move || prefs::save(&paths, &values, &foreign))
-                        .await
-                        .map_err(|error| CoreError::new("STORAGE_IO", error.to_string(), false))
-                        .and_then(|result| result);
+                let result = write_storage(move || prefs::save(&paths, &values, &foreign))
+                    .await
+                    .and_then(|result| result);
                 if report_error && let Err(error) = &result {
                     core.error(None, error.clone());
                 }
@@ -428,9 +439,7 @@ async fn save_once(core: &Rc<Core>) -> Result<(), CoreError> {
         )
     };
     let paths = core.store.borrow().paths.clone();
-    let outcome = tokio::task::spawn_blocking(move || storage::save(&paths, job))
-        .await
-        .map_err(|error| CoreError::new("STORAGE_IO", error.to_string(), false))?;
+    let outcome = write_storage(move || storage::save(&paths, job)).await?;
     let mut store = core.store.borrow_mut();
     match outcome {
         Ok(saved) => {
@@ -458,6 +467,7 @@ async fn save_once(core: &Rc<Core>) -> Result<(), CoreError> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Flutter `_reloadSharedHosts`: rows another window/process added to `state.json`.
 pub(crate) async fn shared_hosts(core: &Rc<Core>) -> Result<Vec<storage::LoadedHost>, CoreError> {
     let (paths, writable) = {
@@ -478,6 +488,7 @@ pub(crate) async fn shared_hosts(core: &Rc<Core>) -> Result<Vec<storage::LoadedH
     .map_err(|error| CoreError::new("STORAGE_IO", error.to_string(), false))?
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Reads the cached directory of a host that joined after startup.
 pub(crate) async fn read_replica(
     core: &Rc<Core>,
@@ -495,6 +506,7 @@ pub(crate) async fn read_replica(
     Ok(replica)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Records a host's saved row as the merge base after loading it from disk.
 pub(crate) fn remember_saved_host(core: &Rc<Core>, config_id: &str, row: Value) {
     core.store
@@ -503,7 +515,7 @@ pub(crate) fn remember_saved_host(core: &Rc<Core>, config_id: &str, row: Value) 
         .insert(config_id.to_owned(), row);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod prefs_writer_tests {
     use super::*;
     use std::sync::Arc;

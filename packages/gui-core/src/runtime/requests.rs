@@ -10,7 +10,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use paseo_client::{DaemonClient, transport::decode_frame};
+use paseo_client::DaemonClient;
+#[cfg(not(target_arch = "wasm32"))]
+use paseo_client::transport::decode_frame;
 use paseo_protocol::binary_frames::{
     TerminalOpcode, decode_terminal_frame, decode_terminal_resize, decode_terminal_snapshot,
 };
@@ -19,9 +21,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::{Core, Host, directory, hosts};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::connection::RouteIn;
 use crate::{
     CoreError, Operation, RequestId,
-    connection::{Control, Liveness, Opened, RouteIn, SlotText},
+    connection::{Control, Liveness, Opened, SlotText},
     error::{invalid_request, not_connected},
     ids,
     legacy::{LegacyWorkspaces, legacy_event_filter, legacy_matches, sorted_union},
@@ -57,6 +61,7 @@ pub(crate) struct Conn {
     pending: RefCell<HashMap<String, Pending>>,
     /// Owned subscription id → observation id.
     pub subscriptions: RefCell<HashMap<String, RequestId>>,
+    #[cfg(not(target_arch = "wasm32"))]
     /// Connected-host routes carried by this connection, by route id.
     pub routes: RefCell<HashMap<String, mpsc::UnboundedSender<RouteIn>>>,
     /// Terminal slots bound by a core-correlated `subscribe_terminal_response`.
@@ -78,6 +83,7 @@ impl Conn {
             legacy: RefCell::new(legacy),
             pending: RefCell::new(HashMap::new()),
             subscriptions: RefCell::new(HashMap::new()),
+            #[cfg(not(target_arch = "wasm32"))]
             routes: RefCell::new(HashMap::new()),
             terminal_slots: RefCell::new(HashMap::new()),
             closed: Cell::new(false),
@@ -106,7 +112,11 @@ impl Conn {
                 true,
             )));
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = error;
+        #[cfg(not(target_arch = "wasm32"))]
         let routes: Vec<_> = self.routes.borrow_mut().drain().map(|(_, r)| r).collect();
+        #[cfg(not(target_arch = "wasm32"))]
         for route in routes {
             let _ = route.send(RouteIn::Closed(CoreError::new(
                 "DAEMON_CONNECTION_LOST",
@@ -433,6 +443,7 @@ pub(crate) fn handle_message(core: &Rc<Core>, host: &Rc<Host>, conn: &Rc<Conn>, 
     {
         *conn.server_info.borrow_mut() = body.clone();
     }
+    #[cfg(not(target_arch = "wasm32"))]
     if matches!(kind.as_str(), "hosts.route.frame" | "hosts.route.closed") {
         let route_id = body["subscriptionId"].as_str().unwrap_or_default();
         let route = conn.routes.borrow().get(route_id).cloned();
@@ -516,6 +527,7 @@ pub(crate) fn handle_binary(core: &Rc<Core>, host: &Rc<Host>, conn: &Rc<Conn>, b
         return;
     }
     match bytes.first() {
+        #[cfg(not(target_arch = "wasm32"))]
         Some(0x30) => {
             let Ok((route_id, offset)) = decode_frame(&bytes) else {
                 return;
@@ -1293,6 +1305,7 @@ pub(crate) fn release_internal(core: &Rc<Core>, host: &Rc<Host>) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Releases every observation of a removed host; GUI owners get a cancellation response.
 pub(crate) fn release_host(core: &Rc<Core>, host: &Rc<Host>) {
     let ids: Vec<RequestId> = core

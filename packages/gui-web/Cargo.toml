@@ -1,0 +1,14 @@
+[package]
+name = "paseo-gui-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The Passession web client's WebAssembly module (wasm32-wasip1)."
+
+[lib]
+crate-type = ["cdylib"]
+
+# Native builds compile this crate empty; only the browser build links the GUI.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+paseo-gui = { path = "../gui" }

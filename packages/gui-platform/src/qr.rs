@@ -8,14 +8,13 @@
 //! `request_permission` after the shell explained it, and returning to the app
 //! rechecks a missing permission so access granted in system settings opens
 //! the camera. Camera frames come from Makepad's video input (Android NDK
-//! camera, iOS AVCapture); desktop clients pair by link and report `Unavailable`.
+//! camera, iOS AVCapture); desktop and browser clients pair by link.
 
 use crate::action::{PermissionState, PlatformAction, PlatformRequestId};
 use makepad_widgets::*;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 live_design! {
     use link::shaders::*;
@@ -54,7 +53,7 @@ pub enum QrScanState {
     /// Camera access can only be turned on in system settings.
     PermissionBlocked,
     Failed(String),
-    /// This platform has no pairing camera (desktop).
+    /// This platform has no pairing camera.
     Unavailable,
 }
 
@@ -69,6 +68,7 @@ struct LumaFrame {
 #[derive(Default)]
 struct Shared {
     frame: Mutex<Option<LumaFrame>>,
+    #[cfg(not(target_arch = "wasm32"))]
     decoding: AtomicBool,
     found: Mutex<Option<String>>,
 }
@@ -355,6 +355,7 @@ impl QrScanView {
         self.shown_serial = serial;
         self.update_texture(cx, width, height, &luma);
         crate::action::post_event(crate::PlatformEvent::CameraFrame);
+        #[cfg(not(target_arch = "wasm32"))]
         if self.state.0 == QrScanState::Scanning
             && !self.shared.decoding.swap(true, Ordering::SeqCst)
         {
@@ -594,9 +595,13 @@ mod camera {
     }
 }
 
-/// Desktop clients pair by link; the scanner reports `Unavailable` before a
-/// camera opens.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+/// Pairing by link does not select a camera.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_arch = "wasm32"
+))]
 mod camera {
     use super::{CameraMount, PreviewTransform};
     use makepad_widgets::VideoInputDesc;
@@ -710,7 +715,7 @@ fn decode(width: usize, height: usize, luma: &[u8]) -> Option<String> {
         .find_map(|content| crate::deep_link::pairing_link_from_scan(&content))
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn decode(_width: usize, _height: usize, _luma: &[u8]) -> Option<String> {
     None
 }

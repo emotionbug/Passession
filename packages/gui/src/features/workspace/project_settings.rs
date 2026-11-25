@@ -20,6 +20,7 @@ use super::select::{SelectOption, SelectRequest, WaSelectWidgetRefExt};
 use crate::common::widgets::PSwitchWidgetRefExt;
 use crate::common::{UiContext, UiEffect};
 use paseo_client::RequestOptions;
+#[cfg(not(target_arch = "wasm32"))]
 use paseo_gui_platform::{PickFilesOptions, PlatformAction, PlatformValue, platform};
 
 live_design! {
@@ -233,6 +234,7 @@ enum IconChoice {
     #[default]
     Unchanged,
     Automatic,
+    #[cfg(not(target_arch = "wasm32"))]
     Upload,
     Url,
 }
@@ -243,11 +245,13 @@ struct ProjectSheet {
     project: Value,
     display_name: String,
     view_key: String,
+    #[cfg(not(target_arch = "wasm32"))]
     picked: Option<(std::path::PathBuf, String)>,
     choice: IconChoice,
     saving: bool,
     name_error: Option<String>,
     icon_error: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
     pick_request: Option<u64>,
 }
 
@@ -625,6 +629,7 @@ impl WaProjectSettingsView {
     fn icon_intent(&self, url: &str) -> Option<IconChoice> {
         match self.project_sheet.choice {
             IconChoice::Automatic if self.has_custom_icon() => Some(IconChoice::Automatic),
+            #[cfg(not(target_arch = "wasm32"))]
             IconChoice::Upload if self.project_sheet.picked.is_some() => Some(IconChoice::Upload),
             IconChoice::Url if !url.trim().is_empty() => Some(IconChoice::Url),
             _ => None,
@@ -657,12 +662,14 @@ impl WaProjectSettingsView {
         sheet.name_error = None;
         sheet.icon_error = None;
         let project_id = str_of(&sheet.project, "projectId").to_owned();
+        #[cfg(not(target_arch = "wasm32"))]
         let picked = sheet.picked.as_ref().map(|(path, _)| path.clone());
         let http_core = ctx.core.clone();
         let http_host = self.host_id.clone();
         let id = ctx.core.operation(&self.host_id, move |client| async move {
             let source = match intent {
                 Some(IconChoice::Automatic) => Some(json!({ "type": "automatic" })),
+                #[cfg(not(target_arch = "wasm32"))]
                 Some(IconChoice::Upload) => match picked.map(|path| read_icon_file(&path)) {
                     Some(Ok(data)) => Some(json!({ "type": "upload", "data": data })),
                     Some(Err(error)) => return Ok(json!({ "iconError": error })),
@@ -713,6 +720,7 @@ impl WaProjectSettingsView {
         self.pending.track_operation(id, Req::EditProject);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn handle_platform(&mut self, cx: &mut Cx, actions: &Actions) {
         let Some(request) = self.project_sheet.pick_request else {
             return;
@@ -756,6 +764,7 @@ impl WaProjectSettingsView {
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, ctx: &mut UiContext) {
+        #[cfg(not(target_arch = "wasm32"))]
         self.handle_platform(cx, actions);
         let view = self.root();
         let dialog = view.wa_dialog(id!(dialog));
@@ -933,17 +942,25 @@ impl WaProjectSettingsView {
             if let Some(url) = view.wa_input(id!(icon_url)).changed(actions) {
                 // Emptying the box withdraws the URL without discarding an earlier pick.
                 let sheet = &mut self.project_sheet;
-                sheet.choice = if !url.trim().is_empty() {
-                    IconChoice::Url
-                } else if sheet.picked.is_some() {
-                    IconChoice::Upload
-                } else {
+                sheet.choice = if url.trim().is_empty() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if sheet.picked.is_some() {
+                            IconChoice::Upload
+                        } else {
+                            IconChoice::Unchanged
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
                     IconChoice::Unchanged
+                } else {
+                    IconChoice::Url
                 };
                 sheet.name_error = None;
                 sheet.icon_error = None;
                 self.presentation_dirty = true;
             }
+            #[cfg(not(target_arch = "wasm32"))]
             if view.wa_button(id!(choose_image)).clicked(actions) && !self.project_sheet.saving {
                 match platform() {
                     Some(platform) => {
@@ -963,7 +980,10 @@ impl WaProjectSettingsView {
             if view.wa_button(id!(use_automatic)).clicked(actions) && !self.project_sheet.saving {
                 let custom = self.has_custom_icon();
                 let sheet = &mut self.project_sheet;
-                sheet.picked = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    sheet.picked = None;
+                }
                 sheet.choice = if custom {
                     IconChoice::Automatic
                 } else {
@@ -1286,7 +1306,10 @@ impl WaProjectSettingsView {
             .set_text(cx, &t("settings.project.edit.name"));
         view.widget(id!(project_sheet.sheet.fields.icon_field.label))
             .set_text(cx, &t("settings.project.edit.icon"));
+        #[cfg(not(target_arch = "wasm32"))]
         let show_picked = sheet.choice == IconChoice::Upload && sheet.picked.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let show_picked = false;
         view.widget(id!(preview_icon)).set_visible(cx, !show_picked);
         view.widget(id!(preview_image)).set_visible(cx, show_picked);
         if !show_picked {
@@ -1297,18 +1320,26 @@ impl WaProjectSettingsView {
                 &sheet.view_key,
             );
         }
-        set_optional(
-            cx,
-            &view.widget(id!(picked)),
-            if show_picked {
-                sheet.picked.as_ref().map(|(_, n)| n.as_str()).unwrap_or("")
-            } else {
-                ""
-            },
-        );
-        let choose = view.wa_button(id!(choose_image));
-        choose.set_text(cx, &t("settings.project.edit.chooseImage"));
-        choose.set_enabled(cx, !sheet.saving);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            set_optional(
+                cx,
+                &view.widget(id!(picked)),
+                if show_picked {
+                    sheet.picked.as_ref().map(|(_, n)| n.as_str()).unwrap_or("")
+                } else {
+                    ""
+                },
+            );
+            let choose = view.wa_button(id!(choose_image));
+            choose.set_text(cx, &t("settings.project.edit.chooseImage"));
+            choose.set_enabled(cx, !sheet.saving);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            view.widget(id!(picked)).set_visible(cx, false);
+            view.wa_button(id!(choose_image)).set_visible(cx, false);
+        }
         let url = view.wa_input(id!(icon_url)).text();
         let intent = self.icon_intent(&url);
         let can_use_automatic = match intent {
@@ -1356,6 +1387,7 @@ fn operation_error(outcome: anyhow::Result<Value>) -> Option<String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_icon_file(path: &std::path::Path) -> Result<String, String> {
     use base64::Engine;
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;

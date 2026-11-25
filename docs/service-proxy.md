@@ -79,7 +79,7 @@ For generated URLs to be reachable, you need wildcard DNS pointing to the machin
 
 Public service URLs expose the workspace service itself. Daemon password authentication protects daemon APIs; it does not protect proxied dev services.
 
-The Rust daemon does not serve a bundled product web UI. When proxying its API/WebSocket endpoint over TLS, forward WebSocket upgrades and the correct scheme. Trust forwarded headers only from configured proxy ranges; do not let arbitrary clients impersonate a trusted proxy:
+When the daemon's web UI is enabled, the daemon serves the browser client at `/` on the same listener; the page connects back to `/ws` on its own origin, so a proxy that forwards the daemon endpoint serves both. When proxying its API/WebSocket endpoint over TLS, forward WebSocket upgrades and the correct scheme. Trust forwarded headers only from configured proxy ranges; do not let arbitrary clients impersonate a trusted proxy:
 
 ```json
 {

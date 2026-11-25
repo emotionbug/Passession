@@ -85,8 +85,14 @@ impl From<std::io::Error> for PlatformError {
 #[derive(Debug, Clone)]
 pub enum PlatformValue {
     None,
+    /// Handed off to the browser; the final outcome is not observable.
+    #[cfg(target_arch = "wasm32")]
+    Submitted,
     Bool(bool),
     Text(Option<String>),
+    /// Browser file contents, without local paths. An empty list means the user cancelled.
+    #[cfg(target_arch = "wasm32")]
+    FileBytes(Vec<PickedFileBytes>),
     Json(Value),
     /// An empty list means the user cancelled.
     Files(Vec<PickedFile>),
@@ -109,10 +115,20 @@ pub struct PickedFile {
     pub temporary: bool,
 }
 
+/// A file selected in the browser, with its bytes already loaded in memory.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone)]
+pub struct PickedFileBytes {
+    pub name: String,
+    pub mime_type: Option<String>,
+    pub bytes: Arc<Vec<u8>>,
+}
+
 /// A private, process-local copy of an Android Sharesheet selection. Keep the
 /// lease alive through the local import; dropping it removes the staging batch.
 #[derive(Debug)]
 pub struct SharedImages {
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) directory: PathBuf,
     pub(crate) files: Vec<PickedFile>,
 }
@@ -123,12 +139,14 @@ impl SharedImages {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for SharedImages {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn inbound_share_copies_exist_only_while_a_lease_is_held() {
     let temp = tempfile::tempdir().unwrap();
@@ -415,24 +433,30 @@ pub(crate) fn post_result(
     request: PlatformRequestId,
     result: Result<PlatformValue, PlatformError>,
 ) {
-    let waiter = WAITERS
-        .lock()
-        .unwrap()
-        .as_mut()
-        .and_then(|waiters| waiters.remove(&request));
-    if let Some(waiter) = waiter {
-        let _ = waiter.send(result);
-        return;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let waiter = WAITERS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|waiters| waiters.remove(&request));
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(result);
+            return;
+        }
     }
     Cx::post_action(PlatformAction::Completed { request, result });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type Waiter = std::sync::mpsc::Sender<Result<PlatformValue, PlatformError>>;
+#[cfg(not(target_arch = "wasm32"))]
 static WAITERS: std::sync::Mutex<Option<std::collections::HashMap<PlatformRequestId, Waiter>>> =
     std::sync::Mutex::new(None);
 
 /// Routes the result of `request` to the returned receiver instead of the UI.
 /// Register before the request can complete.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn wait_for(
     request: PlatformRequestId,
 ) -> std::sync::mpsc::Receiver<Result<PlatformValue, PlatformError>> {

@@ -54,7 +54,7 @@ pub fn image_texture(cx: &mut Cx, image: &Value, thumbnail: bool) -> Option<Text
 
 pub(super) use composer::blobs::ImageContent as OriginalContent;
 
-pub(super) fn read_original_blob(id: &str) -> Result<Vec<u8>, String> {
+pub(super) fn read_original_blob(id: &str) -> Result<composer::attachments::ImageBytes, String> {
     composer::blobs::read_blob(&composer::state_keys::blob_dir(), id)
 }
 

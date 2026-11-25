@@ -19,6 +19,7 @@ use super::editor::field::{FieldEvent, TextField};
 use super::editor::view::{EditorLook, SourceEditor};
 use super::handle::Snapshot;
 use super::host;
+#[cfg(not(target_arch = "wasm32"))]
 use super::html_preview::HtmlPreview;
 use super::i18n::{l, lf, t, ta};
 use super::images::{self, ImageSlot};
@@ -30,12 +31,18 @@ use super::path::{
     remote_relative,
 };
 use super::resolve::{
-    FileTextPresentation, HTML_FILE_PANEL, IMAGE_FILE_PANEL, MARKDOWN_FILE_PANEL,
+    FilePanelCandidate, FileTextPresentation, HTML_FILE_PANEL, IMAGE_FILE_PANEL,
+    MARKDOWN_FILE_PANEL,
 };
 use super::session::TextView;
 use super::store::{self, Asset, OwnerEvent};
 use super::transfer::TransferMode;
 use super::ui::{self, ButtonSize, ButtonVariant, Interaction, TOOLBAR_HEIGHT};
+
+fn supports_text_preview(panel: Option<FilePanelCandidate>) -> bool {
+    panel == Some(MARKDOWN_FILE_PANEL)
+        || (!cfg!(target_arch = "wasm32") && panel == Some(HTML_FILE_PANEL))
+}
 
 /// The code font size range of the appearance settings.
 const MIN_CODE_FONT: f64 = 9.0;
@@ -62,8 +69,11 @@ enum Hot {
     AlertReload,
     Retry,
     Download,
+    #[cfg(not(target_arch = "wasm32"))]
     OpenCopy,
+    #[cfg(not(target_arch = "wasm32"))]
     OpenHtml,
+    #[cfg(not(target_arch = "wasm32"))]
     ShowSource,
     SetWrap,
     SetHighlight,
@@ -160,6 +170,7 @@ pub struct FileView {
     markdown: MarkdownPreview,
     /// Store epoch and the corresponding layout fingerprint of the preview's image sources.
     markdown_image_epochs: Option<(u64, u64)>,
+    #[cfg(not(target_arch = "wasm32"))]
     html: Option<HtmlPreview>,
     overlays: HashMap<u64, Pending>,
     settings_open: bool,
@@ -226,6 +237,7 @@ impl FileView {
             focus: Focus::None,
             markdown: MarkdownPreview::default(),
             markdown_image_epochs: None,
+            #[cfg(not(target_arch = "wasm32"))]
             html: None,
             overlays: HashMap::new(),
             settings_open: false,
@@ -280,6 +292,7 @@ impl FileView {
         self.session_id = None;
         self.markdown = MarkdownPreview::default();
         self.markdown_image_epochs = None;
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(mut html) = self.html.take() {
             html.close();
         }
@@ -466,6 +479,7 @@ impl FileView {
                 self.count_matches();
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let (Some(html), Some(editor)) = (&self.html, &self.editor) {
             html.update(editor.text());
         }
@@ -866,6 +880,7 @@ impl FileView {
         });
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_html(&mut self, ui: &mut UiContext) {
         let Some(target) = self.target.clone() else {
             return;
@@ -921,7 +936,7 @@ impl FileView {
     ) {
         let mut entries = Vec::new();
         if has_text {
-            if panel_html {
+            if panel_html && !cfg!(target_arch = "wasm32") {
                 entries.push(
                     MenuItem::new("html", l("Preview HTML in system browser"))
                         .icon("globe")
@@ -947,11 +962,13 @@ impl FileView {
                 .icon("download")
                 .entry(),
         );
+        #[cfg(not(target_arch = "wasm32"))]
         entries.push(
             MenuItem::new("share", t("downloads.shareFile"))
                 .icon("share-2")
                 .entry(),
         );
+        #[cfg(not(target_arch = "wasm32"))]
         entries.push(
             MenuItem::new("external", l("Open downloaded copy externally"))
                 .icon("external-link")
@@ -1002,6 +1019,7 @@ impl FileView {
                 self.settings_open = true;
                 self.settings_scroll = 0.0;
             }
+            #[cfg(not(target_arch = "wasm32"))]
             "html" => {
                 self.clear_text_selection(cx);
                 let owner = self.owner.clone();
@@ -1013,7 +1031,9 @@ impl FileView {
                 self.open_html(ui);
             }
             "download" => self.download(ui, TransferMode::Save),
+            #[cfg(not(target_arch = "wasm32"))]
             "share" => self.download(ui, TransferMode::Share),
+            #[cfg(not(target_arch = "wasm32"))]
             "external" => self.download(ui, TransferMode::Open),
             "local" => {
                 let Some(target) = self.target.clone() else {
@@ -1285,6 +1305,7 @@ impl FileView {
             store::with(|s| s.epoch = s.epoch.wrapping_add(1));
         }
         let mut changed = web_images_changed;
+        #[cfg(not(target_arch = "wasm32"))]
         if let Event::Signal = event
             && let Some(html) = self.html.as_mut()
         {
@@ -1699,8 +1720,7 @@ impl FileView {
     fn preview_visible(&self) -> bool {
         store::with(|s| {
             s.session(&self.owner).is_some_and(|session| {
-                session.view == TextView::Preview
-                    && matches!(session.panel(), Some(p) if p == MARKDOWN_FILE_PANEL || p == HTML_FILE_PANEL)
+                session.view == TextView::Preview && supports_text_preview(session.panel())
             })
         })
     }
@@ -1831,8 +1851,11 @@ impl FileView {
                 }
             }
             Hot::Download => self.download(ui, TransferMode::Save),
+            #[cfg(not(target_arch = "wasm32"))]
             Hot::OpenCopy => self.download(ui, TransferMode::Open),
+            #[cfg(not(target_arch = "wasm32"))]
             Hot::OpenHtml => self.open_html(ui),
+            #[cfg(not(target_arch = "wasm32"))]
             Hot::ShowSource => {
                 self.clear_text_selection(cx);
                 let owner = self.owner.clone();
@@ -1979,8 +2002,7 @@ impl FileView {
             right -= size + 1.0;
         }
         right -= 12.0;
-        let has_preview =
-            matches!(panel, Some(p) if p == MARKDOWN_FILE_PANEL || p == HTML_FILE_PANEL);
+        let has_preview = supports_text_preview(panel);
         let show_preview = has_preview && view == TextView::Preview;
         if has_text && has_preview {
             let labels = [
@@ -2362,6 +2384,7 @@ impl FileView {
                     Some("download"),
                     ButtonVariant::Outline,
                 ),
+                #[cfg(not(target_arch = "wasm32"))]
                 (
                     Hot::OpenCopy,
                     l("Open a downloaded copy").to_owned(),
@@ -2448,6 +2471,7 @@ impl FileView {
             self.hits.push(area, Hot::Preview);
             return;
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if show_preview && panel == HTML_FILE_PANEL {
             let base = ty.ui_size(14.0);
             let cy = area.pos.y + area.size.y / 2.0;

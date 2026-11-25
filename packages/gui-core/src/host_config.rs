@@ -1,12 +1,13 @@
 //! Flutter `HostConfig`: endpoint resolution on top of the SDK target parser, the local socket
 //! identity used for credential selection, and hello authentication.
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_arch = "wasm32"))]
 use base64::{Engine, engine::general_purpose::STANDARD};
-use paseo_client::{
-    crypto::SecurityMode,
-    transport::target::{Endpoint, Target},
-};
+#[cfg(not(target_arch = "wasm32"))]
+use paseo_client::crypto::SecurityMode;
+use paseo_client::transport::target::{Endpoint, Target};
 use serde_json::{Value, json};
 
 use crate::CoreError;
@@ -80,6 +81,7 @@ fn invalid() -> CoreError {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn resolve(config: &Value) -> Result<ResolvedHost, CoreError> {
     if !matches!(config.get("networkMode"), None | Some(Value::Null))
         && !matches!(text(config, "networkMode"), Some("normal" | "tailnet"))
@@ -168,6 +170,66 @@ pub(crate) fn resolve(config: &Value) -> Result<ResolvedHost, CoreError> {
     })
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn websocket_endpoint(page: &str) -> Result<String, CoreError> {
+    let page = url::Url::parse(page).map_err(|_| invalid())?;
+    let scheme = match page.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => return Err(invalid()),
+    };
+    let mut endpoint =
+        url::Url::parse(&page.origin().ascii_serialization()).map_err(|_| invalid())?;
+    endpoint.set_scheme(scheme).map_err(|_| invalid())?;
+    endpoint.set_path("/ws");
+    Ok(endpoint.into())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn browser_endpoint() -> Result<&'static str, CoreError> {
+    static ENDPOINT: std::sync::LazyLock<Result<String, CoreError>> =
+        std::sync::LazyLock::new(|| websocket_endpoint(&paseo_browser::page_url()));
+    ENDPOINT.as_deref().map_err(Clone::clone)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn resolve(config: &Value) -> Result<ResolvedHost, CoreError> {
+    let unsupported = || {
+        CoreError::new(
+            "BROWSER_UNSUPPORTED",
+            "Only the serving daemon's WebSocket endpoint is available in the browser",
+            false,
+        )
+    };
+    if (!config["networkMode"].is_null() && config["networkMode"] != "normal")
+        || !config["localCredential"].is_null()
+        || !config["localCredentialPath"].is_null()
+    {
+        return Err(unsupported());
+    }
+    let endpoint = text(config, "endpoint").unwrap_or_default();
+    let mut target = Target::parse(endpoint).map_err(|_| unsupported())?;
+    let Endpoint::Socket { url, ipc: None } = &target.endpoint else {
+        return Err(unsupported());
+    };
+    if url != browser_endpoint()? {
+        return Err(unsupported());
+    }
+    let password = text(config, "password")
+        .map(str::to_owned)
+        .or_else(|| target.password.take())
+        .filter(|password| !password.is_empty());
+    Ok(ResolvedHost {
+        target,
+        expected_server_id: text(config, "expectedServerId").map(str::to_owned),
+        relay_key: None,
+        require_protected: false,
+        ssh: false,
+        password,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn expand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
@@ -177,6 +239,7 @@ fn expand_home(path: &str) -> String {
     path.to_owned()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Flutter `identity(uri)`: the socket a non-relay, non-SSH endpoint listens on. Loopback
 /// hosts compare equal, Unix sockets and pipes by path.
 pub(crate) fn socket_identity(endpoint: &str) -> Option<String> {
@@ -212,6 +275,7 @@ pub(crate) fn socket_identity(endpoint: &str) -> Option<String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn valid_credential(token: &str) -> bool {
     token.len() == 43
         && token
@@ -219,6 +283,7 @@ pub(crate) fn valid_credential(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Flutter `PaseoClient._authentication`: a credential file is used only while the daemon that
 /// owns it (its sibling `paseo.pid`) listens on the selected socket.
 pub(crate) async fn authentication(config: &Value, resolved: &ResolvedHost) -> Option<Value> {
@@ -246,6 +311,15 @@ pub(crate) async fn authentication(config: &Value, resolved: &ResolvedHost) -> O
         .map(|password| json!({"kind": "password", "password": password}))
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn authentication(_config: &Value, resolved: &ResolvedHost) -> Option<Value> {
+    resolved
+        .password
+        .as_ref()
+        .map(|password| json!({"kind":"password","password":password}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn credential_for(path: &Path, config: &Value) -> Option<String> {
     let lock_path: PathBuf = path.parent()?.join("paseo.pid");
     let lock: Value = serde_json::from_slice(&tokio::fs::read(lock_path).await.ok()?).ok()?;
@@ -319,9 +393,22 @@ pub(crate) fn probe_connect_timeout(config: &Value) -> std::time::Duration {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_endpoint_uses_only_the_serving_origin() {
+        assert_eq!(
+            websocket_endpoint("https://[::1]:8443/ui/?password=secret#route").unwrap(),
+            "wss://[::1]:8443/ws"
+        );
+        assert_eq!(
+            websocket_endpoint("http://localhost:6767/").unwrap(),
+            "ws://localhost:6767/ws"
+        );
+        assert!(websocket_endpoint("file:///app/index.html").is_err());
+    }
 
     #[test]
     fn loopback_sockets_share_an_identity_and_relays_have_none() {

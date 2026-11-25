@@ -5,20 +5,26 @@
 //! The shell feeds it each core event batch (`handle_core_events`) and background signals
 //! (`poll_background`). GUI thread only.
 
-use super::attachments::ImageImportError;
-use super::blobs::{BlobJob, BlobResult, BlobStore, StatFile};
+use super::attachments::{ImageImportError, SelectedFile};
+#[cfg(not(target_arch = "wasm32"))]
+use super::blobs::StatFile;
+use super::blobs::{BlobJob, BlobResult, BlobStore};
 use super::drafts::*;
 use super::i18n::t;
 use super::json::*;
 use super::state_keys;
 use crate::common::{UiContext, UiEffect};
-use makepad_widgets::{Cx, SignalToUI};
+use makepad_widgets::Cx;
+#[cfg(not(target_arch = "wasm32"))]
+use makepad_widgets::SignalToUI;
 use paseo_gui_core::{CoreError, CoreEvent, CoreHandle, CoreState};
-use paseo_gui_platform::{ClipboardImage, PickedFile};
+use paseo_gui_platform::ClipboardImage;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 thread_local! {
@@ -71,6 +77,7 @@ pub enum PanelNotice {
         images: Result<Vec<Value>, ImageImportError>,
     },
     /// Dropped/picked paths were inspected.
+    #[cfg(not(target_arch = "wasm32"))]
     FilesStat {
         token: u64,
         files: Result<Vec<StatFile>, String>,
@@ -158,16 +165,19 @@ impl ProviderRequests {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct SaveDeadline {
     at: Option<Instant>,
     stopped: bool,
 }
 
-/// One parked worker wakes the GUI at the current deadline; edits only move that
-/// deadline, never clone drafts or allocate a new timer/thread.
+/// The native worker wakes the GUI at the current deadline. In the browser the
+/// application's periodic Makepad timer polls the same deadline.
 struct DraftSaveTimer {
+    #[cfg(not(target_arch = "wasm32"))]
     deadline: Arc<Mutex<SaveDeadline>>,
+    #[cfg(not(target_arch = "wasm32"))]
     worker: std::thread::Thread,
     first: Option<Instant>,
     due: Option<Instant>,
@@ -176,34 +186,40 @@ struct DraftSaveTimer {
 
 impl DraftSaveTimer {
     fn new() -> Self {
-        let deadline = Arc::new(Mutex::new(SaveDeadline::default()));
-        let shared = deadline.clone();
-        let worker = std::thread::spawn(move || {
-            loop {
-                let sleep = {
-                    let mut state = shared.lock().unwrap();
-                    if state.stopped {
-                        return;
-                    }
-                    match state.at {
-                        Some(at) if at <= Instant::now() => {
-                            state.at = None;
-                            SignalToUI::set_ui_signal();
-                            None
+        #[cfg(not(target_arch = "wasm32"))]
+        let (deadline, worker) = {
+            let deadline = Arc::new(Mutex::new(SaveDeadline::default()));
+            let shared = deadline.clone();
+            let worker = std::thread::spawn(move || {
+                loop {
+                    let sleep = {
+                        let mut state = shared.lock().unwrap();
+                        if state.stopped {
+                            return;
                         }
-                        Some(at) => Some(at.saturating_duration_since(Instant::now())),
-                        None => None,
+                        match state.at {
+                            Some(at) if at <= Instant::now() => {
+                                state.at = None;
+                                SignalToUI::set_ui_signal();
+                                None
+                            }
+                            Some(at) => Some(at.saturating_duration_since(Instant::now())),
+                            None => None,
+                        }
+                    };
+                    match sleep {
+                        Some(duration) => std::thread::park_timeout(duration),
+                        None => std::thread::park(),
                     }
-                };
-                match sleep {
-                    Some(duration) => std::thread::park_timeout(duration),
-                    None => std::thread::park(),
                 }
-            }
-        });
+            });
+            (deadline, worker.thread().clone())
+        };
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             deadline,
-            worker: worker.thread().clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            worker,
             first: None,
             due: None,
             revision: 0,
@@ -220,18 +236,25 @@ impl DraftSaveTimer {
         // bounds unsaved input during sustained typing without periodic idle polling.
         let due = (now + Duration::from_millis(500)).min(first + Duration::from_secs(2));
         self.due = Some(due);
-        self.deadline.lock().unwrap().at = Some(due);
-        self.worker.unpark();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.wake_at(Some(due));
     }
 
     fn cancel(&mut self) {
         self.first = None;
         self.due = None;
-        self.deadline.lock().unwrap().at = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.wake_at(None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wake_at(&self, at: Option<Instant>) {
+        self.deadline.lock().unwrap().at = at;
         self.worker.unpark();
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for DraftSaveTimer {
     fn drop(&mut self) {
         self.deadline.lock().unwrap().stopped = true;
@@ -914,13 +937,14 @@ impl ComposerService {
         token
     }
 
-    pub fn import_images(&mut self, panel: u64, files: Vec<PickedFile>) -> u64 {
+    pub fn import_images(&mut self, panel: u64, files: Vec<SelectedFile>) -> u64 {
         let token = self.blobs.next_token();
         self.blob_owners.insert(token, panel);
         self.blobs.submit(BlobJob::ImportImages { token, files });
         token
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn stat_paths(&mut self, panel: u64, paths: Vec<std::path::PathBuf>) -> u64 {
         let token = self.blobs.next_token();
         self.blob_owners.insert(token, panel);
@@ -947,6 +971,7 @@ impl ComposerService {
                         self.notify(Some(panel), PanelNotice::ImagesStored { token, images });
                     }
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 BlobResult::Stat { token, files } => {
                     if let Some(panel) = self.blob_owners.remove(&token) {
                         self.notify(Some(panel), PanelNotice::FilesStat { token, files });

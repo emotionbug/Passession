@@ -3,11 +3,15 @@
 //!
 //! The store is `shared_preferences.json` in the application-support directory, using the
 //! `flutter.` key prefix and preserving unrelated plugin values.
-use std::{collections::VecDeque, fs};
+use std::collections::VecDeque;
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs;
 
 use serde_json::{Map, Value};
 
-use super::{Paths, atomic_write, io_error};
+#[cfg(not(target_arch = "wasm32"))]
+use super::io_error;
+use super::{Paths, atomic_write, read_file};
 use crate::CoreError;
 
 const PREFIX: &str = "flutter.";
@@ -57,8 +61,8 @@ fn split(file: Map<String, Value>) -> (Map<String, Value>, Map<String, Value>) {
 
 pub(crate) fn load(paths: &Paths) -> Prefs {
     let path = paths.prefs();
-    match fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+    match read_file(&path) {
+        Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(Value::Object(file)) => {
                 let (values, foreign) = split(file);
                 Prefs {
@@ -79,12 +83,12 @@ pub(crate) fn load(paths: &Paths) -> Prefs {
                 ..Prefs::default()
             },
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Prefs {
+        Ok(None) => Prefs {
             writable: true,
             ..Prefs::default()
         },
         Err(error) => Prefs {
-            error: Some(io_error("Cannot read", &path, error)),
+            error: Some(error),
             writable: false,
             ..Prefs::default()
         },
@@ -100,6 +104,7 @@ pub(crate) fn save(
     for (key, value) in values {
         file.insert(format!("{PREFIX}{key}"), value.clone());
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fs::create_dir_all(&paths.app).map_err(|e| io_error("Cannot create", &paths.app, e))?;
     let encoded = serde_json::to_string(&Value::Object(file))
         .map_err(|e| CoreError::new("STORAGE_ENCODE", e.to_string(), false))?;
@@ -115,7 +120,7 @@ pub(crate) fn stored_value(value: Value) -> Option<Value> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -270,6 +270,7 @@ impl TransportService {
             "hostnames",
             "corsAllowedOrigins",
             "trustedProxies",
+            "webEnabled",
             "relayEnabled",
             "relayRequireProtectedSecurity",
         ] {
@@ -1095,6 +1096,9 @@ impl TransportService {
         let hoplite = app.providers.definition("hoplite").is_some();
         let maintenance = app.agents.update_admission.operation()?;
         let mut message = json!({"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":identity["serverId"],"hostname":identity["label"],"version":crate::VERSION,"sourceId":context.actor_source_id(),"permissions":context.permissions(),"features":features::features(&config,hoplite),"capabilities":{}}});
+        if let Some(endpoint) = self.local_http_endpoint() {
+            message["payload"]["webUiUrl"] = json!(endpoint);
+        }
         if let Some(operation_id) = maintenance {
             message["payload"]["daemonUpdate"] = json!({"operationId":operation_id,"active":true});
         }

@@ -33,9 +33,17 @@ pub fn storage_error(state: &Value) -> Option<String> {
 
 /// Retained composer image blobs: immutable, content-addressed files in the application
 /// support directory (never the daemon home).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn blob_dir() -> PathBuf {
     paseo_gui_platform::paths::app_paths()
         .support_dir
         .join("paseo-native")
         .join("composer-blobs")
+}
+
+/// Browser draft image blobs are kept in memory for the page session; no directory
+/// is used. The shared send and export paths pass this empty location to the store.
+#[cfg(target_arch = "wasm32")]
+pub fn blob_dir() -> PathBuf {
+    PathBuf::new()
 }

@@ -498,6 +498,7 @@ impl Cx {
 
 impl CxOsApi for Cx {
     fn init_cx_os(&mut self) {
+        std::sync::LazyLock::force(&APP_START);
         self.live_registry.borrow_mut().package_root = Some("".to_string());
         self.live_expand();
         self.live_scan_dependencies();
@@ -579,7 +580,7 @@ impl CxOsApi for Cx {
     }
     
     fn seconds_since_app_start(&self)->f64{
-        0.0
+        Self::time_now() - *APP_START
     }
     
     fn spawn_thread<F>(&mut self, f: F) where F: FnOnce() + Send + 'static {
@@ -610,6 +611,9 @@ impl CxOsApi for Cx {
         self.platform.from_wasm(FromWasmSpawnAudioOutput {closure_ptr: closure_ptr as u32});
     }*/
 }
+
+/// Page time (seconds) when the app started, for `seconds_since_app_start`.
+static APP_START: std::sync::LazyLock<f64> = std::sync::LazyLock::new(Cx::time_now);
 
 impl Cx{
     pub(crate) fn spawn_timer_thread<F>(&mut self, timer:u32, f: F) where F: Fn() + Send + 'static {

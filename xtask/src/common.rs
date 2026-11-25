@@ -175,6 +175,10 @@ pub fn cargo_output(profile: &str) -> Result<PathBuf> {
 pub fn gui_output() -> Result<PathBuf> {
     Ok(root()?.join(".dev/build/gui"))
 }
+/// Checkout-local browser bundle shared by daemon runtime staging.
+pub fn web_output() -> Result<PathBuf> {
+    Ok(root()?.join(".dev/build/web"))
+}
 pub fn release() -> Result<PathBuf> {
     Ok(root()?.join("artifacts/native"))
 }

@@ -14,8 +14,10 @@ members = [
     "packages/gui-core",
     "packages/gui-platform",
     "packages/gui",
+    "packages/browser",
+    "packages/gui-web",
 ]
-exclude = ["packages/gui-platform/vendor", "packages/gui/vendor", "packages/terminal/vendor", "packages/daemon/vendor"]
+exclude = ["packages/gui-platform/vendor", "packages/gui/vendor", "packages/terminal/vendor", "packages/daemon/vendor", "packages/highlight/vendor"]
 resolver = "3"
 
 [workspace.package]
@@ -85,6 +87,9 @@ zbus-secret-service-keyring-store = { path = "packages/gui-platform/vendor/zbus-
 libghostty-vt-sys = { path = "packages/terminal/vendor/libghostty-vt-sys" }
 # Share the workspace nix/winreg: packages/terminal/vendor/portable-pty/VENDORED.md.
 portable-pty = { path = "packages/terminal/vendor/portable-pty" }
+# Keep wasi-libc on wasm32-wasip1: packages/highlight/vendor/VENDORED.md.
+arborium = { path = "packages/highlight/vendor/arborium" }
+arborium-sysroot = { path = "packages/highlight/vendor/arborium-sysroot" }
 # Preserve authored sequence-event order when laying out Mermaid groups.
 mermaid-rs-renderer = { path = "packages/gui/vendor/mermaid-rs-renderer" }
 # Share PNG decoding with the client: packages/gui/vendor/tiny-skia/VENDORED.md.

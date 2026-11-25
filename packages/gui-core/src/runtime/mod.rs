@@ -9,6 +9,7 @@ mod http;
 mod requests;
 mod selector;
 mod store;
+#[cfg(not(target_arch = "wasm32"))]
 mod tailnet;
 
 use std::{
@@ -47,11 +48,13 @@ pub(crate) struct Core {
     network_change: RefCell<Option<tokio::task::AbortHandle>>,
     /// Relay daemon keys seen protected in this process (Flutter `_protectedIdentities`).
     pub protected_keys: RefCell<HashSet<String>>,
+    #[cfg(not(target_arch = "wasm32"))]
     /// Routes being opened (`origin/server`), Flutter `_routing`.
     pub routing: RefCell<HashSet<String>>,
     pub initialized: Cell<bool>,
     pub closing: Cell<bool>,
     next_key: Cell<u64>,
+    #[cfg(not(target_arch = "wasm32"))]
     tailnet: tailnet::Tailnet,
     state_scheduled: Cell<bool>,
     last_state: Cell<Option<Instant>>,
@@ -65,6 +68,7 @@ impl Core {
     fn new(config: CoreConfig, queue: Arc<EventQueue>) -> Rc<Self> {
         Rc::new(Self {
             store: RefCell::new(Store::new(&config.state_dir)),
+            #[cfg(not(target_arch = "wasm32"))]
             tailnet: tailnet::Tailnet::new(config.tailnet_key_store.clone()),
             config,
             queue,
@@ -79,6 +83,7 @@ impl Core {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             network_change: RefCell::new(None),
             protected_keys: RefCell::new(HashSet::new()),
+            #[cfg(not(target_arch = "wasm32"))]
             routing: RefCell::new(HashSet::new()),
             initialized: Cell::new(false),
             closing: Cell::new(false),
@@ -195,7 +200,13 @@ impl Core {
             Value::Array(store.suppressed.iter().cloned().map(Value::from).collect()),
         );
         state.insert("hosts".into(), Value::Array(records));
+        #[cfg(not(target_arch = "wasm32"))]
         state.insert("tailnet".into(), self.tailnet.state());
+        #[cfg(target_arch = "wasm32")]
+        state.insert(
+            "tailnet".into(),
+            json!({"available": false, "enabled": false, "backendState": "Disabled"}),
+        );
         let old_revisions = &previous.value["revisions"];
         let mut revisions = Map::new();
         for (section, fields) in [
@@ -289,6 +300,7 @@ pub(crate) async fn run(
         handle(&core, command).await;
     }
     hosts::shutdown(&core).await;
+    #[cfg(not(target_arch = "wasm32"))]
     tailnet::shutdown(&core).await;
     // Shutdown is FIFO with GUI saves. Do not drop the LocalSet while a preferences
     // replacement (including its fsync/rename) or an earlier flush barrier is pending.
@@ -302,7 +314,23 @@ async fn handle(core: &Rc<Core>, command: Command) {
         Command::Tailnet {
             request_id,
             message,
-        } => tailnet::request(core, request_id, message),
+        } => {
+            #[cfg(not(target_arch = "wasm32"))]
+            tailnet::request(core, request_id, message);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = message;
+                core.respond(
+                    "",
+                    &request_id,
+                    Err(CoreError::new(
+                        "BROWSER_UNSUPPORTED",
+                        "Embedded Tailscale is not available in the browser",
+                        false,
+                    )),
+                );
+            }
+        }
         Command::HostHttp {
             host_id,
             request_id,
@@ -352,8 +380,22 @@ async fn handle(core: &Rc<Core>, command: Command) {
         },
         Command::RefreshHosts => hosts::refresh_hosts(core).await,
         Command::DiscoverLocalDaemon { explicit } => {
-            hosts::discover_local_daemon(core, explicit).await;
-            hosts::refresh_hosts(core).await;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                hosts::discover_local_daemon(core, explicit).await;
+                hosts::refresh_hosts(core).await;
+            }
+            #[cfg(target_arch = "wasm32")]
+            if explicit {
+                core.error(
+                    None,
+                    CoreError::new(
+                        "BROWSER_UNSUPPORTED",
+                        "Local daemons are not available in the browser",
+                        false,
+                    ),
+                );
+            }
         }
         Command::SetAppVisible { visible } => hosts::set_app_visible(core, visible),
         #[cfg(any(target_os = "android", target_os = "ios"))]

@@ -15,6 +15,12 @@ Fetch Rust dependencies with `cargo fetch --locked`. Desktop builds require thei
 
 Default CI runs Rust workspace tests (including GUI crates) and isolated native Tailscale control/DERP regressions on one Ubuntu x64 runner; it does not build release artifacts or repeat tests across platforms. Packaging and deployment workflows run only on explicit manual dispatch.
 
+### Web client (wasm32-wasip1)
+
+On a Unix build host, install the `wasm32-wasip1` standard library (`rustup target add wasm32-wasip1 --toolchain 1.93.1`) and Zig 0.15.2 for Ghostty and the C grammars. `cargo xtask build-web` sets `CC_wasm32_wasip1` and `AR_wasm32_wasip1` to Zig wrappers in `.dev/build/web-tools/bin/`; use the same wrappers for direct Cargo builds of the WASI target.
+
+`cargo xtask build-web` always builds release: debug wasm functions exceed browser engines' local-variable limits (V8 rejects the tree-sitter lexers). The bundle in `.dev/build/web` holds `index.html`, `boot.js` (the page's WASI shim and browser bridge), `app.wasm`, Makepad resources, notices, and `.gz` copies of files of 16 KiB or more, which the daemon serves to browsers that accept gzip. To try it, run a daemon with `PASEO_WEB_ENABLED=true PASEO_WEB_DIR=$PWD/.dev/build/web` and open its address. Panics appear in the browser console.
+
 ## Development commands
 
 Run commands from the repository root:
@@ -27,9 +33,10 @@ cargo xtask dev app                     # build/run the native desktop client
 cargo xtask dev app android --device <device-id>
 cargo xtask dev app ios --device <device-id-or-simulator-udid>
 cargo xtask dev cli ls                  # native CLI against the checkout dev home
+cargo xtask build-web                   # browser client bundle in .dev/build/web
 ```
 
-`cargo xtask dev daemon` starts the development daemon. There is no website build, Metro server, Expo prebuild, Electron renderer, Chromium debugging port, or web client build.
+`cargo xtask dev daemon` starts the development daemon. There is no website build, Metro server, Expo prebuild, Electron renderer or Chromium debugging port.
 
 For direct Rust iteration, `cargo build --locked -p paseo-daemon --bin paseo` compiles the executable. Use `cargo xtask build-daemon` when the run also needs staged skills, native runtime assets or packaging provenance. Cargo-only compilation is not a complete distributable runtime.
 

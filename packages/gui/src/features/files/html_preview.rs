@@ -4,6 +4,8 @@
 //! outside the asset root are refused; every response carries a strict CSP (no scripts, frames
 //! or forms), `nosniff`, `no-store` and `no-referrer`. The route is never exposed to the daemon.
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};

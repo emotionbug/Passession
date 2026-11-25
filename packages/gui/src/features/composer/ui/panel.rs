@@ -243,12 +243,18 @@ impl PanelState {
         !matches!(self.overlay(), Overlay::None)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn accepts_file_drop(&self, visible: bool) -> bool {
         // Native drags target a visible pane without activating its keyboard.
         // `hidden` also covers an unfocused app, so it is not drop admission.
         visible
             && !self.modal_open()
             && self.ctl.as_ref().is_some_and(Controller::accepts_file_drop)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn accepts_file_drop(&self, _visible: bool) -> bool {
+        false
     }
 
     pub(super) fn cancel_gestures(&mut self) {
@@ -1734,6 +1740,9 @@ impl ComposerPanelRef {
 
     /// Files dropped on the host's `FileDropZone` (useFileDrop `onFiles`/`onGenericFiles`).
     pub fn drop_files(&self, cx: &mut Cx, paths: Vec<std::path::PathBuf>) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = (cx, paths);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(mut inner) = self.borrow_mut()
             && inner.st.ctl.is_some()
         {

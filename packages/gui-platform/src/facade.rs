@@ -1,9 +1,10 @@
-//! Blocking convenience calls for UI code that already runs its native work on
-//! a worker thread (settings). Never call these on the GUI thread: they wait
-//! for a result that may need the GUI event loop.
+//! Convenience calls for appearance, notifications and the desktop host.
+//! On native clients, call blocking operations from a worker: the result may
+//! need the GUI event loop.
 
-/// OS appearance and language (cheap; safe on the GUI thread, cached briefly).
+/// System appearance and language (safe on the GUI thread).
 pub mod appearance {
+    #[cfg(not(target_arch = "wasm32"))]
     use std::{
         sync::Mutex,
         time::{Duration, Instant},
@@ -12,6 +13,12 @@ pub mod appearance {
     pub use crate::fonts::{
         FontFace, FontRequest, Role, RoleSet, SystemFonts, fallback_fonts, parse_family_list,
         system_fonts,
+    };
+
+    #[cfg(target_arch = "wasm32")]
+    pub use paseo_browser::{
+        language as system_language, prefers_dark as system_prefers_dark,
+        timezone as system_timezone, timezone_offset_minutes as system_timezone_offset_minutes,
     };
 
     /// Android's SP-to-DP curve, sampled at its nonlinear font-scaling knots.
@@ -91,6 +98,7 @@ pub mod appearance {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     struct Cached {
         at: Instant,
         dark: bool,
@@ -98,8 +106,10 @@ pub mod appearance {
         text_scale: TextScale,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn read<R>(f: impl FnOnce(&Cached) -> R) -> R {
         let mut cache = CACHE.lock().unwrap();
         let stale = cache
@@ -114,7 +124,7 @@ pub mod appearance {
                 crate::native::system_language(),
                 crate::native::system_text_scale(),
             );
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             let (dark, language, text_scale) = (
                 crate::native::system_prefers_dark(),
                 crate::native::system_language(),
@@ -131,11 +141,15 @@ pub mod appearance {
     }
 
     /// Theme `auto`: the OS prefers a dark appearance.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn system_prefers_dark() -> bool {
         read(|c| c.dark)
     }
 
     pub fn system_text_scale() -> TextScale {
+        #[cfg(target_arch = "wasm32")]
+        return TextScale::default();
+        #[cfg(not(target_arch = "wasm32"))]
         read(|c| c.text_scale)
     }
 
@@ -151,6 +165,7 @@ pub mod appearance {
         crate::native::set_system_bars(dark, background);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// BCP 47-ish language tag of the OS UI language (`ko-KR`, `en_US.UTF-8`, …).
     pub fn system_language() -> String {
         read(|c| c.language.clone())
@@ -196,12 +211,16 @@ pub mod appearance {
 
 /// OS notifications.
 pub mod notifications {
+    #[cfg(not(target_arch = "wasm32"))]
     use crate::{
         action::PlatformValue, notification_policy::NotificationRequest, platform::blocking,
     };
 
     /// Asks for notification permission; `true` when allowed.
     pub fn request_permission() -> Result<bool, String> {
+        #[cfg(target_arch = "wasm32")]
+        return Err(crate::web::NOTIFICATIONS_UNAVAILABLE.to_owned());
+        #[cfg(not(target_arch = "wasm32"))]
         match blocking(crate::native::request_notification_permission) {
             Ok(PlatformValue::Permission(state)) => Ok(state.allowed()),
             Ok(PlatformValue::Bool(allowed)) => Ok(allowed),
@@ -212,32 +231,43 @@ pub mod notifications {
 
     /// Shows one notification (settings diagnostics "test notification").
     pub fn notify(id: i32, title: &str, body: &str) -> Result<(), String> {
-        let request = NotificationRequest {
-            id,
-            title: title.to_owned(),
-            body: Some(body.to_owned()),
-            data: Default::default(),
-            event_key: None,
-            sound: None,
-        };
-        blocking(|shared, done| crate::native::notify(shared, request, done))
-            .map(|_| ())
-            .map_err(|error| error.message)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (id, title, body);
+            Err(crate::web::NOTIFICATIONS_UNAVAILABLE.to_owned())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let request = NotificationRequest {
+                id,
+                title: title.to_owned(),
+                body: Some(body.to_owned()),
+                data: Default::default(),
+                event_key: None,
+                sound: None,
+            };
+            blocking(|shared, done| crate::native::notify(shared, request, done))
+                .map(|_| ())
+                .map_err(|error| error.message)
+        }
     }
 }
 
-/// The desktop host (local daemon start, settings, updates). Mobile clients
-/// never start a local daemon.
+/// The desktop host (local daemon start, settings, updates).
 pub mod desktop {
     use serde_json::Value;
 
     pub fn available() -> bool {
-        cfg!(not(any(target_os = "android", target_os = "ios"))) && crate::platform().is_some()
+        cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) && crate::platform().is_some()
     }
 
     /// One desktop host command (`desktop_settings_get`, `start_desktop_daemon`, …).
     pub fn invoke(command: &str, args: &Value) -> Result<Value, String> {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             let command = command.to_owned();
             let args = args.clone();
@@ -253,6 +283,11 @@ pub mod desktop {
         {
             let _ = (command, args);
             Err("Mobile clients never manage a local daemon.".to_owned())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (command, args);
+            Err(crate::web::DESKTOP_UNAVAILABLE.to_owned())
         }
     }
 
@@ -273,7 +308,7 @@ pub mod desktop {
 
     /// Current local daemon state; cheap, safe to call while drawing.
     pub fn local_daemon() -> LocalDaemon {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             let Some(handle) = crate::platform() else {
                 return LocalDaemon::Unavailable;
@@ -285,13 +320,14 @@ pub mod desktop {
                 (false, None, false) => LocalDaemon::Idle,
             }
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         {
             LocalDaemon::Unavailable
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Settings diagnostics playback test.
 pub(crate) fn play_thinking_tone() -> Result<(), String> {
     use crate::{action::PlatformValue, audio};
@@ -309,7 +345,7 @@ pub(crate) fn play_thinking_tone() -> Result<(), String> {
             &submit,
             id,
             audio::THINKING_TONE_PCM16_16K.to_vec(),
-            audio::THINKING_TONE_MIME.to_owned(),
+            audio::THINKING_TONE_MIME,
         );
     });
     match receiver.recv() {
@@ -318,4 +354,9 @@ pub(crate) fn play_thinking_tone() -> Result<(), String> {
         Ok(Err(error)) => Err(error.message),
         Err(_) => Err("The playback request was dropped.".to_owned()),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn play_thinking_tone() -> Result<(), String> {
+    Err("The blocking playback test is not available in the browser.".to_owned())
 }

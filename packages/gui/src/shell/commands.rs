@@ -233,6 +233,7 @@ pub enum ShellOverlay {
 }
 
 /// Results posted back from worker threads.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub enum ShellAsync {
     /// `project.icon.set` upload bytes read off the GUI thread.
@@ -252,6 +253,7 @@ pub struct PendingFileLink {
 }
 
 /// Pending project icon picks by platform request id.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 struct IconPick {
     window: String,
@@ -260,6 +262,7 @@ struct IconPick {
 }
 
 thread_local! {
+    #[cfg(not(target_arch = "wasm32"))]
     static ICON_PICKS: RefCell<HashMap<u64, IconPick>> = RefCell::new(HashMap::new());
     /// Quit votes: token → (approving windows, already answered).
     static QUIT_VOTES: RefCell<HashMap<u64, (usize, bool)>> = RefCell::new(HashMap::new());
@@ -3765,6 +3768,7 @@ fn project_menu(
         ("import", "importSession.title"),
         ("rename", "sidebar.project.actions.rename"),
         ("reset", "sidebar.project.actions.resetName"),
+        #[cfg(not(target_arch = "wasm32"))]
         ("icon", "sidebar.project.actions.chooseIcon"),
         ("resetIcon", "sidebar.project.actions.resetIcon"),
         ("settings", "sidebar.project.actions.openSettings"),
@@ -3855,6 +3859,7 @@ fn project_action(
         }
         "up" => sidebar::move_in_order(ui, "projectOrder", order, &key, -1),
         "down" => sidebar::move_in_order(ui, "projectOrder", order, &key, 1),
+        #[cfg(not(target_arch = "wasm32"))]
         "icon" => {
             if let Some(request) = platform::pick_image_file() {
                 ICON_PICKS.with(|picks| {
@@ -4474,6 +4479,7 @@ pub fn handle_platform_actions(
     ui: &mut UiContext,
 ) {
     process_routes(shell, cx, ui);
+    #[cfg(not(target_arch = "wasm32"))]
     super::image_share::present_pending(shell, cx);
     // Host removals waiting on push revocation: the 2.5 s bound passed.
     if let Some(index) = shell
@@ -4534,21 +4540,25 @@ pub fn handle_platform_actions(
                     ui.core.remove_host(&host_id);
                     continue;
                 }
-                let pick = ICON_PICKS.with(|picks| picks.borrow_mut().remove(&request));
-                if let Some(pick) = pick {
-                    if let Ok(PlatformValue::Files(files)) = result {
-                        if let Some(file) = files.into_iter().next() {
-                            read_icon(pick, file.path);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let pick = ICON_PICKS.with(|picks| picks.borrow_mut().remove(&request));
+                    if let Some(pick) = pick {
+                        if let Ok(PlatformValue::Files(files)) = result {
+                            if let Some(file) = files.into_iter().next() {
+                                read_icon(pick, file.path);
+                            }
+                        } else if let Err(error) = result
+                            && error.code != "cancelled"
+                        {
+                            toast(shell, cx, error.message, true);
                         }
-                    } else if let Err(error) = result
-                        && error.code != "cancelled"
-                    {
-                        toast(shell, cx, error.message, true);
                     }
                 }
             }
             PlatformAction::Event(event) => match event {
                 PlatformEvent::Route(route) if main => queue_route(shell, route),
+                #[cfg(not(target_arch = "wasm32"))]
                 PlatformEvent::SharedImages(share) if main => {
                     super::image_share::receive(shell, cx, share)
                 }
@@ -4607,6 +4617,7 @@ pub fn handle_platform_actions(
             },
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     for action in actions.iter() {
         if let Some(ShellAsync::ProjectIcon {
             window,
@@ -4648,6 +4659,7 @@ pub fn handle_platform_actions(
 }
 
 /// Reads and encodes a picked project icon off the GUI thread.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_icon(pick: IconPick, path: std::path::PathBuf) {
     std::thread::spawn(move || {
         use base64::Engine;

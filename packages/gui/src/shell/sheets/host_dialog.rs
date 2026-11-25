@@ -1300,36 +1300,39 @@ impl ConnectionSheet {
                 }
             }
             _ => {
-                y += field_label(ui, cx, x, y, w, &tr("tailnet.hostMode"), true);
-                for (id, key, selected) in [
-                    ("network.normal", "tailnet.normal", !self.embedded_tailnet),
-                    ("network.tailnet", "tailnet.embedded", self.embedded_tailnet),
-                ] {
-                    ui.button(
-                        cx,
-                        rect(x, y, w, BUTTON_H),
-                        id,
-                        &tr(key),
-                        selected.then_some("check"),
-                        if selected {
-                            Variant::Primary
-                        } else {
-                            Variant::Outline
-                        },
-                        ControlSize::Md,
-                        enabled,
-                    );
-                    y += BUTTON_H + 8.0;
+                // The browser has no embedded Tailscale node: only the normal network.
+                if !cfg!(target_arch = "wasm32") {
+                    y += field_label(ui, cx, x, y, w, &tr("tailnet.hostMode"), true);
+                    for (id, key, selected) in [
+                        ("network.normal", "tailnet.normal", !self.embedded_tailnet),
+                        ("network.tailnet", "tailnet.embedded", self.embedded_tailnet),
+                    ] {
+                        ui.button(
+                            cx,
+                            rect(x, y, w, BUTTON_H),
+                            id,
+                            &tr(key),
+                            selected.then_some("check"),
+                            if selected {
+                                Variant::Primary
+                            } else {
+                                Variant::Outline
+                            },
+                            ControlSize::Md,
+                            enabled,
+                        );
+                        y += BUTTON_H + 8.0;
+                    }
+                    let hint = tr(if self.embedded_tailnet {
+                        "tailnet.hostHint"
+                    } else {
+                        "tailnet.normalHint"
+                    });
+                    let spec = ui.spec(Font::Regular, 12.0, p.muted);
+                    let h = ui.painter.paragraph_height(cx, w, spec, &hint);
+                    ui.painter.paragraph(cx, dvec2(x, y), w, spec, &hint);
+                    y += h + 16.0;
                 }
-                let hint = tr(if self.embedded_tailnet {
-                    "tailnet.hostHint"
-                } else {
-                    "tailnet.normalHint"
-                });
-                let spec = ui.spec(Font::Regular, 12.0, p.muted);
-                let h = ui.painter.paragraph_height(cx, w, spec, &hint);
-                ui.painter.paragraph(cx, dvec2(x, y), w, spec, &hint);
-                y += h + 16.0;
                 if !self.advanced || !self.editing {
                     let port_w = 112.0;
                     let host_w = w - port_w - 12.0;

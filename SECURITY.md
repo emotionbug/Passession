@@ -79,6 +79,14 @@ For remote access, use the encrypted relay or a properly configured Tailscale co
 
 Host header validation and CORS origin checks are defense-in-depth controls for localhost exposure. They help block DNS rebinding and browser-based attacks, but they do not replace network isolation.
 
+### Browser UI
+
+`daemon.web.enabled` is off by default. When enabled, `GET` and `HEAD` can read the bundled HTML, JavaScript, Wasm and other static assets without a daemon password, subject to the normal `Host` allowlist. API routes and WebSocket origin checks are unchanged. The page connects to same-origin `/ws` and sends the password in the existing `hello` exchange; unauthenticated asset access does not grant control of the daemon.
+
+Use TLS (HTTPS and WSS through a reverse proxy) or a trusted network when using a daemon password. Plain HTTP and WebSocket do not protect the password or the downloaded code from interception. Keep the bundle directory, including any `PASEO_WEB_DIR` override, under trusted administrative control: the served JavaScript runs on the daemon's origin and can read passwords entered in the page.
+
+The page saves a password entered for the host with its other client state in the browser's local storage for the daemon's origin, as the native app saves it in its state file. Anyone who can use that browser profile can connect with it; use a private window or clear the site's data on a shared computer.
+
 ## DNS rebinding protection
 
 CORS is not a complete security boundary. It controls which browser origins can make requests, but does not prevent a malicious website from resolving its domain to your local machine (DNS rebinding).

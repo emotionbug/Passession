@@ -1,6 +1,6 @@
-//! Syntax colors for fenced code and read/write tool content. Both use one
-//! native parser worker with a bounded latest-per-block queue. This worker does
-//! not access Makepad fonts or UI draw state.
+//! Syntax colors for fenced code and read/write tool content. Both share one
+//! parser worker with a bounded latest-per-block queue, independent of Makepad
+//! fonts and UI draw state.
 
 use makepad_widgets::{Cx, DrawListId, ToUIReceiver, Vec4};
 use paseo_highlight::{
@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::{Rc, Weak};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{SyncSender, sync_channel};
 
 /// Content longer than this renders as plain (selectable) text.
@@ -76,12 +77,20 @@ struct FenceWork {
     dark: bool,
 }
 
+fn highlight(highlighter: &mut Option<Highlighter>, job: FenceWork) -> Option<RawColored> {
+    highlighter
+        .as_mut()
+        .and_then(|h| h.highlight_spans(&job.code, job.language).ok())
+        .map(|spans| resolve(spans, &job.theme, job.dark))
+}
+
 struct QueuedFence {
     slot: Weak<RefCell<FenceSlot>>,
     work: FenceWork,
 }
 
 struct FenceWorker {
+    #[cfg(not(target_arch = "wasm32"))]
     sender: Option<SyncSender<FenceWork>>,
     receiver: ToUIReceiver<Option<RawColored>>,
     active: Option<(Weak<RefCell<FenceSlot>>, u64)>,
@@ -93,28 +102,51 @@ struct FenceWorker {
 impl FenceWorker {
     fn new() -> Self {
         let receiver = ToUIReceiver::default();
-        let done = receiver.sender();
-        let (sender, work) = sync_channel::<FenceWork>(1);
-        let spawned = std::thread::Builder::new()
-            .name("paseo-chat-highlight".into())
-            .spawn(move || {
-                let mut highlighter = Highlighter::new().ok();
-                while let Ok(job) = work.recv() {
-                    let result = highlighter
-                        .as_mut()
-                        .and_then(|h| h.highlight_spans(&job.code, job.language).ok())
-                        .map(|spans| resolve(spans, &job.theme, job.dark));
-                    if done.send(result).is_err() {
-                        break;
+        #[cfg(not(target_arch = "wasm32"))]
+        let sender = {
+            let done = receiver.sender();
+            let (sender, work) = sync_channel::<FenceWork>(1);
+            let spawned = std::thread::Builder::new()
+                .name("paseo-chat-highlight".into())
+                .spawn(move || {
+                    let mut highlighter = Highlighter::new().ok();
+                    while let Ok(job) = work.recv() {
+                        if done.send(highlight(&mut highlighter, job)).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            spawned.ok().map(|_| sender)
+        };
         Self {
-            sender: spawned.ok().map(|_| sender),
+            #[cfg(not(target_arch = "wasm32"))]
+            sender,
             receiver,
             active: None,
             pending: VecDeque::new(),
             deferred: Vec::new(),
+        }
+    }
+
+    fn submit(&self, work: FenceWork) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.sender
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(work).is_ok())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            thread_local! {
+                static HIGHLIGHTER: RefCell<Option<Highlighter>> =
+                    RefCell::new(Highlighter::new().ok());
+            }
+            let done = self.receiver.sender();
+            crate::common::background::spawn("paseo-chat-highlight", move || {
+                let result = HIGHLIGHTER.with(|h| highlight(&mut h.borrow_mut(), work));
+                let _ = done.send(result);
+            })
+            .is_ok()
         }
     }
 
@@ -131,11 +163,7 @@ impl FenceWorker {
                 continue;
             }
             let key = job.work.key;
-            if self
-                .sender
-                .as_ref()
-                .is_some_and(|sender| sender.try_send(job.work).is_ok())
-            {
+            if self.submit(job.work) {
                 self.active = Some((job.slot, key));
                 break;
             }
@@ -307,7 +335,7 @@ fn request_colors(
             worker.pending.push_back(job);
         }
         // Requested during a draw, where repaint requests are ignored: without a
-        // worker thread each block settles as it is requested and draws plain text now.
+        // working parser each block settles as it is requested and draws plain text now.
         worker.dispatch(|_| {});
     });
     None

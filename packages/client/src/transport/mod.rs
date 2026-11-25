@@ -1,7 +1,9 @@
-//! Shared native socket, encrypted relay, IPC and SSH transport.
+//! Shared host framing and target-specific transports.
 pub mod connector;
 pub mod http;
+#[cfg(not(target_arch = "wasm32"))]
 mod network;
+#[cfg(not(target_arch = "wasm32"))]
 mod socks;
 pub mod target;
 use anyhow::{Result, ensure};

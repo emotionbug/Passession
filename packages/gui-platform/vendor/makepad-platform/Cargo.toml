@@ -139,7 +139,7 @@ version = "0.61"
 [target."cfg(windows)".dependencies.windows-future]
 version = "0.2"
 
-[target.wasm32-unknown-unknown.dependencies.makepad-wasm-bridge]
+[target.'cfg(target_arch = "wasm32")'.dependencies.makepad-wasm-bridge]
 version = "1.0.0"
 
 [target.x86_64-apple-darwin.dependencies.makepad-objc-sys]

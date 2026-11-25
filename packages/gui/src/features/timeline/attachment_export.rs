@@ -1,13 +1,16 @@
-//! Mobile exports take original bytes, never a rendered/thumbnail texture.
-//! The lightbox owns preparation; once the OS receives a path, the native
-//! request owns it until completion (which only acknowledges presenting Share).
+//! Exports take original bytes, never a rendered or thumbnail texture.
+//! The browser downloads those bytes directly. On mobile, the native request
+//! owns a staged path until the platform acknowledges the handoff.
 
 use super::composer_bridge;
 use super::i18n::{t, ta};
 use super::images::{ImageSource, resolve_image_source};
 use crate::common::UiContext;
 use crate::common::host_http::IMAGE_MAX_BYTES;
-use crate::features::files::{path::safe_local_name, transfer::remove_staging_later};
+use crate::features::composer::attachments::ImageBytes;
+use crate::features::files::path::safe_local_name;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::features::files::transfer::remove_staging_later;
 use base64::Engine;
 use makepad_widgets::{Event, SignalToUI};
 use paseo_gui_core::{CoreHandle, RequestId};
@@ -15,16 +18,25 @@ use paseo_gui_platform::{PlatformAction, PlatformError, PlatformRequestId, Platf
 use serde_json::Value;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::{LazyLock, Mutex, mpsc};
-use mpsc::{Receiver, SyncSender, TryRecvError};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{LazyLock, Mutex, mpsc::SyncSender};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, SystemTime};
 
+#[cfg(not(target_arch = "wasm32"))]
 const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_STAGED_FILES: usize = 64;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_STAGED_BYTES: u64 = 256 << 20;
+#[cfg(not(target_arch = "wasm32"))]
 static ACTIVE_FILES: LazyLock<Mutex<HashSet<uuid::Uuid>>> = LazyLock::new(Mutex::default);
 
 pub(super) enum Original<'a> {
@@ -131,6 +143,7 @@ impl HostRoute {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {
     Save,
+    #[cfg(not(target_arch = "wasm32"))]
     Share,
 }
 
@@ -138,7 +151,9 @@ pub(super) enum Mode {
 enum Notice {
     ReadFailed,
     StageFailed,
+    #[cfg(not(target_arch = "wasm32"))]
     SavedToPhotos,
+    #[cfg(not(target_arch = "wasm32"))]
     SavedFile,
     NativeFailed(Mode, String),
 }
@@ -148,11 +163,14 @@ impl Notice {
         match self {
             Self::ReadFailed => t("message.attachments.lightbox.readFailed"),
             Self::StageFailed => t("message.attachments.lightbox.stageFailed"),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::SavedToPhotos => t("message.attachments.lightbox.savedToPhotos"),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::SavedFile => t("message.attachments.lightbox.savedFile"),
             Self::NativeFailed(mode, error) => ta(
                 match mode {
                     Mode::Save => "message.attachments.lightbox.saveFailed",
+                    #[cfg(not(target_arch = "wasm32"))]
                     Mode::Share => "message.attachments.lightbox.shareFailed",
                 },
                 &[("error", error)],
@@ -161,7 +179,10 @@ impl Notice {
     }
 
     fn is_error(&self) -> bool {
-        !matches!(self, Self::SavedToPhotos | Self::SavedFile)
+        #[cfg(not(target_arch = "wasm32"))]
+        return !matches!(self, Self::SavedToPhotos | Self::SavedFile);
+        #[cfg(target_arch = "wasm32")]
+        true
     }
 }
 
@@ -207,6 +228,7 @@ impl Export {
             return Some((
                 t(match mode {
                     Mode::Save => "message.attachments.lightbox.saving",
+                    #[cfg(not(target_arch = "wasm32"))]
                     Mode::Share => "message.attachments.lightbox.preparingShare",
                 }),
                 false,
@@ -237,7 +259,7 @@ impl Export {
                 if !queue(move || {
                     let prepared = composer_bridge::read_original_blob(&id)
                         .map_err(|_| Notice::ReadFailed)
-                        .and_then(|bytes| stage(&bytes, name.as_deref(), mime.as_deref()));
+                        .and_then(|bytes| prepare(bytes, name.as_deref(), mime.as_deref()));
                     publish(sender, prepared);
                 }) {
                     self.notice = Some(Notice::StageFailed);
@@ -255,7 +277,7 @@ impl Export {
                 let mime = mime.map(str::to_owned);
                 if !queue(move || {
                     let prepared = decode_inline(&data).and_then(|(bytes, hint)| {
-                        stage(&bytes, name.as_deref(), mime.as_deref().or(hint))
+                        prepare(bytes, name.as_deref(), mime.as_deref().or(hint))
                     });
                     publish(sender, prepared);
                 }) {
@@ -280,7 +302,8 @@ impl Export {
                         .await?;
                     if !queue(move || {
                         let name = file.metadata.file_name.as_deref().unwrap_or(&path);
-                        let prepared = stage(&file.bytes, Some(name), Some(&file.metadata.mime));
+                        let prepared =
+                            prepare(Vec::from(file.bytes), Some(name), Some(&file.metadata.mime));
                         publish(sender, prepared);
                     }) {
                         return Ok(serde_json::json!(false));
@@ -345,23 +368,31 @@ impl Export {
     }
 
     fn present(&mut self, mode: Mode, staged: Staged) {
-        let Some(platform) =
-            paseo_gui_platform::platform().filter(|platform| platform.capabilities().photo_library)
-        else {
+        let Some(platform) = paseo_gui_platform::platform() else {
             self.pending = None;
             self.notice = Some(Notice::StageFailed);
             return;
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        if !platform.capabilities().photo_library {
+            self.pending = None;
+            self.notice = Some(Notice::StageFailed);
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         let request = match mode {
             Mode::Save => platform.save_image(&staged.path, staged.mime, &staged.name),
             Mode::Share => platform.share_file(&staged.path, staged.mime, &staged.name),
         };
+        #[cfg(target_arch = "wasm32")]
+        let request = platform.download_file(&staged.name, staged.mime, &staged.bytes);
         let outcome = Rc::new(Cell::new(None));
         PRESENTED.with_borrow_mut(|requests| {
             requests.insert(
                 request,
                 Presented {
                     mode,
+                    #[cfg(not(target_arch = "wasm32"))]
                     staged,
                     outcome: Rc::downgrade(&outcome),
                 },
@@ -373,6 +404,7 @@ impl Export {
 
 struct Presented {
     mode: Mode,
+    #[cfg(not(target_arch = "wasm32"))]
     staged: Staged,
     outcome: Weak<NativeResult>,
 }
@@ -389,10 +421,13 @@ pub(super) fn handle_event(event: &Event) {
         let Some(PlatformAction::Completed { request, result }) = action.downcast_ref() else {
             continue;
         };
-        let Some(mut pending) = PRESENTED.with_borrow_mut(|requests| requests.remove(request))
+        let Some(pending) = PRESENTED.with_borrow_mut(|requests| requests.remove(request))
         else {
             continue;
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut pending = pending;
+        #[cfg(not(target_arch = "wasm32"))]
         if matches!((pending.mode, result), (Mode::Share, Ok(PlatformValue::None))) {
             // Both mobile bridges acknowledge the launch only: the receiver
             // may open the URL/URI later. The bounded transfer cache expires it.
@@ -406,8 +441,13 @@ pub(super) fn handle_event(event: &Event) {
 
 fn native_notice(mode: Mode, result: &Result<PlatformValue, PlatformError>) -> Option<Notice> {
     match (mode, result) {
+        #[cfg(target_arch = "wasm32")]
+        (Mode::Save, Ok(PlatformValue::Submitted)) => None,
+        #[cfg(not(target_arch = "wasm32"))]
         (Mode::Save, Ok(PlatformValue::PhotoLibrarySaved)) => Some(Notice::SavedToPhotos),
+        #[cfg(not(target_arch = "wasm32"))]
         (Mode::Save, Ok(PlatformValue::Bool(true))) => Some(Notice::SavedFile),
+        #[cfg(not(target_arch = "wasm32"))]
         (Mode::Save, Ok(PlatformValue::Bool(false))) | (Mode::Share, Ok(PlatformValue::None)) => None,
         (_, Err(error)) if error.code == "cancelled" => None,
         (_, Err(error)) => Some(Notice::NativeFailed(mode, error.message.clone())),
@@ -418,7 +458,9 @@ fn native_notice(mode: Mode, result: &Result<PlatformValue, PlatformError>) -> O
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type Job = Box<dyn FnOnce() + Send>;
+#[cfg(not(target_arch = "wasm32"))]
 static WORKER: LazyLock<Option<SyncSender<Job>>> = LazyLock::new(|| {
     let (sender, receiver) = mpsc::sync_channel::<Job>(4);
     std::thread::Builder::new()
@@ -432,10 +474,16 @@ static WORKER: LazyLock<Option<SyncSender<Job>>> = LazyLock::new(|| {
     Some(sender)
 });
 
+#[cfg(not(target_arch = "wasm32"))]
 fn queue(job: impl FnOnce() + Send + 'static) -> bool {
     WORKER
         .as_ref()
         .is_some_and(|sender| sender.try_send(Box::new(job)).is_ok())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn queue(job: impl FnOnce() + Send + 'static) -> bool {
+    crate::common::background::spawn("paseo-lightbox-transfer", job).is_ok()
 }
 
 fn publish(sender: mpsc::Sender<Prepared>, prepared: Prepared) {
@@ -445,13 +493,19 @@ fn publish(sender: mpsc::Sender<Prepared>, prepared: Prepared) {
 }
 
 struct Staged {
+    #[cfg(not(target_arch = "wasm32"))]
     id: uuid::Uuid,
+    #[cfg(not(target_arch = "wasm32"))]
     path: PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
     retain: bool,
+    #[cfg(target_arch = "wasm32")]
+    bytes: ImageBytes,
     mime: &'static str,
     name: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Staged {
     fn drop(&mut self) {
         ACTIVE_FILES.lock().unwrap().remove(&self.id);
@@ -529,17 +583,24 @@ fn export_name(name: Option<&str>, mime: &str) -> Option<String> {
     Some(format!("{stem}.{default_ext}"))
 }
 
-fn stage(bytes: &[u8], name: Option<&str>, hint: Option<&str>) -> Prepared {
+fn prepare(bytes: impl Into<ImageBytes>, name: Option<&str>, hint: Option<&str>) -> Prepared {
+    let bytes = bytes.into();
     if bytes.len() > IMAGE_MAX_BYTES {
         return Err(Notice::ReadFailed);
     }
-    let mime = paseo_gui_platform::image::sniff_image_mime_with_hint(bytes, hint)
+    let mime = paseo_gui_platform::image::sniff_image_mime_with_hint(&bytes, hint)
         .ok_or(Notice::ReadFailed)?;
     let name = export_name(name, mime).ok_or(Notice::ReadFailed)?;
-    let root = paseo_gui_platform::paths::app_paths().temp_dir.join("paseo-files/lightbox");
-    stage_original(&root, bytes, name, mime).map_err(|_| Notice::StageFailed)
+    #[cfg(target_arch = "wasm32")]
+    return Ok(Staged { bytes, name, mime });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let root = paseo_gui_platform::paths::app_paths().temp_dir.join("paseo-files/lightbox");
+        stage_original(&root, &bytes, name, mime).map_err(|_| Notice::StageFailed)
+    }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn stage_original(
     root: &Path,
     bytes: &[u8],

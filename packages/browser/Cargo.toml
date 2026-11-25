@@ -1,0 +1,9 @@
+[package]
+name = "paseo-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Browser bindings of the Passession web client (wasm32 only)."
+
+[dependencies]

@@ -62,6 +62,7 @@ pub fn app_version() -> &'static str {
         .unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn core_config() -> CoreConfig {
     // `cargo xtask dev app` isolates development state from the installed app.
     let state_dir = std::env::var_os("PASEO_GUI_STATE_DIR")
@@ -82,9 +83,26 @@ fn core_config() -> CoreConfig {
     }
 }
 
+/// The browser core keeps its state in the page's storage and connects only to the
+/// daemon that served the page.
+#[cfg(target_arch = "wasm32")]
+fn core_config() -> CoreConfig {
+    CoreConfig {
+        state_dir: PathBuf::new(),
+        default_endpoint: None,
+    }
+}
+
 // Leave event-loop turns between transcript batches for input and painting.
 const CORE_BATCH_BUDGET: Duration = Duration::from_millis(4);
 const LAYOUT_RETIREMENT_INTERVAL: f64 = 1.0 / 60.0;
+/// Browser: how often the core's timers (reconnects, heartbeats, request
+/// deadlines) get a turn when nothing else wakes the app.
+#[cfg(target_arch = "wasm32")]
+const BROWSER_TICK_SECONDS: f64 = 0.05;
+/// Browser: background work per event turn, so input and painting keep going.
+#[cfg(target_arch = "wasm32")]
+const BROWSER_WORK_BUDGET: Duration = Duration::from_millis(8);
 
 /// Everything that exists once startup succeeded.
 struct Runtime {
@@ -123,6 +141,9 @@ pub struct App {
     font_roles: FontRoles,
     #[rust]
     system_fonts: SystemFontState,
+    #[cfg(target_arch = "wasm32")]
+    #[rust]
+    browser_tick: Timer,
 }
 
 impl LiveRegister for App {
@@ -145,6 +166,13 @@ impl LiveRegister for App {
 
 impl App {
     fn start(&mut self, cx: &mut Cx) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Browser callbacks (socket data, fetches, picked files) queue work for the
+            // core; the signal brings it to the next event turn.
+            paseo_browser::set_wake(SignalToUI::set_ui_signal);
+            self.browser_tick = cx.start_interval(BROWSER_TICK_SECONDS);
+        }
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(SignalToUI::set_ui_signal);
         let core = match GuiCore::start(core_config(), wake) {
             Ok(core) => core,
@@ -498,6 +526,9 @@ fn dispatch_core_turn(budget: Duration, mut dispatch_chunk: impl FnMut() -> bool
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         common::transition::begin_event(event);
+        // Browser: the page thread runs the core and background work between events.
+        #[cfg(target_arch = "wasm32")]
+        self.browser_turn();
         cx.with_timer_owner(common::APP_TIMERS, |cx| {
             if matches!(event, Event::Signal) {
                 if dispatch_core_turn(CORE_BATCH_BUDGET, || self.dispatch_event(cx, event)) {
@@ -509,6 +540,23 @@ impl AppMain for App {
                 self.dispatch_event(cx, event);
             }
         });
+        // Commands this event sent reach the core now, not at the next tick.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(runtime) = &self.runtime {
+            runtime.core.turn();
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl App {
+    fn browser_turn(&mut self) {
+        if let Some(runtime) = &self.runtime {
+            runtime.core.turn();
+        }
+        if common::background::run_queued(BROWSER_WORK_BUDGET) {
+            SignalToUI::set_ui_signal();
+        }
     }
 }
 
@@ -523,6 +571,12 @@ impl App {
         }
         // Retired layouts outlive their row/window. Drain independently of drawing
         // and core startup, with one paced continuation rather than a signal loop.
+        // Browser: the periodic tick also polls work that native threads would signal
+        // (draft save deadlines).
+        #[cfg(target_arch = "wasm32")]
+        let browser_tick = self.browser_tick.is_event(event).is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let browser_tick = false;
         let retirement_tick = self.layout_retirement_timer.is_event(event).is_some();
         if retirement_tick {
             self.layout_retirement_timer = Timer::default();
@@ -598,7 +652,7 @@ impl App {
         if batch {
             crate::features::composer::handle_core_events(cx, &mut runtime.ui);
         }
-        if let Event::Signal = event {
+        if matches!(event, Event::Signal) || browser_tick {
             crate::features::composer::poll_background(cx);
         }
         let platform_completion = matches!(event, Event::Actions(actions) if actions.iter().any(|action| {

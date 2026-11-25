@@ -178,6 +178,10 @@ pub async fn bind(
         let (bound, _) = bind_target(parse(proxy_listen)?, &state.user_home).await?;
         listeners.push((bound, true));
     }
+    let web_dir = std::env::var_os("PASEO_WEB_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| state.executable.parent().map(|parent| parent.join("web")));
     drop(state);
     Ok(HttpListener {
         listeners,
@@ -185,6 +189,7 @@ pub async fn bind(
             app,
             transport,
             listen,
+            web_dir,
             shutdown: cancel.clone(),
         }),
         cancel,

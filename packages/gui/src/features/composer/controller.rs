@@ -11,14 +11,25 @@ use super::forge::*;
 use super::i18n::{t, t_args};
 use super::json::*;
 use super::model_picks::{MODEL_PICKS_KEY, ModelPicks, ModelRef, record_recent, toggle_favorite};
+use super::ops::UploadFile;
 use super::service::{self, PanelNotice, SendJob, SendOrigin};
 use crate::common::{UiContext, UiEffect};
 use paseo_gui_core::{CoreError, CoreEvent};
-use paseo_gui_platform::PickedFile;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn upload_file(file: SelectedFile) -> UploadFile {
+    let mime = mime_type_for_path(&file.name).to_owned();
+    UploadFile::from_path(file.path, file.name, mime, file.size)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn upload_file(file: SelectedFile) -> UploadFile {
+    UploadFile::from(file)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ComposerKind {
@@ -161,7 +172,7 @@ pub struct Controller {
     upload_request: Option<String>,
     /// Files of the selection still to upload, the files done so far and the draft they
     /// attach to.
-    upload_queue: Vec<(std::path::PathBuf, String, String)>,
+    upload_queue: VecDeque<UploadFile>,
     uploaded: Vec<Value>,
     upload_key: String,
     pub requests: HashMap<String, Tag>,
@@ -236,7 +247,7 @@ impl Controller {
             cancelling: false,
             uploading: Vec::new(),
             upload_request: None,
-            upload_queue: Vec::new(),
+            upload_queue: VecDeque::new(),
             uploaded: Vec::new(),
             upload_key: String::new(),
             requests: HashMap::new(),
@@ -1234,6 +1245,7 @@ impl Controller {
     /// cannot be dropped while a message is submitting (the submit path clears and restores
     /// the attachments) or while files are uploading, counting a drop that is still being
     /// inspected. The host's drop zone refuses the drag then.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn accepts_file_drop(&self) -> bool {
         self.initialized
             && !self.is_subagent()
@@ -1243,6 +1255,7 @@ impl Controller {
     }
 
     /// Dropped paths: raster images join the tray, everything else uploads (useFileDrop).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn drop_paths(&mut self, paths: Vec<std::path::PathBuf>) {
         if paths.is_empty() || !self.accepts_file_drop() {
             return;
@@ -1255,7 +1268,7 @@ impl Controller {
     pub fn picked_files(
         &mut self,
         ui: &mut UiContext,
-        files: Vec<PickedFile>,
+        files: Vec<SelectedFile>,
         images: bool,
     ) {
         if files.is_empty() {
@@ -1266,9 +1279,10 @@ impl Controller {
             self.blob_tokens.insert(token, false);
             return;
         }
-        self.upload(ui, files);
+        self.upload(ui, files.into_iter().map(upload_file).collect());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn files_stat(&mut self, ui: &mut UiContext, files: Vec<super::blobs::StatFile>) {
         let (images, uploads): (Vec<_>, Vec<_>) =
             files.into_iter().partition(|f| f.is_image);
@@ -1278,12 +1292,15 @@ impl Controller {
             self.blob_tokens.insert(token, true);
         }
         if !uploads.is_empty() {
-            self.upload(ui, uploads.into_iter().map(|f| f.file).collect());
+            self.upload(
+                ui,
+                uploads.into_iter().map(|f| upload_file(f.file)).collect(),
+            );
         }
     }
 
     /// actions.ts uploadFileAttachments.
-    fn upload(&mut self, ui: &mut UiContext, files: Vec<PickedFile>) {
+    fn upload(&mut self, ui: &mut UiContext, files: Vec<UploadFile>) {
         if let Err(too_large) = check_upload_sizes(files.iter().map(|f| (f.name.as_str(), f.size)))
         {
             ui.toast(
@@ -1301,24 +1318,17 @@ impl Controller {
         }
         self.upload_key = self.key.clone();
         self.uploaded.clear();
-        self.upload_queue = files
-            .into_iter()
-            .map(|f| {
-                let mime = mime_type_for_path(&f.name).to_owned();
-                (f.path, f.name, mime)
-            })
-            .collect();
+        self.upload_queue = files.into();
         self.upload_next(ui);
     }
 
     /// Upload the next file of the selection (Flutter `_uploadFiles`: one file at a time,
     /// its name on the pending pill).
     fn upload_next(&mut self, ui: &mut UiContext) {
-        if self.upload_queue.is_empty() {
+        let Some(job) = self.upload_queue.pop_front() else {
             return;
-        }
-        let job = self.upload_queue.remove(0);
-        self.uploading = vec![job.1.clone()];
+        };
+        self.uploading = vec![job.name.clone()];
         let id = ui.core.operation(&self.target.host_id, move |client| {
             super::ops::upload_files(client, vec![job])
         });
@@ -2167,6 +2177,7 @@ impl Controller {
                         }
                     }
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 PanelNotice::FilesStat { token, files } => {
                     if self.blob_tokens.remove(&token).is_some() {
                         match files {
@@ -2253,7 +2264,12 @@ impl Controller {
                     ui.toast(message, true);
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             (PlatformTag::Pick { images }, Ok(PlatformValue::Files(files))) => {
+                self.picked_files(ui, files, images)
+            }
+            #[cfg(target_arch = "wasm32")]
+            (PlatformTag::Pick { images }, Ok(PlatformValue::FileBytes(files))) => {
                 self.picked_files(ui, files, images)
             }
             (PlatformTag::Pick { .. }, Err(error)) => {

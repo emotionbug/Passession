@@ -8,7 +8,8 @@ pub fn defaults() -> Value {
         "daemon": {
             "listen": "127.0.0.1:6767",
             "cors": { "allowedOrigins": ["https://app.paseo.sh"] },
-            "relay": { "enabled": false }
+            "relay": { "enabled": false },
+            "web": { "enabled": false }
         },
         "app": { "baseUrl": "https://app.paseo.sh" }
     })
@@ -79,6 +80,7 @@ enum Kind {
     Persisted,
     Daemon,
     Mcp,
+    Web,
     Git,
     Cors,
     Relay,
@@ -153,6 +155,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
                 ("hostnames", Hosts, false),
                 ("trustedProxies", Hosts, false),
                 ("mcp", Mcp, false),
+                ("web", Web, false),
                 ("git", Git, false),
                 ("autoArchiveAfterMerge", Boolean, false),
                 ("enableTerminalAgentHooks", Boolean, false),
@@ -172,6 +175,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
                 ("injectIntoAgents", Boolean, false),
             ],
         ),
+        Web => (Strict, &[("enabled", Boolean, false)]),
         Git => (
             Strict,
             &[
@@ -365,6 +369,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
             &[
                 ("relay", PatchRelay, false),
                 ("mcp", PatchMcp, false),
+                ("web", Web, false),
                 ("providers", Record(&PatchProvider), false),
                 ("removeProviders", Array(&Nonempty), false),
                 ("metadataGeneration", PatchMetadata, false),

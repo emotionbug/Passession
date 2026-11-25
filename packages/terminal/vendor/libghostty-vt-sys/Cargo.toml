@@ -1,5 +1,5 @@
 # Vendored libghostty-vt-sys 0.2.2 (libghostty-rs c9876b2902d5bb3e1f3d61b6395059f1e5e7b721).
-# See ../VENDORED.md for the build-script changes; bindings are unmodified.
+# See ../VENDORED.md for build-script and binding layout changes.
 [package]
 edition = "2024"
 rust-version = "1.90"

@@ -2,6 +2,7 @@
 mod listener;
 mod policy;
 mod proxy;
+mod web;
 pub use listener::{HttpListener, bind};
 
 use crate::{
@@ -17,6 +18,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use std::{
     net::IpAddr,
+    path::PathBuf,
     sync::{Arc, Weak},
 };
 use tokio_tungstenite::{
@@ -37,6 +39,7 @@ struct Handler {
     app: Weak<AppState>,
     transport: Arc<TransportService>,
     listen: Value,
+    web_dir: Option<PathBuf>,
     shutdown: CancellationToken,
 }
 
@@ -206,6 +209,16 @@ impl Handler {
                 ),
             };
         }
+        let is_get = matches!(*request.method(), Method::GET | Method::HEAD);
+        if is_get && config["webEnabled"] == true && !web::reserved_path(path) {
+            return web::serve(
+                self.web_dir.as_deref(),
+                path,
+                request.method(),
+                request.headers(),
+            )
+            .await;
+        }
         let bearer_free = matches!(path, "/api/health" | "/api/files/download" | "/mcp/agents");
         if !bearer_free {
             let authorized = if path == "/api/status" {
@@ -221,7 +234,6 @@ impl Handler {
                 return error(StatusCode::UNAUTHORIZED, "Unauthorized");
             }
         }
-        let is_get = request.method() == Method::GET || request.method() == Method::HEAD;
         if is_get && path == "/api/health" {
             return json_response(
                 StatusCode::OK,

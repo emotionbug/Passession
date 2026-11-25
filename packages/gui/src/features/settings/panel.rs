@@ -134,10 +134,15 @@ const HOST_SECTIONS: &[(&str, &str, Icon)] = &[
     ("version", "settings.hostSections.version", Icon::Package),
 ];
 
+/// Sections with no browser implementation: OS notifications and the embedded
+/// Tailscale node exist only in the native app.
+const NATIVE_APP_ONLY: &[&str] = &["notifications", "tailscale"];
+
 fn app_sections() -> impl Iterator<Item = &'static (&'static str, &'static str, Icon, bool)> {
-    APP_SECTIONS
-        .iter()
-        .filter(|(_, _, _, desktop_only)| !desktop_only || DESKTOP)
+    APP_SECTIONS.iter().filter(|(id, _, _, desktop_only)| {
+        (!desktop_only || DESKTOP)
+            && !(cfg!(target_arch = "wasm32") && NATIVE_APP_ONLY.contains(id))
+    })
 }
 
 live_design! {
@@ -317,7 +322,6 @@ impl SettingsPanel {
             prefs,
             tailnet: ui.state.get("tailnet").cloned().unwrap_or(Value::Null),
             compact: ui.compact,
-            desktop: DESKTOP,
         }
     }
 
@@ -599,6 +603,7 @@ impl Widget for SettingsPanel {
             dirty |= self.handle_core(cx, ui);
         }
         dirty |= self.with_env(cx, ui, |s, env| platform::handle_event(s, env, event));
+        #[cfg(not(target_arch = "wasm32"))]
         if self.st.local_daemon.loaded
             && let Event::Actions(actions) = event
         {
@@ -618,6 +623,7 @@ impl Widget for SettingsPanel {
             Event::Foreground | Event::Resume | Event::AppGotFocus
         ) {
             self.with_env(cx, ui, pages::system::refresh_notification_permission);
+            #[cfg(not(target_arch = "wasm32"))]
             if self.st.local_daemon.loaded {
                 self.with_env(cx, ui, pages::system::refresh_local_daemon);
             }
@@ -1295,6 +1301,7 @@ fn page_title(s: &Settings, _v: &View) -> Option<String> {
         return Some(t("settings.projects"));
     }
     let current = s.section.clone().unwrap_or_else(|| "general".into());
+    #[cfg(not(target_arch = "wasm32"))]
     if current == "local-daemon" {
         return Some(t("desktop.daemon.title"));
     }
@@ -1421,6 +1428,7 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
         if mobile { 18.0 } else { 16.0 },
     );
     let gap = 2.0;
+    #[cfg(not(target_arch = "wasm32"))]
     let no_local = DESKTOP && !v.hosts.iter().any(|h| h.local);
     let x = kit.x + 8.0;
     let w = kit.w - 16.0;
@@ -1552,6 +1560,7 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
             .lead(super::ui::kit::Lead::Icon(Icon::Plus, None));
             add.separator_before = true;
             items.push(add);
+            #[cfg(not(target_arch = "wasm32"))]
             if no_local {
                 items.push(
                     item(t("desktop.daemon.title"), nav("local-daemon"))
@@ -1600,6 +1609,7 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
             handler(|_, env| env.ctx.effects.push(UiEffect::OpenHostDialog)),
         );
         kit.y += row_h + gap;
+        #[cfg(not(target_arch = "wasm32"))]
         if no_local {
             let r = Rect {
                 pos: dvec2(x, kit.y),

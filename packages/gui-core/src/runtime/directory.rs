@@ -487,6 +487,7 @@ async fn hydrate(core: &Rc<Core>, host: &Rc<Host>) -> Result<(), CoreError> {
         return Ok(());
     }
     mark_child_tabs(core, host, &conn);
+    #[cfg(not(target_arch = "wasm32"))]
     if host.origin.is_none() && conn.supports("connectedHosts") {
         let (_, snapshot) = requests::observe_internal(
             core,
@@ -662,6 +663,7 @@ pub(crate) fn on_message(core: &Rc<Core>, host: &Rc<Host>, _conn: &Rc<Conn>, mes
     let kind = message["type"].as_str().unwrap_or_default();
     let payload = &message["payload"];
     match kind {
+        #[cfg(not(target_arch = "wasm32"))]
         "hosts.changed" => {
             let core = core.clone();
             let origin = host.clone();

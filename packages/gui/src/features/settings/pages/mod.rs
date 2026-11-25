@@ -28,7 +28,6 @@ pub struct View {
     pub prefs: Value,
     pub tailnet: Value,
     pub compact: bool,
-    pub desktop: bool,
 }
 
 impl View {
@@ -70,6 +69,7 @@ pub fn draw_section(ui: &mut Ui, s: &Settings, v: &View, section: &str) {
         return;
     }
     match section {
+        #[cfg(not(target_arch = "wasm32"))]
         "local-daemon" => system::draw_local_daemon(ui, s, v.hosts.iter().any(|host| host.local)),
         "notifications" => system::draw_notifications(ui, s),
         "diagnostics" => system::draw_diagnostics(ui, s),
@@ -97,7 +97,8 @@ pub fn ensure(s: &mut Settings, env: &mut Env, v: &View) {
         match host_section {
             "host" => {
                 daemon::ensure_daemon(s, env, &host);
-                if host.local && v.desktop {
+                #[cfg(not(target_arch = "wasm32"))]
+                if host.local && super::platform::DESKTOP {
                     system::ensure_local_daemon(s, env);
                 }
             }
@@ -126,6 +127,7 @@ pub fn ensure(s: &mut Settings, env: &mut Env, v: &View) {
         return;
     }
     match section.as_str() {
+        #[cfg(not(target_arch = "wasm32"))]
         "local-daemon" => system::ensure_local_daemon(s, env),
         "notifications" => system::ensure_notifications(s, env),
         "about" => about::ensure_about(s, env, v),

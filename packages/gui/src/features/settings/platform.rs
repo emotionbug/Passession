@@ -36,7 +36,12 @@ pub fn app_version() -> Option<String> {
 }
 
 pub fn platform_name() -> &'static str {
-    std::env::consts::OS
+    // `std::env::consts::OS` is empty on wasm32-wasip1.
+    if cfg!(target_arch = "wasm32") {
+        "web"
+    } else {
+        std::env::consts::OS
+    }
 }
 
 /// Whether the native desktop host service is running (Flutter `DesktopHost.instance != null`).

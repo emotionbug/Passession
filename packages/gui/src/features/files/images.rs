@@ -1,12 +1,13 @@
-//! Off-thread image decoding (raster via `image`, SVG via `resvg`) and GUI-thread textures, plus
-//! the material file icon cache (Flutter `MaterialFileIcon`, `SvgPicture`, `Image.memory`).
-//! Decoding never runs on the GUI thread: a fixed pair of worker threads, shared with assistant
-//! images, takes jobs in submission order; finished pixels arrive through a `ToUISender`
+//! Queued image decoding (raster via `image`, SVG via `resvg`) and GUI textures, plus the
+//! material file icon cache (Flutter `MaterialFileIcon`, `SvgPicture`, `Image.memory`).
+//! Jobs are shared with assistant images. Finished pixels arrive through a `ToUISender`
 //! (Signal wake) and become textures in [`poll`].
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Condvar, Mutex};
 
 use makepad_widgets::image_cache::ImageBuffer;
 use makepad_widgets::*;
@@ -121,6 +122,7 @@ fn decode_svg(bytes: &[u8], scale: impl Fn(f32, f32) -> f32) -> Result<Decoded, 
 
 type DecodeJob = Box<dyn FnOnce() + Send>;
 
+#[cfg(not(target_arch = "wasm32"))]
 struct DecodeQueue {
     jobs: VecDeque<(u64, DecodeJob)>,
     next: u64,
@@ -128,15 +130,19 @@ struct DecodeQueue {
 }
 
 /// Worker threads decoding images; started on first use and kept for the process.
+#[cfg(not(target_arch = "wasm32"))]
 const DECODE_WORKERS: usize = 2;
+#[cfg(not(target_arch = "wasm32"))]
 static DECODE_QUEUE: Mutex<DecodeQueue> = Mutex::new(DecodeQueue {
     jobs: VecDeque::new(),
     next: 0,
     workers: 0,
 });
+#[cfg(not(target_arch = "wasm32"))]
 static DECODE_READY: Condvar = Condvar::new();
 
 /// Queues decoding work behind earlier jobs; returns its tag for [`cancel_decode`].
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_decode(job: impl FnOnce() + Send + 'static) -> u64 {
     let mut queue = DECODE_QUEUE.lock().unwrap();
     queue.next += 1;
@@ -155,7 +161,29 @@ pub fn spawn_decode(job: impl FnOnce() + Send + 'static) -> u64 {
     tag
 }
 
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static NEXT_DECODE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DECODE_JOBS: RefCell<HashMap<u64, DecodeJob>> = RefCell::default();
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_decode(job: impl FnOnce() + Send + 'static) -> u64 {
+    let tag = NEXT_DECODE.get() + 1;
+    NEXT_DECODE.set(tag);
+    DECODE_JOBS.with(|jobs| jobs.borrow_mut().insert(tag, Box::new(job)));
+    crate::common::background::spawn("paseo-image-decode", move || {
+        let job = DECODE_JOBS.with(|jobs| jobs.borrow_mut().remove(&tag));
+        if let Some(job) = job {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        }
+    })
+    .expect("queue image decode");
+    tag
+}
+
 /// Drops a queued job that has not started; a running one finishes.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cancel_decode(tag: u64) {
     DECODE_QUEUE
         .lock()
@@ -164,6 +192,12 @@ pub fn cancel_decode(tag: u64) {
         .retain(|(queued, _)| *queued != tag);
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn cancel_decode(tag: u64) {
+    DECODE_JOBS.with(|jobs| jobs.borrow_mut().remove(&tag));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn decode_worker() {
     loop {
         let job = {

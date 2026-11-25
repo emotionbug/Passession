@@ -25,6 +25,7 @@ pub struct PlatformConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Capabilities {
+    /// Native desktop host, tray and window lifecycle integration.
     pub desktop_host: bool,
     pub editors: bool,
     pub updater: bool,
@@ -33,7 +34,7 @@ pub struct Capabilities {
     pub push: bool,
     pub qr_scan: bool,
     pub share: bool,
-    /// Images can be saved straight into the device's photo library ([`Platform::save_image`]).
+    /// Images can be saved straight into the device's photo library ([`PlatformHandle::save_image`]).
     pub photo_library: bool,
     pub idle: bool,
 }
@@ -87,6 +88,7 @@ impl Completion {
 
 pub(crate) struct Shared {
     next_request: AtomicU64,
+    #[cfg(not(target_arch = "wasm32"))]
     pub runtime: tokio::runtime::Runtime,
     main_tasks: Mutex<Vec<MainTask>>,
     pub audio: audio::engine::AudioQueue,
@@ -94,7 +96,7 @@ pub(crate) struct Shared {
     /// Mobile push registration sends through the core's host connections.
     #[cfg(any(target_os = "android", target_os = "ios"))]
     pub core: CoreHandle,
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub desktop: crate::desktop::DesktopShared,
     #[cfg(any(target_os = "android", target_os = "ios"))]
     pub mobile: crate::mobile::MobileShared,
@@ -112,12 +114,14 @@ impl Shared {
         self.main_tasks.lock().unwrap().push(Box::new(task));
         SignalToUI::set_ui_signal();
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
         self.runtime.spawn(future);
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn_blocking<F>(&self, work: F)
     where
         F: FnOnce() + Send + 'static,
@@ -125,7 +129,12 @@ impl Shared {
         self.runtime.spawn_blocking(work);
     }
     /// Finishes `done` with the result of blocking `work` on a worker thread.
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ))]
     pub fn complete_blocking<F>(&self, done: Completion, work: F)
     where
         F: FnOnce() -> Result<PlatformValue, PlatformError> + Send + 'static,
@@ -156,6 +165,7 @@ pub fn platform() -> Option<PlatformHandle> {
 
 /// Runs one request to completion on the calling (non-GUI) thread. Used by the
 /// blocking facades (`desktop::invoke`, `notifications::*`, the tone test).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn blocking(
     start: impl FnOnce(&Arc<Shared>, Completion),
 ) -> Result<PlatformValue, PlatformError> {
@@ -175,7 +185,11 @@ impl Platform {
             HANDLE.get().is_none(),
             "Platform::start was already called."
         );
+        #[cfg(target_arch = "wasm32")]
+        let _ = (cx, config);
+        #[cfg(not(target_arch = "wasm32"))]
         native::prepare_process(cx)?;
+        #[cfg(not(target_arch = "wasm32"))]
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("paseo-platform")
@@ -184,20 +198,21 @@ impl Platform {
         let audio = AudioEngine::default();
         let shared = Arc::new(Shared {
             next_request: AtomicU64::new(1),
+            #[cfg(not(target_arch = "wasm32"))]
             runtime,
             main_tasks: Mutex::new(Vec::new()),
             audio: audio.queue(),
             insets: Mutex::new(SafeInsets::default()),
             #[cfg(any(target_os = "android", target_os = "ios"))]
             core: config.core.clone(),
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             desktop: crate::desktop::DesktopShared::new(&config)?,
             #[cfg(any(target_os = "android", target_os = "ios"))]
             mobile: crate::mobile::MobileShared::new(),
         });
         let state = PlatformState { audio };
         let _ = HANDLE.set(PlatformHandle(shared.clone()));
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         crate::desktop::start(&shared, &config);
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let state = {
@@ -222,7 +237,7 @@ impl Platform {
             Event::Signal => self.state.audio.update(cx),
             _ => {}
         }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         crate::desktop::handle_event(&self.shared);
         #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::mobile::handle_event(cx, &self.shared, &mut self.state, event);
@@ -231,6 +246,9 @@ impl Platform {
     pub fn finish_event(&mut self, cx: &mut Cx, event: &Event) {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::mobile::finish_event(&self.shared, event);
+        #[cfg(target_arch = "wasm32")]
+        let _ = (cx, event);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Event::BackPressed { handled } = event
             && !handled.get()
         {
@@ -243,12 +261,14 @@ impl Platform {
     pub fn observe_core_event(&mut self, event: &CoreEvent) {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::mobile::observe_core_event(&self.shared, event);
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         crate::desktop::observe_core_event(&self.shared, event);
+        #[cfg(target_arch = "wasm32")]
+        let _ = event;
     }
 
     pub fn window_ready(&mut self) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         self.shared.desktop.window_ready();
         #[cfg(any(target_os = "android", target_os = "ios"))]
         self.shared.mobile.window_ready();
@@ -287,6 +307,7 @@ impl PlatformHandle {
         native::capabilities()
     }
 
+    /// Browser calls complete with `Submitted`; whether a new tab opened is unknown.
     pub fn open_external(&self, url: &str) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
@@ -300,6 +321,7 @@ impl PlatformHandle {
     pub fn open_path(&self, path: &Path) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
+        #[cfg(not(target_arch = "wasm32"))]
         if !path.is_absolute() {
             done.fail(PlatformError::invalid(format!(
                 "Paths must be absolute: {}",
@@ -308,16 +330,24 @@ impl PlatformHandle {
         } else {
             native::open_path(self.shared(), path.to_owned(), done);
         }
+        #[cfg(target_arch = "wasm32")]
+        native::open_path(path, done);
         id
     }
 
     pub fn reveal_path(&self, path: &Path) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
+        #[cfg(not(target_arch = "wasm32"))]
         native::reveal_path(self.shared(), path.to_owned(), done);
+        #[cfg(target_arch = "wasm32")]
+        native::reveal_path(path, done);
         id
     }
 
+    /// Completes with `Files` on native clients or `FileBytes` in the browser.
+    /// The browser supplies the chooser's title.
+    /// Neither backend returns a file when the user cancels.
     pub fn pick_files(&self, options: PickFilesOptions) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
@@ -335,15 +365,30 @@ impl PlatformHandle {
     pub fn save_location(&self, suggested_name: &str) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
+        #[cfg(not(target_arch = "wasm32"))]
         native::save_location(self.shared(), suggested_name.to_owned(), done);
+        #[cfg(target_arch = "wasm32")]
+        native::save_location(suggested_name, done);
+        id
+    }
+
+    /// Hands bytes to the browser's download manager without a local staging file.
+    /// Completes with `Submitted`, not confirmation that the user saved the file.
+    #[cfg(target_arch = "wasm32")]
+    pub fn download_file(&self, name: &str, mime_type: &str, bytes: &[u8]) -> PlatformRequestId {
+        let done = self.0.completion();
+        let id = done.id();
+        native::download_file(name, mime_type, bytes, done);
         id
     }
 
     /// Copy a generated file to a user-selected native document destination.
     /// The caller retains the source until completion; cancellation is `Bool(false)`.
+    /// Browser callers use `download_file` instead.
     pub fn save_file(&self, path: &Path, mime_type: &str, name: &str) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
+        #[cfg(not(target_arch = "wasm32"))]
         native::save_file(
             self.shared(),
             path.to_owned(),
@@ -351,6 +396,8 @@ impl PlatformHandle {
             name.to_owned(),
             done,
         );
+        #[cfg(target_arch = "wasm32")]
+        native::save_file(path, mime_type, name, done);
         id
     }
 
@@ -362,6 +409,7 @@ impl PlatformHandle {
     pub fn save_image(&self, path: &Path, mime_type: &str, name: &str) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
+        #[cfg(not(target_arch = "wasm32"))]
         native::save_image(
             self.shared(),
             path.to_owned(),
@@ -369,12 +417,15 @@ impl PlatformHandle {
             name.to_owned(),
             done,
         );
+        #[cfg(target_arch = "wasm32")]
+        native::save_image(path, mime_type, name, done);
         id
     }
 
     pub fn share_file(&self, path: &Path, mime_type: &str, name: &str) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
+        #[cfg(not(target_arch = "wasm32"))]
         native::share_file(
             self.shared(),
             path.to_owned(),
@@ -382,6 +433,8 @@ impl PlatformHandle {
             name.to_owned(),
             done,
         );
+        #[cfg(target_arch = "wasm32")]
+        native::share_file(path, mime_type, name, done);
         id
     }
 
@@ -389,6 +442,7 @@ impl PlatformHandle {
         crate::paths::transfer_staging_file(name)
     }
 
+    /// Browser calls complete with `Submitted`; clipboard permission may still be refused.
     pub fn copy_text(&self, text: String) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
@@ -406,7 +460,10 @@ impl PlatformHandle {
     pub fn copy_image(&self, bytes: Vec<u8>, mime_type: &str) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
+        #[cfg(not(target_arch = "wasm32"))]
         native::copy_image(self.shared(), bytes, mime_type.to_owned(), done);
+        #[cfg(target_arch = "wasm32")]
+        native::copy_image(bytes, mime_type, done);
         id
     }
 
@@ -492,7 +549,7 @@ impl PlatformHandle {
     /// finished or `Bool(false)` when cancelled.
     pub fn play_audio(&self, bytes: Vec<u8>, mime_type: &str) -> PlatformRequestId {
         let id = self.0.next_id();
-        submit_audio(&self.0, id, bytes, mime_type.to_owned());
+        submit_audio(&self.0, id, bytes, mime_type);
         id
     }
 
@@ -530,7 +587,7 @@ impl PlatformHandle {
     pub fn desktop_invoke(&self, command: &str, args: Value) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         crate::desktop::invoke_command(self.shared(), command.to_owned(), args, done);
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
@@ -539,13 +596,15 @@ impl PlatformHandle {
                 "Mobile clients never manage a local daemon.",
             ));
         }
+        #[cfg(target_arch = "wasm32")]
+        native::desktop_invoke(command, args, done);
         id
     }
 
     pub fn list_editor_targets(&self) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         self.0.complete_blocking(done, || {
             Ok(PlatformValue::EditorTargets(
                 crate::desktop::editors::list_editor_targets(),
@@ -553,13 +612,15 @@ impl PlatformHandle {
         });
         #[cfg(any(target_os = "android", target_os = "ios"))]
         done.ok(PlatformValue::EditorTargets(Vec::new()));
+        #[cfg(target_arch = "wasm32")]
+        native::list_editor_targets(done);
         id
     }
 
     pub fn open_editor(&self, request: OpenEditorRequest) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         self.0.complete_blocking(done, move || {
             crate::desktop::editors::open_editor(&request).map(|()| PlatformValue::None)
         });
@@ -570,16 +631,18 @@ impl PlatformHandle {
                 "Opening a local editor is a desktop feature.",
             ));
         }
+        #[cfg(target_arch = "wasm32")]
+        native::open_editor(request, done);
         id
     }
 
     /// Returns true if closing this window requests a guarded application quit.
     pub fn window_close_requested(&self, open_windows: usize) -> bool {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             crate::desktop::window_close_requested(self.shared(), open_windows)
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         {
             let _ = open_windows;
             false
@@ -591,33 +654,33 @@ impl PlatformHandle {
     /// top-level frame for `window` when the platform ops are processed
     /// (Windows: the `CreateWindowExW` frame HWND, resolved then, never a
     /// cached child handle). Routes from notification clicks and links can reopen it.
-    /// Android and iOS have one OS-owned window; there this does nothing.
+    /// Only supported with `Capabilities::desktop_host`.
     pub fn hide_window(&self, cx: &mut Cx, window: makepad_widgets::WindowId) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             cx.push_unique_platform_op(makepad_widgets::CxOsOp::HideWindow(window));
             self.0.desktop.set_dormant(true);
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         let _ = (cx, window);
     }
 
     /// Shows a window hidden with [`Self::hide_window`] (restoring it if
     /// minimized) and activates it. GUI thread; same frame resolution.
     pub fn show_window(&self, cx: &mut Cx, window: makepad_widgets::WindowId) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             cx.push_unique_platform_op(makepad_widgets::CxOsOp::Deminiaturize(window));
             self.0.desktop.set_dormant(false);
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         let _ = (cx, window);
     }
 
     pub fn window_geometry(&self, key: &str) -> Option<WindowGeometry> {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         return self.0.desktop.geometry.get(key);
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         {
             let _ = key;
             None
@@ -625,23 +688,23 @@ impl PlatformHandle {
     }
 
     pub fn record_window_geometry(&self, key: &str, geometry: WindowGeometry) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         self.0.desktop.geometry.record(&self.0, key, geometry);
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         let _ = (key, geometry);
     }
 
     pub fn request_quit(&self, reason: QuitReason, force: bool) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         crate::desktop::request_quit(self.shared(), reason, force);
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         let _ = (reason, force);
     }
 
     pub fn respond_quit(&self, token: u64, allowed: bool) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         crate::desktop::respond_quit(self.shared(), token, allowed);
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
         let _ = (token, allowed);
     }
 
@@ -652,11 +715,13 @@ impl PlatformHandle {
         let id = done.id();
         #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::mobile::revoke_host(self.shared(), host_id.to_owned(), done);
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             let _ = host_id;
             done.ok(PlatformValue::None);
         }
+        #[cfg(target_arch = "wasm32")]
+        native::revoke_push_host(host_id, done);
         id
     }
 }
@@ -673,18 +738,25 @@ pub fn dropped_file_paths(event: &makepad_widgets::DropEvent) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Admits `id` to the FIFO (fixing its place) and decodes on a worker.
+/// Admits `id` to the FIFO before decoding. Native clients decode off the GUI thread.
 pub(crate) fn submit_audio(
     shared: &Arc<Shared>,
     id: PlatformRequestId,
     bytes: Vec<u8>,
-    mime: String,
+    mime: &str,
 ) {
-    let queue = shared.audio.clone();
+    let queue = &shared.audio;
     let generation = queue.admit(id);
-    shared.spawn_blocking(move || {
-        let decoded = audio::decode_source(&bytes, &mime);
-        queue.decoded(id, generation, decoded);
-    });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let queue = queue.clone();
+        let mime = mime.to_owned();
+        shared.spawn_blocking(move || {
+            let decoded = audio::decode_source(&bytes, &mime);
+            queue.decoded(id, generation, decoded);
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    queue.decoded(id, generation, audio::decode_source(&bytes, mime));
     SignalToUI::set_ui_signal();
 }

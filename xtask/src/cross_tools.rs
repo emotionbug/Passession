@@ -226,6 +226,29 @@ fn wrapper(root: &Path, name: &str, body: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Select Zig's WASI libc without requiring a separate WASI SDK.
+pub(crate) fn configure_web(command: &mut Command) -> Result<()> {
+    ensure!(cfg!(unix), "build-web requires a Unix build host");
+    require_zig()?;
+    let zig = which::which(env::var_os("ZIG").unwrap_or_else(|| "zig".into()))?.canonicalize()?;
+    let zig_path = shell(&zig)?;
+    let work = root()?.join(".dev/build/web-tools");
+    // cc-rs passes LLVM's spelling; Zig 0.15 uses wasm32-wasi for preview 1.
+    let cc = wrapper(
+        &work,
+        "wasip1-cc",
+        &format!(
+            "for arg do\n  shift\n  case \"$arg\" in --target=wasm32-wasip1) arg=--target=wasm32-wasi;; esac\n  set -- \"$@\" \"$arg\"\ndone\nexec {zig_path} cc -target wasm32-wasi \"$@\""
+        ),
+    )?;
+    let ar = wrapper(&work, "wasip1-ar", &format!("exec {zig_path} ar \"$@\""))?;
+    command
+        .env("ZIG", zig)
+        .env("CC_wasm32_wasip1", cc)
+        .env("AR_wasm32_wasip1", ar);
+    Ok(())
+}
+
 /// Legacy feasibility caches are accelerators only: authenticate before copying.
 fn download(
     root: &Path,

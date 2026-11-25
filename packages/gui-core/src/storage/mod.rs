@@ -1,13 +1,15 @@
-//! Flutter-compatible client state under the application-support directory
-//! (`app_store.dart` `_initialize`, `savePreferences`, `_mergeState`, replicas and per-window
-//! layouts). Everything here is blocking and runs on Tokio's blocking pool.
+//! Flutter-compatible client state and layouts (JSON files on native, origin-local JSON
+//! values in the browser).
 pub(crate) mod prefs;
 
 use std::{
     collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -33,6 +35,7 @@ impl Paths {
     fn state(&self) -> PathBuf {
         self.dir.join("state.json")
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fn lock(&self) -> PathBuf {
         self.dir.join("state.lock")
     }
@@ -51,12 +54,39 @@ impl Paths {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn io_error(action: &str, path: &Path, error: std::io::Error) -> CoreError {
     CoreError::new(
         "STORAGE_IO",
         format!("{action} {}: {error}", path.display()),
         false,
     )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_optional<T>(
+    path: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<T>,
+) -> Result<Option<T>, CoreError> {
+    match read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error("Cannot read", path, error)),
+    }
+}
+
+pub(crate) fn read_file(path: &Path) -> Result<Option<Vec<u8>>, CoreError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return read_optional(path, |path| fs::read(path));
+    #[cfg(target_arch = "wasm32")]
+    Ok(paseo_browser::storage_get(storage_key(path)).map(String::into_bytes))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn storage_key(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .expect("storage paths have a UTF-8 file name")
 }
 
 pub(crate) struct Replica {
@@ -88,6 +118,7 @@ pub(crate) struct Loaded {
     pub written_files: HashMap<PathBuf, String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Restricts private state to its owner (Flutter `_restrict`: Linux and macOS only; mobile
 /// sandboxes and Windows profile ACLs already do).
 pub(crate) fn restrict(path: &Path, directory: bool) -> Result<(), CoreError> {
@@ -121,10 +152,8 @@ fn structure_error() -> CoreError {
 
 /// Flutter `_readStateFile`: absent is empty; an invalid document is an error, never defaults.
 fn read_state(path: &Path) -> Result<Map<String, Value>, CoreError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(error) => return Err(io_error("Cannot read", path, error)),
+    let Some(bytes) = read_file(path)? else {
+        return Ok(Map::new());
     };
     let decoded: Value = serde_json::from_slice(&bytes).map_err(|error| {
         CoreError::new(
@@ -182,10 +211,12 @@ pub(crate) fn read_replica(
     written: &mut HashMap<PathBuf, String>,
 ) -> Result<Option<Replica>, CoreError> {
     let path = paths.replica(server_id);
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error("Cannot read", &path, error)),
+    #[cfg(not(target_arch = "wasm32"))]
+    let contents = read_optional(&path, |path| fs::read_to_string(path))?;
+    #[cfg(target_arch = "wasm32")]
+    let contents = paseo_browser::storage_get(storage_key(&path));
+    let Some(contents) = contents else {
+        return Ok(None);
     };
     let data: Value = serde_json::from_str(&contents).map_err(|error| {
         CoreError::new(
@@ -219,6 +250,7 @@ pub(crate) fn read_replica(
     Ok(Some(replica))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_layouts(paths: &Paths, loaded: &mut Loaded) {
     let Ok(entries) = fs::read_dir(&paths.dir) else {
         return;
@@ -226,22 +258,35 @@ fn load_layouts(paths: &Paths, loaded: &mut Loaded) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(encoded) = name
-            .strip_prefix("layout-")
-            .and_then(|rest| rest.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        let Ok(window) = percent_encoding::percent_decode_str(encoded).decode_utf8() else {
-            continue;
-        };
-        let Ok(contents) = fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        if let Ok(layout @ Value::Object(_)) = serde_json::from_str::<Value>(&contents) {
-            loaded.written_files.insert(entry.path(), contents);
-            loaded.layouts.insert(window.into_owned(), layout);
-        }
+        load_layout(entry.path(), name, loaded);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_layouts(paths: &Paths, loaded: &mut Loaded) {
+    for name in paseo_browser::storage_keys() {
+        load_layout(paths.dir.join(&name), &name, loaded);
+    }
+}
+
+fn load_layout(path: PathBuf, name: &str, loaded: &mut Loaded) {
+    let Some(encoded) = name
+        .strip_prefix("layout-")
+        .and_then(|rest| rest.strip_suffix(".json"))
+    else {
+        return;
+    };
+    let Ok(window) = percent_encoding::percent_decode_str(encoded).decode_utf8() else {
+        return;
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let contents = fs::read_to_string(&path).ok();
+    #[cfg(target_arch = "wasm32")]
+    let contents = paseo_browser::storage_get(name);
+    let Some(contents) = contents else { return };
+    if let Ok(layout @ Value::Object(_)) = serde_json::from_str::<Value>(&contents) {
+        loaded.written_files.insert(path, contents);
+        loaded.layouts.insert(window.into_owned(), layout);
     }
 }
 
@@ -251,8 +296,11 @@ pub(crate) fn load(paths: &Paths) -> Loaded {
         ..Loaded::default()
     };
     let result = (|| -> Result<(), CoreError> {
-        fs::create_dir_all(&paths.dir).map_err(|e| io_error("Cannot create", &paths.dir, e))?;
-        restrict(&paths.dir, true)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            fs::create_dir_all(&paths.dir).map_err(|e| io_error("Cannot create", &paths.dir, e))?;
+            restrict(&paths.dir, true)?;
+        }
         let retained = read_state(&paths.state())?;
         if version(&retained) > 1 {
             return Err(CoreError::new(
@@ -348,6 +396,7 @@ pub(crate) fn merge_changes(
     result
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Writes through a same-directory temporary file and rename.
 pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), CoreError> {
     let temporary = PathBuf::from(format!("{}.{}.tmp", path.display(), uuid::Uuid::new_v4()));
@@ -370,6 +419,19 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), CoreError>
     result
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), CoreError> {
+    let key = storage_key(path);
+    if !paseo_browser::storage_set(key, contents) {
+        return Err(CoreError::new(
+            "STORAGE_IO",
+            format!("Browser storage refused to save {key}"),
+            false,
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct StateSnapshot {
     pub preferences: Map<String, Value>,
     pub hosts: Vec<Value>,
@@ -388,6 +450,7 @@ pub(crate) struct Saved {
     pub hosts: Map<String, Value>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The save transaction's lock file. Windows' `LockFileEx` (behind `File::lock`) needs a
 /// handle with read or write access; an append-only handle has neither and fails with
 /// ERROR_ACCESS_DENIED (os error 5), so the lock is opened for reading and writing.
@@ -400,6 +463,7 @@ fn open_lock(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Rust 1.93's File::lock is unsupported on Android. Use the same flock primitive on
 /// Unix, holding the descriptor through the transaction; close releases it even on errors.
 fn lock_exclusive(file: &File) -> std::io::Result<()> {
@@ -424,10 +488,14 @@ fn lock_exclusive(file: &File) -> std::io::Result<()> {
 /// One locked save (Flutter `savePreferences` after change detection): merge `state.json`, then
 /// write each changed file.
 pub(crate) fn save(paths: &Paths, job: SaveJob) -> Result<Option<Saved>, CoreError> {
-    let lock_path = paths.lock();
-    let lock = open_lock(&lock_path).map_err(|e| io_error("Cannot open", &lock_path, e))?;
-    restrict(&lock_path, false)?;
-    lock_exclusive(&lock).map_err(|e| io_error("Cannot lock", &lock_path, e))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let _lock = {
+        let path = paths.lock();
+        let lock = open_lock(&path).map_err(|e| io_error("Cannot open", &path, e))?;
+        restrict(&path, false)?;
+        lock_exclusive(&lock).map_err(|e| io_error("Cannot lock", &path, e))?;
+        lock
+    };
     let saved = match job.state {
         Some(snapshot) => Some(merge_state(
             paths,
@@ -494,7 +562,7 @@ fn merge_state(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

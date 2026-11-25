@@ -2,8 +2,17 @@
 //! helpers of `attachment_pill.dart`.
 
 use super::json::*;
+use paseo_gui_platform::ClipboardImage;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use paseo_gui_platform::PickedFile as SelectedFile;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use paseo_gui_platform::PickedFileBytes as SelectedFile;
 use paseo_gui_platform::image::sniff_image_mime_with_hint;
-use paseo_gui_platform::{ClipboardImage, PickedFile};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type ImageBytes = Vec<u8>;
+#[cfg(target_arch = "wasm32")]
+pub(crate) type ImageBytes = std::sync::Arc<Vec<u8>>;
 use serde_json::{Map, Value, json};
 
 /// attachments/upload-limit.ts FILE_UPLOAD_MAX_BYTES.
@@ -309,10 +318,13 @@ pub(crate) fn invalid_image_file_message(name: &str) -> String {
 }
 
 pub(crate) fn read_image_file(
-    file: &PickedFile,
-) -> Result<(Vec<u8>, &'static str), ImageImportError> {
+    file: &SelectedFile,
+) -> Result<(ImageBytes, &'static str), ImageImportError> {
+    #[cfg(not(target_arch = "wasm32"))]
     let bytes = std::fs::read(&file.path)
         .map_err(|error| ImageImportError::Io(format!("{}: {error}", file.name)))?;
+    #[cfg(target_arch = "wasm32")]
+    let bytes = file.bytes.clone();
     let mime = sniff_image_mime_with_hint(&bytes, file.mime_type.as_deref())
         .ok_or_else(|| ImageImportError::InvalidFile(file.name.clone()))?;
     Ok((bytes, mime))

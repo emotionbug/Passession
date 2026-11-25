@@ -1,5 +1,7 @@
 use crate::{HighlightStyle, HighlightToken, Language, Parser, get_language_for_file};
 use arborium::advanced::{GrammarConfig, Span};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::{
     cell::RefCell,
     cmp::Reverse,
@@ -7,10 +9,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     ops::Range,
-    sync::{
-        Arc, LazyLock,
-        mpsc::{self, Receiver, SyncSender, TryRecvError},
-    },
+    sync::{Arc, LazyLock},
     task::Poll,
 };
 
@@ -348,38 +347,49 @@ fn lines<'a, 'r>(
     let mut offset = 0;
     let mut span_index = 0;
     code.split('\n').map(move |line| {
-        let end = offset + line.len();
-        let mut cursor = offset;
-        let mut tokens: Vec<HighlightToken<'a>> = Vec::new();
-        while cursor < end {
-            while span_index < ranges.len() && ranges[span_index].range.end <= cursor {
-                span_index += 1;
-            }
-            let (stop, style) = match ranges.get(span_index) {
-                Some(span) if span.range.start <= cursor => (end.min(span.range.end), span.style),
-                Some(span) => (end.min(span.range.start), None),
-                None => (end, None),
-            };
-            if let Some(last) = tokens.last_mut().filter(|last| last.style == style) {
-                let from = cursor - last.text.len();
-                last.text = &code[from..stop];
-            } else {
-                tokens.push(HighlightToken {
-                    text: &code[cursor..stop],
-                    style,
-                });
-            }
-            cursor = stop;
-        }
-        if tokens.is_empty() {
-            tokens.push(HighlightToken {
-                text: line,
-                style: None,
-            });
-        }
-        offset = end + 1;
+        let tokens = render_line(code, line, offset, ranges, &mut span_index);
+        offset += line.len() + 1;
         tokens
     })
+}
+
+fn render_line<'a>(
+    code: &'a str,
+    line: &'a str,
+    offset: usize,
+    ranges: &[StyledRange],
+    span_index: &mut usize,
+) -> Vec<HighlightToken<'a>> {
+    let end = offset + line.len();
+    let mut cursor = offset;
+    let mut tokens: Vec<HighlightToken<'a>> = Vec::new();
+    while cursor < end {
+        while *span_index < ranges.len() && ranges[*span_index].range.end <= cursor {
+            *span_index += 1;
+        }
+        let (stop, style) = match ranges.get(*span_index) {
+            Some(span) if span.range.start <= cursor => (end.min(span.range.end), span.style),
+            Some(span) => (end.min(span.range.start), None),
+            None => (end, None),
+        };
+        if let Some(last) = tokens.last_mut().filter(|last| last.style == style) {
+            let from = cursor - last.text.len();
+            last.text = &code[from..stop];
+        } else {
+            tokens.push(HighlightToken {
+                text: &code[cursor..stop],
+                style,
+            });
+        }
+        cursor = stop;
+    }
+    if tokens.is_empty() {
+        tokens.push(HighlightToken {
+            text: line,
+            style: None,
+        });
+    }
+    tokens
 }
 
 /// Returns `None` for out-of-range offsets or an offset inside a UTF-8 scalar.
@@ -425,7 +435,7 @@ pub struct HighlightStepsOptions {
     /// display until `Lines` arrive. Preview is produced only for a small prefix
     /// (less than half the document), and may change after the complete parse.
     pub first_lines: usize,
-    /// Maximum rendered lines per delivered batch. Parsing runs on the worker.
+    /// Maximum rendered lines per delivered batch.
     pub lines_per_step: NonZeroUsize,
 }
 impl Default for HighlightStepsOptions {
@@ -453,26 +463,36 @@ pub enum HighlightStep {
     },
 }
 
-/// Native incremental-delivery handle. `poll_next` never waits on the parser;
-/// `Iterator::next` waits for the next batch for command-line consumers. The
-/// bounded channel provides backpressure. Dropping the handle cancels delivery;
-/// an in-progress native parse can finish, but no caller thread waits for it.
-/// Unlike independent line parsing, final batches always use the complete tree.
+/// Delivers highlighted lines in batches from a complete parse.
+///
+/// On native targets `poll_next` never waits on the worker and `next` waits for
+/// the next batch. Dropping the handle cancels delivery, not an in-progress
+/// parse. On threadless WebAssembly, both methods parse on the caller's thread
+/// when first needed and render at most one batch per call.
 pub struct HighlightSteps {
+    #[cfg(target_arch = "wasm32")]
+    inline: InlineSteps,
+    #[cfg(not(target_arch = "wasm32"))]
     receiver: Receiver<Result<HighlightStep, Error>>,
     finished: bool,
 }
 impl HighlightSteps {
     pub fn poll_next(&mut self) -> Poll<Option<Result<HighlightStep, Error>>> {
-        if self.finished {
-            return Poll::Ready(None);
-        }
-        match self.receiver.try_recv() {
-            Ok(step) => Poll::Ready(Some(self.accept(step))),
-            Err(TryRecvError::Empty) => Poll::Pending,
-            Err(TryRecvError::Disconnected) => {
-                self.finished = true;
-                Poll::Ready(Some(Err(Error::WorkerDisconnected)))
+        #[cfg(target_arch = "wasm32")]
+        return Poll::Ready(self.next());
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.finished {
+                return Poll::Ready(None);
+            }
+            match self.receiver.try_recv() {
+                Ok(step) => Poll::Ready(Some(self.accept(step))),
+                Err(TryRecvError::Empty) => Poll::Pending,
+                Err(TryRecvError::Disconnected) => {
+                    self.finished = true;
+                    Poll::Ready(Some(Err(Error::WorkerDisconnected)))
+                }
             }
         }
     }
@@ -489,20 +509,29 @@ impl Iterator for HighlightSteps {
         if self.finished {
             return None;
         }
-        match self.receiver.recv() {
-            Ok(step) => Some(self.accept(step)),
-            Err(_) => {
-                self.finished = true;
-                Some(Err(Error::WorkerDisconnected))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let step = self.inline.next_step();
+            Some(self.accept(step))
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match self.receiver.recv() {
+                Ok(step) => Some(self.accept(step)),
+                Err(_) => {
+                    self.finished = true;
+                    Some(Err(Error::WorkerDisconnected))
+                }
             }
         }
     }
 }
 impl std::iter::FusedIterator for HighlightSteps {}
 
-/// Starts native work without parsing on the caller's thread. Pass an `Arc<str>`
-/// to share an existing immutable document without copying it. This is scheduled
-/// highlighting, not an edit-delta parser API; each document is parsed as a whole.
+/// Prepares whole-document highlighting with incremental delivery. Native work
+/// runs on a worker; on WebAssembly, the caller drives parsing and delivery.
+/// Pass an `Arc<str>` to share an existing document without copying it.
 pub fn highlight_code_in_steps(
     code: impl Into<Arc<str>>,
     filename: impl Into<String>,
@@ -513,21 +542,110 @@ pub fn highlight_code_in_steps(
         return Err(Error::InputTooLarge);
     }
     let filename = filename.into();
-    let (sender, receiver) = mpsc::sync_channel(2);
-    std::thread::Builder::new()
-        .name("paseo-highlight".into())
-        .spawn(move || {
-            if let Err(error) = run_steps(&code, &filename, options, &sender) {
-                let _ = sender.send(Err(error));
-            }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let line_count = code.split('\n').count();
+        Ok(HighlightSteps {
+            inline: InlineSteps {
+                code,
+                filename,
+                options,
+                line_count,
+                spans: None,
+                first_line: 0,
+                offset: 0,
+                span_index: 0,
+            },
+            finished: false,
         })
-        .map_err(Error::Worker)?;
-    Ok(HighlightSteps {
-        receiver,
-        finished: false,
-    })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        std::thread::Builder::new()
+            .name("paseo-highlight".into())
+            .spawn(move || {
+                if let Err(error) = run_steps(&code, &filename, options, &sender) {
+                    let _ = sender.send(Err(error));
+                }
+            })
+            .map_err(Error::Worker)?;
+        Ok(HighlightSteps {
+            receiver,
+            finished: false,
+        })
+    }
 }
 
+#[cfg(target_arch = "wasm32")]
+struct InlineSteps {
+    code: Arc<str>,
+    filename: String,
+    options: HighlightStepsOptions,
+    line_count: usize,
+    spans: Option<Vec<StyledRange>>,
+    first_line: usize,
+    offset: usize,
+    span_index: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl InlineSteps {
+    fn next_step(&mut self) -> Result<HighlightStep, Error> {
+        let first_lines = std::mem::take(&mut self.options.first_lines);
+        if first_lines > 0 && first_lines < self.line_count / 2 {
+            return with_highlighter(|highlighter| {
+                preview(highlighter, &self.code, &self.filename, first_lines)
+            });
+        }
+        if self.first_line == self.line_count {
+            return Ok(HighlightStep::Finished {
+                line_count: self.line_count,
+            });
+        }
+        if self.spans.is_none() {
+            self.spans = Some(with_highlighter(|highlighter| {
+                highlighter.ranges_for_file(&self.code, &self.filename)
+            })?);
+        }
+        let spans = self.spans.as_deref().unwrap();
+        let first_line = self.first_line;
+        let count = self
+            .options
+            .lines_per_step
+            .get()
+            .min(self.line_count - first_line);
+        let mut lines = Vec::with_capacity(count);
+        for line in self.code[self.offset..].split('\n').take(count) {
+            let tokens = render_line(&self.code, line, self.offset, spans, &mut self.span_index);
+            self.offset += line.len() + 1;
+            lines.push(tokens.into_iter().map(Into::into).collect());
+        }
+        self.first_line += count;
+        Ok(HighlightStep::Lines { first_line, lines })
+    }
+}
+
+fn preview(
+    highlighter: &mut Highlighter,
+    code: &str,
+    filename: &str,
+    first_lines: usize,
+) -> Result<HighlightStep, Error> {
+    let end = code
+        .match_indices('\n')
+        .nth(first_lines - 1)
+        .map(|(offset, _)| offset)
+        .unwrap_or(code.len());
+    let lines = highlighter
+        .highlight_code(&code[..end], filename)?
+        .into_iter()
+        .map(|line| line.into_iter().map(Into::into).collect())
+        .collect();
+    Ok(HighlightStep::Preview { lines })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn run_steps(
     code: &str,
     filename: &str,
@@ -537,20 +655,8 @@ fn run_steps(
     let mut highlighter = Highlighter::new()?;
     let line_count = code.split('\n').count();
     if options.first_lines > 0 && options.first_lines < line_count / 2 {
-        let end = code
-            .match_indices('\n')
-            .nth(options.first_lines - 1)
-            .map(|(offset, _)| offset)
-            .unwrap_or(code.len());
-        let preview = highlighter
-            .highlight_code(&code[..end], filename)?
-            .into_iter()
-            .map(|line| line.into_iter().map(Into::into).collect())
-            .collect();
-        if sender
-            .send(Ok(HighlightStep::Preview { lines: preview }))
-            .is_err()
-        {
+        let preview = preview(&mut highlighter, code, filename, options.first_lines)?;
+        if sender.send(Ok(preview)).is_err() {
             return Ok(());
         }
     }

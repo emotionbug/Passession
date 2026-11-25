@@ -17,6 +17,7 @@
     "error": "Diagram unavailable. Use Source to inspect the diagram.",
     "exporting": "Preparing export…",
     "saved": "Diagram saved",
+    "downloadSubmitted": "Diagram download started",
     "exportError": "Could not export diagram",
     "cancelled": "Export cancelled",
     "errors": {
@@ -3306,6 +3307,11 @@
         "moveDown": "Move down"
       },
       "daemon": {
+        "webUi": {
+          "enable": "Enable web UI",
+          "listenUrl": "On the daemon host: {{url}}",
+          "noHttpListener": "The daemon is not listening on an HTTP address."
+        },
         "rename": {
           "editLabel": "Edit label",
           "title": "Rename host",

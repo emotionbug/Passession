@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Web UI: open the daemon's address (for example `http://my-computer:6767/`) in a browser and use Passession there, with the same chat, terminals, files and settings as the app. It is off by default; turn it on in Settings → the host's Overview → **Enable web UI**, which takes effect without restarting the daemon. With a daemon password the sidebar shows "Password required"; enter it under "Authentication / connection", and the browser remembers it. Use HTTPS or a trusted network, because plain HTTP does not protect the password. Images and files attach through the browser's file picker, and exports download through the browser. Things that need the local machine (dropping files from disk, managing a local daemon, app updates, notifications, embedded Tailscale) stay in the app. The first visit downloads about 12 MB.
+
 ### Fixed
 
 - OMP: a message sent while the agent is replying no longer lands in the middle of the reply. OMP reads such a message only after its current step, but Passession put it into the conversation the moment it was sent, so the rest of the reply continued below it, split in two. The message now waits at the bottom of the conversation marked "Queued · the agent reads it after its current step", and moves into the conversation where OMP reads it.

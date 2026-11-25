@@ -1,5 +1,7 @@
 //! Auxiliary image/icon resources share host routing and cancellation authority.
-use super::{Core, tailnet};
+use super::Core;
+#[cfg(not(target_arch = "wasm32"))]
+use super::tailnet;
 use crate::{CoreError, HostHttpResponse, RequestId, host_config};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
@@ -41,7 +43,9 @@ pub(super) fn request(
     let core = core.clone();
     tokio::task::spawn_local(async move {
         let result = async {
-            let host = core.host_for(&host_id).ok_or_else(|| crate::error::host_unknown(&host_id))?;
+            let host = core
+                .host_for(&host_id)
+                .ok_or_else(|| crate::error::host_unknown(&host_id))?;
             let config = host.config.borrow().clone();
             let epoch = host.client_epoch.get();
             let host_cancel = host.resource_cancellation();
@@ -51,34 +55,63 @@ pub(super) fn request(
                 let mut current = url;
                 for redirects in 0..=10 {
                     let (same_origin, tailnet_host) = host_config::http_route(&config, &current)?;
-                    let (proxy, network_cancel, password) = if same_origin || tailnet_host {
-                        let resolved = host_config::resolve(&config)?;
-                        let (proxy, cancel) = tailnet::route(&core, &config)?;
-                        let credentials = allow_credentials && same_origin && !external_chain && redirects == 0;
-                        (proxy, cancel, credentials.then_some(resolved.password).flatten())
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let (proxy, network_cancel) = if same_origin || tailnet_host {
+                        tailnet::route(&core, &config)?
                     } else {
-                        (None, core.cancel.clone(), None)
+                        (None, core.cancel.clone())
+                    };
+                    #[cfg(target_arch = "wasm32")]
+                    let network_cancel = core.cancel.clone();
+                    let credentials =
+                        allow_credentials && same_origin && !external_chain && redirects == 0;
+                    let password = if credentials {
+                        host_config::resolve(&config)?.password
+                    } else {
+                        None
                     };
                     let result = tokio::select! { biased;
                         _ = core.cancel.cancelled() => Err(cancelled()),
                         _ = cancel.cancelled() => Err(cancelled()),
                         _ = host_cancel.cancelled() => Err(cancelled()),
                         _ = network_cancel.cancelled() => Err(cancelled()),
-                        result = paseo_client::transport::http::get(&current, proxy, password.as_deref(), max_bytes, cancel.clone(), external_chain && !tailnet_host) => result.map_err(|error| CoreError::from_anyhow(&error)),
+                        result = paseo_client::transport::http::get(
+                            &current,
+                            #[cfg(not(target_arch = "wasm32"))]
+                            proxy,
+                            password.as_deref(),
+                            max_bytes,
+                            cancel.clone(),
+                            external_chain && !tailnet_host,
+                        ) => result.map_err(|error| CoreError::from_anyhow(&error)),
                     }?;
-                    if host.client_epoch.get() != epoch || host_cancel.is_cancelled() || network_cancel.is_cancelled() || !core.contains(&host) {
+                    if host.client_epoch.get() != epoch
+                        || host_cancel.is_cancelled()
+                        || network_cancel.is_cancelled()
+                        || !core.contains(&host)
+                    {
                         return Err(cancelled());
                     }
                     match result {
                         paseo_client::transport::http::HttpOutcome::Body(body) => return Ok(body),
-                        paseo_client::transport::http::HttpOutcome::Redirect(next) => current = next,
+                        paseo_client::transport::http::HttpOutcome::Redirect(next) => {
+                            current = next
+                        }
                     }
                 }
-                Err(CoreError::new("HOST_HTTP_REDIRECT", "Resource exceeded ten redirects", false))
+                Err(CoreError::new(
+                    "HOST_HTTP_REDIRECT",
+                    "Resource exceeded ten redirects",
+                    false,
+                ))
             };
-            tokio::time::timeout(std::time::Duration::from_secs(30), transfer).await
-                .map_err(|_| CoreError::new("HOST_HTTP_TIMEOUT", "Resource request timed out", false))?
-        }.await;
+            tokio::time::timeout(std::time::Duration::from_secs(30), transfer)
+                .await
+                .map_err(|_| {
+                    CoreError::new("HOST_HTTP_TIMEOUT", "Resource request timed out", false)
+                })?
+        }
+        .await;
         core.requests.borrow_mut().remove(&request_id);
         if let Some(reply) = reply {
             let _ = reply.send(result);
@@ -99,7 +132,7 @@ fn cancelled() -> CoreError {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use std::sync::Arc;

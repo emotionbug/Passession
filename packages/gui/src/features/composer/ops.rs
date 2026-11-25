@@ -11,6 +11,53 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::attachments::{SelectedFile, mime_type_for_path};
+
+#[cfg(not(target_arch = "wasm32"))]
+type UploadSource = PathBuf;
+#[cfg(target_arch = "wasm32")]
+type UploadSource = Arc<Vec<u8>>;
+
+pub(crate) struct UploadFile {
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    source: UploadSource,
+}
+
+impl From<SelectedFile> for UploadFile {
+    fn from(file: SelectedFile) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (source, size) = (file.path, file.size);
+        #[cfg(target_arch = "wasm32")]
+        let (source, size) = {
+            let size = file.bytes.len() as u64;
+            (file.bytes, size)
+        };
+        let mime = file
+            .mime_type
+            .unwrap_or_else(|| mime_type_for_path(&file.name).to_owned());
+        Self {
+            name: file.name,
+            mime,
+            size,
+            source,
+        }
+    }
+}
+
+impl UploadFile {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn from_path(path: PathBuf, name: String, mime: String, size: u64) -> Self {
+        Self {
+            name,
+            mime,
+            size,
+            source: path,
+        }
+    }
+}
+
 /// SDK codes whose outcome is unknown once the request was submitted.
 fn outcome_unknown(error: &ClientError) -> bool {
     if let Some(flag) = error
@@ -55,14 +102,14 @@ fn local_error(message: String) -> Value {
 
 /// Wire images: retained blobs are read and base64-encoded; inline legacy images pass as-is.
 async fn wire_images(images: Vec<Value>, blob_dir: PathBuf) -> Result<Vec<Value>, String> {
-    tokio::task::spawn_blocking(move || {
+    let encode = move || {
         images
             .into_iter()
             .map(|image| {
                 let mime = image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png").to_owned();
                 if let Some(id) = image.get("blobId").and_then(Value::as_str) {
                     let bytes = read_blob(&blob_dir, id)?;
-                    Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes), "mimeType": mime}))
+                    Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()), "mimeType": mime}))
                 } else {
                     Ok(json!({
                         "data": image.get("data").cloned().unwrap_or(Value::Null),
@@ -71,9 +118,13 @@ async fn wire_images(images: Vec<Value>, blob_dir: PathBuf) -> Result<Vec<Value>
                 }
             })
             .collect()
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    return tokio::task::spawn_blocking(encode)
+        .await
+        .map_err(|e| e.to_string())?;
+    #[cfg(target_arch = "wasm32")]
+    encode()
 }
 
 /// Run one RPC whose request may carry composer images (send_agent_message, agent.create;
@@ -120,30 +171,36 @@ pub async fn rpc_with_images(
 }
 
 /// actions.ts uploadFileAttachments: upload each file in order; the uploaded files attach
-/// together once all succeed. Files are read here, off the GUI thread.
-pub async fn upload_files(
+/// together once all succeed. Native files are read off the GUI thread.
+pub(crate) async fn upload_files(
     client: Arc<DaemonClient>,
-    files: Vec<(PathBuf, String, String)>,
+    files: Vec<UploadFile>,
 ) -> anyhow::Result<Value> {
     let mut uploaded = Vec::with_capacity(files.len());
-    for (path, name, mime) in files {
-        let read_path = path.clone();
-        let read = tokio::task::spawn_blocking(move || {
-            let bytes = std::fs::read(&read_path)?;
-            let modified = std::fs::metadata(&read_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .map(chrono_like_rfc3339);
-            Ok::<_, std::io::Error>((bytes, modified))
-        })
-        .await;
-        let (bytes, modified) = match read {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => return Ok(local_error(format!("{name}: {error}"))),
-            Err(error) => return Ok(local_error(error.to_string())),
+    for UploadFile {
+        source, name, mime, ..
+    } in files
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (bytes, modified) = {
+            let read = tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&source)?;
+                let modified = std::fs::metadata(&source)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(chrono_like_rfc3339);
+                Ok::<_, std::io::Error>((bytes, modified))
+            })
+            .await;
+            match read {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => return Ok(local_error(format!("{name}: {error}"))),
+                Err(error) => return Ok(local_error(error.to_string())),
+            }
         };
-        let modified =
-            modified.unwrap_or_else(|| chrono_like_rfc3339(std::time::SystemTime::now()));
+        #[cfg(target_arch = "wasm32")]
+        let (bytes, modified) = (source, None);
+        let modified = modified.unwrap_or_else(now_rfc3339);
         // Uploads have no deadline (Flutter streamed until the host answered or the
         // connection dropped); cancel_request drops this future.
         let options = RequestOptions {

@@ -93,11 +93,21 @@ All desktop windows live in one process and share one set of host connections; e
 
 A notification click or agent link raises the app and routes into the first window. While that window is dormant, it is reopened with the route rather than routing invisibly. On Linux the notification's `ActivationToken` becomes the window's `_NET_STARTUP_ID` and activation timestamp, so focus-stealing prevention can grant the raise. On Windows a refused `SetForegroundWindow` briefly attaches to the foreground thread's input. Runtime verification is platform-specific; Linux lifecycle evidence does not establish Windows or macOS execution.
 
+## Browser client
+
+Host Overview → Host Configuration → **Enable web UI** sets `daemon.web.enabled` (off by default). The daemon applies changes without restarting. `PASEO_WEB_ENABLED` overrides the persisted setting for the lifetime of the process.
+
+The daemon serves the Makepad WebAssembly client at `/` on its existing HTTP listener. `cargo xtask build-web` builds the release bundle in `.dev/build/web`; daemon runtime staging copies it to `web/` beside the executable when present. Set `PASEO_WEB_DIR` to an absolute bundle path for development. A daemon-only runtime without those assets still works; its web entry point returns 404 even if enabled.
+
+The static bundle is public on allowed hosts. All browser control goes through the same-origin `/ws` connection with the existing `hello` authentication. For password-protected access, use TLS or a trusted network. See the [security policy](../SECURITY.md#browser-ui).
+
+The browser build is the same Makepad client compiled for `wasm32-wasip1` with WebGL rendering. The page has one thread: the client core, Markdown parsing, highlighting, text layout and image decoding run as queued work on the page thread instead of worker threads. Browser APIs (WebSocket, local storage, file picker, downloads, clipboard) are reached through `packages/browser`. Client state and host settings, including a saved password, live in the page's local storage, as the native app keeps them in its state file. Features that need the local machine are not shown: dropping files by path, local HTML previews, project-icon picking, local daemon management, app updates, OS notifications and embedded Tailscale. Attachments come from the browser's file picker, and exports download through the browser.
+
 ## Terminals and excluded surfaces
 
 Daemon PTYs back interactive terminals and project scripts. The client opens interactive shells as Terminal tabs on every platform and presents script output as read-only logs; see [terminal activity](terminal-activity.md). Native CLI chat remains available outside the application.
 
-The client has no embedded browser, browser automation, web target, Chromium capture surface, or executable React UI-plugin host. Links open externally. Backend plugin RPCs/providers/lifecycle/usage contributions remain an optional extension boundary, described in [plugins](plugins.md); a server extension does not imply support for its former React client entry.
+The client has no embedded browser, browser automation, Chromium capture surface, or executable React UI-plugin host. Links open externally. Backend plugin RPCs/providers/lifecycle/usage contributions remain an optional extension boundary, described in [plugins](plugins.md); a server extension does not imply support for its former React client entry.
 
 ## Runtime assets and release boundary
 

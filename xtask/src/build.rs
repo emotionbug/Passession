@@ -374,6 +374,10 @@ pub fn bundle_raw_runtime(destination: &Path, profile: &str, kind: &str) -> Resu
     copy_tree(&build.executable, &destination.join(executable()))?;
     chmod(&destination.join(executable()), 0o755)?;
     copy_tree(&build.directory.join("skills"), &destination.join("skills"))?;
+    let web = web_output()?;
+    if web.is_dir() {
+        copy_tree(&web, &destination.join("web"))?;
+    }
     for name in [
         "RUST-THIRD-PARTY-NOTICES.json",
         "RUST-THIRD-PARTY-NOTICES.txt",

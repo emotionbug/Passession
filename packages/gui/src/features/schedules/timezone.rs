@@ -3,13 +3,18 @@
 //! `/etc/localtime` zoneinfo link (`/etc/timezone` on Linux), else the fixed-offset
 //! `Etc/GMT∓N` zone for whole-hour offsets, else UTC. Probing runs once on a background
 //! thread (it reads the filesystem or spawns `getprop`), never on the GUI thread.
+//! The browser supplies its zone directly.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(not(target_arch = "wasm32"))]
 use chrono::{Local, Offset};
 
+#[cfg(not(target_arch = "wasm32"))]
 static PROBED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 fn iana(value: &str) -> Option<String> {
     let value = value.trim().trim_start_matches(':');
     let mut segments = value.split('/');
@@ -23,6 +28,7 @@ fn iana(value: &str) -> Option<String> {
     (valid_first && valid_rest).then(|| value.to_owned())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn probe() -> Option<String> {
     if let Some(zone) = std::env::var("TZ").ok().as_deref().and_then(iana) {
         return Some(zone);
@@ -54,6 +60,7 @@ fn probe() -> Option<String> {
 }
 
 /// Fallback when the platform exposes no IANA zone.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn offset_time_zone() -> String {
     let seconds = Local::now().offset().fix().local_minus_utc();
     if seconds == 0 || seconds % 3600 != 0 {
@@ -68,21 +75,28 @@ pub fn offset_time_zone() -> String {
 }
 
 /// The probed zone once known; the offset zone until then. The first call starts the probe.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn device_time_zone() -> String {
     let cell = PROBED.get_or_init(|| {
-        std::thread::spawn(|| {
+        crate::common::background::spawn("paseo-timezone", || {
             let zone = probe().unwrap_or_else(offset_time_zone);
             if let Some(cell) = PROBED.get() {
                 *cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(zone);
             }
             makepad_widgets::SignalToUI::set_ui_signal();
-        });
+        })
+        .expect("spawn time-zone probe");
         Mutex::new(None)
     });
     cell.lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
         .unwrap_or_else(offset_time_zone)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn device_time_zone() -> String {
+    paseo_gui_platform::appearance::system_timezone()
 }
 
 #[cfg(test)]

@@ -524,6 +524,208 @@ fn host_binary_preserves_payload_and_rejects_bad_route_utf8() {
 }
 
 #[tokio::test]
+async fn web_ui_serves_assets_after_a_live_config_patch_without_changing_daemon_routes() {
+    use ::http::{Method, Request, StatusCode};
+    use http_body_util::{BodyExt, Empty};
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
+
+    let root = tempfile::tempdir().unwrap();
+    let web = root.path().join("web");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(web.join("api")).unwrap();
+    std::fs::write(web.join("index.html"), b"<title>Passession</title>").unwrap();
+    std::fs::write(web.join("app.wasm"), b"\0asm").unwrap();
+    std::fs::write(web.join("ws"), b"not a websocket").unwrap();
+    std::fs::write(web.join("api/health"), b"not a health response").unwrap();
+    std::fs::write(web.join("api/status"), b"not a status response").unwrap();
+    std::fs::write(root.path().join("outside.txt"), b"outside the bundle").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.path().join("outside.txt"), web.join("escape.txt")).unwrap();
+    let app = AppState::new(home, root.path().into(), root.path().join("paseo"));
+    app.config
+        .initialize_with_overrides(&json!({"listen": "127.0.0.1:0", "relayEnabled": false}))
+        .await
+        .unwrap();
+    app.transport.initialize().await.unwrap();
+    let authority = app.transport.listen_string().unwrap();
+    let stream = tokio::net::TcpStream::connect(&authority).await.unwrap();
+    let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.unwrap();
+    let conn = tokio::spawn(conn);
+
+    let request = |method: Method, path: &str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", authority.as_str())
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    let response = sender
+        .send_request(request(Method::GET, "/"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"404 Not Found")
+    );
+
+    // With a password set, only the bundle bypasses bearer authentication.
+    app.transport.config.write().unwrap()["auth"] =
+        json!({"password": bcrypt::hash("web test password", 4).unwrap()});
+    let config = app
+        .config
+        .patch(json!({"web": {"enabled": true}}))
+        .await
+        .unwrap();
+    assert_eq!(config["web"]["enabled"], true);
+    for (path, mime, body) in [
+        (
+            "/",
+            "text/html; charset=utf-8",
+            b"<title>Passession</title>".as_slice(),
+        ),
+        ("/app.wasm", "application/wasm", b"\0asm".as_slice()),
+    ] {
+        let response = sender
+            .send_request(request(Method::GET, path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], mime);
+        assert_eq!(response.headers()["cache-control"], "no-cache");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            body
+        );
+    }
+    let response = sender
+        .send_request(request(Method::HEAD, "/app.wasm"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-length"], "4");
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+
+    // Revalidation answers 304; a gzip client gets the precompressed sibling.
+    let response = sender
+        .send_request(request(Method::GET, "/app.wasm"))
+        .await
+        .unwrap();
+    let tag = response.headers()["etag"].clone();
+    response.into_body().collect().await.unwrap();
+    let mut conditional = request(Method::GET, "/app.wasm");
+    conditional.headers_mut().insert("if-none-match", tag);
+    let response = sender.send_request(conditional).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    std::fs::write(web.join("app.wasm.gz"), b"gzipped").unwrap();
+    for (accept, encoding, body) in [
+        ("br, gzip", Some("gzip"), b"gzipped".as_slice()),
+        ("gzip;q=0", None, b"\0asm".as_slice()),
+    ] {
+        let mut gzip = request(Method::GET, "/app.wasm");
+        gzip.headers_mut()
+            .insert("accept-encoding", accept.parse().unwrap());
+        let response = sender.send_request(gzip).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{accept}");
+        assert_eq!(response.headers()["content-type"], "application/wasm");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().unwrap()),
+            encoding,
+            "{accept}"
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            body,
+            "{accept}"
+        );
+    }
+
+    for (path, status) in [
+        ("/missing", StatusCode::NOT_FOUND),
+        ("/%2e%2e/outside.txt", StatusCode::NOT_FOUND),
+        ("/%2e%2e%2foutside.txt", StatusCode::NOT_FOUND),
+        #[cfg(unix)]
+        ("/escape.txt", StatusCode::NOT_FOUND),
+        ("/ws", StatusCode::BAD_REQUEST),
+        ("/api/status", StatusCode::UNAUTHORIZED),
+        ("/api/health", StatusCode::OK),
+    ] {
+        let response = sender
+            .send_request(request(Method::GET, path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{path}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        if path == "/api/health" {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["status"],
+                "ok"
+            );
+        }
+    }
+    let mut disallowed = request(Method::GET, "/");
+    disallowed
+        .headers_mut()
+        .insert("host", "not-allowed.example".parse().unwrap());
+    let response = sender.send_request(disallowed).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    response.into_body().collect().await.unwrap();
+
+    std::fs::remove_file(web.join("index.html")).unwrap();
+    let response = sender
+        .send_request(request(Method::GET, "/"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let explanation = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        std::str::from_utf8(&explanation)
+            .unwrap()
+            .contains("PASEO_WEB_DIR")
+    );
+
+    let config = app
+        .config
+        .patch(json!({"web": {"enabled": false}}))
+        .await
+        .unwrap();
+    assert_eq!(config["web"]["enabled"], false);
+    assert_eq!(
+        sender
+            .send_request(request(Method::GET, "/"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    drop(sender);
+    app.transport.shutdown().await.unwrap();
+    conn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn loopback_websocket_rejects_wrong_protocol_and_reserved_plugin_identity() {
     for (client_id, version, code, reason) in [
         ("regular", 0, 4003, "incompatible_protocol"),

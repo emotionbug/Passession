@@ -17,6 +17,7 @@
     "error": "다이어그램을 표시할 수 없습니다. 소스를 눌러 내용을 확인하세요.",
     "exporting": "내보내기 준비 중…",
     "saved": "다이어그램을 저장했습니다",
+    "downloadSubmitted": "다이어그램 다운로드가 시작되었습니다",
     "exportError": "다이어그램을 내보내지 못했습니다",
     "cancelled": "내보내기를 취소했습니다",
     "errors": {
@@ -3307,6 +3308,11 @@
         "moveDown": "아래로 이동"
       },
       "daemon": {
+        "webUi": {
+          "enable": "웹 UI 활성화",
+          "listenUrl": "데몬 호스트에서: {{url}}",
+          "noHttpListener": "데몬이 HTTP 주소에서 수신 대기 중이 아닙니다."
+        },
         "rename": {
           "editLabel": "레이블 편집",
           "title": "호스트 이름 변경",

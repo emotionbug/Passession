@@ -23,16 +23,20 @@ use std::{
 };
 
 use bytes::Bytes;
+#[cfg(not(target_arch = "wasm32"))]
+use paseo_client::transport::encode_frame;
 use paseo_client::{
     DaemonClient, IncomingFrame,
     crypto::SecurityMode,
     transport::{
         HostFrame,
         connector::{Connection, Sender as RawSender},
-        decode_frame, encode_frame,
+        decode_frame,
     },
 };
-use serde_json::{Map, Value, json};
+#[cfg(any(test, not(target_arch = "wasm32")))]
+use serde_json::json;
+use serde_json::{Map, Value};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +70,7 @@ pub(crate) enum Inbound {
     Closed(CoreError),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Frames a parent connection delivers to one of its host routes.
 pub(crate) enum RouteIn {
     Text(String),
@@ -166,6 +171,7 @@ enum Raw {
         task: Option<tokio::task::JoinHandle<()>>,
         written: Arc<AtomicU64>,
     },
+    #[cfg(not(target_arch = "wasm32"))]
     Routed {
         parent: Arc<DaemonClient>,
         route_id: String,
@@ -191,6 +197,7 @@ impl Raw {
     async fn send(&self, frame: HostFrame) -> anyhow::Result<()> {
         match self {
             Self::Direct { sender, .. } => sender.send(frame).await,
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Routed {
                 parent, route_id, ..
             } => match frame {
@@ -218,6 +225,7 @@ impl Raw {
     async fn send_urgent(&self, frame: HostFrame) -> anyhow::Result<()> {
         match self {
             Self::Direct { sender, .. } => sender.send_urgent(frame).await,
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Routed { .. } => self.send(frame).await,
         }
     }
@@ -225,6 +233,7 @@ impl Raw {
     fn written(&self) -> Arc<AtomicU64> {
         match self {
             Self::Direct { written, .. } => written.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Routed { .. } => Arc::default(),
         }
     }
@@ -235,6 +244,7 @@ impl Raw {
                 .recv()
                 .await
                 .map(|frame| frame.map_err(|error| transport_error(&error))),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Routed { incoming, .. } => incoming.recv().await.map(|frame| match frame {
                 RouteIn::Text(text) => Ok(HostFrame::Text(text)),
                 RouteIn::Binary(bytes) => Ok(HostFrame::Binary(bytes)),
@@ -251,6 +261,7 @@ impl Raw {
                     let _ = task.await;
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Routed {
                 parent,
                 route_id,
@@ -491,13 +502,14 @@ pub(crate) async fn open_direct(
     request: OpenRequest,
     global: Arc<Semaphore>,
     parent: &CancellationToken,
-    proxy: Option<paseo_tailnet::Proxy>,
+    #[cfg(not(target_arch = "wasm32"))] proxy: Option<paseo_tailnet::Proxy>,
 ) -> Result<Opened, CoreError> {
     let deadline = request.timeout;
     let cancel = parent.child_token();
     let guard = cancel.clone().drop_guard();
     let work = async {
         let resolved = host_config::resolve(config)?;
+        #[cfg(not(target_arch = "wasm32"))]
         if host_config::uses_tailnet(config) != proxy.is_some() {
             return Err(CoreError::new(
                 "TAILNET_UNAVAILABLE",
@@ -513,25 +525,33 @@ pub(crate) async fn open_direct(
             ));
         }
         let auth = host_config::authentication(config, &resolved).await;
-        let mut target = resolved.target.clone();
-        // A password travels as a bearer header too (never over a relay); a local credential
-        // only inside the application hello.
-        target.password = auth
-            .as_ref()
-            .filter(|auth| auth["kind"] == "password" && !resolved.is_relay())
-            .and_then(|auth| auth["password"].as_str().map(str::to_owned));
+        let is_relay = resolved.is_relay();
+        let target = resolved.target;
+        #[cfg(not(target_arch = "wasm32"))]
+        let target = {
+            let mut target = target;
+            // Native direct connections also send the password as a bearer header.
+            target.password = auth
+                .as_ref()
+                .filter(|auth| auth["kind"] == "password" && !is_relay)
+                .and_then(|auth| auth["password"].as_str().map(str::to_owned));
+            target
+        };
         let minimum = if resolved.require_protected || request.protected_known {
             SecurityMode::Protected
         } else {
             SecurityMode::Legacy
         };
+        #[cfg(not(target_arch = "wasm32"))]
         let connection =
             Connection::connect_with_proxy(&target, minimum, global, cancel.clone(), proxy)
                 .await
                 .map_err(|error| CoreError::from_anyhow(&error))?;
-        let relay = resolved
-            .is_relay()
-            .then_some((connection.security, request.protected_known));
+        #[cfg(target_arch = "wasm32")]
+        let connection = Connection::connect(&target, minimum, global, cancel.clone())
+            .await
+            .map_err(|error| CoreError::from_anyhow(&error))?;
+        let relay = is_relay.then_some((connection.security, request.protected_known));
         let raw = Raw::Direct {
             sender: connection.sender,
             incoming: connection.incoming,
@@ -566,6 +586,7 @@ pub(crate) async fn open_direct(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Opens a connected-host route already admitted by the parent (`hosts.route.open.response`).
 pub(crate) async fn open_routed(
     parent: Arc<DaemonClient>,
