@@ -965,6 +965,7 @@ impl AgentManager {
             "session",
             "pendingPermissions",
             "liveProviderTasks",
+            "queuedMessages",
             "availableModes",
             "capabilities",
             "activeTurn",

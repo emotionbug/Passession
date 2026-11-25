@@ -1675,6 +1675,7 @@ impl ChatPanel {
         }
         self.model_sig = Some(sig);
         let mut entries: Vec<Rc<Value>> = snap.timeline.iter().cloned().collect();
+        let mut queued: Vec<Value> = Vec::new();
         if !target.is_subagent() {
             let echoed: HashSet<String> = entries
                 .iter()
@@ -1684,14 +1685,37 @@ impl ChatPanel {
                         .map(str::to_owned)
                 })
                 .collect();
+            queued = queued_messages(&snap.agent, &echoed);
+            let held: HashSet<&str> = queued
+                .iter()
+                .filter_map(|entry| get(entry, "clientMessageId").as_str())
+                .collect();
+            let mut sending = Vec::new();
             for row in bridge::outgoing_rows(
                 &target.host_id,
                 &target.workspace_id,
                 &target.agent_id,
-                &|id| echoed.contains(id),
+                &|id| echoed.contains(id) || held.contains(id),
             ) {
-                entries.push(Rc::new(row));
+                // Sent into a running turn, a message waits below the reply with the queued
+                // ones rather than splitting it, and keeps that place once it is queued.
+                if snap.running {
+                    sending.push(row);
+                } else {
+                    entries.push(Rc::new(row));
+                }
             }
+            // The sending composer kept the images and attachments the host does not echo.
+            for entry in &mut queued {
+                let client = str_of(get(entry, "clientMessageId")).to_owned();
+                if let Some(local) =
+                    bridge::sent_attachments(&target.host_id, &target.agent_id, &client)
+                {
+                    entry["item"]["images"] = get(&local, "images").clone();
+                    entry["item"]["attachments"] = get(&local, "attachments").clone();
+                }
+            }
+            queued.extend(sending);
         }
         let rows = Rc::new(build_stream_rows(
             &entries,
@@ -1819,9 +1843,47 @@ impl ChatPanel {
                 });
             }
         }
+        // Messages the agent has not read yet wait below everything it is doing, nearest the
+        // composer; each moves into the conversation where the agent reads it.
+        let queued_shown = !queued.is_empty();
+        if queued_shown {
+            items.push(RowItem {
+                id: "queued-gap".into(),
+                kind: RowKind::Inset(16.0),
+            });
+            let queued: Rc<Vec<StreamRow>> = Rc::new(
+                queued
+                    .into_iter()
+                    .map(|entry| StreamRow {
+                        entry: Rc::new(entry),
+                        group: None,
+                        fold: None,
+                    })
+                    .collect(),
+            );
+            for index in 0..queued.len() {
+                let entry = &queued[index].entry;
+                let below = queued.get(index + 1).map(|row| &*row.entry);
+                items.push(RowItem {
+                    id: match get(entry, "clientMessageId").as_str() {
+                        Some(client) => format!("queued:{client}"),
+                        None => format!("queued:#{index}"),
+                    },
+                    kind: RowKind::Entry {
+                        rows: queued.clone(),
+                        index,
+                        previous_tasks: None,
+                        footer_below: false,
+                        streaming: false,
+                        live: false,
+                        gap_below: gap_between_stream_items(Some(entry), below),
+                    },
+                });
+            }
+        }
         // The tail inset keeps the newest rows clear of the floating track bar.
         let footer_at_end = has_auxiliary;
-        let existing = if footer_at_end && permission_count == 0 {
+        let existing = if footer_at_end && permission_count == 0 && !queued_shown {
             32.0
         } else {
             0.0

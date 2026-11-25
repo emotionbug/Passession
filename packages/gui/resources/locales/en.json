@@ -353,7 +353,8 @@
       "discard": "Discard failed draft",
       "agentRunning": "Agent running · separate from pending delivery",
       "stateUnavailable": "Live agent state unavailable",
-      "agentNotReady": "The agent isn't ready yet. Your message is kept in the composer."
+      "agentNotReady": "The agent isn't ready yet. Your message is kept in the composer.",
+      "queued": "Queued · the agent reads it after its current step"
     },
     "placeholders": {
       "desktop": "Message the agent, tag @files, or use /commands and /skills",

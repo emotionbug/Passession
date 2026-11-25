@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- OMP: a message sent while the agent is replying no longer lands in the middle of the reply. OMP reads such a message only after its current step, but Passession put it into the conversation the moment it was sent, so the rest of the reply continued below it, split in two. The message now waits at the bottom of the conversation marked "Queued · the agent reads it after its current step", and moves into the conversation where OMP reads it.
+
 ## 0.13.50 - 2026-11-25
 
 ### Fixed

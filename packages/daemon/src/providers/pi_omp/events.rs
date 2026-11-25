@@ -275,6 +275,34 @@ impl Mapper {
             self.clients.remove(index);
         }
     }
+    /// OMP's user messages accepted but not yet read (`queue_update`): steering, then
+    /// follow-ups, each with the client message it was sent as when its text matches one.
+    fn queue(&self, frame: &Value) -> Value {
+        let mut matched = vec![false; self.clients.len()];
+        let messages: Vec<Value> = array(&frame["steering"])
+            .iter()
+            .chain(array(&frame["followUp"]))
+            .filter_map(Value::as_str)
+            .map(|text| {
+                let mut message = json!({ "text": text });
+                let client = self
+                    .clients
+                    .iter()
+                    .enumerate()
+                    .position(|(index, (sent, _))| !matched[index] && sent == text);
+                if let Some(index) = client {
+                    matched[index] = true;
+                    put(
+                        &mut message,
+                        "clientMessageId",
+                        self.clients[index].1.as_deref(),
+                    );
+                }
+                message
+            })
+            .collect();
+        json!({"type":"provider_queue_changed","provider":self.provider,"messages":messages})
+    }
     pub fn set_bridged_tools(&mut self, tools: &Value) {
         self.bridged.clear();
         for pair in array(tools) {
@@ -647,6 +675,7 @@ impl Mapper {
                 if let Some(e)=mapped{out.extend(self.subagents(vec![e]));}
             },
             "subagent_event" if self.family=="omp"=>{let p=&frame["payload"];if p["event"]["type"]=="message_end"{let id=string(&p["id"]);let child=self.child_mappers.entry(id.into()).or_insert_with(||Box::new(Mapper::new("omp",&self.provider).native_ids()));for e in child.replay_message(&p["event"]["message"],None){if e["type"]=="timeline"{let mut event=json!({"type":"timeline","id":id,"item":e["item"]});if let Some(ts)=e.get("timestamp"){event["timestamp"]=ts.clone();}out.push(json!({"type":"provider_subagent","provider":self.provider,"event":event}));}}}},
+            "queue_update" if self.family=="omp"=>out.push(self.queue(frame)),
             "agent_end"|"agent_settled"=>{
                 if self.turn.is_none()&&!(self.family=="omp"&&self.started){return out;}
                 if self.family!="omp"&&kind=="agent_end"&&frame.get("willRetry").is_some(){self.settled=array(&frame["messages"]).to_vec();return out;}
@@ -1502,6 +1531,23 @@ mod tests {
             "title":"Review plan","options":["Approve","Revise","Abort"]}),
         );
         assert_ne!(events[0]["request"]["kind"], "tool");
+    }
+
+    #[test]
+    fn omp_queue_report_names_the_client_message_of_each_queued_text() {
+        let mut mapper = Mapper::new("omp", "omp");
+        mapper.queue_client_message("first", Some("c1"));
+        mapper.queue_client_message("same", Some("c2"));
+        mapper.queue_client_message("same", Some("c3"));
+        let events = mapper.map(&json!({"type":"queue_update","liveSteered":0,
+            "steering":["same","first"],"followUp":["same","typed in the OMP TUI"]}));
+        let queued = json!({"type":"provider_queue_changed","provider":"omp","messages":[
+            {"text":"same","clientMessageId":"c2"},
+            {"text":"first","clientMessageId":"c1"},
+            {"text":"same","clientMessageId":"c3"},
+            {"text":"typed in the OMP TUI"}
+        ]});
+        assert_eq!(events, vec![queued]);
     }
 
     #[test]

@@ -1104,6 +1104,25 @@ impl AgentManager {
             }
             return Ok(());
         }
+        if event["type"] == "provider_queue_changed" {
+            // The provider's own list of user messages it accepted but has not read yet.
+            if !from_history {
+                let mut data = cell.data.lock().await;
+                let previous = data.snapshot.get("queuedMessages").cloned();
+                match event["messages"].as_array() {
+                    Some(messages) if !messages.is_empty() && !data.owner_ended => {
+                        data.snapshot["queuedMessages"] = Value::Array(messages.clone());
+                    }
+                    _ => {
+                        object(&mut data.snapshot).remove("queuedMessages");
+                    }
+                }
+                if data.ready && data.snapshot.get("queuedMessages") != previous.as_ref() {
+                    self.publish_state(&data.snapshot);
+                }
+            }
+            return Ok(());
+        }
         let (mut snapshot, ready, owner_ended) = {
             let data = cell.data.lock().await;
             (data.snapshot.clone(), data.ready, data.owner_ended)
@@ -1229,6 +1248,9 @@ impl AgentManager {
                     snapshot["activeTurnId"] = Value::Null;
                     snapshot["activeForegroundTurnId"] = Value::Null;
                     snapshot["activeTurn"] = Value::Null;
+                    // The provider reads queued messages within the run, or carries them into
+                    // the run it starts next, which records them; none stays queued here.
+                    object(&mut snapshot).remove("queuedMessages");
                     if kind != "turn_completed" {
                         if let Some(pending) = snapshot["pendingPermissions"].as_array() {
                             for request in pending {
@@ -1391,6 +1413,8 @@ impl AgentManager {
                     if item["type"] == "user_message"
                         && let Some(message_id) = text(&item, "clientMessageId").map(str::to_owned)
                     {
+                        // Read by the agent: the message is in the timeline, no longer queued.
+                        unqueue(&mut snapshot, &message_id);
                         // A provider echo of a recorded submission only adds its native identity.
                         let timeline = cell.timeline.clone();
                         let path = self.timeline_path(id);
@@ -1867,6 +1891,20 @@ fn hook_stream(snapshot: &Value, event: &Value) -> Option<(&'static str, Value)>
         ),
         _ => return None,
     })
+}
+
+/// Drops client message `id` from the messages the provider holds unread (`queuedMessages`).
+fn unqueue(snapshot: &mut Value, id: &str) {
+    let Some(queued) = snapshot
+        .get_mut("queuedMessages")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    queued.retain(|message| message["clientMessageId"] != id);
+    if queued.is_empty() {
+        object(snapshot).remove("queuedMessages");
+    }
 }
 
 /// agent-manager.ts SYSTEM_ERROR_PREFIX.
@@ -2494,6 +2532,73 @@ pub(super) mod tests {
             assert_eq!(rows[1]["item"]["messageId"], "pending");
             assert_eq!(rows[2]["item"]["messageId"], "live");
         }
+        cell.cancel.cancel();
+        cell.task.lock().await.take().unwrap().await.unwrap();
+    }
+
+    /// A steer the provider records once the agent reads it waits as queued, while the reply
+    /// that was streaming when it was sent goes on as one message; it lands where the provider
+    /// reports reading it.
+    #[tokio::test]
+    async fn steer_recorded_on_delivery_waits_queued_below_the_streaming_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(
+            root.path().join("home"),
+            root.path().into(),
+            std::env::current_exe().unwrap(),
+        );
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000009";
+        let cell = staged_cell(&app, id).await;
+        let reply = |text: &str| {
+            json!({"type":"timeline","provider":"mock","turnId":"live-turn",
+                "item":{"type":"assistant_message","text":text,"messageId":"reply"}})
+        };
+        cell.sink.emit(reply("The first half, ")).await.unwrap();
+        manager
+            .queue_submitted(&cell, &json!("stop that"), Some("client"))
+            .await
+            .unwrap();
+        manager.release_event_stage(&cell).await.unwrap();
+        cell.sink.emit(reply("the second half.")).await.unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert_eq!(
+            wire::snapshot_payload(&cell.data.lock().await.snapshot)["queuedMessages"],
+            json!([{"text":"stop that","clientMessageId":"client"}])
+        );
+        {
+            let timeline = cell.timeline.lock().unwrap();
+            let rows = timeline.rows();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["item"]["text"], "The first half, the second half.");
+        }
+        cell.sink
+            .emit(json!({"type":"timeline","provider":"mock","turnId":"live-turn",
+                "item":{"type":"user_message","text":"stop that","clientMessageId":"client",
+                    "messageId":"native-1"}}))
+            .await
+            .unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert!(cell.data.lock().await.snapshot.get("queuedMessages").is_none());
+        {
+            let timeline = cell.timeline.lock().unwrap();
+            let rows = timeline.rows();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1]["item"]["type"], "user_message");
+            assert_eq!(rows[1]["item"]["clientMessageId"], "client");
+        }
+        // A message the run ends without reading does not stay queued.
+        manager
+            .queue_submitted(&cell, &json!("and this"), Some("other"))
+            .await
+            .unwrap();
+        assert!(cell.data.lock().await.snapshot.get("queuedMessages").is_some());
+        cell.sink
+            .emit(json!({"type":"turn_completed","provider":"mock","turnId":"live-turn"}))
+            .await
+            .unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert!(cell.data.lock().await.snapshot.get("queuedMessages").is_none());
         cell.cancel.cancel();
         cell.task.lock().await.take().unwrap().await.unwrap();
     }

@@ -351,7 +351,8 @@
       "discard": "실패한 초안 버리기",
       "agentRunning": "에이전트 실행 중 · 전송 대기와 별개",
       "stateUnavailable": "실시간 실행 상태 확인 불가",
-      "agentNotReady": "에이전트가 아직 준비되지 않았습니다. 메시지는 입력창에 유지됩니다."
+      "agentNotReady": "에이전트가 아직 준비되지 않았습니다. 메시지는 입력창에 유지됩니다.",
+      "queued": "대기 중 · 에이전트가 지금 단계를 마치면 읽습니다"
     },
     "placeholders": {
       "desktop": "에이전트에게 메시지를 보내거나 @files 태그, /commands, /skills를 사용하세요",

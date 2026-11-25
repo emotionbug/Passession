@@ -1955,7 +1955,9 @@ impl AgentSession for Session {
                 }
             }
         }
-        Ok(json!({"status":"accepted"}))
+        // OMP reads a steer at its next step and then reports it as a user message carrying
+        // this client message id; that report is where the message belongs in the timeline.
+        Ok(json!({"status":"accepted","recordsOnDelivery":omp}))
     }
     async fn history_revision(&self) -> Option<Value> {
         if self.inner.spec.family != "omp" {

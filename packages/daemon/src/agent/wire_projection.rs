@@ -83,6 +83,11 @@ pub(crate) fn snapshot_payload(agent: &Value) -> Value {
         {
             out["liveProviderTasks"] = tasks.clone();
         }
+        if status != "closed"
+            && let Some(queued) = agent.get("queuedMessages").filter(|v| v.is_array())
+        {
+            out["queuedMessages"] = queued.clone();
+        }
         out["activeTurn"] = agent.get("activeTurn").cloned().unwrap_or_else(|| {
             if let Some(turn) = agent.get("activeTurnId").filter(|v| v.is_string()) {
                 json!({"turnId":turn,"startedAt":agent["activeTurnStartedAt"]})

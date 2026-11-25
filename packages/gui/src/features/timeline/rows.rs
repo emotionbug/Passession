@@ -1041,6 +1041,21 @@ fn user_message(
                     None,
                 );
             }
+        } else if is_true(get(entry, "queued")) {
+            // Accepted by the provider; the agent reads it after its current step.
+            let note = t("composer.delivery.queued");
+            let meta = look.ui(STREAM_METADATA_SIZE);
+            let size = d.kit.measure(cx, Font::Regular, meta, 1.3, &note, None);
+            d.kit.label(
+                cx,
+                Font::Regular,
+                meta,
+                1.3,
+                p.muted,
+                dvec2(x + w - size.x, ry + (24.0 - size.y) * 0.5),
+                &note,
+                None,
+            );
         }
         h += 8.0 + 24.0;
     }

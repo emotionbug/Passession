@@ -210,6 +210,29 @@ pub fn build_stream_rows(
     }
 }
 
+/// Messages the provider accepted but has not read yet (the agent's `queuedMessages`), as
+/// pending user rows, leaving out those already `recorded`. The provider records each one in
+/// the timeline where the agent reads it, which also takes it off the queue.
+pub fn queued_messages(agent: &Value, recorded: &HashSet<String>) -> Vec<Value> {
+    list(get(agent, "queuedMessages"))
+        .iter()
+        .filter_map(|message| {
+            let client = get(message, "clientMessageId").as_str();
+            if client.is_some_and(|id| recorded.contains(id)) {
+                return None;
+            }
+            let mut item = json!({"type": "user_message", "text": str_of(get(message, "text"))});
+            let mut entry = json!({"pending": true, "queued": true});
+            if let Some(client) = client {
+                item["clientMessageId"] = json!(client);
+                entry["clientMessageId"] = json!(client);
+            }
+            entry["item"] = item;
+            Some(entry)
+        })
+        .collect()
+}
+
 /// The identity a turn's fold is kept under: its prompt's sequence, else its
 /// client message id.
 pub fn turn_key(prompt: &Value) -> Option<String> {

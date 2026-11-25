@@ -574,8 +574,13 @@ impl AgentManager {
                 if let Some(gate) = gate {
                     gate.correlate(json!({"turnId":expected,"delivery":"steer"}));
                 }
-                let submitted = self
-                    .record_submitted(
+                // A provider that records the steer once the agent reads it shows it queued until
+                // then: recorded now, it would land inside the reply still streaming.
+                let submitted = if steered["recordsOnDelivery"] == true {
+                    self.queue_submitted(cell, prompt, client_id.as_deref())
+                        .await
+                } else {
+                    self.record_submitted(
                         id,
                         cell,
                         prompt,
@@ -583,7 +588,8 @@ impl AgentManager {
                         expected.as_deref(),
                         false,
                     )
-                    .await;
+                    .await
+                };
                 let released = self.release_event_stage(cell).await;
                 submitted?;
                 released?;
@@ -736,6 +742,41 @@ impl AgentManager {
                 Err(error)
             }
         }
+    }
+    /// Lists a steer the provider records when the agent reads it (`queuedMessages`). Its
+    /// record, the provider's queue report or the end of the run takes it off the list.
+    pub(super) async fn queue_submitted(
+        &self,
+        cell: &Arc<AgentCell>,
+        prompt: &Value,
+        client_id: Option<&str>,
+    ) -> Result<()> {
+        let Some(client_id) = client_id else {
+            return Ok(());
+        };
+        let lookup = client_id.to_owned();
+        if cell
+            .read_timeline(move |timeline| timeline.submitted_user_message(&lookup))
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let message =
+            json!({"text":crate::providers::prompt::text(prompt)?,"clientMessageId":client_id});
+        self.update_snapshot(cell, |snapshot| {
+            let mut queued = snapshot["queuedMessages"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if !queued.iter().any(|m| m["clientMessageId"] == client_id) {
+                queued.push(message);
+            }
+            snapshot["queuedMessages"] = Value::Array(queued);
+            Ok(())
+        })
+        .await?;
+        Ok(())
     }
     /// agent-manager.ts recordSubmittedPrompt: human attempts stay in history on
     /// rejection; delivery notices require acceptance.
