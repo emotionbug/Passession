@@ -105,6 +105,12 @@ The browser build is the same Makepad client compiled for `wasm32-wasip1` with W
 
 Composer images live in memory for the page session; local storage is too small for image bytes. The daemon echoes a sent prompt without its images, so after a reload, messages sent from that page show their text only, as they do on another device. The native app keeps sent images in its blob directory.
 
+## Agent forms in web views
+
+OMP's `ask` tool sends one HTML form. The daemon shows it as a question card (`metadata.ompAskForm`) that carries the form's HTML (`input.html`) and each question's field `name`. It accepts either the card's answers or `formData` (`{values: {name: [value…]}, other: {name: text}}`) from a client that showed the HTML, maps both onto the form's fields, and answers OMP 19.1's `form` dialog or replays the per-field dialogs of earlier OMP.
+
+Where an OS web view is available, the card shows that HTML (`paseo_gui_platform::webview`). On Linux it is WebKitGTK 4.1, loaded at run time so the app starts without it, in a GTK window reparented into a child of the Makepad X11 window that clips it to the transcript; GLib runs from the row's 16 ms timer. Elsewhere, and on Linux without WebKitGTK, the card shows the questions as before. The card's Submit asks the page for its values, and Enter in a one-line field does the same. A native view paints above everything the app draws, so it hides while a menu, dialog or sheet covers the window, while a popover overlaps it, and while its row is scrolled out or another page is shown. A wheel turn the page does not use scrolls the transcript.
+
 ## Terminals and excluded surfaces
 
 Daemon PTYs back interactive terminals and project scripts. The client opens interactive shells as Terminal tabs on every platform and presents script output as read-only logs; see [terminal activity](terminal-activity.md). Native CLI chat remains available outside the application.

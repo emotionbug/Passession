@@ -3568,6 +3568,14 @@ impl ChatPanel {
                     self.list.as_portal_list().scroll_selection(cx, delta);
                 }
             }
+            RowEventKind::Wheel { delta } => {
+                if !self.input_is_modal() && delta != 0.0 {
+                    self.reader_scrolled = true;
+                    self.at_bottom = false;
+                    self.detach();
+                    self.list.as_portal_list().scroll_selection(cx, delta);
+                }
+            }
             RowEventKind::RevealTop => {
                 self.reveal_top = Some(row);
             }

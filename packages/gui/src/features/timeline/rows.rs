@@ -15,7 +15,7 @@ use super::json::*;
 use super::layout::{StreamRow, TurnTiming, parse_time};
 use super::markdown::{self, FindMark, MdOpts};
 use super::paint::{Draw, Look};
-use super::permission::{self, AnswerField};
+use super::permission::{self, CardField};
 use super::tools::{
     self, ToolGlyph, build_tool_call_presentation, detail_blocks, detail_is_full_bleed,
 };
@@ -392,8 +392,8 @@ fn draw_glyph(cx: &mut Cx2d, d: &mut Draw, glyph: ToolGlyph, r: Rect, size: f64,
     }
 }
 
-/// Paints one row at (x, y) in `w`; returns its height and the answer field
-/// of a question permission (drawn by the row widget as a native TextInput).
+/// Paints one row at (x, y) in `w`; returns its height and what the row widget places over a
+/// question permission: its answer TextInput, or the web view of an HTML form.
 pub fn draw_row(
     cx: &mut Cx2d,
     d: &mut Draw,
@@ -402,7 +402,7 @@ pub fn draw_row(
     x: f64,
     y: f64,
     w: f64,
-) -> (f64, Option<AnswerField>) {
+) -> (f64, Option<CardField>) {
     let look = ctx.look;
     match &item.kind {
         RowKind::Inset(h) => (*h, None),

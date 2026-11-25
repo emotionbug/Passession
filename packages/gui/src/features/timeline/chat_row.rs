@@ -16,9 +16,23 @@ use crate::common::{FileLinkIntent, UiContext, UiEffect};
 use makepad_widgets::makepad_draw::event::{DigitDevice, TAP_COUNT_DISTANCE, TouchState};
 use makepad_widgets::scroll_bars::TouchScroll;
 use makepad_widgets::*;
+use paseo_gui_platform::webview::{WebView, WebViewEvent};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
+
+/// How long a hidden form keeps its web view (and what was typed) before it is closed.
+const HIDDEN_FORM_LIFETIME: f64 = 30.0;
+
+/// The web view of an OMP `ask` form card, placed over the card by the row.
+struct FormView {
+    request: String,
+    view: WebView,
+    /// Pumps the view while it is shown.
+    pump: Timer,
+    /// Closes the view when it stays hidden.
+    expiry: Timer,
+}
 
 live_design! {
     use link::theme::*;
@@ -54,6 +68,8 @@ pub enum RowEventKind {
     Answer { key: String, dismiss: bool },
     /// Content-signed edge movement while a row-owned selection handle is captured.
     SelectionScroll { delta: f64 },
+    /// A wheel turn over the row's web view, which the page does not use (content-signed).
+    Wheel { delta: f64 },
     /// The row's top edge should be brought on screen if it is above it.
     RevealTop,
 }
@@ -146,6 +162,8 @@ pub struct ChatRow {
     model: Option<RowModel>,
     #[rust]
     answer_field: Option<permission::AnswerField>,
+    #[rust]
+    form: Option<FormView>,
     #[rust]
     pressed: Option<(HitTarget, Rect)>,
     #[rust(Drag::None)]
@@ -264,6 +282,7 @@ impl ChatRow {
                 && old.ctx.agent_id == model.ctx.agent_id
         });
         if !same_owner {
+            self.close_form(cx);
             // Recycled widgets surrender native gesture ownership, not the
             // previous row's source-indexed selection anchors.
             let old_selection = self.model.as_ref().map(|old| {
@@ -368,6 +387,141 @@ impl ChatRow {
 
     fn rel(&self, cx: &Cx, abs: DVec2) -> DVec2 {
         abs - self.area.rect(cx).pos
+    }
+
+    /// Places the form's web view over `field`, creating it for a new request. A web view
+    /// that cannot be created leaves the card showing the form's questions.
+    fn place_form(&mut self, cx: &mut Cx2d, field: Option<permission::FormField>) {
+        let Some(field) = field else {
+            self.close_form(cx);
+            return;
+        };
+        let Some(model) = self.model.clone() else {
+            return;
+        };
+        let RowKind::Permission { request, .. } = &model.item.kind else {
+            return;
+        };
+        let id = request["id"].as_str().unwrap_or_default();
+        if self.form.as_ref().is_some_and(|form| form.request != id) {
+            self.close_form(cx);
+        }
+        if self.form.is_none() {
+            let created = cx
+                .get_current_window_id()
+                .ok_or_else(|| "No window to place the form in".to_owned())
+                .and_then(|window| {
+                    let options = permission::form_options(request, field.theme)
+                        .ok_or_else(|| "The request has no form".to_owned())?;
+                    WebView::new(cx, window, options)
+                });
+            match created {
+                Ok(view) => {
+                    self.form = Some(FormView {
+                        request: id.to_owned(),
+                        view,
+                        pump: Timer::empty(),
+                        expiry: Timer::empty(),
+                    });
+                }
+                Err(error) => {
+                    log!("The form is shown as questions: {error}");
+                    if let Some(card) = model.state.borrow_mut().permission.as_mut() {
+                        card.form_unavailable = true;
+                    }
+                    self.area.redraw(cx);
+                    return;
+                }
+            }
+        }
+        let dpi = cx.current_dpi_factor();
+        let viewport = self.canvas.viewport;
+        if let Some(form) = &mut self.form {
+            form.view.place(cx, field.rect, viewport, dpi);
+            if form.pump.is_empty() {
+                form.pump = cx.start_interval(0.016);
+            }
+            if !form.expiry.is_empty() {
+                cx.stop_timer(std::mem::replace(&mut form.expiry, Timer::empty()));
+            }
+        }
+    }
+
+    fn close_form(&mut self, cx: &mut Cx) {
+        if let Some(form) = self.form.take() {
+            cx.stop_timer(form.pump);
+            cx.stop_timer(form.expiry);
+        }
+    }
+
+    /// Runs the web view and applies what the page reported. A row whose paint left the
+    /// window (scrolled out, another page shown) hides the view and stops pumping it.
+    fn pump_form(&mut self, cx: &mut Cx) {
+        let attached = self.area.is_attached(cx);
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        if !attached {
+            form.view.place(cx, Rect::default(), None, 1.0);
+            cx.stop_timer(std::mem::replace(&mut form.pump, Timer::empty()));
+            if form.expiry.is_empty() {
+                form.expiry = cx.start_timeout(HIDDEN_FORM_LIFETIME);
+            }
+        } else if let Some(visible) = form.view.visible_rect() {
+            let obscured = crate::common::overlay::floats_over(cx, self.area, visible);
+            form.view.set_obscured(cx, obscured);
+        }
+        let events = form.view.pump(cx);
+        let Some(model) = self.model.clone() else {
+            return;
+        };
+        let RowKind::Permission { key, .. } = &model.item.kind else {
+            return;
+        };
+        for event in events {
+            let mut state = model.state.borrow_mut();
+            let Some(card) = state.permission.as_mut() else {
+                continue;
+            };
+            match event {
+                WebViewEvent::Height(height) => {
+                    if card.form_height != Some(height) {
+                        card.form_height = Some(height);
+                        drop(state);
+                        self.cache.invalidate();
+                        self.area.redraw(cx);
+                    }
+                }
+                WebViewEvent::Submitted(data) => {
+                    if card.pending {
+                        continue;
+                    }
+                    card.form_data = Some(data);
+                    drop(state);
+                    self.post(
+                        cx,
+                        RowEventKind::Answer {
+                            key: key.clone(),
+                            dismiss: false,
+                        },
+                    );
+                }
+                WebViewEvent::Invalid => {}
+                WebViewEvent::Scroll { dy, .. } => {
+                    drop(state);
+                    self.post(cx, RowEventKind::Wheel { delta: dy });
+                }
+                WebViewEvent::Failed(error) => {
+                    log!("The form is shown as questions: {error}");
+                    card.form_unavailable = true;
+                    drop(state);
+                    self.close_form(cx);
+                    self.cache.invalidate();
+                    self.area.redraw(cx);
+                    return;
+                }
+            }
+        }
     }
 
     fn post(&self, cx: &mut Cx, kind: RowEventKind) {
@@ -503,6 +657,19 @@ impl ChatRow {
                 true
             }
             HitTarget::QuestionPrimary { key } => {
+                // A form shown as HTML submits from its page: the data arrives as an event.
+                if let Some(form) = self.form.as_mut() {
+                    let pending = model
+                        .state
+                        .borrow()
+                        .permission
+                        .as_ref()
+                        .is_some_and(|card| card.pending);
+                    if !pending {
+                        form.view.submit();
+                    }
+                    return true;
+                }
                 let RowKind::Permission { request, .. } = &model.item.kind else {
                     return true;
                 };
@@ -712,6 +879,18 @@ impl ChatRow {
 
 impl Widget for ChatRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Some(form) = &mut self.form {
+            match event {
+                Event::Timer(timer) if form.expiry.is_timer(timer).is_some() => {
+                    self.close_form(cx);
+                }
+                Event::Timer(timer) if form.pump.is_timer(timer).is_some() => self.pump_form(cx),
+                Event::Signal => self.pump_form(cx),
+                // A press on the app's own surface takes the keyboard back from the page.
+                Event::MouseDown(_) | Event::TouchUpdate(_) => form.view.blur(),
+                _ => {}
+            }
+        }
         if self.handle_selection_event(cx, event) {
             return;
         }
@@ -968,6 +1147,7 @@ impl Widget for ChatRow {
             || self.cache.viewport != self.canvas.viewport
             || self.touch_selection
             || self.answer_field.is_some()
+            || self.form.is_some()
             || cx.text_actions_active(self.area);
         let compose = repaint || cx.will_redraw(&mut self.composition, walk);
         if self.composition.begin_maybe(cx, compose).is_err() {
@@ -1049,6 +1229,11 @@ impl Widget for ChatRow {
             self.kit.rect.end_many_instances(cx);
             self.kit.rect.area()
         };
+        let (field, form) = match field {
+            Some(permission::CardField::Answer(field)) => (Some(field), None),
+            Some(permission::CardField::Form(form)) => (None, Some(form)),
+            None => (None, None),
+        };
         if let Some(field) = &field {
             let text = self.answer.text();
             if text != field.text {
@@ -1076,6 +1261,7 @@ impl Widget for ChatRow {
             );
         }
         self.answer_field = field;
+        self.place_form(cx, form);
         cx.walk_turtle(Walk {
             abs_pos: None,
             margin: Margin::default(),

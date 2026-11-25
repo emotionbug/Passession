@@ -24,6 +24,8 @@ const HEADER_CHARS: usize = 24;
 
 pub(super) struct AskForm {
     pub(super) tool: String,
+    /// The form as OMP sent it, for clients that render HTML.
+    html: String,
     plans: Vec<Plan>,
     title: String,
     trailing: Vec<String>,
@@ -267,6 +269,7 @@ impl AskForm {
             .to_owned();
         Some(Self {
             tool: tool.to_owned(),
+            html: html.to_owned(),
             plans,
             title,
             trailing: pending,
@@ -311,7 +314,8 @@ impl AskForm {
         }
     }
 
-    /// Answers the `form` dialog, or the held first per-field dialog, from the card's response.
+    /// Answers the `form` dialog, or the held first per-field dialog, from the card's response:
+    /// its question answers, or `formData` from a client that showed the form's HTML.
     pub(super) fn submit(&mut self, response: &Value) -> Result<Submitted, String> {
         let held = match &self.stage {
             Stage::Shown { held, .. } => Some(held.clone()),
@@ -323,7 +327,10 @@ impl AskForm {
         if response["behavior"] != "allow" {
             return Ok(Submitted::Cancelled);
         }
-        let targets = self.targets(response)?;
+        let targets = match response.get("formData") {
+            Some(form) => self.form_targets(form)?,
+            None => self.targets(response)?,
+        };
         let Some(held) = held else {
             return Ok(Submitted::Data(json!({ "data": self.data(&targets)? })));
         };
@@ -369,7 +376,7 @@ impl AskForm {
                                 }
                             })
                             .collect();
-                        json!({"question":text,"header":plan.header,"options":options,"multiSelect":multi,"allowOther":other.is_some(),"allowEmpty":*multi && !required})
+                        json!({"question":text,"header":plan.header,"name":plan.name,"options":options,"multiSelect":multi,"allowOther":other.is_some(),"allowEmpty":*multi && !required})
                     }
                     PlanKind::Text {
                         value,
@@ -377,7 +384,7 @@ impl AskForm {
                         required,
                         ..
                     } => {
-                        let mut q = json!({"question":text,"header":plan.header,"options":[],"multiSelect":false,"allowEmpty":!required});
+                        let mut q = json!({"question":text,"header":plan.header,"name":plan.name,"options":[],"multiSelect":false,"allowEmpty":!required});
                         if !placeholder.is_empty() {
                             q["placeholder"] = json!(placeholder);
                         }
@@ -389,7 +396,61 @@ impl AskForm {
                 }
             })
             .collect();
-        json!({"id":id,"provider":provider,"name":"OMP ask","kind":"question","title":self.title,"input":{"questions":questions},"metadata":{"ompAskForm":true}})
+        json!({"id":id,"provider":provider,"name":"OMP ask","kind":"question","title":self.title,"input":{"questions":questions,"html":self.html},"metadata":{"ompAskForm":true}})
+    }
+
+    /// Targets from the data of the form shown as HTML: `values` holds every submitted
+    /// control value under its name (an unchecked box or unselected radio submits nothing),
+    /// `other` the text typed into the Other answer a client adds to a choice that allows one.
+    fn form_targets(&self, form: &Value) -> Result<Vec<Target>, String> {
+        self.plans
+            .iter()
+            .map(|plan| {
+                let submitted: Vec<&str> = form["values"][&plan.name]
+                    .as_array()
+                    .map(|values| values.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let custom = form["other"][&plan.name]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned);
+                match &plan.kind {
+                    PlanKind::Choice {
+                        multi,
+                        values,
+                        other,
+                        ..
+                    } => {
+                        if let Some(text) = custom.as_ref().filter(|_| other.is_none()) {
+                            return Err(format!("“{}” has no option “{text}”", plan.title));
+                        }
+                        let picks = submitted
+                            .iter()
+                            .map(|value| {
+                                values.iter().position(|v| v == value).ok_or_else(|| {
+                                    format!("“{}” has no option “{value}”", plan.title)
+                                })
+                            })
+                            .collect::<Result<BTreeSet<usize>, String>>()?;
+                        if *multi {
+                            return Ok(Target::Multi {
+                                picks,
+                                other: custom,
+                            });
+                        }
+                        match (custom, picks.first()) {
+                            (Some(text), _) => Ok(Target::Single(Pick::Other(text))),
+                            (None, Some(&index)) => Ok(Target::Single(Pick::Option(index))),
+                            (None, None) => Err(format!("Answer “{}”", plan.title)),
+                        }
+                    }
+                    PlanKind::Text { .. } => Ok(Target::Text(
+                        submitted.first().copied().unwrap_or_default().to_owned(),
+                    )),
+                }
+            })
+            .collect()
     }
 
     fn targets(&self, response: &Value) -> Result<Vec<Target>, String> {

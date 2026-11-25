@@ -1018,6 +1018,16 @@ impl Widget for PaseoShell {
         let shell_modal = self.data.overlays.is_modal();
         let command_center = self.data.command_center_open;
         let overlay_key = self.data.overlays.presentation_key();
+        // Native web views paint above the app: they step aside for menus, dialogs and sheets,
+        // the shell's own and those holding the window's modal slot.
+        if let Some(window) = self.data.os_window {
+            paseo_gui_platform::webview::set_covered(
+                window,
+                !self.data.overlays.stack.is_empty()
+                    || command_center
+                    || overlay_api::window_modal_open(&self.data.window_id),
+            );
+        }
         // Only the matching native window can receive a geometry event.
         if let Event::WindowGeomChange(e) = event
             && Some(e.window_id) == self.data.os_window

@@ -5,6 +5,7 @@
 ### Added
 
 - Web UI: open the daemon's address (for example `http://my-computer:6767/`) in a browser and use Passession there, with the same chat, terminals, files and settings as the app. It is off by default; turn it on in Settings → the host's Overview → **Enable web UI**, which takes effect without restarting the daemon. With a daemon password the sidebar shows "Password required"; enter it under "Authentication / connection", and the browser remembers it. Use HTTPS or a trusted network, because plain HTTP does not protect the password. Images and files attach through the browser's file picker, and exports download through the browser. Things that need the local machine (dropping files from disk, managing a local daemon, app updates, notifications, embedded Tailscale) stay in the app. The first visit downloads about 12 MB.
+- Linux: a form from OMP's `ask` tool appears in its question card as the agent wrote it — headings, tables, code, images and the form's own fields — instead of being rebuilt as plain questions. Submit, or Enter in a field, answers with the form's values; radio and checkbox groups keep the "Other" answer, and the form's own checks (a required field, a number range) apply before anything is sent. Scrolling over the form scrolls the conversation. This uses WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`) when it is installed; without it, and on other platforms, the card shows the questions as before.
 
 ### Fixed
 

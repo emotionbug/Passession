@@ -14,6 +14,7 @@ use super::markdown;
 use super::paint::Draw;
 use super::tools::{detail_blocks, detail_is_full_bleed};
 use makepad_widgets::*;
+use paseo_gui_platform::webview::{WebTheme, WebView, WebViewOptions};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 
@@ -54,6 +55,36 @@ pub fn elicitation_url(request: &Value) -> Option<String> {
 }
 
 pub(crate) const OPEN_ELICITATION_URL: &str = "mcp_open_url";
+
+/// The HTML of an OMP `ask` form, which the card shows as is where web views exist.
+pub fn form_html(request: &Value) -> Option<&str> {
+    (get(get(request, "metadata"), "ompAskForm") == true)
+        .then(|| get(get(request, "input"), "html").as_str())
+        .flatten()
+        .filter(|html| !html.trim().is_empty())
+}
+
+/// Whether the card shows the form's HTML in a web view rather than its questions.
+pub fn shows_form(request: &Value, state: &CardState) -> bool {
+    !state.form_unavailable && form_html(request).is_some() && WebView::supported()
+}
+
+/// The web view of the form in `request`: its HTML, an Other answer for every choice that
+/// allows one (by field name), and the card's colors and text size.
+pub fn form_options(request: &Value, theme: WebTheme) -> Option<WebViewOptions> {
+    let other = get(get(request, "input"), "questions")
+        .as_array()?
+        .iter()
+        .filter(|q| is_true(get(q, "allowOther")))
+        .filter_map(|q| get(q, "name").as_str().map(str::to_owned))
+        .collect();
+    Some(WebViewOptions {
+        html: form_html(request)?.to_owned(),
+        other,
+        other_label: t("message.question.otherPlaceholder"),
+        theme,
+    })
+}
 
 /// parseQuestionFormQuestions: None unless every question is well formed.
 pub fn questions(request: &Value) -> Option<Vec<Question>> {
@@ -117,6 +148,12 @@ pub struct CardState {
     pub failed: bool,
     pub responding_action: Option<String>,
     pub plan_expanded: Option<bool>,
+    /// The form's content height its web view reported, in logical px.
+    pub form_height: Option<f64>,
+    /// The data the form's web view submitted, sent as the answer.
+    pub form_data: Option<Value>,
+    /// The web view failed: the card shows the form's questions instead.
+    pub form_unavailable: bool,
 }
 
 impl CardState {
@@ -321,6 +358,12 @@ pub fn action_response(action: &Value) -> Value {
     }
 }
 
+/// What the row places over the card: the answer TextInput, or the form's web view.
+pub enum CardField {
+    Answer(AnswerField),
+    Form(FormField),
+}
+
 /// The answer field the row draws (a native TextInput) for the active question.
 pub struct AnswerField {
     pub rect: Rect,
@@ -328,6 +371,12 @@ pub struct AnswerField {
     pub text: String,
     pub enabled: bool,
     pub highlighted: bool,
+}
+
+/// Where the row places the form's web view (window logical px).
+pub struct FormField {
+    pub rect: Rect,
+    pub theme: WebTheme,
 }
 
 /// _CardButton: 8/12 padding, radius 6, 14px icon + base label 8 apart.
@@ -420,7 +469,7 @@ pub fn draw(
     y: f64,
     w: f64,
     opts: &mut markdown::MdOpts,
-) -> (f64, Option<AnswerField>) {
+) -> (f64, Option<CardField>) {
     if d.state
         .permission
         .as_ref()
@@ -429,6 +478,13 @@ pub fn draw(
         d.state.permission = Some(CardState::for_request(r));
     }
     if get(r, "kind") == "question" {
+        if d.state
+            .permission
+            .as_ref()
+            .is_some_and(|s| shows_form(r, s))
+        {
+            return form_card(cx, d, key, x, y, w);
+        }
         return match questions(r) {
             Some(qs) => question_form(cx, d, key, r, &qs, x, y, w),
             None => (0.0, None),
@@ -771,7 +827,7 @@ fn question_form(
     x: f64,
     y: f64,
     w: f64,
-) -> (f64, Option<AnswerField>) {
+) -> (f64, Option<CardField>) {
     let p = d.look.palette;
     let base = d.look.ui(14.0);
     let state = d.state.permission.clone().unwrap_or_default();
@@ -798,7 +854,7 @@ fn question_form(
     let decline_label = elicitation.then(|| t("agentStream.permission.mcpDecline"));
     let selected = state.selections.get(&index).cloned().unwrap_or_default();
     let mut field = None;
-    let paint = |cx: &mut Cx2d, d: &mut Draw, field: &mut Option<AnswerField>| -> f64 {
+    let paint = |cx: &mut Cx2d, d: &mut Draw, field: &mut Option<CardField>| -> f64 {
         let inner = w - 24.0;
         let mut cy = y + 12.0;
         if elicitation {
@@ -918,7 +974,7 @@ fn question_form(
                 },
                 1.0,
             );
-            *field = Some(AnswerField {
+            *field = Some(CardField::Answer(AnswerField {
                 rect,
                 placeholder: q.placeholder.clone().unwrap_or_else(|| {
                     t(if q.options.is_empty() {
@@ -930,7 +986,7 @@ fn question_form(
                 text: other,
                 enabled: !state.pending,
                 highlighted,
-            });
+            }));
             cy += fh;
         }
         cy += 12.0;
@@ -949,45 +1005,156 @@ fn question_form(
             (true, false) => "message.question.submit",
             (false, _) => "message.question.next",
         });
-        let dismiss_target = HitTarget::QuestionDismiss {
-            key: key.to_owned(),
-        };
-        let primary_target = HitTarget::QuestionPrimary {
-            key: key.to_owned(),
-        };
-        let dismiss_responding =
-            state.pending && state.responding_action.as_deref() == Some("dismiss");
-        let primary_responding =
-            state.pending && state.responding_action.as_deref() == Some("submit");
-        let decline = decline_label.as_deref().map(|label| {
-            let responding = state.responding_action.as_deref() == Some("decline") && state.pending;
-            (label, "x", p.muted, None, p.border_accent, responding, state.pending && !responding,
-                HitTarget::PermissionAction { key: key.to_owned(), action: "decline".into() })
-        });
-        let buttons = [
-            Some((dismiss_label.as_str(), "x", p.muted, None, p.border_accent, dismiss_responding,
-                state.pending && !dismiss_responding, dismiss_target)),
-            decline,
-            Some((primary_label.as_str(), "check", p.on_tertiary, Some(p.accent), p.accent,
-                primary_responding, primary_disabled, primary_target)),
-        ];
+        cy += answer_buttons(
+            cx,
+            d,
+            key,
+            &state,
+            x,
+            cy,
+            w,
+            &dismiss_label,
+            decline_label.as_deref(),
+            &primary_label,
+            primary_disabled,
+        );
+        cy + 12.0 - y
+    };
+    let mut scratch = None;
+    let h = d.measure(|d| paint(cx, d, &mut scratch));
+    d.kit
+        .bordered(cx, rect_xywh(x, y, w, h), p.surface1, 8.0, p.border, 1.0);
+    paint(cx, d, &mut field);
+    (h, field)
+}
 
-        let stacked = d.look.compact || buttons.iter().flatten().map(|(label, ..)| {
-            button_width(d.kit.measure(cx, Font::Regular, base, 1.4, label, None).x) + 8.0
-        }).sum::<f64>() - 8.0 > inner;
-        let mut bx = x + 12.0;
-        let mut row_h: f64 = 0.0;
-        for (label, icon, fg, bg, border, responding, disabled, target) in buttons.into_iter().flatten() {
-            let size = card_button(cx, d, bx, cy, stacked.then_some(inner),
-                x + w - 12.0 - bx, label, icon, fg, bg, border, responding, disabled, target);
-            if stacked {
-                cy += size.y + 8.0;
-            } else {
-                bx += size.x + 8.0;
-                row_h = row_h.max(size.y);
-            }
+/// The card's dismiss, optional decline and primary buttons from `y`, in one row or
+/// stacked when they do not fit; returns their height.
+#[allow(clippy::too_many_arguments)]
+fn answer_buttons(
+    cx: &mut Cx2d,
+    d: &mut Draw,
+    key: &str,
+    state: &CardState,
+    x: f64,
+    y: f64,
+    w: f64,
+    dismiss_label: &str,
+    decline_label: Option<&str>,
+    primary_label: &str,
+    primary_disabled: bool,
+) -> f64 {
+    let p = d.look.palette;
+    let base = d.look.ui(14.0);
+    let inner = w - 24.0;
+    let mut cy = y;
+    let dismiss_target = HitTarget::QuestionDismiss {
+        key: key.to_owned(),
+    };
+    let primary_target = HitTarget::QuestionPrimary {
+        key: key.to_owned(),
+    };
+    let dismiss_responding = state.pending && state.responding_action.as_deref() == Some("dismiss");
+    let primary_responding = state.pending && state.responding_action.as_deref() == Some("submit");
+    let decline = decline_label.map(|label| {
+        let responding = state.responding_action.as_deref() == Some("decline") && state.pending;
+        (label, "x", p.muted, None, p.border_accent, responding, state.pending && !responding,
+            HitTarget::PermissionAction { key: key.to_owned(), action: "decline".into() })
+    });
+    let buttons = [
+        Some((dismiss_label, "x", p.muted, None, p.border_accent, dismiss_responding,
+            state.pending && !dismiss_responding, dismiss_target)),
+        decline,
+        Some((primary_label, "check", p.on_tertiary, Some(p.accent), p.accent,
+            primary_responding, primary_disabled, primary_target)),
+    ];
+    let stacked = d.look.compact || buttons.iter().flatten().map(|(label, ..)| {
+        button_width(d.kit.measure(cx, Font::Regular, base, 1.4, label, None).x) + 8.0
+    }).sum::<f64>() - 8.0 > inner;
+    let mut bx = x + 12.0;
+    let mut row_h: f64 = 0.0;
+    for (label, icon, fg, bg, border, responding, disabled, target) in buttons.into_iter().flatten() {
+        let size = card_button(cx, d, bx, cy, stacked.then_some(inner),
+            x + w - 12.0 - bx, label, icon, fg, bg, border, responding, disabled, target);
+        if stacked {
+            cy += size.y + 8.0;
+        } else {
+            bx += size.x + 8.0;
+            row_h = row_h.max(size.y);
         }
-        cy += if stacked { -8.0 } else { row_h };
+    }
+    cy += if stacked { -8.0 } else { row_h };
+    cy - y
+}
+
+/// The form's area before its web view reports the content height.
+const FORM_LOADING_HEIGHT: f64 = 96.0;
+
+/// An OMP `ask` form shown as its HTML: the row places a web view over the reserved area;
+/// Submit asks the page for its data, which the row then sends.
+fn form_card(
+    cx: &mut Cx2d,
+    d: &mut Draw,
+    key: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+) -> (f64, Option<CardField>) {
+    let p = d.look.palette;
+    let state = d.state.permission.clone().unwrap_or_default();
+    let dismiss_label = t("common.actions.dismiss");
+    let primary_label = t("message.question.submit");
+    let theme = WebTheme {
+        dark: p.is_dark,
+        background: p.surface1,
+        foreground: p.foreground,
+        muted: p.muted,
+        border: p.border,
+        accent: p.accent,
+        surface: p.surface2,
+        font_size: d.look.ui(14.0),
+    };
+    let mut field = None;
+    let paint = |cx: &mut Cx2d, d: &mut Draw, field: &mut Option<CardField>| -> f64 {
+        let inner = w - 24.0;
+        let mut cy = y + 12.0;
+        let height = state.form_height.unwrap_or(FORM_LOADING_HEIGHT);
+        let rect = rect_xywh(x + 12.0, cy, inner, height);
+        if state.form_height.is_none() {
+            d.spinner(
+                cx,
+                rect_xywh(x + 12.0 + inner * 0.5 - 9.0, cy + height * 0.5 - 9.0, 18.0, 18.0),
+                p.muted,
+            );
+        }
+        *field = Some(CardField::Form(FormField {
+            rect,
+            theme: theme.clone(),
+        }));
+        cy += height + 12.0;
+        if state.failed {
+            cy += super::chrome::error_alert(
+                cx,
+                d,
+                &t("message.question.responseFailed"),
+                x + 12.0,
+                cy,
+                inner,
+            ) + 12.0;
+        }
+        cy += answer_buttons(
+            cx,
+            d,
+            key,
+            &state,
+            x,
+            cy,
+            w,
+            &dismiss_label,
+            None,
+            &primary_label,
+            state.pending,
+        );
         cy + 12.0 - y
     };
     let mut scratch = None;
@@ -1150,7 +1317,12 @@ pub fn question_response(r: &Value, qs: &[Question], state: &CardState, dismiss:
                 "updatedInput":{"selections":state.build_selections(qs)}})
         };
     }
+    if !dismiss && let Some(data) = &state.form_data {
+        return json!({"behavior": "allow", "formData": data});
+    }
     let mut input = map(get(r, "input")).clone();
+    // The answer names its fields; the form's HTML need not travel back.
+    input.remove("html");
     if dismiss {
         let submit_empty = qs.iter().all(|q| q.allow_empty && q.options.is_empty());
         if !submit_empty {

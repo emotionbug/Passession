@@ -105,6 +105,10 @@ Native builds narrow this gap rather than closing it outright. The WebView refus
 
 If you don't trust a page, read it in `Source`, which executes nothing. Source is available as an editable view on supported web hosts and a read-only view everywhere else.
 
+## Agent forms
+
+The HTML of an OMP `ask` form is shown in an OS web view inside its question card. Its own scripts never run: a Content-Security-Policy (`default-src 'none'`) refuses scripts, fetches, frames, fonts and media, and the engine's page scripts are switched off as well (WebKitGTK `enable-javascript-markup`). Images may load from `data:`, `http:` and `https:` URLs, so a form can reach the servers its images name. The view refuses every navigation after its initial document, opens no windows and has no context menu. Only Passession's own script runs in it, to theme the form, measure it and collect its values, which reach the agent only when you submit.
+
 ## Agent authentication
 
 Paseo wraps agent CLIs (Claude Code, Codex, OpenCode) but does not manage their authentication. Each agent provider handles its own credentials. Paseo never stores or transmits provider API keys. Agents run in your user context with your existing credentials.

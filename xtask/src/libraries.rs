@@ -271,7 +271,8 @@ pub fn component_app(root: &Path) -> Result<()> {
 /// Libraries the desktop client opens with `dlopen` (paseo-gui-platform): native
 /// window activation and idle time (`libX11`, `libXss`) and XSMP logout
 /// without a GNOME SessionManager (`libSM`, `libICE`), plus system-font discovery
-/// (`libfontconfig`). The Debian package declares the same set in `package.rs`.
+/// (`libfontconfig`). The Debian package declares the same set in `package.rs`. WebKitGTK
+/// (HTML forms) is only recommended there: an AppImage uses the system's copy, if any.
 pub const LINUX_DLOPENED: [&str; 5] = [
     "libX11.so.6",
     "libXss.so.1",

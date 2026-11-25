@@ -931,6 +931,30 @@ fn float_drawn(cx: &Cx, area: Area) -> bool {
     false
 }
 
+/// Whether a floating surface drawn in `area`'s window (a declared float, or the open
+/// popover's card) covers part of `rect`, other than one `area` is drawn inside. A native
+/// view placed over content (an `ask` form's web view) paints above everything the app
+/// draws, so it steps aside while one does.
+pub(crate) fn floats_over(cx: &Cx, area: Area, rect: Rect) -> bool {
+    let Some(pass) = float_pass(cx, area) else {
+        return false;
+    };
+    let over = |surface: Area| {
+        float_drawn(cx, surface)
+            && float_pass(cx, surface) == Some(pass)
+            && !cx.area_drawn_within(area, surface)
+            && {
+                let other = surface.clipped_rect(cx);
+                other.pos.x < rect.pos.x + rect.size.x
+                    && rect.pos.x < other.pos.x + other.size.x
+                    && other.pos.y < rect.pos.y + rect.size.y
+                    && rect.pos.y < other.pos.y + other.size.y
+            }
+    };
+    FLOATS.with(|floats| floats.borrow().iter().any(|float| over(float.area)))
+        || POPOVERS.with(|popovers| popovers.borrow().iter().any(|popup| over(popup.body)))
+}
+
 /// Claim dismissal before dispatching to children; a handled Back or repeat must not
 /// unwind another owner. Escape is contained by the caller's arrival-time modal lock.
 pub fn take_dismissal(event: &makepad_widgets::Event) -> bool {

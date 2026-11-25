@@ -517,6 +517,83 @@ fn form_dialog_data_follows_html_form_submission() {
     );
 }
 
+/// The answer of a client that showed the form's HTML: every submitted value by name, and the
+/// text of the Other answer it added to a choice.
+fn html_answer(values: Value, other: Value) -> Value {
+    json!({"behavior":"allow","formData":{"values":values,"other":other}})
+}
+
+#[test]
+fn html_form_data_answers_the_form_dialog() {
+    const HTML: &str = r#"<form>
+        <label><input type="checkbox" name="agree" value="yes"> I agree</label>
+        <label>Size <select name="size"><option value="s">Small</option><option value="l" selected>Large</option></select></label>
+        <fieldset><legend>Tags</legend>
+          <label><input type="checkbox" name="tags" value="x" checked disabled> Locked</label>
+          <label><input type="checkbox" name="tags" value="y"> Y</label>
+          <label><input type="checkbox" name="tags" value="z"> Z</label></fieldset>
+        <label>Who <input type="text" name="who" required></label>
+    </form>"#;
+    let mut mapper = Mapper::new("omp", "omp");
+    let card = form_card(&mut mapper, HTML);
+    assert_eq!(
+        card["input"]["html"], HTML,
+        "the card carries the form as sent"
+    );
+    let names: Vec<&str> = card["input"]["questions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["agree", "size", "tags", "who"]);
+    let id = card["id"].as_str().unwrap();
+
+    let empty_who = html_answer(json!({"size":["s"],"who":[""]}), json!({}));
+    assert!(mapper.permission_response(id, &empty_who).is_err());
+    let unknown = html_answer(json!({"size":["xl"],"who":["Kim"]}), json!({}));
+    assert!(mapper.permission_response(id, &unknown).is_err());
+    assert_eq!(
+        mapper.pending_permissions().len(),
+        1,
+        "a refused answer keeps the card"
+    );
+
+    let answer = html_answer(
+        json!({"agree":["yes"],"size":["s"],"tags":["z","y"],"who":["Kim"]}),
+        json!({"tags":"  w  "}),
+    );
+    let reply = mapper.permission_response(id, &answer).unwrap();
+    assert_eq!(
+        reply["data"],
+        json!({"agree":"yes","size":"s","tags":["y","z","w"],"who":"Kim"})
+    );
+    assert!(mapper.pending_permissions().is_empty());
+}
+
+#[test]
+fn html_form_data_drives_the_replay_of_earlier_omp() {
+    let mut harness = Harness::new(CLEANUP, |_| {
+        html_answer(
+            json!({"wine":["target"],"items":["review","codex_old"]}),
+            json!({"wine":"   ","items":"logs"}),
+        )
+    });
+    let data = omp(CLEANUP, |dialog| harness.answer(dialog)).unwrap();
+    assert_eq!(data["wine"], "target");
+    assert_eq!(data["items"], json!(["codex_old", "review", "logs"]));
+    assert_eq!(harness.cards.len(), 1, "the whole form is one card");
+
+    let mut harness = Harness::new(CLEANUP, |_| {
+        html_answer(json!({"items":[]}), json!({"wine":"Only logs"}))
+    });
+    let data = omp(CLEANUP, |dialog| harness.answer(dialog)).unwrap();
+    assert_eq!(
+        data["wine"], "Only logs",
+        "Other text answers a radio group"
+    );
+}
+
 #[test]
 fn dismissed_form_cancels_the_ask() {
     let mut harness = Harness::new(

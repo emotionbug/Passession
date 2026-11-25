@@ -18,6 +18,7 @@ pub mod qr;
 mod tailnet_keys;
 #[cfg(target_arch = "wasm32")]
 mod web;
+pub mod webview;
 
 pub use facade::{appearance, notifications};
 #[cfg(not(target_arch = "wasm32"))]

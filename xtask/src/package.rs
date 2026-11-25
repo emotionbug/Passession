@@ -166,8 +166,9 @@ fn shlibdeps_notices(stderr: &str) -> Vec<&str> {
     kept
 }
 
-/// Optional idle-time, XSMP logout and system-font discovery libraries.
-const DEBIAN_RECOMMENDS: &str = "libxss1, libsm6, libice6, libfontconfig1";
+/// Optional idle-time, XSMP logout and system-font discovery libraries, and WebKitGTK for
+/// HTML forms (never bundled: its web processes and closure belong to the system).
+const DEBIAN_RECOMMENDS: &str = "libxss1, libsm6, libice6, libfontconfig1, libwebkit2gtk-4.1-0";
 
 pub fn desktop(args: &[String]) -> Result<()> {
     ensure!(
