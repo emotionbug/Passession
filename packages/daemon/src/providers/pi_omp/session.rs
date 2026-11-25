@@ -1350,6 +1350,7 @@ impl Session {
             .map(|p| p["metadata"]["bridgedTools"].clone())
             .unwrap_or(Value::Null);
         mapper.set_bridged_tools(&bridged_tools);
+        mapper.set_cwd(config["cwd"].as_str().unwrap_or(""));
         let usage_env = launch_command.as_ref().map(|command| &command.env);
         let usage_command = usage_env
             .map(|env| launch::command_prefix(&spec, env))

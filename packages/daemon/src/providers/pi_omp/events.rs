@@ -303,6 +303,10 @@ impl Mapper {
             .collect();
         json!({"type":"provider_queue_changed","provider":self.provider,"messages":messages})
     }
+    /// The agent's working directory, which `ask` form image paths are relative to.
+    pub fn set_cwd(&mut self, cwd: &str) {
+        self.permissions.set_cwd(cwd);
+    }
     pub fn set_bridged_tools(&mut self, tools: &Value) {
         self.bridged.clear();
         for pair in array(tools) {

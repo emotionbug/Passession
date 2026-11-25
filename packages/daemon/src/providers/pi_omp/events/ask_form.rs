@@ -7,6 +7,7 @@
 //! every later one.
 
 mod dom;
+mod images;
 mod parse;
 #[cfg(test)]
 mod tests;
@@ -15,6 +16,7 @@ use crate::providers::question_answers;
 use parse::{Block, Kind};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 /// OMP's automatic free-text option of a radio or checkbox group.
 const OTHER: &str = "Other (type your own)";
@@ -26,6 +28,8 @@ pub(super) struct AskForm {
     pub(super) tool: String,
     /// The form as OMP sent it, for clients that render HTML.
     html: String,
+    /// The agent's working directory, which image paths in the form are relative to.
+    cwd: Option<PathBuf>,
     plans: Vec<Plan>,
     title: String,
     trailing: Vec<String>,
@@ -270,11 +274,18 @@ impl AskForm {
         Some(Self {
             tool: tool.to_owned(),
             html: html.to_owned(),
+            cwd: None,
             plans,
             title,
             trailing: pending,
             stage: Stage::Waiting,
         })
+    }
+
+    /// Resolves the form's image paths against `cwd` when the card is built.
+    pub(super) fn with_cwd(mut self, cwd: Option<PathBuf>) -> Self {
+        self.cwd = cwd;
+        self
     }
 
     pub(super) fn shows(&self, request: &str) -> bool {
@@ -396,7 +407,12 @@ impl AskForm {
                 }
             })
             .collect();
-        json!({"id":id,"provider":provider,"name":"OMP ask","kind":"question","title":self.title,"input":{"questions":questions,"html":self.html},"metadata":{"ompAskForm":true}})
+        // A client elsewhere cannot read the agent's files: images named by path go inline.
+        let html = match &self.cwd {
+            Some(cwd) => images::inline(&self.html, cwd),
+            None => self.html.clone(),
+        };
+        json!({"id":id,"provider":provider,"name":"OMP ask","kind":"question","title":self.title,"input":{"questions":questions,"html":html},"metadata":{"ompAskForm":true}})
     }
 
     /// Targets from the data of the form shown as HTML: `values` holds every submitted

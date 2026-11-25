@@ -595,6 +595,29 @@ fn html_form_data_drives_the_replay_of_earlier_omp() {
 }
 
 #[test]
+fn form_images_named_by_path_reach_the_card_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("chart.png"), b"png").unwrap();
+    const HTML: &str = r#"<form><img src="chart.png"><label><input type="radio" name="a" value="x" checked> X</label></form>"#;
+    let mut mapper = Mapper::new("omp", "omp");
+    mapper.set_cwd(dir.path().to_str().unwrap());
+    let card = form_card(&mut mapper, HTML);
+    assert!(
+        card["input"]["html"]
+            .as_str()
+            .unwrap()
+            .contains(r#"<img src="data:image/png;base64,cG5n">"#)
+    );
+    let reply = mapper
+        .permission_response(
+            card["id"].as_str().unwrap(),
+            &html_answer(json!({"a":["x"]}), json!({})),
+        )
+        .unwrap();
+    assert_eq!(reply["data"], json!({"a":"x"}));
+}
+
+#[test]
 fn dismissed_form_cancels_the_ask() {
     let mut harness = Harness::new(
         CLEANUP,

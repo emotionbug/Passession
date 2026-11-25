@@ -17,6 +17,8 @@ pub struct Permissions {
     pi_pending: Option<(String, Option<String>)>,
     rpiv: Option<Rpiv>,
     form: Option<AskForm>,
+    /// The agent's working directory: `ask` form image paths are relative to it.
+    cwd: Option<std::path::PathBuf>,
 }
 struct Pending {
     title: String,
@@ -51,6 +53,10 @@ fn matches(title: &str, q: &str) -> bool {
             .is_some_and(|s| cached_regex!(r"^ \(\d+/\d+\)$").is_match(s))
 }
 impl Permissions {
+    /// The agent's working directory, which `ask` form image paths are relative to.
+    pub fn set_cwd(&mut self, cwd: &str) {
+        self.cwd = (!cwd.is_empty()).then(|| cwd.into());
+    }
     pub fn pending(&self) -> Vec<Value> {
         self.requests.clone()
     }
@@ -78,7 +84,7 @@ impl Permissions {
             if let Some(html) = args["html"].as_str()
                 && self.form.as_ref().is_none_or(|form| form.tool != id)
             {
-                self.form = AskForm::new(id, html);
+                self.form = AskForm::new(id, html).map(|form| form.with_cwd(self.cwd.clone()));
             }
         }
         if family != "omp" {
@@ -262,7 +268,8 @@ impl Permissions {
         let tool = self.form.take().map(|form| form.tool).unwrap_or_default();
         let form = (family == "omp")
             .then(|| AskForm::new(&tool, string(&event["html"])))
-            .flatten();
+            .flatten()
+            .map(|form| form.with_cwd(self.cwd.clone()));
         let Some(mut form) = form else {
             // OMP waits for an answer to every dialog; one Paseo cannot show is cancelled.
             tracing::warn!(family, "cancelling a form dialog Paseo cannot show");
