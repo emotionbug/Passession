@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 mod sys {
     #[link(wasm_import_module = "paseo")]
@@ -18,6 +19,33 @@ mod sys {
         /// Bytes queued by `send` that the browser has not yet sent (`WebSocket.bufferedAmount`).
         pub fn ws_buffered_amount(id: u32) -> usize;
         pub fn ws_close(id: u32);
+        pub fn webview_supported() -> u32;
+        pub fn webview_open(
+            id: u32,
+            page: *const u8,
+            page_len: usize,
+            html: *const u8,
+            html_len: usize,
+            bridge: *const u8,
+            bridge_len: usize,
+            config: *const u8,
+            config_len: usize,
+        ) -> u32;
+        pub fn webview_place(
+            id: u32,
+            x: f64,
+            y: f64,
+            width: f64,
+            height: f64,
+            clip_x: f64,
+            clip_y: f64,
+            clip_width: f64,
+            clip_height: f64,
+            dpi: f64,
+        );
+        pub fn webview_run_script(id: u32, script: *const u8, len: usize);
+        pub fn webview_blur(id: u32);
+        pub fn webview_close(id: u32);
         /// `(ptr << 32) | len` of a buffer from [`super::paseo_alloc`], or -1 when absent or
         /// when the browser refused access.
         pub fn storage_get(key: *const u8, key_len: usize) -> i64;
@@ -208,6 +236,109 @@ pub extern "C" fn paseo_ws_event(id: u32, kind: u32, data: *mut u8, len: usize, 
         SOCKETS.with(|sockets| sockets.borrow_mut().insert(id, handler));
     }
     wake();
+}
+
+type WebViewHandler = Rc<dyn Fn(Result<&str, &str>)>;
+
+thread_local! {
+    static WEB_VIEWS: RefCell<HashMap<u32, WebViewHandler>> = RefCell::new(HashMap::new());
+    static NEXT_WEB_VIEW: Cell<u32> = const { Cell::new(1) };
+}
+
+/// Whether the page can host a sandboxed web view.
+pub fn webview_supported() -> bool {
+    unsafe { sys::webview_supported() == 1 }
+}
+
+/// An iframe over the Makepad canvas. Dropping it removes it from the page.
+pub struct WebView {
+    id: u32,
+}
+
+impl WebView {
+    /// Opens the trusted `page` wrapper, with `html` parsed as inert content. The handler
+    /// receives posted JSON and engine errors; it runs outside the browser's open call.
+    pub fn open(
+        page: &str,
+        html: &str,
+        bridge: &str,
+        config: &str,
+        on_event: impl Fn(Result<&str, &str>) + 'static,
+    ) -> Result<Self, String> {
+        let id = NEXT_WEB_VIEW.with(|next| {
+            let id = next.get();
+            next.set(id.wrapping_add(1).max(1));
+            id
+        });
+        let opened = unsafe {
+            sys::webview_open(
+                id,
+                page.as_ptr(),
+                page.len(),
+                html.as_ptr(),
+                html.len(),
+                bridge.as_ptr(),
+                bridge.len(),
+                config.as_ptr(),
+                config.len(),
+            )
+        };
+        if opened != 1 {
+            return Err("Could not create a sandboxed form".into());
+        }
+        WEB_VIEWS.with(|views| views.borrow_mut().insert(id, Rc::new(on_event)));
+        Ok(Self { id })
+    }
+
+    /// Sets the logical-pixel frame and clip as `[x, y, width, height]`. An empty clip hides it.
+    pub fn place(&self, frame: [f64; 4], clip: [f64; 4], dpi: f64) {
+        let [x, y, width, height] = frame;
+        let [clip_x, clip_y, clip_width, clip_height] = clip;
+        unsafe {
+            sys::webview_place(
+                self.id,
+                x,
+                y,
+                width,
+                height,
+                clip_x,
+                clip_y,
+                clip_width,
+                clip_height,
+                dpi,
+            )
+        }
+    }
+
+    /// Runs trusted app code with this view's bridge.
+    pub fn run_script(&self, script: &str) {
+        unsafe { sys::webview_run_script(self.id, script.as_ptr(), script.len()) };
+    }
+
+    pub fn blur(&self) {
+        unsafe { sys::webview_blur(self.id) };
+    }
+}
+
+impl Drop for WebView {
+    fn drop(&mut self) {
+        WEB_VIEWS.with(|views| views.borrow_mut().remove(&self.id));
+        unsafe { sys::webview_close(self.id) };
+    }
+}
+
+/// JSON or a browser error for `id`; `data` is a [`paseo_alloc`] buffer owned by this call.
+#[unsafe(no_mangle)]
+pub extern "C" fn paseo_webview_event(id: u32, data: *mut u8, len: usize, failed: u32) {
+    let data = unsafe { take(data, len) };
+    let Ok(data) = std::str::from_utf8(&data) else {
+        return;
+    };
+    let handler = WEB_VIEWS.with(|views| views.borrow().get(&id).cloned());
+    if let Some(handler) = handler {
+        handler(if failed == 1 { Err(data) } else { Ok(data) });
+        wake();
+    }
 }
 
 /// The page's `localStorage` value of `key`; `None` when absent or when the browser refused access.

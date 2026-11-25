@@ -47,7 +47,7 @@ fn vm() -> Result<JavaVM, PlatformError> {
         .map_err(|e| PlatformError::native(e.to_string()))
 }
 
-fn with_activity<R>(
+pub(crate) fn with_activity<R>(
     f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<R>,
 ) -> Result<R, PlatformError> {
     let vm = vm()?;

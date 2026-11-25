@@ -138,6 +138,15 @@ pub fn with_macos_app<R>(f: impl FnOnce(&mut MacosApp) -> R) -> R {
     })
 }
 
+/// The borrowed AppKit content view for a live Makepad window, on the UI thread.
+pub fn webview_host(window: WindowId) -> ObjcId {
+    MACOS_APP.with_borrow(|app| {
+        app.as_ref()
+            .and_then(|app| app.cocoa_windows.iter().find(|entry| entry.0 == window))
+            .map_or(nil, |entry| entry.2)
+    })
+}
+
 pub fn init_macos_app_global(event_callback: Box<dyn FnMut(MacosEvent) -> EventFlow>) {
     unsafe {
         MACOS_CLASSES = Box::into_raw(Box::new(MacosClasses::new()));
@@ -207,7 +216,7 @@ pub struct MacosApp {
     pub timer_delegate_instance: ObjcId,
     timers: Vec<CocoaTimer>,
     //pub signals: Mutex<RefCell<HashSet<Signal>>>,
-    pub cocoa_windows: Vec<(ObjcId, ObjcId)>,
+    pub cocoa_windows: Vec<(WindowId, ObjcId, ObjcId)>,
     last_key_mod: KeyModifiers,
     #[allow(unused)]
     pasteboard: ObjcId,
@@ -528,6 +537,56 @@ impl MacosApp {
         Some((window.window_id, window.ime_key_consumed.clone()))
     }
 
+    unsafe fn is_webview_responder(mut view: ObjcId) -> bool {
+        let Some(webview) = Class::get("WKWebView") else { return false };
+        while view != nil {
+            let is_webview: BOOL = msg_send![view, isKindOfClass: webview];
+            if is_webview == YES {
+                return true;
+            }
+            let is_view: BOOL = msg_send![view, isKindOfClass: class!(NSView)];
+            if is_view != YES {
+                return false;
+            }
+            view = msg_send![view, superview];
+        }
+        false
+    }
+
+    unsafe fn event_targets_webview(ns_event: ObjcId, ev_type: NSEventType) -> bool {
+        match ev_type {
+            NSEventType::NSKeyDown | NSEventType::NSKeyUp | NSEventType::NSFlagsChanged => {
+                let window: ObjcId = msg_send![ns_event, window];
+                if window == nil {
+                    return false;
+                }
+                let is_key: BOOL = msg_send![window, isKeyWindow];
+                let responder: ObjcId = msg_send![window, firstResponder];
+                is_key == YES && Self::is_webview_responder(responder)
+            }
+            NSEventType::NSScrollWheel => {
+                let window: ObjcId = msg_send![ns_event, window];
+                if window == nil {
+                    return false;
+                }
+                let content: ObjcId = msg_send![window, contentView];
+                if content == nil {
+                    return false;
+                }
+                // hitTest: expects coordinates in the receiver's superview.
+                let point: NSPoint = msg_send![ns_event, locationInWindow];
+                let parent: ObjcId = msg_send![content, superview];
+                let point = if parent == nil {
+                    point
+                } else {
+                    msg_send![parent, convertPoint: point fromView: nil]
+                };
+                Self::is_webview_responder(msg_send![content, hitTest: point])
+            }
+            _ => false,
+        }
+    }
+
     unsafe fn process_ns_event(ns_event: ObjcId) {
         let ev_type: NSEventType = msg_send![ns_event, type];
         if ev_type == NSEventType::NSApplicationDefined {
@@ -549,6 +608,12 @@ impl MacosApp {
                 Self::do_callback(MacosEvent::SurfaceWake);
                 return;
             }
+        }
+        // WebKit handles these through AppKit (wheel turns are forwarded by the form bridge).
+        if Self::event_targets_webview(ns_event, ev_type) {
+            let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+            let () = msg_send![ns_app, sendEvent: ns_event];
+            return;
         }
         // sendEvent can invoke responder/IME callbacks or change/close the key window.
         // Preserve the event's own source, never a later key window or widget focus.
@@ -867,7 +932,7 @@ impl MacosApp {
             self.current_cursor = cursor;
             // todo set it on all windows
             unsafe {
-                for (window, view) in &self.cocoa_windows {
+                for (_, window, view) in &self.cocoa_windows {
                     let _: () = msg_send![
                         *window,
                         invalidateCursorRectsForView: *view

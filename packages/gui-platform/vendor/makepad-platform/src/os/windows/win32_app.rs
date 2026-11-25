@@ -208,6 +208,13 @@ pub fn with_win32_app<R>(f: impl FnOnce(&mut Win32App) -> R) -> R {
     })
 }
 
+/// The live top-level HWND for an app window, on its UI thread.
+pub fn window_hwnd(window: WindowId) -> Option<HWND> {
+    WIN32_APP.with_borrow(|app| {
+        app.as_ref()?.window_handles.iter().find_map(|&(id, hwnd)| (id == window).then_some(hwnd))
+    })
+}
+
 pub fn init_win32_app_global(event_callback: Box<dyn FnMut(Win32Event) -> EventFlow>) {
     WIN32_APP.with(|app| {
         *app.borrow_mut() = Some(Win32App::new(event_callback));
@@ -230,6 +237,7 @@ pub struct Win32App {
     pending_events: PendingWindowState,
     pub window_class_name: Vec<u16>,
     pub all_windows: Vec<HWND>,
+    pub(super) window_handles: Vec<(WindowId, HWND)>,
     pub time: Win32Time,
     pub timers: Vec<Win32Timer>,
     pub was_signal_poll: bool,
@@ -328,6 +336,7 @@ impl Win32App {
             pending_events: PendingWindowState::default(),
             event_flow: EventFlow::Poll,
             all_windows: Vec::new(),
+            window_handles: Vec::new(),
             timers: Vec::new(),
             dpi_functions: DpiFunctions::new(),
             current_cursor: None,

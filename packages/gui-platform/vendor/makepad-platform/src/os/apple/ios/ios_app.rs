@@ -10,7 +10,7 @@ use {
                 ios_delegates::*,
                 ios_event::*,
             }
-        }, window::CxWindowPool
+        }, window::{CxWindowPool, WindowId}
     }, std::{
         cell::{Cell,RefCell},
         time::Instant,
@@ -27,6 +27,14 @@ pub fn with_ios_app<R>(f: impl FnOnce(&mut IosApp) -> R) -> R {
     IOS_APP.with_borrow_mut(|app| {
         f(app.as_mut().unwrap())
     })
+}
+
+/// The borrowed UIKit rendering view for iOS's single window, on the UI thread.
+pub fn webview_host(window: WindowId) -> ObjcId {
+    if window != CxWindowPool::id_zero() {
+        return nil;
+    }
+    IOS_APP.with_borrow(|app| app.as_ref().map_or(nil, |app| app.view))
 }
 
 pub fn init_ios_app_global(event_callback: Box<dyn FnMut(IosEvent) -> EventFlow>) {

@@ -879,3 +879,23 @@ backend's own modules are already selected by `target_arch = "wasm32"`.
 It now reports the page time elapsed since `init_cx_os` (`Cx::time_now`, the
 bridge's `Date.now()`), as the native backends do with their start `Instant`;
 the GUI's overlays time their transitions with it.
+
+## Native web view hosts
+
+The Apple app backends expose the borrowed Makepad rendering view for the
+requested WindowId on the UI thread. macOS tags its existing window list
+with WindowIds and removes entries at close; iOS exposes only its single
+window. An overlay can attach without guessing which window has focus.
+
+On macOS, AppKit alone receives key events while a WKWebView owns first
+responder and wheel events when the native hit test lands in a WKWebView.
+Makepad's raw key/menu and wheel paths otherwise remain in use, so form
+input and the form bridge's wheel messages are not delivered twice.
+
+## Native web view hosts (Windows)
+
+`win32_app::window_hwnd` looks up a top-level HWND by its full Makepad
+`WindowId` on the UI thread. `Win32Window` registers its handle at init and
+removes it before dispatching `WindowClosed`, so a native form can parent its
+clip window without guessing which Makepad window has focus or dereferencing
+window user data.

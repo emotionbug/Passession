@@ -12,15 +12,23 @@
 use makepad_widgets::{Cx, Rect, Vec4, WindowId};
 use serde_json::{Value, json};
 
+// One backend per platform; each implements `supported()` and `WebView` with `new`,
+// `place`, `run_script`, `blur` and `pump` as `linux.rs` does.
 #[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "linux")]
-use linux as backend;
-
-#[cfg(not(target_os = "linux"))]
-mod unsupported;
-#[cfg(not(target_os = "linux"))]
-use unsupported as backend;
+#[path = "linux.rs"]
+mod backend;
+#[cfg(target_arch = "wasm32")]
+#[path = "web.rs"]
+mod backend;
+#[cfg(windows)]
+#[path = "windows.rs"]
+mod backend;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "apple.rs"]
+mod backend;
+#[cfg(target_os = "android")]
+#[path = "android.rs"]
+mod backend;
 
 /// `bridge.js`: defines `window.paseoInit(doc, post, config)`.
 pub const BRIDGE: &str = include_str!("bridge.js");
@@ -174,13 +182,15 @@ impl WebView {
 }
 
 /// The page the engine loads: `html` with a CSP that blocks scripts and remote loads other
-/// than images, and the base style the theme variables drive.
+/// than images, form posts and `<base>` rewrites (`form-action` and `base-uri` do not fall
+/// back to `default-src`), and the base style the theme variables drive.
 pub fn wrap_html(html: &str, theme: &WebTheme) -> String {
     let background = css_color(theme.background);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
-         img-src data: http: https:; style-src 'unsafe-inline'; font-src data:\">\
+         img-src data: http: https:; style-src 'unsafe-inline'; font-src data:; \
+         form-action 'none'; base-uri 'none'\">\
          <meta name=\"viewport\" content=\"width=device-width\">\
          <style>{STYLE}html{{background:{background}}}</style></head><body>{html}</body></html>"
     )
@@ -323,6 +333,7 @@ mod tests {
         let csp = page.find("Content-Security-Policy").unwrap();
         assert!(csp < page.find("<form>").unwrap());
         assert!(page.contains("default-src 'none'"));
+        assert!(page.contains("form-action 'none'") && page.contains("base-uri 'none'"));
         assert!(!page.contains("script-src"), "no source may run scripts");
     }
 }

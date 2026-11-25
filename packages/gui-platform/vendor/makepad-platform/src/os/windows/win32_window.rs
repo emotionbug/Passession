@@ -465,7 +465,10 @@ impl Win32Window {
         unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *const _ as isize) };
 
         with_win32_app(|app| app.dpi_functions.enable_non_client_dpi_scaling(self.hwnd));
-        with_win32_app(|app| app.all_windows.push(self.hwnd));
+        with_win32_app(|app| {
+            app.all_windows.push(self.hwnd);
+            app.window_handles.push((self.window_id, self.hwnd));
+        });
 
         self.set_inner_size(size);
     }
@@ -688,6 +691,10 @@ impl Win32Window {
                 }
             },
             WM_DESTROY => { // window actively destroyed
+                with_win32_app(|app| {
+                    app.all_windows.retain(|&window| window != hwnd);
+                    app.window_handles.retain(|&(_, window)| window != hwnd);
+                });
                 window.do_callback(
                     Win32Event::WindowClosed(WindowClosedEvent {
                         window_id: window.window_id,

@@ -67,14 +67,33 @@ secret-service = "~5.1.0"
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "NSError", "NSGeometry", "NSObject", "NSString", "NSURL", "objc2-core-foundation",
+] }
+objc2-web-kit = { version = "0.3", default-features = false, features = [
+  "WKContentWorld", "WKFrameInfo", "WKNavigation", "WKNavigationAction",
+  "WKNavigationDelegate", "WKScriptMessage", "WKScriptMessageHandler", "WKUIDelegate",
+  "WKUserContentController", "WKUserScript", "WKWebViewConfiguration",
+  "WKWebpagePreferences", "WKWebsiteDataStore",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "NSColor", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSKeyValueCoding", "NSValue"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["WKWebView", "block2", "objc2-app-kit", "objc2-core-foundation"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["protected"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = [
+  "UIColor", "UIContextMenuConfiguration", "UIGestureRecognizer", "UIPanGestureRecognizer",
+  "UIPinchGestureRecognizer", "UIResponder", "UIScrollView", "UIView", "objc2-core-foundation",
+] }
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
 windows-collections = "0.2"
 # COM implementation macros expand absolute windows_core paths.

@@ -8,6 +8,7 @@ const STORAGE_PREFIX = "passession:";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 let instance = null;
+const canvas = document.querySelector("canvas.full_canvas");
 
 const memory = () => instance.exports.memory;
 const view = () => new DataView(memory().buffer);
@@ -117,6 +118,123 @@ function wasi() {
 
 const sockets = new Map();
 const fetches = new Map();
+const webViews = new Map();
+let webViewsAvailable;
+let initForm;
+
+function webViewsSupported() {
+    return webViewsAvailable ??= !!canvas && typeof ResizeObserver === "function"
+        && "sandbox" in HTMLIFrameElement.prototype && "srcdoc" in HTMLIFrameElement.prototype;
+}
+
+function blurWebView({frame}) {
+    if (document.activeElement !== frame) return;
+    const input = document.querySelector("textarea.cx_webgl_textinput");
+    if (!input) canvas.tabIndex = -1;
+    (input ?? canvas).focus({preventScroll: true});
+}
+
+function openWebView(id, page, html, bridge, config) {
+    if (!webViewsSupported()) return 0;
+    const clip = document.createElement("div");
+    const frame = document.createElement("iframe");
+    const view = {clip, frame, bridge: null};
+    try {
+        initForm ??= new Function("window", `${bridge}\nreturn window.paseoInit;`)({});
+        // Parse elsewhere, inertly. A form may not install a refresh, a nested browsing
+        // context or a base URL. Adopt the nodes after the trusted srcdoc's CSP is active;
+        // do not serialize them back into HTML and reparse them in the live document.
+        const template = document.createElement("template");
+        template.innerHTML = html;
+        for (const node of template.content.querySelectorAll(
+            "base, meta, link, iframe, frame, frameset, object, embed, portal, fencedframe",
+        )) node.remove();
+        for (const link of template.content.querySelectorAll("a, area")) {
+            link.removeAttribute("href");
+            link.removeAttribute("xlink:href");
+        }
+
+        // In particular, a run_script import must return before its post reenters WASM.
+        const send = (message, failed = 0) => queueMicrotask(() => {
+            if (webViews.get(id) !== view) return;
+            const data = encoder.encode(message);
+            instance.exports.paseo_webview_event(id, give(data), data.length, failed);
+        });
+        clip.style.cssText = "position:fixed;overflow:hidden;overflow:clip;visibility:hidden;z-index:1";
+        frame.style.cssText = "position:absolute;border:0;display:block;transform-origin:0 0;visibility:hidden";
+        frame.title = "Form";
+        frame.sandbox = "allow-same-origin";
+        frame.onload = () => {
+            try {
+                const doc = frame.contentDocument;
+                if (!doc || doc.URL !== "about:srcdoc" || view.bridge) {
+                    throw new Error("The form iframe left its initial document");
+                }
+                doc.addEventListener("contextmenu", (event) => event.preventDefault());
+                const guardLink = (event) => {
+                    if (event.target.closest?.("a, area")) event.preventDefault();
+                };
+                doc.addEventListener("auxclick", guardLink, true);
+                doc.addEventListener("dragstart", guardLink, true);
+                doc.addEventListener("click", (event) => {
+                    guardLink(event);
+                    // Without allow-forms the browser suppresses the submit event. A user's
+                    // activation of a submit button still goes through the bridge's validation.
+                    const button = event.target.closest?.("button, input");
+                    if (button?.form && button.form === doc.querySelector("form")
+                        && (button.type === "submit" || button.type === "image")) {
+                        event.preventDefault();
+                        view.bridge?.submit();
+                    }
+                }, true);
+                doc.body.replaceChildren(template.content);
+                view.bridge = initForm(doc, (message) => send(JSON.stringify(message)), config);
+                frame.style.removeProperty("visibility");
+            } catch (error) {
+                frame.style.visibility = "hidden";
+                send(String(error?.message ?? error), 1);
+            }
+        };
+        frame.srcdoc = page;
+        clip.append(frame);
+        document.body.append(clip);
+        webViews.set(id, view);
+        return 1;
+    } catch (error) {
+        clip.remove();
+        console.warn("Could not open form iframe", error);
+        return 0;
+    }
+}
+
+function placeWebView(id, x, y, width, height, clipX, clipY, clipWidth, clipHeight, dpi) {
+    const view = webViews.get(id);
+    if (!view) return;
+    const {clip, frame} = view;
+    if (!(clipWidth > 0 && clipHeight > 0)) {
+        blurWebView(view);
+        clip.style.visibility = "hidden";
+        return;
+    }
+    const bounds = canvas.getBoundingClientRect();
+    // Makepad measures the canvas in CSS px and sets its backing buffer to CSS px * DPR.
+    // Only a Makepad DPI override needs scaling; the iframe still lays out in logical px.
+    const scale = dpi / window.devicePixelRatio;
+    Object.assign(clip.style, {
+        left: `${bounds.left + clipX * scale}px`,
+        top: `${bounds.top + clipY * scale}px`,
+        width: `${clipWidth * scale}px`,
+        height: `${clipHeight * scale}px`,
+        visibility: "visible",
+    });
+    Object.assign(frame.style, {
+        left: `${(x - clipX) * scale}px`,
+        top: `${(y - clipY) * scale}px`,
+        width: `${width}px`,
+        height: `${height}px`,
+        transform: scale === 1 ? "" : `scale(${scale})`,
+    });
+}
 
 function socketEvent(id, kind, data = null, code = 0) {
     const ptr = data ? give(data) : 0;
@@ -174,6 +292,37 @@ const paseo = {
         const socket = sockets.get(id);
         sockets.delete(id);
         socket?.close(1000);
+    },
+    webview_supported: () => (webViewsSupported() ? 1 : 0),
+    webview_open(id, page, pageLen, html, htmlLen, bridge, bridgeLen, config, configLen) {
+        return openWebView(
+            id, text(page, pageLen), text(html, htmlLen), text(bridge, bridgeLen),
+            JSON.parse(text(config, configLen)),
+        );
+    },
+    webview_place: placeWebView,
+    webview_run_script(id, ptr, len) {
+        const view = webViews.get(id);
+        if (!view?.bridge) return;
+        try {
+            new Function("window", "document", text(ptr, len))(
+                {paseo: view.bridge}, view.frame.contentDocument,
+            );
+        } catch (error) {
+            console.warn("Could not run form bridge code", error);
+        }
+    },
+    webview_blur(id) {
+        const view = webViews.get(id);
+        if (view) blurWebView(view);
+    },
+    webview_close(id) {
+        const view = webViews.get(id);
+        if (!view) return;
+        webViews.delete(id);
+        blurWebView(view);
+        view.frame.onload = null;
+        view.clip.remove();
     },
     storage_get(ptr, len) {
         try {
@@ -322,4 +471,4 @@ attach(instance);
 instance._has_thread_support = false;
 instance._memory = instance.exports.memory;
 instance._module = module;
-new WasmWebGL(instance, {}, document.getElementsByClassName("full_canvas")[0]);
+new WasmWebGL(instance, {}, canvas);

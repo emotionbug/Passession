@@ -66,7 +66,7 @@ impl MacosWindow {
             let view: ObjcId = msg_send![get_macos_class_global().view, alloc];
             
             let () = msg_send![pool, drain];
-            with_macos_app(|app| app.cocoa_windows.push((window, view)));
+            with_macos_app(|app| app.cocoa_windows.push((window_id, window, view)));
             MacosWindow {
                 is_fullscreen: false,
                 is_fullscreen_transitioning: false,
@@ -465,6 +465,7 @@ impl MacosWindow {
     }
     
     pub fn send_window_closed_event(&mut self) {
+        with_macos_app(|app| app.cocoa_windows.retain(|entry| entry.0 != self.window_id));
         self.do_callback(MacosEvent::WindowClosed(WindowClosedEvent {
             window_id: self.window_id
         }))

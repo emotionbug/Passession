@@ -17,6 +17,7 @@ import dev.makepad.android.MakepadNative;
  */
 public class MainActivity extends MakepadActivity {
     private PaseoBridge bridge;
+    private final PaseoWebViews webViews = new PaseoWebViews(this);
     private OnBackInvokedCallback backCallback;
 
     @Override
@@ -74,6 +75,7 @@ public class MainActivity extends MakepadActivity {
         // The live activity finishing ends the native app (MakepadActivity), so
         // its tailnet node closes and the foreground service must go with it.
         if (isFinishing() && isLiveActivity()) PaseoTailnetService.close();
+        webViews.close();
         bridge.onDestroy();
         super.onDestroy();
     }
@@ -120,5 +122,30 @@ public class MainActivity extends MakepadActivity {
 
     public void paseoAudioCancel() {
         bridge.audio().cancel();
+    }
+
+    public boolean paseoWebViewSupported() {
+        return webViews.supported();
+    }
+
+    public void paseoWebViewCreate(long id, String html, String bootstrap, int background) {
+        webViews.create(id, html, bootstrap, background);
+    }
+
+    public void paseoWebViewPlace(long id, int x, int y, int width, int height,
+                                  int left, int top, int clipWidth, int clipHeight, double dpi) {
+        webViews.place(id, x, y, width, height, left, top, clipWidth, clipHeight, dpi);
+    }
+
+    public void paseoWebViewEvaluate(long id, String script) {
+        webViews.evaluate(id, script);
+    }
+
+    public void paseoWebViewBlur(long id) {
+        webViews.blur(id);
+    }
+
+    public void paseoWebViewDestroy(long id) {
+        webViews.destroy(id);
     }
 }
