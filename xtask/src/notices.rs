@@ -198,9 +198,12 @@ pub(crate) fn dependency_closure<'a>(metadata: &'a Value, root: &str) -> Result<
 /// exact published source through its `.cargo_vcs_info.json`. A crate published
 /// without VCS information is identified instead by `checksum`, the registry
 /// SHA-256 Cargo.lock records for the downloaded `.crate`, and its license URL
-/// must then be pinned by `upstreamRevision`. Supplements identify registry
-/// sources only: a vendored or patched path copy (`source` null) must carry its
-/// own license file, because its bytes no longer match the published revision.
+/// must then be pinned by `upstreamRevision`. A text taken from an immutable
+/// release archive (such as a vendored SDK's package) is cited as `archive#member`
+/// and pinned by the archive's `archiveSha256` instead of a revision. Supplements
+/// identify registry sources only: a vendored or patched path copy (`source` null)
+/// must carry its own license file, because its bytes no longer match the
+/// published revision.
 fn supplement_notices(
     pkg: &Value,
     directory: &Path,
@@ -248,8 +251,8 @@ fn supplement_notices(
             None => {
                 let expected = string(entry, "checksum")?;
                 ensure!(
-                    entry.get("upstreamRevision").is_some(),
-                    "Checksum-bound supplement needs upstreamRevision: {}@{}",
+                    entry.get("upstreamRevision").is_some() || entry.get("archiveSha256").is_some(),
+                    "Checksum-bound supplement needs upstreamRevision or archiveSha256: {}@{}",
                     pkg["name"],
                     pkg["version"]
                 );
@@ -262,16 +265,18 @@ fn supplement_notices(
             pkg["name"],
             pkg["version"]
         );
-        let pin = match entry.get("upstreamRevision") {
-            Some(_) => string(entry, "upstreamRevision")?,
-            None => string(entry, "revision")?,
-        };
-        ensure!(
-            is_sha(pin, 40)
+        let url_pinned = if let Some(archive) = entry.get("archiveSha256") {
+            archive.as_str().is_some_and(|archive| is_sha(archive, 64))
                 && url.starts_with("https://")
-                && url.split('/').any(|part| part == pin),
-            "Supplement URL is not revision-pinned: {url}"
-        );
+                && url.contains('#')
+        } else {
+            let pin = match entry.get("upstreamRevision") {
+                Some(_) => string(entry, "upstreamRevision")?,
+                None => string(entry, "revision")?,
+            };
+            is_sha(pin, 40) && url.starts_with("https://") && url.split('/').any(|part| part == pin)
+        };
+        ensure!(url_pinned, "Supplement URL is not revision-pinned: {url}");
         notices.push(Notice {
             source: url.to_owned(),
             text: value.to_owned(),
@@ -1433,6 +1438,22 @@ mod tests {
                 .len(),
             1
         );
+        // A text from a vendored SDK's release archive is pinned by the archive digest.
+        let mut archived = supplement.clone();
+        archived["url"] = json!("https://example.com/sdk-1.0.nupkg#LICENSE.txt");
+        assert!(supplement_notices(&pkg, dir.path(), &[archived.clone()], None).is_err());
+        archived["archiveSha256"] = json!("a".repeat(64));
+        assert_eq!(
+            supplement_notices(&pkg, dir.path(), &[archived.clone()], None)
+                .unwrap()
+                .len(),
+            1
+        );
+        archived["url"] = json!("https://example.com/sdk-1.0.nupkg");
+        assert!(supplement_notices(&pkg, dir.path(), &[archived.clone()], None).is_err());
+        archived["url"] = json!("https://example.com/sdk-1.0.nupkg#LICENSE.txt");
+        archived["archiveSha256"] = json!("not a digest");
+        assert!(supplement_notices(&pkg, dir.path(), &[archived], None).is_err());
         // Without VCS information the registry checksum binds the published
         // bytes; the upstream revision still pins the license URL.
         let checksum = "c".repeat(64);
