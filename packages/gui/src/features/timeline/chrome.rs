@@ -546,6 +546,7 @@ pub fn empty_state(cx: &mut Cx2d, d: &mut Draw, x: f64, bottom: f64, w: f64) {
 
 /// scrollToBottomButton: a 48px surface2 circle with a 24px ChevronDown. With
 /// pending permissions it becomes a pill naming them ("Approval pending ↓").
+/// Returns the button's rect.
 pub fn jump_button(
     cx: &mut Cx2d,
     d: &mut Draw,
@@ -553,7 +554,7 @@ pub fn jump_button(
     bottom: f64,
     max_w: f64,
     approval_pending: bool,
-) {
+) -> Rect {
     let p = d.look.palette;
     let shadow = if d.look.dark() {
         rgba(0x40000000)
@@ -585,13 +586,14 @@ pub fn jump_button(
             Some((w - 40.0).max(1.0)),
         );
         d.canvas.add_hit(r, HitTarget::Chrome("jump-latest".into()));
-        return;
+        return r;
     }
     let r = rect_xywh(center_x - 24.0, bottom - 48.0, 48.0, 48.0);
     d.kit.rect(cx, r.translate(dvec2(0.0, 2.0)), shadow, 24.0);
     d.kit.rect(cx, r, p.surface2, 24.0);
     d.kit.icon(cx, "chevron-down", r, 24.0, p.foreground);
     d.canvas.add_hit(r, HitTarget::Chrome("jump-latest".into()));
+    r
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- An OMP `ask` form no longer covers the controls drawn over the conversation: the subagent and task bar at the bottom, the "jump to latest" button, the find bar and notices. The form now stops short of them as you scroll. Scrolling over a form also brings up the "jump to latest" button, which it did not before.
+
 ## 0.13.52 - 2026-11-26
 
 ### Fixed

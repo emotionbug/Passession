@@ -63,6 +63,10 @@ pub struct RowContext {
     pub footer: LiveFooter,
     pub can_fork_cursor: bool,
     pub epoch: Option<String>,
+    /// The part of the stream (window logical px) the panel's own controls leave clear this
+    /// frame: native views such as an `ask` form's web view stay inside it. Set after the
+    /// panel draws its chrome, which follows the rows.
+    pub native_bounds: std::cell::Cell<Option<Rect>>,
 }
 
 impl RowContext {
@@ -116,6 +120,8 @@ impl<'a> From<&'a RowContext> for ContextInputs<'a> {
             footer,
             can_fork_cursor,
             epoch,
+            // Native views only; never affects what a row paints.
+            native_bounds: _,
         } = ctx;
         Self {
             host_id,

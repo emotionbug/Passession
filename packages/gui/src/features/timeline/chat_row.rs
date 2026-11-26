@@ -455,9 +455,15 @@ impl ChatRow {
     }
 
     /// Runs the web view and applies what the page reported. A row whose paint left the
-    /// window (scrolled out, another page shown) hides the view and stops pumping it.
+    /// window (scrolled out, another page shown) hides the view and stops pumping it. A
+    /// shown view keeps clear of the panel's controls over the stream: the bounds the
+    /// panel publishes after drawing them, which follows this row's placement.
     fn pump_form(&mut self, cx: &mut Cx) {
         let attached = self.area.is_attached(cx);
+        let bounds = self
+            .model
+            .as_ref()
+            .and_then(|model| model.ctx.native_bounds.get());
         let Some(form) = self.form.as_mut() else {
             return;
         };
@@ -467,9 +473,12 @@ impl ChatRow {
             if form.expiry.is_empty() {
                 form.expiry = cx.start_timeout(HIDDEN_FORM_LIFETIME);
             }
-        } else if let Some(visible) = form.view.visible_rect() {
-            let obscured = crate::common::overlay::floats_over(cx, self.area, visible);
-            form.view.set_obscured(cx, obscured);
+        } else {
+            form.view.set_bounds(cx, bounds);
+            if let Some(visible) = form.view.visible_rect() {
+                let obscured = crate::common::overlay::floats_over(cx, self.area, visible);
+                form.view.set_obscured(cx, obscured);
+            }
         }
         let events = form.view.pump(cx);
         let Some(model) = self.model.clone() else {

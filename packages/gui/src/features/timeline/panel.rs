@@ -584,6 +584,9 @@ struct ChromeLayer {
     canvas: Canvas,
     area: Area,
     visited: bool,
+    /// How far the surface reaches into the stream from the edge it rests on, as last
+    /// painted: a layer that needs no repaint keeps showing that paint.
+    reach: f64,
 }
 
 impl ChromeLayer {
@@ -593,6 +596,7 @@ impl ChromeLayer {
             canvas: Canvas::default(),
             area: Area::Empty,
             visited: false,
+            reach: 0.0,
         }
     }
 
@@ -632,6 +636,7 @@ impl ChromeLayer {
         if !std::mem::take(&mut self.visited) {
             self.list.release(cx);
             self.canvas.hits.clear();
+            self.reach = 0.0;
         }
     }
 }
@@ -1981,6 +1986,7 @@ impl ChatPanel {
             },
             can_fork_cursor: self.feature("agentForkContextCursor"),
             epoch: snap.as_ref().and_then(|s| s.epoch.clone()),
+            native_bounds: std::cell::Cell::new(None),
         })
     }
 
@@ -3564,6 +3570,8 @@ impl ChatPanel {
                         self.reader_scrolled = true;
                         self.at_bottom = false;
                         self.detach();
+                        // The jump button follows the laid-out position, like a list scroll.
+                        self.redraw_chrome_part(cx, JUMP);
                     }
                     self.list.as_portal_list().scroll_selection(cx, delta);
                 }
@@ -3574,6 +3582,7 @@ impl ChatPanel {
                     self.at_bottom = false;
                     self.detach();
                     self.list.as_portal_list().scroll_selection(cx, delta);
+                    self.redraw_chrome_part(cx, JUMP);
                 }
             }
             RowEventKind::RevealTop => {
@@ -4816,6 +4825,14 @@ impl Widget for ChatPanel {
         } else {
             self.rail.hide(cx);
         }
+        // A native view (an `ask` form's web view) paints over everything the app draws,
+        // so it stays inside the stream band this chrome leaves clear. Each layer's last
+        // paint stays on screen until it repaints, so its recorded reach counts.
+        let chrome_gap = tracks::pill_clearance(compact);
+        let stream_top = stream_rect.pos.y;
+        let stream_bottom = stream_top + stream_rect.size.y;
+        let mut clear_top = stream_top;
+        let mut clear_bottom = stream_bottom;
         if tracks_visible {
             let model = TrackModel {
                 tasks: &tasks,
@@ -4829,19 +4846,23 @@ impl Widget for ChatPanel {
                 providers: &self.providers,
                 host_label: &host_label_fn,
             };
-            chrome_part!(TRACKS, stream_rect, |cx, d| {
+            if let Some(top) = chrome_part!(TRACKS, stream_rect, |cx, d| {
                 tracks::draw_bar(
                     cx,
                     d,
                     &model,
                     open_track,
                     stream_rect.pos.x,
-                    stream_rect.pos.y + stream_rect.size.y,
+                    stream_bottom,
                     stream_rect.size.x,
                     track_height,
                     &mut self.track_anchors,
-                );
-            });
+                )
+            }) {
+                self.chrome_layers[TRACKS].reach = stream_bottom - top;
+            }
+            clear_bottom =
+                clear_bottom.min(stream_bottom - self.chrome_layers[TRACKS].reach - chrome_gap);
         } else {
             self.track_anchors = [Area::Empty; 2];
         }
@@ -4851,8 +4872,8 @@ impl Widget for ChatPanel {
             } else {
                 0.0
             };
-            let bottom = stream_rect.pos.y + stream_rect.size.y - clearance.max(16.0);
-            chrome_part!(JUMP, stream_rect, |cx, d| {
+            let bottom = stream_bottom - clearance.max(16.0);
+            if let Some(button) = chrome_part!(JUMP, stream_rect, |cx, d| {
                 chrome::jump_button(
                     cx,
                     d,
@@ -4860,8 +4881,12 @@ impl Widget for ChatPanel {
                     bottom,
                     stream_rect.size.x - 32.0,
                     approval_pending,
-                );
-            });
+                )
+            }) {
+                self.chrome_layers[JUMP].reach = stream_bottom - button.pos.y;
+            }
+            clear_bottom =
+                clear_bottom.min(stream_bottom - self.chrome_layers[JUMP].reach - chrome_gap);
         }
         if find_open {
             if let Some((field, card_h)) = chrome_part!(FIND, stream_rect, |cx, d| {
@@ -4876,7 +4901,10 @@ impl Widget for ChatPanel {
             }) {
                 self.find_field_rect = Some(field);
                 self.find_card_h = card_h;
+                // The card rests 8px below the stream top, as find scrolling assumes.
+                self.chrome_layers[FIND].reach = 8.0 + card_h;
             }
+            clear_top = clear_top.max(stream_top + self.chrome_layers[FIND].reach + chrome_gap);
         } else {
             self.find_field_rect = None;
         }
@@ -4916,9 +4944,12 @@ impl Widget for ChatPanel {
             chrome_part!(HISTORY, rect, |cx, d| chrome::history_overlay(cx, d, rect));
         }
         if let Some(toast) = &toast {
-            chrome_part!(TOAST, rect, |cx, d| {
-                chrome::toast(cx, d, toast, rect);
-            });
+            if let Some(card) =
+                chrome_part!(TOAST, rect, |cx, d| chrome::toast(cx, d, toast, rect))
+            {
+                self.chrome_layers[TOAST].reach = card.pos.y + card.size.y - stream_top;
+            }
+            clear_top = clear_top.max(stream_top + self.chrome_layers[TOAST].reach + chrome_gap);
         }
         if self.archiving {
             chrome_part!(ARCHIVING, rect, |cx, d| chrome::archiving_overlay(
@@ -4929,6 +4960,14 @@ impl Widget for ChatPanel {
             self.cover_list.end(cx);
         }
         self.finish_chrome(cx);
+        if let Some(ctx) = &self.ctx {
+            ctx.native_bounds.set(Some(rect_xywh(
+                stream_rect.pos.x,
+                clear_top,
+                stream_rect.size.x,
+                (clear_bottom - clear_top).max(0.0),
+            )));
+        }
         let find_field_rect = self.find_field_rect;
 
         // ── the find field ──────────────────────────────────────────────

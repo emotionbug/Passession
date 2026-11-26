@@ -391,6 +391,7 @@ fn pill(
 }
 
 /// The track bar resting `pill_clearance` above `bottom`; records the drawn triggers.
+/// Returns the bar's top edge.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_bar(
     cx: &mut Cx2d,
@@ -402,7 +403,7 @@ pub fn draw_bar(
     w: f64,
     height: f64,
     anchors: &mut [Area; 2],
-) {
+) -> f64 {
     let outer = (w - 32.0).min(d.look.typo.content_max_width);
     let bx = x + (w - outer) * 0.5;
     let y = bottom - pill_clearance(d.look.compact) - height;
@@ -463,6 +464,7 @@ pub fn draw_bar(
     } else {
         anchors[TrackPanel::Subagents as usize] = Area::Empty;
     }
+    y
 }
 
 /// Panel rows (ComposerTrackRow): returns the content height.

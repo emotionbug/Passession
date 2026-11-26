@@ -82,6 +82,8 @@ pub struct WebView {
     placed: Option<(Rect, Option<Rect>, f64)>,
     /// The caller reports something the app draws over the view ([`WebView::set_obscured`]).
     obscured: bool,
+    /// The part of the window the view may cover ([`WebView::set_bounds`]).
+    bounds: Option<Rect>,
     /// Whether the last placement was applied hidden (window covered or view obscured).
     hidden: bool,
 }
@@ -124,6 +126,7 @@ impl WebView {
             window,
             placed: None,
             obscured: false,
+            bounds: None,
             hidden: false,
         })
     }
@@ -135,11 +138,15 @@ impl WebView {
         self.apply(cx);
     }
 
-    /// The part of the view on screen: its frame within the clip of the last placement.
+    /// The part of the view on screen: its frame within the clip of the last placement and
+    /// the bounds the caller set.
     pub fn visible_rect(&self) -> Option<Rect> {
         let (frame, clip, _) = self.placed?;
-        clip.map(|clip| intersect(frame, clip))
-            .filter(|visible| visible.size.x >= 1.0 && visible.size.y >= 1.0)
+        let mut visible = intersect(frame, clip?);
+        if let Some(bounds) = self.bounds {
+            visible = intersect(visible, bounds);
+        }
+        Some(visible).filter(|visible| visible.size.x >= 1.0 && visible.size.y >= 1.0)
     }
 
     /// Hides the view while the app draws a popover, menu or similar surface over it, and
@@ -147,6 +154,16 @@ impl WebView {
     pub fn set_obscured(&mut self, cx: &mut Cx, obscured: bool) {
         if self.obscured != obscured {
             self.obscured = obscured;
+            self.apply(cx);
+        }
+    }
+
+    /// Keeps the view inside `bounds` (window logical px) besides its placement clip: the app
+    /// draws its own controls over the rest of that content (a bar along the bottom of a
+    /// scrolling list), which a native view would otherwise paint over. `None` lifts the limit.
+    pub fn set_bounds(&mut self, cx: &mut Cx, bounds: Option<Rect>) {
+        if self.bounds != bounds {
+            self.bounds = bounds;
             self.apply(cx);
         }
     }
