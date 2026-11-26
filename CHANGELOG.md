@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.51 - 2026-11-26
+
 ### Added
 
 - Web UI: open the daemon's address (for example `http://my-computer:6767/`) in a browser and use Passession there, with the same chat, terminals, files and settings as the app. It is off by default; turn it on in Settings → the host's Overview → **Enable web UI**, which takes effect without restarting the daemon. With a daemon password the sidebar shows "Password required"; enter it under "Authentication / connection", and the browser remembers it. Use HTTPS or a trusted network, because plain HTTP does not protect the password. Images and files attach through the browser's file picker, and exports download through the browser. Things that need the local machine (dropping files from disk, managing a local daemon, app updates, notifications, embedded Tailscale) stay in the app. The first visit downloads about 32 MB, the app and its fonts; later visits use the browser's cache until the daemon is updated. The daemon in the desktop app and the standalone daemon packages include it, which makes them about 32 MB larger to download; the Docker image does not.

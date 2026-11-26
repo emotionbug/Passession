@@ -1,0 +1,8 @@
+New
+- Web UI: open your computer's daemon address in a browser and use Passession there. Turn it on in the host's settings.
+- OMP ask forms show as the agent wrote them, with tables, images and the form's own fields.
+
+Fixed
+- A message sent while OMP is replying waits at the bottom instead of splitting the reply.
+
+Full notes: https://github.com/emotionbug/Passession/releases/tag/v0.13.51
