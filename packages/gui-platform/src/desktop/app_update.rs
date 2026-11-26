@@ -639,13 +639,36 @@ async fn read_json_file(path: &Path, meta: std::fs::Metadata) -> Result<Value, P
     let bytes = tokio::fs::read(path).await?;
     super::component_store::strict_json(&bytes).map_err(PlatformError::from)
 }
+/// Creates a new updater file with its final access policy before writing bytes.
+pub(super) async fn create_private_file(
+    path: &Path,
+    executable: bool,
+) -> std::io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(if executable { 0o700 } else { 0o600 })
+            .open(path)
+            .await
+    }
+    #[cfg(windows)]
+    {
+        let _ = executable;
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || {
+            paseo_client::windows_security::create_private_file(&path)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(tokio::fs::File::from_std(file))
+    }
+}
+
 pub(super) async fn atomic_json(path: &Path, value: &Value) -> Result<(), PlatformError> {
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&temporary).await?;
+    let mut file = create_private_file(&temporary, false).await?;
     file.write_all(&serde_json::to_vec(value).map_err(|e| error(e.to_string()))?)
         .await?;
     file.sync_all().await?;
@@ -930,6 +953,56 @@ mod tests {
         {
             use std::os::unix::fs::MetadataExt;
             assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o077, 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_update_journals_are_private_across_handoff() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = component_store::canonical_path(temporary.path()).unwrap();
+        let base = support.join("desktop-app-update");
+        let installation = base.join("this-installation");
+        let id = "0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11";
+        let directory = installation.join(id);
+        for path in [&base, &installation, &directory] {
+            private_dir(path).await.unwrap();
+            component_store::private(path).unwrap();
+        }
+
+        let operation = directory.join("operation.json");
+        let handoff = directory.join("handoff.json");
+        let preparation = json!({"operationId":id,"helperStarted":false});
+        atomic_json(&operation, &preparation).await.unwrap();
+        assert_eq!(read_json(&operation).await.unwrap(), preparation);
+        let read_private = |path: &Path| component_store::read_json::<Value>(path, true).unwrap();
+        assert_eq!(read_private(&operation), preparation);
+        for (name, value) in [
+            (
+                "probe-tailnet.json",
+                json!({"component":{"id":"tailnet"},"root":directory.join("validate-digest")}),
+            ),
+            (
+                "request.json",
+                json!({"schemaVersion":2,"operationId":id,"restartGroup":"gui"}),
+            ),
+        ] {
+            let path = directory.join(name);
+            atomic_json(&path, &value).await.unwrap();
+            assert_eq!(read_private(&path), value, "{name}");
+        }
+        assert!(!handoff.exists());
+
+        let started = json!({"operationId":id,"helperStarted":true});
+        atomic_json(&operation, &started).await.unwrap();
+        assert_eq!(read_private(&operation), started);
+        let authorized = json!({"schemaVersion":2,"operationId":id,"nonce":"fixture"});
+        atomic_json(&handoff, &authorized).await.unwrap();
+        assert_eq!(read_private(&handoff), authorized);
+        for name in ["health.json", "rollback-health.json", "stopped.json"] {
+            let path = directory.join(name);
+            atomic_json(&path, &authorized).await.unwrap();
+            assert_eq!(read_private(&path), authorized, "{name}");
         }
     }
 

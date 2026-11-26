@@ -52,7 +52,7 @@ func atomicJSON(path string, value any) error {
 	if len(b) > maxJSON {
 		return errors.New("JSON exceeds size limit")
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".write-")
+	f, err := createOwnedTemp(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
@@ -151,7 +151,7 @@ func copyFile(source, destination string, mode os.FileMode) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	out, err := createOwnedFile(destination, os.O_WRONLY, mode)
 	if err != nil {
 		return err
 	}

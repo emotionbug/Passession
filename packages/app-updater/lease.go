@@ -25,7 +25,7 @@ func acquireInstallationLease(root string) (*os.File, error) {
 		return nil, err
 	}
 	directory := filepath.Join(cache, "passession-update-locks")
-	if err = os.Mkdir(directory, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err = mkdirOwned(directory); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
 	if err = privatePath(directory, true); err != nil {

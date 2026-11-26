@@ -179,14 +179,13 @@ func privatePath(path string, directory bool) error {
 	return checkSecurity(path, true)
 }
 func acquireLease(path string) (*os.File, error) {
-	if _, err := os.Lstat(path); err == nil {
+	f, err := createOwnedFile(path, os.O_RDWR, 0600)
+	if errors.Is(err, os.ErrExist) {
 		if err = regular(path); err != nil {
 			return nil, err
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		f, err = os.OpenFile(path, os.O_RDWR|syscall.FILE_FLAG_OPEN_REPARSE_POINT, 0600)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
 	}

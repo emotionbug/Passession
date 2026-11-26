@@ -48,6 +48,13 @@ func privatePath(path string, directory bool) error {
 	}
 	return nil
 }
+func createOwnedFile(path string, access int, mode os.FileMode) (*os.File, error) {
+	return os.OpenFile(path, access|os.O_CREATE|os.O_EXCL, mode)
+}
+func createOwnedTemp(directory string) (*os.File, error) { return os.CreateTemp(directory, ".write-") }
+func mkdirOwned(path string) error                       { return os.Mkdir(path, 0700) }
+func mkdirAllOwned(path string) error                    { return os.MkdirAll(path, 0700) }
+
 func acquireLease(path string) (*os.File, error) {
 	if _, err := os.Lstat(path); err == nil {
 		if err = privatePath(path, false); err != nil {

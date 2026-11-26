@@ -359,7 +359,7 @@ func sealComponentTree(root string) error {
 	return nil
 }
 func extractComponent(archive, format, root string) error {
-	if err := os.Mkdir(root, 0700); err != nil {
+	if err := mkdirOwned(root); err != nil {
 		return err
 	}
 	seen := make(map[string]bool)
@@ -376,13 +376,16 @@ func extractComponent(archive, format, root string) error {
 			return errors.New("component expansion exceeds limit")
 		}
 		p := filepath.Join(root, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		if err := mkdirAllOwned(filepath.Dir(p)); err != nil {
 			return err
 		}
 		if err := cleanPath(filepath.Dir(p)); err != nil {
 			return err
 		}
 		if mode&os.ModeSymlink != 0 {
+			if runtime.GOOS == "windows" {
+				return errors.New("Windows component symlinks are not supported")
+			}
 			if len(link) == 0 || len(link) > 4096 || filepath.IsAbs(link) || strings.ContainsAny(link, "\\:\x00\r\n") || !within(root, filepath.Clean(filepath.Join(filepath.Dir(p), filepath.FromSlash(link)))) {
 				return errors.New("unsafe component archive link")
 			}
@@ -390,7 +393,7 @@ func extractComponent(archive, format, root string) error {
 			return nil
 		}
 		if mode.IsDir() {
-			return os.MkdirAll(p, 0700)
+			return mkdirAllOwned(p)
 		}
 		if !mode.IsRegular() {
 			return errors.New("special file in component archive")
@@ -399,7 +402,7 @@ func extractComponent(archive, format, root string) error {
 		if mode.Perm()&0111 != 0 {
 			perm = 0700
 		}
-		out, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+		out, err := createOwnedFile(p, os.O_WRONLY, perm)
 		if err != nil {
 			return err
 		}
@@ -494,7 +497,7 @@ func (o *componentOperation) stageObjects() error {
 	r := o.request
 	for _, name := range []string{"objects", "archives", "receipts"} {
 		p := filepath.Join(r.StoreDirectory, name)
-		if err := os.Mkdir(p, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+		if err := mkdirOwned(p); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}
 		if err := privatePath(p, true); err != nil {

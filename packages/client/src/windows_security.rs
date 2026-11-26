@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     ffi::c_void,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
     mem::size_of,
     os::windows::{
         ffi::OsStrExt,
@@ -25,7 +25,8 @@ use windows_sys::Win32::{
     Foundation::{
         CERT_E_CHAINING, CERT_E_EXPIRED, CERT_E_REVOKED, CERT_E_UNTRUSTEDROOT,
         CERT_E_UNTRUSTEDTESTROOT, CRYPT_E_FILE_ERROR, CRYPT_E_REVOKED, CRYPT_E_SECURITY_SETTINGS,
-        ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE, LocalFree,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, ERROR_SUCCESS, GENERIC_WRITE, GetLastError,
+        HANDLE, INVALID_HANDLE_VALUE, LocalFree,
         TRUST_E_BAD_DIGEST, TRUST_E_CERT_SIGNATURE, TRUST_E_EXPLICIT_DISTRUST,
         TRUST_E_MALFORMED_SIGNATURE, TRUST_E_NO_SIGNER_CERT, TRUST_E_NOSIGNATURE,
         TRUST_E_SUBJECT_FORM_UNKNOWN, TRUST_E_SUBJECT_NOT_TRUSTED, TRUST_E_TIME_STAMP,
@@ -56,7 +57,10 @@ use windows_sys::Win32::{
             WTHelperProvDataFromStateData, WinVerifyTrust,
         },
     },
-    Storage::FileSystem::{FILE_ALL_ACCESS, FILE_SHARE_READ},
+    Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    },
     System::{
         SystemServices::SECURITY_DESCRIPTOR_REVISION,
         Threading::{GetCurrentProcess, OpenProcessToken},
@@ -228,15 +232,14 @@ fn with_current_user_acl<T>(
     apply(&user, acl)
 }
 
-pub(crate) fn create_private_named_pipe(
-    options: &tokio::net::windows::named_pipe::ServerOptions,
-    name: &str,
-) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+fn with_private_security_attributes<T>(
+    create: impl FnOnce(&mut SECURITY_ATTRIBUTES) -> io::Result<T>,
+) -> io::Result<T> {
     with_current_user_acl(0, |user, acl| {
         let mut descriptor = SECURITY_DESCRIPTOR::default();
         let descriptor = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast::<c_void>();
         // SAFETY: the descriptor is initialized before use and borrows the
-        // current-user SID and DACL only until the kernel creates the pipe.
+        // current-user SID and DACL only during the creation call.
         unsafe {
             if InitializeSecurityDescriptor(descriptor, SECURITY_DESCRIPTOR_REVISION) == 0
                 || SetSecurityDescriptorOwner(descriptor, user.as_psid(), 0) == 0
@@ -246,17 +249,50 @@ pub(crate) fn create_private_named_pipe(
             {
                 return Err(std::io::Error::last_os_error().into());
             }
-            let mut attributes = SECURITY_ATTRIBUTES {
+            Ok(create(&mut SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: descriptor,
                 bInheritHandle: 0,
-            };
-            Ok(options.create_with_security_attributes_raw(
-                name,
-                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast(),
-            )?)
+            }))
         }
     })
+    .map_err(io::Error::other)?
+}
+
+/// Exclusively creates a writable file with the token user as owner and only
+/// that user on its protected DACL. An elevated token's default owner can be
+/// Administrators even when its parent directory is private to the user.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let name = wide(path).map_err(io::Error::other)?;
+    with_private_security_attributes(|attributes| {
+        // SAFETY: name and the security descriptor live through CreateFileW.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a new, owned file handle.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    })
+}
+
+pub(crate) fn create_private_named_pipe(
+    options: &tokio::net::windows::named_pipe::ServerOptions,
+    name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    Ok(with_private_security_attributes(|attributes| {
+        // SAFETY: the security attributes are valid for the duration of this call.
+        unsafe { options.create_with_security_attributes_raw(name, ptr::from_mut(attributes).cast()) }
+    })?)
 }
 
 pub(crate) fn verify_private_named_pipe(
@@ -1018,6 +1054,18 @@ mod tests {
         };
         assert_eq!(status, ERROR_SUCCESS);
         assert!(verify_private_directory(&path, AllowedDirectoryUsers::CurrentUserAndSystem).is_err());
+    }
+
+    #[test]
+    fn private_file_is_user_owned_and_never_reopens_an_existing_file() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory.json");
+        create_private_file(&path).unwrap().write_all(b"original").unwrap();
+        verify_private_directory(&path, AllowedDirectoryUsers::CurrentUser).unwrap();
+        assert_eq!(create_private_file(&path).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
     }
 
     #[test]

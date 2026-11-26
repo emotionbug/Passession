@@ -884,11 +884,7 @@ impl Updater {
     }
     async fn download(&self, url: &str, path: &Path, size: u64) -> Result<(), PlatformError> {
         use futures_util::StreamExt as _;
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut sink = options.open(path).await?;
+        let mut sink = app_update::create_private_file(path, false).await?;
         let mut stream = self.request(url, None).await?.0.bytes_stream();
         let mut received = 0u64;
         while let Some(chunk) = tokio::time::timeout(Duration::from_secs(120), stream.next())
@@ -1074,11 +1070,7 @@ enum VersionPart {
     Text(String),
 }
 async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).await?;
+    let mut file = app_update::create_private_file(path, false).await?;
     file.write_all(bytes).await?;
     file.sync_all().await?;
     Ok(())
@@ -1215,13 +1207,7 @@ pub(super) async fn copy_private(
     executable: bool,
 ) -> Result<(), PlatformError> {
     let mut input = tokio::fs::File::open(source).await?;
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(if executable { 0o700 } else { 0o600 });
-    #[cfg(windows)]
-    let _ = executable;
-    let mut output = options.open(destination).await?;
+    let mut output = app_update::create_private_file(destination, executable).await?;
     tokio::io::copy(&mut input, &mut output).await?;
     output.sync_all().await?;
     Ok(())
@@ -1458,6 +1444,50 @@ mod tests {
             .iter()
             .filter(|path| path.starts_with("/repos/"))
             .count()
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_update_staging_creates_private_files_without_clobbering() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = component_store::canonical_path(temporary.path()).unwrap();
+        let directory = root.join("operation");
+        app_update::private_dir(&directory).await.unwrap();
+
+        let manifest = inventory("2.0.0", "stable", true);
+        let metadata = directory.join("inventory.json");
+        write_private(&metadata, &serde_json::to_vec(&manifest).unwrap())
+            .await
+            .unwrap();
+        assert!(write_private(&metadata, b"{}").await.is_err());
+        assert_eq!(
+            component_store::read_json::<Value>(&metadata, true).unwrap(),
+            manifest
+        );
+
+        let site = TestSite::start().await;
+        let updater = site.updater(&root);
+        let published = format!("/{REPOSITORY}/releases/download/v2.0.0/passession.zip");
+        let url = format!("https://github.com{published}");
+        let bytes = b"component archive fixture";
+        site.reply(&published, "200 OK", String::new(), bytes.to_vec());
+        let archive = directory.join(format!("{:x}.zip", Sha256::digest(bytes)));
+        updater
+            .download(&url, &archive, bytes.len() as u64)
+            .await
+            .unwrap();
+        assert!(updater.download(&url, &archive, 0).await.is_err());
+        assert_eq!(site.take_requests(), vec![published]);
+        component_store::private(&archive).unwrap();
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+
+        let source = root.join("installed-helper.exe");
+        std::fs::write(&source, b"installed helper fixture").unwrap();
+        let helper = directory.join("passession-update-helper.exe");
+        copy_private(&source, &helper, true).await.unwrap();
+        assert!(copy_private(&archive, &helper, true).await.is_err());
+        component_store::private(&helper).unwrap();
+        assert_eq!(std::fs::read(helper).unwrap(), b"installed helper fixture");
     }
 
     #[tokio::test]

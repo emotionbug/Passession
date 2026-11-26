@@ -949,6 +949,9 @@ pub(super) fn extract(archive: &Path, format: &str, destination: &Path) -> Resul
         }
         _ => bail!("Unsupported component archive format"),
     }
+    #[cfg(windows)]
+    ensure!(links.is_empty(), "Windows component symlinks are not supported");
+    #[cfg(unix)]
     for (path, target) in &links {
         ensure!(
             target.is_relative() && !target.to_string_lossy().contains('\\'),
@@ -972,11 +975,9 @@ pub(super) fn extract(archive: &Path, format: &str, destination: &Path) -> Resul
             }
         }
         std::fs::create_dir_all(path.parent().context("Missing link parent")?)?;
-        #[cfg(unix)]
         std::os::unix::fs::symlink(target, path)?;
-        #[cfg(windows)]
-        bail!("Windows component symlinks are not supported");
     }
+    #[cfg(unix)]
     for (path, _) in links {
         ensure!(
             canonical_path(&path)?.starts_with(destination),
@@ -1026,6 +1027,29 @@ mod tests {
         assert!(extract(&archive, "tar.gz", &output).is_err());
         assert_eq!(std::fs::read(output.join("image")).unwrap(), b"old");
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_archive_rejects_even_internal_links() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("component.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&archive).unwrap());
+        zip.start_file("image", SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"component").unwrap();
+        zip.add_symlink("alias", "image", SimpleFileOptions::default()).unwrap();
+        zip.finish().unwrap();
+
+        let output = temp.path().join("unpacked");
+        assert!(extract(&archive, "zip", &output).is_err());
+        assert_eq!(std::fs::read(output.join("image")).unwrap(), b"component");
+        assert_eq!(
+            std::fs::symlink_metadata(output.join("alias")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
     #[test]
     fn json_limit_and_symlink_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
