@@ -188,11 +188,14 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: native-web-bundle
-          # The bundle and its provenance live under the hidden `.dev` directory.
+          # The bundle and its provenance live under the hidden `.dev` directory. The
+          # downloaded `.dev/build` must carry xtask's ownership marker: `components build`
+          # refuses to adopt an existing unmarked build directory.
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
           path: |
+            .dev/build/.paseo-managed
             .dev/build/web
             .dev/build/web-build.json
 
