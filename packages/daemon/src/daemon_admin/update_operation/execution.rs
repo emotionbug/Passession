@@ -7,6 +7,28 @@ use tokio_util::sync::CancellationToken;
 
 const STOP_DEADLINE: Duration = Duration::from_secs(20);
 const READY_DEADLINE: Duration = Duration::from_secs(90);
+/// How long an executor or admission waits for the installation lease that a
+/// starting daemon's store cleanup may briefly hold.
+pub(super) const LEASE_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a starting daemon waits for a running update to release the store.
+const STARTUP_CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// Polls for the installation lease until `deadline`; `None` once it passes.
+pub(super) async fn lease_within(
+    installation: &Installation,
+    deadline: Duration,
+) -> Result<Option<InstallationLease>> {
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        if let Some(lease) = installation.try_lease()? {
+            return Ok(Some(lease));
+        }
+        if tokio::time::Instant::now() >= until {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
 
 async fn release_drain(operation: &Operation) -> Result<()> {
     let client = continuation::connect(operation).await?;
@@ -265,8 +287,8 @@ pub async fn execute(home: &Path, operation_id: &str) -> Result<i32> {
     let home = tokio::fs::canonicalize(home).await?;
     let _execution = journal::Lease::acquire(&home, "executor")?;
     let installation = Installation::for_home(&home)?;
-    let lease = installation
-        .try_lease()?
+    let lease = lease_within(&installation, LEASE_DEADLINE)
+        .await?
         .context("Another executor owns runtime selection")?;
     let mut operation = journal::current(&home)
         .await?
@@ -342,30 +364,34 @@ pub async fn execute(home: &Path, operation_id: &str) -> Result<i32> {
     if let Err(error) = release_drain(&operation).await {
         tracing::warn!(operation_id, %error, "Native update admission release was not acknowledged");
     }
-    if operation.phase == Phase::Committed {
-        if let Err(error) = continuation::resume(&mut operation).await {
-            if let Some(continuation) = &mut operation.continuation {
-                continuation.state = if continuation.attempted_at.is_some() {
-                    super::ContinuationState::Unknown
-                } else {
-                    super::ContinuationState::NotDelivered
-                };
-                continuation.error = Some(error.to_string());
-            }
-            journal::save(&mut operation).await?;
+    if operation.phase == Phase::Committed
+        && let Err(error) = continuation::resume(&mut operation).await
+    {
+        if let Some(continuation) = &mut operation.continuation {
+            continuation.state = if continuation.attempted_at.is_some() {
+                super::ContinuationState::Unknown
+            } else {
+                super::ContinuationState::NotDelivered
+            };
+            continuation.error = Some(error.to_string());
         }
-        if let Err(error) = cleanup(&home, &installation, &lease).await {
+        journal::save(&mut operation).await?;
+    }
+    // Every outcome cleans up: a failed or rolled-back attempt leaves no download
+    // or candidate behind either; the selection keeps the runtime that runs.
+    if let Err(error) = cleanup(&home, &installation, &lease).await {
+        if operation.phase == Phase::Committed {
             operation.error = Some(format!("Runtime committed; owned cleanup failed: {error}"));
             journal::save(&mut operation).await?;
+        } else {
+            tracing::warn!(operation_id, %error, "Native update store cleanup failed");
         }
-        Ok(0)
-    } else {
-        Ok(1)
     }
+    Ok(if operation.phase == Phase::Committed { 0 } else { 1 })
 }
 
-/// Removes store material that neither the selection nor a recoverable
-/// operation references; a committed update's replaced runtime is included.
+/// Removes store material that neither the selection, a running process nor an
+/// unfinished operation references, including the replaced runtime.
 async fn cleanup(
     home: &Path,
     installation: &Installation,
@@ -373,6 +399,26 @@ async fn cleanup(
 ) -> Result<Vec<std::path::PathBuf>> {
     let (operations, runtimes) = journal::retained(home).await?;
     installation.cleanup(lease, &operations, &runtimes).await
+}
+
+/// Daemon start is a cleanup point too. The service launcher and the executor
+/// that installed this runtime can be older builds with older retention rules;
+/// the runtime that now runs applies its own once no update holds the store.
+/// A home without a recorded installation is left untouched.
+pub(crate) async fn clean_store_after_start(home: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let Some(installation) = Installation::recorded(home)? else {
+        return Ok(Vec::new());
+    };
+    if installation.load()?.is_none() {
+        return Ok(Vec::new());
+    }
+    // A running update's executor cleans up itself when it ends; this only
+    // waits so that the rules of the runtime it installed apply afterwards.
+    let Some(lease) = lease_within(&installation, STARTUP_CLEANUP_DEADLINE).await? else {
+        return Ok(Vec::new());
+    };
+    let home = tokio::fs::canonicalize(home).await?;
+    cleanup(&home, &installation, &lease).await
 }
 
 pub async fn recover_bootstrap(home: &Path) -> Result<()> {

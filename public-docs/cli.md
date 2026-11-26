@@ -464,12 +464,15 @@ become ready, the launch owner restores the known-good runtime; a later launcher
 also recovers an interrupted, uncommitted activation. Readiness checks the actual supervisor
 and worker images, their process identities, the authenticated server identity and the launch
 owner—not merely an open port. The replaced runtime is kept only until the update commits;
-no backup runtime remains afterwards. Runtime cleanup runs after a commit and when the
-launcher starts with no update in progress. It removes runtimes of committed updates, including
-a backup an earlier version kept, and best-effort failures are reported without undoing the
-commit. It retains the active and trial runtimes, the candidate and known-good runtimes of
-uncommitted, failed or rolled-back operations, and anything a running process uses. It does
-not copy or restore the user's chat/receipt database.
+no backup runtime remains afterwards. Runtime cleanup runs when an update finishes, whether
+it committed, failed or rolled back, when the launcher starts with no update in progress, and
+when the daemon starts. The daemon waits for a running update to finish first, so the rules of
+the version just installed apply even though the executor and launcher were older builds.
+It removes replaced runtimes, failed or rolled-back candidates, downloaded staging copies and
+executor copies, including those an earlier version kept, and best-effort failures are
+reported without undoing the commit. It retains the active and trial runtimes, the candidate,
+known-good runtime and staging of an unfinished update, and anything a running process uses.
+It does not copy or restore the user's chat/receipt database.
 
 ### Foreground deployments and migration
 

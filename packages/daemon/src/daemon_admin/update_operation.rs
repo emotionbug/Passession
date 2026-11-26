@@ -11,7 +11,7 @@ mod tests;
 
 pub(crate) use admission::submit;
 pub(crate) use drain::{handle_drain, initialize as initialize_admission, wire_admission};
-pub(crate) use execution::{execute, recover_bootstrap};
+pub(crate) use execution::{clean_store_after_start, execute, recover_bootstrap};
 pub(crate) use migration::handover as migrate_desktop_legacy;
 
 use anyhow::{Context, Result, bail};

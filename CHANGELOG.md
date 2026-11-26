@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Daemon updates no longer leave old versions and downloads behind. A failed or rolled-back update kept its download, the version it tried and the version it would have rolled back to, and kept them through every later update, so several older daemon versions piled up (about 100 MB each). An update that downloaded a version already on disk also left the second copy. Now every finished update, successful or not, removes them, and the next daemon start also clears what earlier versions left.
+
 ## 0.13.51 - 2026-11-26
 
 ### Added

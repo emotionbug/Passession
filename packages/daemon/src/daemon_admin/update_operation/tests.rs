@@ -391,7 +391,8 @@ async fn committed_update_keeps_no_backup_runtime_while_rollback_keeps_known_goo
     assert!(!old.root.exists());
     assert!(!runtimes.join("older").exists());
 
-    // Rollback before commit: the known-good runtime stays selected and on disk.
+    // Rollback before commit: the known-good runtime stays selected and on disk;
+    // the finished attempt's candidate and staging go.
     std::fs::create_dir_all(&retry.root)?;
     let mut rolled_back = fixture(&home);
     rolled_back.installation_root = root.clone();
@@ -399,10 +400,16 @@ async fn committed_update_keeps_no_backup_runtime_while_rollback_keeps_known_goo
     rolled_back.previous = Some(new.clone());
     rolled_back.candidate = Some(retry.clone());
     journal::admit(&mut rolled_back).await?;
+    let staging = installation.staging_path(&rolled_back.operation_id)?;
+    std::fs::create_dir_all(&staging)?;
     let lease = installation.try_lease()?.unwrap();
     installation
         .select_trial(&lease, &rolled_back.operation_id, &retry)
         .await?;
+    // While unfinished, the attempt keeps everything it may roll back with.
+    let (operations, runtimes) = journal::retained(&home).await?;
+    assert!(operations.contains(&rolled_back.operation_id));
+    assert!(runtimes.contains(&new.root) && runtimes.contains(&retry.root));
     installation
         .abandon_trial(&lease, Some(&rolled_back.operation_id))
         .await?;
@@ -414,7 +421,68 @@ async fn committed_update_keeps_no_backup_runtime_while_rollback_keeps_known_goo
     assert_eq!(selection.active.root, new.root);
     assert!(selection.trial.is_none());
     assert!(new.root.exists());
-    // Failed or rolled-back candidates remain for diagnosis.
-    assert!(retry.root.exists());
+    assert!(!retry.root.exists());
+    assert!(!staging.parent().unwrap().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_start_clears_what_a_failed_update_left_and_ignores_unmanaged_homes() -> Result<()> {
+    use crate::daemon_control::managed::Installation;
+    let base = tempfile::tempdir()?;
+    let base = base.path().canonicalize()?;
+    // A development or container home records no installation: nothing is created.
+    let unmanaged = base.join("unmanaged");
+    std::fs::create_dir(&unmanaged)?;
+    assert!(clean_store_after_start(&unmanaged).await?.is_empty());
+    assert_eq!(std::fs::read_dir(&unmanaged)?.count(), 0);
+
+    let home = base.join("home");
+    std::fs::create_dir(&home)?;
+    let root = base.join("install");
+    std::fs::write(
+        home.join("native-installation.json"),
+        serde_json::to_vec(&json!({"schemaVersion":1,"root":root}))?,
+    )?;
+    let installation = Installation::for_home(&home)?;
+    let runtimes = root.join("runtimes");
+    let active = runtime(&runtimes.join("active"), "1.0.0");
+    let tried = runtime(&runtimes.join("tried"), "1.1.0");
+    for runtime in [&active, &tried] {
+        std::fs::create_dir_all(&runtime.root)?;
+    }
+    std::fs::write(
+        root.join("installation.json"),
+        serde_json::to_vec(&json!({
+            "schemaVersion":1,"home":home,"serverId":"server-one",
+            "control":{"path":root.join("bin/paseo"),"sha256":"control","protocol":1},
+            "active":active,"updatedAt":""
+        }))?,
+    )?;
+    // An earlier build failed this update and kept its download and candidate.
+    let mut failed = fixture(&home);
+    failed.installation_root = root.clone();
+    failed.phase = Phase::Preparing;
+    failed.previous = Some(active.clone());
+    failed.candidate = Some(tried.clone());
+    journal::admit(&mut failed).await?;
+    let staging = installation.staging_path(&failed.operation_id)?;
+    std::fs::create_dir_all(&staging)?;
+    failed.phase = Phase::Failed;
+    journal::save(&mut failed).await?;
+
+    // A running update holds the store; the cleanup waits for it to finish.
+    let update = installation.try_lease()?.unwrap();
+    let cleanup = tokio::spawn({
+        let home = home.clone();
+        async move { clean_store_after_start(&home).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert!(tried.root.exists());
+    drop(update);
+    cleanup.await??;
+    assert!(active.root.exists());
+    assert!(!tried.root.exists());
+    assert!(!staging.parent().unwrap().exists());
     Ok(())
 }

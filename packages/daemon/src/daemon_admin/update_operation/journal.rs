@@ -167,13 +167,15 @@ pub(super) async fn restore_migration(record: &Operation) -> Result<()> {
     }
 }
 
+/// Store material that unfinished operations still need. A finished update
+/// (committed, failed or rolled back) needs none of its staging, executor copy,
+/// candidate or replaced runtime: the selection and running processes protect
+/// the runtimes that run, and status reads only the journal.
 pub(super) async fn retained(home: &Path) -> Result<(Vec<String>, Vec<PathBuf>)> {
     let mut operations = Vec::new();
     let mut runtimes = Vec::new();
     let mut records = Vec::new();
-    let current = current(home).await?;
-    let current_id = current.as_ref().map(|value| value.operation_id.clone());
-    records.extend(current);
+    records.extend(current(home).await?);
     let directory = home.join("native-update-history");
     match tokio::fs::read_dir(&directory).await {
         Ok(mut entries) => {
@@ -191,27 +193,19 @@ pub(super) async fn retained(home: &Path) -> Result<(Vec<String>, Vec<PathBuf>)>
         Err(error) => return Err(error.into()),
     }
     for mut operation in records {
-        // Failure to inspect a receipt retains its unknown recovery material.
+        // A late continuation receipt can finish a committed update; failing to
+        // read it leaves the update unfinished and its material retained.
         let _ = super::continuation::observe(&mut operation).await;
-        let retain = current_id.as_deref() == Some(operation.operation_id.as_str())
-            || !operation.terminal()
-            || matches!(
-                operation.phase,
-                super::Phase::Failed | super::Phase::RolledBack
-            )
-            || operation
-                .continuation
-                .as_ref()
-                .is_some_and(|value| value.state == super::ContinuationState::Unknown);
-        if retain {
-            operations.push(operation.operation_id);
-            // A committed update is never rolled back, so its replaced runtime is
-            // not recovery material; every other retained operation may need it.
-            if operation.phase != super::Phase::Committed {
-                runtimes.extend(operation.previous.into_iter().map(|value| value.root));
-            }
-            runtimes.extend(operation.candidate.into_iter().map(|value| value.root));
+        if operation.terminal() {
+            continue;
         }
+        operations.push(operation.operation_id);
+        // A committed update is never rolled back, so its replaced runtime is
+        // not recovery material; an uncommitted one may roll back to it.
+        if operation.phase != super::Phase::Committed {
+            runtimes.extend(operation.previous.into_iter().map(|value| value.root));
+        }
+        runtimes.extend(operation.candidate.into_iter().map(|value| value.root));
     }
     Ok((operations, runtimes))
 }

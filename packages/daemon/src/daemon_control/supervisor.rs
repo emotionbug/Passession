@@ -444,6 +444,16 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
         tokio::task::spawn_blocking(move || lock::PidLock::acquire(&owned_home)).await??;
     let executable = std::env::current_exe()?.canonicalize()?;
     let log = Arc::new(DurableLog::new(home));
+    // Runs alongside the worker; it waits for any update still holding the store.
+    let cleanup_home = home.to_owned();
+    let cleanup_log = log.clone();
+    tokio::spawn(async move {
+        if let Err(error) =
+            crate::daemon_admin::update_operation::clean_store_after_start(&cleanup_home).await
+        {
+            cleanup_log.write(format!("{}\n",json!({"level":"warn","time":chrono::Utc::now().to_rfc3339(),"pid":std::process::id(),"name":"DaemonRunner","msg":format!("Runtime store cleanup failed; nothing selected was affected: {error:#}")})).as_bytes()).await;
+        }
+    });
     let stop = CancellationToken::new();
     let signal_stop = stop.clone();
     #[cfg(unix)]

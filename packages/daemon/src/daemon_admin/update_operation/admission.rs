@@ -85,9 +85,10 @@ pub async fn submit(
         let installation = Installation::for_home(&home)?;
         // A terminal journal can precede the executor's final cleanup write.
         // Do not archive/replace it while that executor still owns selection.
-        let _selection = installation
-            .try_lease()?
-            .context("The preceding update executor is still finishing")?;
+        let _selection =
+            super::execution::lease_within(&installation, super::execution::LEASE_DEADLINE)
+                .await?
+                .context("The preceding update executor is still finishing")?;
         let continuation = continuation::prepare(&home, request.resume.as_ref()).await?;
         let timestamp = now();
         let mut operation = Operation {

@@ -914,6 +914,15 @@ impl Drop for InstallationLease {
 }
 
 impl Installation {
+    /// The installation this home already records; `None` for a home that never
+    /// had one (development and container daemons). Nothing is created.
+    pub(crate) fn recorded(home: &Path) -> Result<Option<Self>> {
+        let home = home.canonicalize().context("Daemon home is unavailable")?;
+        read_pointer(&home)?
+            .map(|root| Self::at(root, home))
+            .transpose()
+    }
+
     /// The home records its installation root once, so CLI, worker, transient
     /// executor units and the service launcher agree regardless of their
     /// differing XDG/user environments.
@@ -1319,7 +1328,13 @@ impl Installation {
                 Ok(())
             };
             if target.exists() {
-                return verify(&target);
+                verify(&target)?;
+                // An earlier attempt admitted the same tree: drop the staged copy,
+                // which the rename below would otherwise have consumed.
+                return match fs::remove_dir_all(&source.root) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+                    _ => Ok(()),
+                };
             }
             verify(&source.root)?;
             fs::rename(&source.root, &target)?;
@@ -1405,11 +1420,10 @@ impl Installation {
     }
 
     /// Removes unreferenced runtime trees, staging and executor copies. Kept:
-    /// selected runtimes, `retain_runtimes` (journal-referenced roots: candidates
-    /// and known-good runtimes of uncommitted, failed, rolled-back or unknown
-    /// operations), staging and executor material of `retain_operations`, and
-    /// every store entry that a running process executes from or uses as its
-    /// working directory. A committed update's replaced runtime is not retained.
+    /// selected runtimes, `retain_runtimes` (candidates and known-good runtimes of
+    /// unfinished operations), staging and executor material of
+    /// `retain_operations`, and every store entry that a running process
+    /// executes from or uses as its working directory.
     pub(crate) async fn cleanup(
         &self,
         lease: &InstallationLease,
@@ -2894,6 +2908,28 @@ mod tests {
         );
         // Orphaned trial (executor died, e.g. power loss): known-good only.
         assert_eq!(roots(false), [selection.active.root.clone()]);
+    }
+
+    #[tokio::test]
+    async fn admitting_an_already_stored_runtime_drops_the_staged_copy() -> Result<()> {
+        let (_base, installation, lease, _) = fixture();
+        let staged = |operation_id: &str| -> Result<RuntimeIdentity> {
+            let root = installation.staging_path(operation_id)?;
+            fs::create_dir_all(&root)?;
+            fs::write(root.join(EXECUTABLE), b"runtime image")?;
+            let mut identity = runtime(&root, "2.0.0");
+            identity.executable_sha256 = sha256_file(&root.join(EXECUTABLE))?;
+            identity.tree_digest = crate::daemon_admin::updater::tree_digest(&root)?;
+            Ok(identity)
+        };
+        let first = installation.admit_runtime(&lease, &staged("op-1")?).await?;
+        // A retry of the same release stages identical bytes again.
+        let retry = staged("op-2")?;
+        let second = installation.admit_runtime(&lease, &retry).await?;
+        assert_eq!(first.root, second.root);
+        assert!(second.root.join(EXECUTABLE).is_file());
+        assert!(!retry.root.exists());
+        Ok(())
     }
 
     #[tokio::test]
