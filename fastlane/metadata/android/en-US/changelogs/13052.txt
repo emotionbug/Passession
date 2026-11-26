@@ -1,0 +1,5 @@
+Fixed
+- Daemon updates no longer leave old versions and downloads on the computer.
+- Windows desktop app updates no longer stop with "Object is not owned by the current user".
+
+Full notes: https://github.com/emotionbug/Passession/releases/tag/v0.13.52

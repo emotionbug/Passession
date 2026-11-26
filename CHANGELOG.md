@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.52 - 2026-11-26
+
 ### Fixed
 
 - Windows: fixed desktop app updates stopping with “Object is not owned by the current user” when Windows assigned new update files to the Administrators group. The updater now creates its files under the signed-in user's ownership instead of accepting files with an unexpected owner.
