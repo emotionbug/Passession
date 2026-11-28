@@ -60,6 +60,9 @@ struct State {
     live: bool,
     settling: bool,
     settle_epoch: u64,
+    /// The open run paused until outside work (a background job, child agent
+    /// or peer message) resumes it; reported on the active turn.
+    awaiting_work: bool,
     bridged_tools: Value,
     followed_children: HashSet<String>,
     /// The current prompt's native acknowledgement, taken once by the manager.
@@ -187,6 +190,10 @@ impl Inner {
         data.update_features();
         Ok(state)
     }
+    /// Whether the run of `turn` waits for outside work before its next model loop.
+    fn waiting_event(&self, turn: Option<String>, awaiting: bool) -> Value {
+        json!({"type":"turn_waiting","provider":self.spec.id,"turnId":turn,"waitingFor":awaiting.then_some("background_work")})
+    }
     async fn emit(&self, event: Value) -> Result<()> {
         let session_ended = event["sessionEnded"] == true;
         let descriptor = (event["type"] == "provider_subagent")
@@ -251,6 +258,7 @@ impl Inner {
                 state.prompt_results.clear();
                 state.prompt_epoch += 1;
                 state.settling = false;
+                state.awaiting_work = false;
             }
             self.emit(event).await?;
         }
@@ -508,7 +516,7 @@ impl Inner {
             }
             return Ok(());
         }
-        {
+        let resumed = {
             let mut state = self.state.lock().unwrap();
             if frame["type"] == "agent_start" {
                 state.live = true;
@@ -537,16 +545,40 @@ impl Inner {
             if frame["type"] == "message_end" && frame["message"]["role"] == "user" {
                 state.turn_has_user = true;
             }
+            // A paused run resumes with a new model loop.
+            let resumed = state.awaiting_work
+                && matches!(
+                    frame["type"].as_str(),
+                    Some("agent_start" | "turn_start" | "message_start" | "tool_execution_start")
+                );
+            if resumed {
+                state.awaiting_work = false;
+            }
+            resumed.then(|| state.active.clone())
+        };
+        if let Some(turn) = resumed {
+            self.emit(self.waiting_event(turn, false)).await?;
         }
         if self.spec.family == "omp" && frame["type"] == "agent_end" {
+            if frame["isTerminal"] == false {
+                // A model loop paused, not the run. Invalidate any idle
+                // deadline from an earlier run in this session stretch.
+                let changed = {
+                    let mut state = self.state.lock().unwrap();
+                    state.settling = false;
+                    let awaiting = frame["awaitingAsyncWork"] == true;
+                    (state.awaiting_work != awaiting).then(|| {
+                        state.awaiting_work = awaiting;
+                        (state.active.clone(), awaiting)
+                    })
+                };
+                if let Some((turn, awaiting)) = changed {
+                    self.emit(self.waiting_event(turn, awaiting)).await?;
+                }
+                return Ok(());
+            }
             let (turn, epoch) = {
                 let mut state = self.state.lock().unwrap();
-                if frame["isTerminal"] == false {
-                    // A model loop paused, not the run. Invalidate any idle
-                    // deadline from an earlier run in this session stretch.
-                    state.settling = false;
-                    return Ok(());
-                }
                 if state.settling && frame["isTerminal"] != true {
                     return Ok(());
                 }
@@ -1386,6 +1418,7 @@ impl Session {
                 live: persistence.is_none(),
                 settling: false,
                 settle_epoch: 0,
+                awaiting_work: false,
                 bridged_tools,
                 followed_children: HashSet::new(),
                 acknowledgement: None,

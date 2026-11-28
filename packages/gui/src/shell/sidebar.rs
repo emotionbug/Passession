@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 
 use crate::common::paint::{Font, HitViewport, rect};
 use crate::common::widgets::{
-    PTextFieldWidgetRefExt, RowMetrics, StatusBucket, agent_live_status_bucket, paint_status_badge,
+    PTextFieldWidgetRefExt, RowMetrics, StatusBucket, agent_awaiting_background_work,
+    agent_live_status_bucket, paint_static_status_badge, paint_status_badge,
 };
 use crate::common::{PanelTarget, UiContext, UiEffect, json as j, tr, tr_args};
 use crate::features::workspace::observe::{ObsEvent, Observation};
@@ -977,6 +978,9 @@ fn agent_status_label(agent: &Value, bucket: StatusBucket) -> String {
     match bucket {
         StatusBucket::NeedsInput => tr("sidebar.statusBucket.needsInput"),
         StatusBucket::Failed => tr("sidebar.statusBucket.failed"),
+        StatusBucket::Running if agent_awaiting_background_work(agent) => {
+            tr("sidebar.statusBucket.awaitingBackgroundWork")
+        }
         StatusBucket::Running => tr("sidebar.statusBucket.working"),
         StatusBucket::Attention => tr("sidebar.statusBucket.readyToReview"),
         StatusBucket::Done => {
@@ -1853,7 +1857,13 @@ fn draw_tree(
                     14.0,
                     14.0,
                 );
-                paint_status_badge(
+                // A run waiting on background work is not busy: no spinning ring.
+                let paint = if agent_awaiting_background_work(agent) {
+                    paint_static_status_badge
+                } else {
+                    paint_status_badge
+                };
+                paint(
                     ui.painter,
                     cx,
                     glyph,
@@ -2526,6 +2536,13 @@ mod tests {
         assert_eq!(
             label(json!({"status": "idle", "activeTurn": {"id": "t"}})),
             tr("sidebar.statusBucket.working")
+        );
+        assert_eq!(
+            label(json!({
+                "status": "running",
+                "activeTurn": {"turnId": "t", "waitingFor": "background_work"}
+            })),
+            tr("sidebar.statusBucket.awaitingBackgroundWork")
         );
         assert_eq!(
             label(

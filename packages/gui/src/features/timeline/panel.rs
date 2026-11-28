@@ -41,7 +41,7 @@ use crate::common::overlay::{
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::transition::{Intent, Transition, Visual};
-use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
+use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics, agent_awaiting_background_work};
 use crate::common::{FileLinkIntent, PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::features::composer::ComposerPanelWidgetRefExt;
 use makepad_widgets::scroll_bars::TouchScroll;
@@ -1983,6 +1983,7 @@ impl ChatPanel {
                         &target.workspace_id,
                         &target.agent_id,
                     ),
+                awaiting_work: agent_awaiting_background_work(&agent),
             },
             can_fork_cursor: self.feature("agentForkContextCursor"),
             epoch: snap.as_ref().and_then(|s| s.epoch.clone()),

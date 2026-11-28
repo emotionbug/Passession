@@ -219,6 +219,11 @@ fn fake_native_omp() {
                     println!("{}", notice("pause", "Waiting for async work".into()));
                 }
             }
+            "fixture_resume" => {
+                println!("{}", json!({"type":"agent_start"}));
+                println!("{}", json!({"type":"turn_start"}));
+                respond(&q, Value::Null);
+            }
             "fixture_terminal" => {
                 terminal_polls = Some(0);
                 println!(
@@ -579,6 +584,13 @@ async fn omp_terminal_agent_end_waits_for_settlement_but_legacy_end_still_comple
             Some("turn_completed" | "turn_failed" | "turn_canceled")
         )
     };
+    let waiting = until(&mut events, |event| {
+        assert!(!terminal_event(event), "ended on pause: {event}");
+        event["type"] == "turn_waiting"
+    })
+    .await;
+    assert_eq!(waiting["turnId"], paused["turnId"]);
+    assert_eq!(waiting["waitingFor"], "background_work");
     until(&mut events, |event| {
         assert!(!terminal_event(event), "ended on pause: {event}");
         event["item"]["message"] == "Waiting for async work"
@@ -589,6 +601,17 @@ async fn omp_terminal_agent_end_waits_for_settlement_but_legacy_end_still_comple
         assert_eq!(state.active.as_deref(), paused["turnId"].as_str());
         assert!(!state.settling, "a pause must not start the idle deadline");
     }
+    runtime
+        .request(json!({"type":"fixture_resume"}))
+        .await
+        .unwrap();
+    let resumed = until(&mut events, |event| {
+        assert!(!terminal_event(event), "ended on resume: {event}");
+        event["type"] == "turn_waiting"
+    })
+    .await;
+    assert_eq!(resumed["turnId"], paused["turnId"]);
+    assert!(resumed["waitingFor"].is_null());
     runtime
         .request(json!({"type":"fixture_terminal"}))
         .await

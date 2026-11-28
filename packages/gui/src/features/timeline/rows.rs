@@ -43,6 +43,8 @@ pub struct LiveFooter {
     pub live: bool,
     pub started_ms: Option<i64>,
     pub pending_delivery: bool,
+    /// The reply ended; the run stays open until background work resumes it.
+    pub awaiting_work: bool,
 }
 
 /// Everything rows share for one frame.
@@ -1977,7 +1979,15 @@ fn footer(
     match host {
         None => {
             let f = &ctx.footer;
-            if f.live {
+            if f.live && f.awaiting_work {
+                d.kit.icon(
+                    cx,
+                    "hourglass",
+                    rect_xywh(cursor - 2.0, top, 16.0, slot),
+                    16.0,
+                    p.muted,
+                );
+            } else if f.live {
                 d.indicator(
                     cx,
                     Indicator::Dots {
@@ -2017,6 +2027,15 @@ fn footer(
                     .add_hit(r, HitTarget::ForkMenu { completed: false });
                 cursor += 24.0 + 12.0;
             }
+            let note = if !f.live {
+                Some("composer.delivery.stateUnavailable")
+            } else if f.awaiting_work {
+                Some("message.turnFooter.awaitingBackgroundWork")
+            } else if f.pending_delivery {
+                Some("composer.delivery.agentRunning")
+            } else {
+                None
+            };
             if let (true, Some(start)) = (f.live, f.started_ms) {
                 d.indicator(
                     cx,
@@ -2025,17 +2044,10 @@ fn footer(
                         started_ms: start,
                         size: look.ui(13.0),
                         color: p.muted,
-                        note: f
-                            .pending_delivery
-                            .then(|| (t("composer.delivery.agentRunning"), look.ui(12.0))),
+                        note: note.map(|key| (t(key), look.ui(12.0))),
                     },
                 );
-            } else if !f.live || f.pending_delivery {
-                let note = t(if f.live {
-                    "composer.delivery.agentRunning"
-                } else {
-                    "composer.delivery.stateUnavailable"
-                });
+            } else if let Some(key) = note {
                 d.kit.label(
                     cx,
                     Font::Regular,
@@ -2043,7 +2055,7 @@ fn footer(
                     1.3,
                     p.muted,
                     dvec2(cursor, top + 4.0),
-                    &note,
+                    &t(key),
                     Some((fx + fw - cursor).max(1.0)),
                 );
             }
@@ -2625,6 +2637,7 @@ mod cache_input_tests {
             live: true,
             started_ms: Some(100),
             pending_delivery: true,
+            awaiting_work: false,
         };
         let old = inputs(&capabilities, &titles, &footer);
         let rows = Rc::new(vec![

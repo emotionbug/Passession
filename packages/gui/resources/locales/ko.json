@@ -821,7 +821,10 @@
         "completed": "완료됨"
       }
     },
-    "turnFooter": { "workedFor": "작업 시간 {{duration}}" },
+    "turnFooter": {
+      "workedFor": "작업 시간 {{duration}}",
+      "awaitingBackgroundWork": "답변 완료 · 백그라운드 작업 대기 중"
+    },
     "compaction": {
       "loading": "압축하는 중...",
       "auto": "컨텍스트가 자동으로 압축되었습니다",
@@ -1794,6 +1797,7 @@
       "failed": "실패",
       "readyToReview": "검토 대기",
       "working": "실행 중",
+      "awaitingBackgroundWork": "백그라운드 작업 대기 중",
       "done": "완료"
     },
     "display": {

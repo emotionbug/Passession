@@ -5,6 +5,9 @@
 ### Fixed
 
 - An OMP `ask` form no longer covers the controls drawn over the conversation: the subagent and task bar at the bottom, the "jump to latest" button, the find bar and notices. The form now stops short of them as you scroll. Scrolling over a form also brings up the "jump to latest" button, which it did not before.
+- OMP: an agent that finished its reply but keeps its run open for a background job no longer looks like it is still working. OMP keeps the run open until the job, a child agent or a message wakes it, and Passession showed "Working" with a spinning mark the whole time, even when the job had stalled. The sidebar now shows "Waiting on background work" with a still mark, and the conversation shows an hourglass with "Reply finished · waiting on background work". A message you send still reaches the agent, Stop ends the wait, and "Working" returns when the agent resumes.
+- Linux: an agent or terminal that uses too much memory no longer takes down the daemon and every other session. systemd-oomd stops a whole cgroup at once, and everything the daemon started ran in `paseo.service`'s cgroup, so one agent's large build or decompiler run made it stop the service. When the daemon runs as a systemd user service, each agent, terminal and other long-running process it starts now runs in its own systemd scope bound to the service, and memory pressure kills that scope alone.
+- The model picker no longer lags with a long model list. Every redraw of the open list (scrolling, moving the pointer, typing a search) copied the provider's whole catalog once for each model it showed, so the work grew with the square of the list: with about 140 OMP models a redraw took roughly 50 times longer than it needed to, and with 500 models several hundred times longer. The composer's model, thinking and mode controls also copied the catalog several times on each redraw. The list and the controls now read the catalog in place.
 
 ## 0.13.52 - 2026-11-26
 

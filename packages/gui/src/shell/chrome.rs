@@ -11,7 +11,10 @@ use serde_json::Value;
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::transition::{Intent, Transition};
-use crate::common::widgets::{StatusBucket, agent_live_status_bucket, paint_status_badge};
+use crate::common::widgets::{
+    StatusBucket, agent_awaiting_background_work, agent_live_status_bucket,
+    paint_static_status_badge, paint_status_badge,
+};
 use crate::common::{PanelTarget, Route, UiContext, icons, json as j, layer, tr, tr_args};
 use crate::shell::hosts::{self, Host};
 use crate::shell::layout::{Axis, CompactDestination, Layout as WindowLayout, Node};
@@ -1933,7 +1936,13 @@ pub fn tab_icon(
                 .is_some()
                 .then(|| agent_live_status_bucket(agent));
             let p = ui.p;
-            paint_status_badge(
+            // A run waiting on background work is not busy: no spinning ring.
+            let paint = if agent_awaiting_background_work(agent) {
+                paint_static_status_badge
+            } else {
+                paint_status_badge
+            };
+            paint(
                 ui.painter,
                 cx,
                 r,

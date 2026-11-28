@@ -2062,6 +2062,12 @@ pub fn agent_live_status_bucket(agent: &Value) -> StatusBucket {
     )
 }
 
+/// Whether the agent finished its reply while its run stays open for outside work (a background
+/// job, child agent or peer message) to resume it.
+pub fn agent_awaiting_background_work(agent: &Value) -> bool {
+    agent["activeTurn"]["waitingFor"] == "background_work"
+}
+
 fn agent_bucket(agent: &Value, status: Option<&str>) -> StatusBucket {
     let pending = agent
         .get("pendingPermissions")

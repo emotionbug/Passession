@@ -1123,6 +1123,34 @@ impl AgentManager {
             }
             return Ok(());
         }
+        if event["type"] == "turn_waiting" {
+            // The provider's open run paused until outside work (a background job, child
+            // agent or peer message) resumes it; the turn stays open meanwhile.
+            if !from_history {
+                let mut data = cell.data.lock().await;
+                let turn = text(&event, "turnId");
+                if let Some(active) = data
+                    .snapshot
+                    .get_mut("activeTurn")
+                    .filter(|active| active.is_object())
+                    .filter(|active| turn.is_none_or(|turn| active["turnId"] == turn))
+                {
+                    let previous = active.get("waitingFor").cloned();
+                    match event["waitingFor"].as_str() {
+                        Some(reason) => active["waitingFor"] = json!(reason),
+                        None => {
+                            object(active).remove("waitingFor");
+                        }
+                    }
+                    if data.ready
+                        && data.snapshot["activeTurn"].get("waitingFor") != previous.as_ref()
+                    {
+                        self.publish_state(&data.snapshot);
+                    }
+                }
+            }
+            return Ok(());
+        }
         let (mut snapshot, ready, owner_ended) = {
             let data = cell.data.lock().await;
             (data.snapshot.clone(), data.ready, data.owner_ended)
@@ -2464,6 +2492,54 @@ pub(super) mod tests {
         manager.close_cell(id, &cell).await.unwrap();
         assert!(wire::snapshot_payload(&cell.data.lock().await.snapshot).pointer(chrome).is_none());
         manager.close_cell(sibling_id, &sibling).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_wait_marks_only_the_open_turn_until_it_resumes_or_ends() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(
+            root.path().join("home"),
+            root.path().into(),
+            std::env::current_exe().unwrap(),
+        );
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000097";
+        let cell = staged_cell(&app, id).await;
+        manager.release_event_stage(&cell).await.unwrap();
+        let waiting = |turn: &str, reason: Option<&str>| json!({"type":"turn_waiting","provider":"mock","turnId":turn,"waitingFor":reason});
+        let active = || async {
+            wire::snapshot_payload(&cell.data.lock().await.snapshot)["activeTurn"].clone()
+        };
+        cell.sink
+            .emit(waiting("earlier-turn", Some("background_work")))
+            .await
+            .unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert!(
+            active().await.get("waitingFor").is_none(),
+            "another turn's pause"
+        );
+        cell.sink
+            .emit(waiting("live-turn", Some("background_work")))
+            .await
+            .unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert_eq!(active().await["waitingFor"], "background_work");
+        assert_eq!(cell.data.lock().await.snapshot["status"], "running");
+        cell.sink.emit(waiting("live-turn", None)).await.unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert_eq!(active().await, json!({"turnId":"live-turn"}));
+        cell.sink
+            .emit(waiting("live-turn", Some("background_work")))
+            .await
+            .unwrap();
+        cell.sink
+            .emit(json!({"type":"turn_completed","provider":"mock","turnId":"live-turn"}))
+            .await
+            .unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert!(active().await.is_null());
+        manager.close_cell(id, &cell).await.unwrap();
     }
 
     #[tokio::test]
