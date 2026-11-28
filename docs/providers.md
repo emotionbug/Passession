@@ -105,16 +105,26 @@ them to match the generated format.
 
 Bootstrap reads the daemon home's `agent-timelines/*.sqlite3` and retained legacy
 `*.json` checkpoints, plus OMP's resolved session directory, configured
-`PI_CODING_AGENT_DIR/sessions`, and `HOME/.omp/agent/sessions`. It runs off Tokio's
-async workers and checkpoints source progress in
-`$PASEO_HOME/omp-host-tool-history.sqlite3`. The cache stores tool identities/names
-and source cursors, not invocation arguments or conversation bodies. Existing history
-is read-only; new cache files are private on Unix.
+`PI_CODING_AGENT_DIR/sessions`, and `HOME/.omp/agent/sessions`. Only records that
+can hold a tool call (`"toolCall"` session blocks, `"tool_call"` timeline rows) are
+parsed. Source progress is checkpointed per source in
+`$PASEO_HOME/omp-host-tool-history.sqlite3`, together with whether the last scan
+covered every source. The cache stores tool identities/names and source cursors, not
+invocation arguments or conversation bodies. Existing history is read-only; new cache
+files are private on Unix.
 
-Successful and failed host calls extend a durable union before dispatch. Load modes
-stay fixed for the current provider runtime; a newly used tool becomes essential on
-the next launch/restart. Unused tools remain available through OMP discovery.
-This is prompt-loading policy, not a permission boundary.
+A launch never waits for this scan. It registers with the result of the last finished
+scan (on a daemon's first launch, the one stored by the previous process), and one
+background scanner per daemon home then reads what changed for the next launch. A
+history that never finished a scan proves nothing, so that launch keeps every tool
+essential. A session with no host tool to register does not read the history.
+
+Successful and failed host calls extend a durable union before dispatch, through their
+own database connection, so a running scan never delays a call. Load modes stay fixed
+for the current provider runtime. A tool called through the host becomes essential on
+the next launch/restart; one used only in OMP sessions outside Paseo does once a scan
+has read it. Unused tools remain available through OMP discovery. This is
+prompt-loading policy, not a permission boundary.
 
 Unreadable or incomplete sources warn and conservatively keep the current catalog
 essential until a later scan succeeds. Some legacy `plain_text` rows discarded

@@ -31,7 +31,8 @@ pub struct Router {
     executor: Option<Arc<dyn NativeToolExecutor>>,
     tools: HashMap<String, BridgedTool>,
     catalog: history::Catalog,
-    history: history::History,
+    /// None when nothing was registered: no call can be recorded then.
+    history: Option<history::History>,
     clients: Vec<Arc<McpConnection>>,
     /// One user-facing line per configured MCP server left out of this session.
     unavailable: Vec<String>,
@@ -146,15 +147,19 @@ impl Router {
                 .map(|tool| (tool.server.as_str(), tool.name.as_str()));
             catalog.insert(name, identity);
         }
-        let mut history_options = session_options.clone();
-        history_options["cwd"] = json!(cwd);
-        if history_options["homeDir"].is_null() {
-            history_options["homeDir"] = json!(env.get("HOME"));
-        }
-        let sessions = super::history::sessions_dir("omp", env, &history_options).await?;
-        let roots = history::session_roots(env, cwd, sessions);
-        let history = history::History::load(&context.home, roots).await;
-        {
+        // Which tools were used before decides their load mode; with no tool to
+        // register, the session history is not read at all.
+        let history = if definitions.is_empty() {
+            None
+        } else {
+            let mut history_options = session_options.clone();
+            history_options["cwd"] = json!(cwd);
+            if history_options["homeDir"].is_null() {
+                history_options["homeDir"] = json!(env.get("HOME"));
+            }
+            let sessions = super::history::sessions_dir("omp", env, &history_options).await?;
+            let roots = history::session_roots(env, cwd, sessions);
+            let history = history::History::load(&context.home, roots).await;
             let observed = catalog.observed(&history);
             for definition in &mut definitions {
                 let identity = catalog
@@ -166,7 +171,8 @@ impl Router {
                     "discoverable"
                 });
             }
-        }
+            Some(history)
+        };
         // Registered names are unique, so no tie-breaker or allocated sort keys
         // are needed. Sort only after history has assigned every load mode.
         definitions.sort_unstable_by(|left, right| {
@@ -261,8 +267,9 @@ impl Router {
         args: Value,
         cancel: CancellationToken,
     ) {
-        if let Some(identity) = self.catalog.identity(&name)
-            && let Err(error) = self.history.record(identity).await
+        if let Some(history) = &self.history
+            && let Some(identity) = self.catalog.identity(&name)
+            && let Err(error) = history.record(identity).await
         {
             tracing::warn!(%name, %error, "OMP host tool invocation could not be retained for future catalogs");
         }
@@ -570,7 +577,7 @@ mod tests {
             let home = tempfile::tempdir()?;
             let cancel = CancellationToken::new();
             let _cleanup = cancel.clone().drop_guard();
-            let history = history::History::load(home.path(), Vec::new()).await;
+            let history = history::History::settled(home.path(), Vec::new()).await;
             history
                 .record(&json!(["native", "z_native"]).to_string())
                 .await?;
@@ -771,7 +778,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn router_emits_final_result_after_progress_with_retained_sender() -> Result<()> {
-        let home = tempfile::tempdir()?;
         let cancel = CancellationToken::new();
         let _cleanup = cancel.clone().drop_guard();
         let (runtime, mut events) = Transport::spawn(
@@ -794,7 +800,7 @@ mod tests {
             executor: Some(executor.clone()),
             tools: HashMap::new(),
             catalog: history::Catalog::default(),
-            history: history::History::load(home.path(), Vec::new()).await,
+            history: None,
             clients: Vec::new(),
             unavailable: Vec::new(),
             pending: Mutex::new(HashMap::new()),

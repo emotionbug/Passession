@@ -60,7 +60,7 @@ async fn bootstrap_counts_failed_calls_and_excludes_schema_reads_and_mentions() 
             {"type":"text","text":"toolCall name mentioned"}
         ]),
     )?;
-    let history = History::load(home.path(), vec![sessions]).await;
+    let history = History::settled(home.path(), vec![sessions]).await;
     assert!(history.complete);
     let mut catalog = Catalog::default();
     for name in ["used", "executed", "schema_only", "mentioned", "unseen"] {
@@ -91,7 +91,7 @@ async fn exact_server_identity_and_ambiguous_aliases_do_not_cross_promote() -> R
             {"type":"toolCall","id":"a","name":"functions.mcp__first__search","arguments":{}}
         ]),
     )?;
-    let history = History::load(home.path(), vec![sessions.clone()]).await;
+    let history = History::settled(home.path(), vec![sessions.clone()]).await;
     assert!(catalog.essential(&first, &history));
     assert!(!catalog.essential(&second, &history));
     assert!(!catalog.essential("search", &history));
@@ -100,7 +100,7 @@ async fn exact_server_identity_and_ambiguous_aliases_do_not_cross_promote() -> R
     assert!(!catalog.essential(&first, &history));
     assert!(!catalog.essential("mcp__first__search", &history));
     history.record(catalog.identity(&first).unwrap()).await?;
-    let reloaded = History::load(home.path(), vec![sessions]).await;
+    let reloaded = History::settled(home.path(), vec![sessions]).await;
     assert!(catalog.essential(&first, &reloaded));
     assert!(!catalog.essential("mcp__first__search", &reloaded));
     Ok(())
@@ -110,8 +110,8 @@ async fn exact_server_identity_and_ambiguous_aliases_do_not_cross_promote() -> R
 async fn concurrent_persist_reload_and_next_launch_keep_current_catalog_fixed() -> Result<()> {
     let home = tempfile::tempdir()?;
     let (first, second) = tokio::join!(
-        History::load(home.path(), vec![]),
-        History::load(home.path(), vec![])
+        History::settled(home.path(), vec![]),
+        History::settled(home.path(), vec![])
     );
     let mut catalog = Catalog::default();
     catalog.insert("one", None);
@@ -128,7 +128,7 @@ async fn concurrent_persist_reload_and_next_launch_keep_current_catalog_fixed() 
     b?;
     duplicate?;
     assert!(!catalog.essential("one", &first));
-    let reloaded = History::load(home.path(), vec![]).await;
+    let reloaded = History::settled(home.path(), vec![]).await;
     assert!(catalog.essential("one", &reloaded));
     assert!(catalog.essential("two", &reloaded));
     Ok(())
@@ -144,20 +144,20 @@ async fn repeated_registration_reuses_index_and_reads_only_changed_sources() -> 
         &file,
         json!([{"type":"toolCall","id":"initial","name":"initial","arguments":{}}]),
     )?;
-    let first = History::load(home.path(), vec![root.clone()]).await;
+    let first = History::settled(home.path(), vec![root.clone()]).await;
     assert!(first.complete);
     let counts = || {
-        let slot = first.index.lock().unwrap();
+        let slot = first.home.index.lock().unwrap();
         let index = slot.as_ref().unwrap();
         (index.source_scans, index.refreshes)
     };
     let initial_counts = counts();
     let (second, concurrent) = tokio::join!(
-        History::load(home.path(), vec![root.clone()]),
-        History::load(home.path(), vec![root.clone()]),
+        History::settled(home.path(), vec![root.clone()]),
+        History::settled(home.path(), vec![root.clone()]),
     );
     assert!(second.complete && concurrent.complete);
-    assert!(Arc::ptr_eq(&first.index, &second.index));
+    assert!(Arc::ptr_eq(&first.home, &second.home));
     assert!(Arc::ptr_eq(&first.names, &second.names));
     assert!(Arc::ptr_eq(&second.names, &concurrent.names));
     assert_eq!(counts(), initial_counts);
@@ -165,10 +165,11 @@ async fn repeated_registration_reuses_index_and_reads_only_changed_sources() -> 
     let identity = json!(["native", "used"]).to_string();
     first.record(&identity).await?;
     let after_call = counts();
-    let reused = History::load(home.path(), vec![root.clone()]).await;
+    let reused = History::settled(home.path(), vec![root.clone()]).await;
     assert!(reused.identities.contains(&identity));
     assert!(!first.identities.contains(&identity));
-    assert_eq!(counts(), after_call);
+    // The call was recorded through its own connection; the scanner only reads it.
+    assert_eq!(counts(), (after_call.0, after_call.1 + 1));
 
     let mut writer = fs::OpenOptions::new().append(true).open(&file)?;
     writeln!(
@@ -178,7 +179,7 @@ async fn repeated_registration_reuses_index_and_reads_only_changed_sources() -> 
             {"type":"toolCall","id":"appended","name":"appended","arguments":{}}
         ]}})
     )?;
-    let appended = History::load(home.path(), vec![root.clone()]).await;
+    let appended = History::settled(home.path(), vec![root.clone()]).await;
     assert!(appended.names.contains("initial"));
     assert!(appended.names.contains("appended"));
     assert_eq!(counts().0, initial_counts.0 + 1);
@@ -189,15 +190,15 @@ async fn repeated_registration_reuses_index_and_reads_only_changed_sources() -> 
         &other_root.join("other.jsonl"),
         json!([{"type":"toolCall","id":"other","name":"other","arguments":{}}]),
     )?;
-    let expanded = History::load(home.path(), vec![other_root.clone(), root.clone()]).await;
+    let expanded = History::settled(home.path(), vec![other_root.clone(), root.clone()]).await;
     assert!(expanded.complete);
     assert!(expanded.names.contains("other"));
     assert_eq!(counts().0, initial_counts.0 + 2);
 
     let before_external = counts();
-    let database = Connection::open(&first.path)?;
+    let database = Connection::open(&first.home.path)?;
     database.execute("INSERT INTO names(name) VALUES ('external')", [])?;
-    let external = History::load(home.path(), vec![root, other_root]).await;
+    let external = History::settled(home.path(), vec![root, other_root]).await;
     assert!(external.names.contains("external"));
     assert_eq!(counts(), (before_external.0, before_external.1 + 1));
     Ok(())
@@ -217,7 +218,7 @@ async fn incremental_sources_include_updated_old_rows_and_appended_calls() -> Re
         &native,
         json!([{ "type":"toolCall","id":"a","name":"initial","arguments":{} }]),
     )?;
-    let first = History::load(home.path(), vec![sessions.clone()]).await;
+    let first = History::settled(home.path(), vec![sessions.clone()]).await;
     assert!(first.complete);
     let database = Connection::open(path)?;
     database.execute("UPDATE timeline_rows SET row_json=?1 WHERE position=0", [json!({"seqEnd":2,"item":{"type":"tool_call","callId":"a","name":"updated","detail":{"type":"unknown"}}}).to_string()])?;
@@ -228,7 +229,7 @@ async fn incremental_sources_include_updated_old_rows_and_appended_calls() -> Re
         "{}",
         json!({"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"b","name":"appended","arguments":{}}]}})
     )?;
-    let second = History::load(home.path(), vec![sessions.clone()]).await;
+    let second = History::settled(home.path(), vec![sessions.clone()]).await;
     assert!(second.complete);
     for name in ["old", "initial", "updated", "appended"] {
         assert!(second.names.contains(name));
@@ -238,7 +239,7 @@ async fn incremental_sources_include_updated_old_rows_and_appended_calls() -> Re
         &native,
         json!([{ "type":"toolCall","id":"x","name":"replacement","arguments":{} }]),
     )?;
-    let replaced = History::load(home.path(), vec![sessions]).await;
+    let replaced = History::settled(home.path(), vec![sessions]).await;
     assert!(replaced.names.contains("replacement"));
     assert!(replaced.names.contains("appended"));
     Ok(())
@@ -249,26 +250,33 @@ async fn missing_history_is_empty_but_unreadable_history_is_explicitly_partial()
     let home = tempfile::tempdir()?;
     let mut catalog = Catalog::default();
     catalog.insert("unseen", None);
-    let empty = History::load(home.path(), vec![home.path().join("missing")]).await;
+    let empty = History::settled(home.path(), vec![home.path().join("missing")]).await;
     assert!(empty.complete);
     assert!(!catalog.essential("unseen", &empty));
     let sessions = home.path().join("sessions");
     fs::create_dir(&sessions)?;
+    // A record that cannot hold a tool call is never parsed.
     fs::write(sessions.join("broken.jsonl"), "not json\n")?;
-    let partial = History::load(home.path(), vec![sessions.clone()]).await;
+    let skipped = History::settled(home.path(), vec![sessions.clone()]).await;
+    assert!(skipped.complete);
+    fs::write(
+        sessions.join("broken.jsonl"),
+        "{\"type\":\"toolCall\" not json\n",
+    )?;
+    let partial = History::settled(home.path(), vec![sessions.clone()]).await;
     assert!(!partial.complete);
     assert!(catalog.essential("unseen", &partial));
     assert!(partial.names.is_empty());
     assert!(partial.identities.is_empty());
     session(&sessions.join("broken.jsonl"), json!([]))?;
-    let repaired = History::load(home.path(), vec![sessions]).await;
+    let repaired = History::settled(home.path(), vec![sessions]).await;
     assert!(repaired.complete);
     assert!(!catalog.essential("unseen", &repaired));
     // A non-directory source is not an absent-history success.
     let not_directory = home.path().join("not-directory");
     fs::write(&not_directory, "")?;
     assert!(
-        !History::load(home.path(), vec![not_directory])
+        !History::settled(home.path(), vec![not_directory])
             .await
             .complete
     );
@@ -288,12 +296,12 @@ async fn trailing_partial_record_retries_without_losing_committed_calls() -> Res
     let pending = json!({"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"b","name":"pending","arguments":{}}]}}).to_string();
     let mut writer = fs::OpenOptions::new().append(true).open(&file)?;
     write!(writer, "{pending}")?;
-    let partial = History::load(home.path(), vec![sessions.clone()]).await;
+    let partial = History::settled(home.path(), vec![sessions.clone()]).await;
     assert!(!partial.complete);
     assert!(partial.names.contains("committed"));
     assert!(!partial.names.contains("pending"));
     writeln!(writer)?;
-    let completed = History::load(home.path(), vec![sessions]).await;
+    let completed = History::settled(home.path(), vec![sessions]).await;
     assert!(completed.complete);
     assert!(completed.names.contains("pending"));
     Ok(())
@@ -335,7 +343,7 @@ async fn hashed_bridge_and_omp_mcp_aliases_preserve_server_identity() -> Result<
             {"type":"toolCall","id":"b","name":"write","arguments":{"path":"xd://mcp__two_run","content":"{}"}}
         ]),
     )?;
-    let history = History::load(home.path(), vec![sessions]).await;
+    let history = History::settled(home.path(), vec![sessions]).await;
     assert!(catalog.essential(&one, &history));
     assert!(catalog.essential(&two, &history));
     assert!(!catalog.essential(&unseen, &history));
@@ -353,13 +361,13 @@ async fn corrupt_source_retains_valid_invocations_without_claiming_complete() ->
         json!([{ "type":"toolCall","id":"a","name":"retained","arguments":{} }]),
     )?;
     let mut writer = fs::OpenOptions::new().append(true).open(&file)?;
-    writeln!(writer, "corrupt record")?;
-    let history = History::load(home.path(), vec![sessions]).await;
+    writeln!(writer, "corrupt \"toolCall\" record")?;
+    let history = History::settled(home.path(), vec![sessions]).await;
     assert!(!history.complete);
     assert!(history.names.contains("retained"));
     drop(writer);
     fs::remove_file(file)?;
-    let reloaded = History::load(home.path(), vec![]).await;
+    let reloaded = History::settled(home.path(), vec![]).await;
     assert!(reloaded.complete);
     assert!(reloaded.names.contains("retained"));
     Ok(())
@@ -386,10 +394,10 @@ fn configured_and_default_omp_roots_are_included_with_resolved_override() {
 async fn new_history_cache_is_private() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir()?;
-    let history = History::load(home.path(), vec![]).await;
+    let history = History::settled(home.path(), vec![]).await;
     assert!(history.complete);
     assert_eq!(
-        fs::metadata(&history.path)?.permissions().mode() & 0o777,
+        fs::metadata(&history.home.path)?.permissions().mode() & 0o777,
         0o600
     );
     Ok(())
@@ -416,8 +424,72 @@ async fn resolved_provider_session_directory_participates_in_bootstrap() -> Resu
     });
     let resolved = super::super::super::history::sessions_dir("omp", &env, &options).await?;
     let roots = session_roots(&env, home.path(), resolved);
-    let history = History::load(home.path(), roots).await;
+    let history = History::settled(home.path(), roots).await;
     assert!(history.complete);
     assert!(history.names.contains("configured_call"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn launches_and_recorded_calls_never_wait_for_a_scan() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    session(
+        &sessions.join("native.jsonl"),
+        json!([{ "type":"toolCall","id":"a","name":"seen","arguments":{} }]),
+    )?;
+    let mut catalog = Catalog::default();
+    catalog.insert("unseen", None);
+    // A long scan holds the scanner.
+    let scanning = Home::of(home.path());
+    let scanner = scanning.index.lock().unwrap();
+    let launch = tokio::time::timeout(
+        Duration::from_secs(5),
+        History::load(home.path(), vec![sessions.clone()]),
+    )
+    .await?;
+    // Nothing scanned yet proves nothing: every tool stays essential.
+    assert!(!launch.complete);
+    assert!(catalog.essential("unseen", &launch));
+    let identity = json!(["native", "called"]).to_string();
+    tokio::time::timeout(Duration::from_secs(5), launch.record(&identity)).await??;
+    drop(scanner);
+    let settled = History::settled(home.path(), vec![sessions]).await;
+    assert!(settled.complete);
+    assert!(settled.names.contains("seen"));
+    assert!(settled.identities.contains(&identity));
+    assert!(!catalog.essential("unseen", &settled));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_restarted_daemon_launches_from_the_stored_history() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    session(
+        &sessions.join("native.jsonl"),
+        json!([{ "type":"toolCall","id":"a","name":"seen","arguments":{} }]),
+    )?;
+    let identity = json!(["native", "called"]).to_string();
+    let before = History::settled(home.path(), vec![sessions.clone()]).await;
+    before.record(&identity).await?;
+    // The next daemon process starts without this one's homes.
+    HOMES.lock().unwrap().remove(&before.home.path);
+    let restarted = Home::of(home.path());
+    let scanner = restarted.index.lock().unwrap();
+    session(
+        &sessions.join("later.jsonl"),
+        json!([{ "type":"toolCall","id":"b","name":"later","arguments":{} }]),
+    )?;
+    let launch = History::load(home.path(), vec![sessions.clone()]).await;
+    assert!(launch.complete);
+    assert!(launch.names.contains("seen"));
+    assert!(!launch.names.contains("later"));
+    assert!(launch.identities.contains(&identity));
+    drop(scanner);
+    let settled = History::settled(home.path(), vec![sessions]).await;
+    assert!(settled.names.contains("later"));
     Ok(())
 }

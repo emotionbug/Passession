@@ -9,13 +9,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
+use tokio::sync::watch;
 
 pub(super) fn session_roots(
     env: &std::collections::BTreeMap<String, String>,
@@ -115,103 +116,265 @@ fn normalize(name: &str) -> &str {
     name.strip_prefix("functions.").unwrap_or(name)
 }
 
-type SharedIndex = Arc<Mutex<Option<Index>>>;
-
-pub(super) struct History {
-    path: PathBuf,
+/// What one OMP launch registers with: the tool names and identities seen so far, and
+/// whether the scan that found them covered every source.
+#[derive(Clone, Default)]
+struct Snapshot {
     names: Arc<HashSet<String>>,
     identities: Arc<HashSet<String>>,
-    index: SharedIndex,
     complete: bool,
 }
 
-impl History {
-    pub async fn load(home: &Path, mut roots: Vec<PathBuf>) -> Self {
-        static INDEXES: LazyLock<Mutex<HashMap<PathBuf, SharedIndex>>> =
-            LazyLock::new(Mutex::default);
+/// The sources the background scanner covers and whether it is running. `requested`
+/// counts scan requests; the scanner reports the last one it served in `Home::scanned`.
+#[derive(Default)]
+struct Scan {
+    roots: BTreeSet<PathBuf>,
+    requested: u64,
+    running: bool,
+}
+
+/// One per daemon home. A launch reads the latest snapshot without waiting; one
+/// background scanner brings it up to date for the next launch. Tool calls record
+/// through their own connection, so neither waits for a scan, however long the
+/// session history is.
+struct Home {
+    path: PathBuf,
+    timelines: PathBuf,
+    /// Held by the scanner for the whole scan.
+    index: Mutex<Option<Index>>,
+    /// The latest snapshot: read from the database on first use, then published by
+    /// each scan and extended by recorded calls.
+    snapshot: Mutex<Option<Snapshot>>,
+    scan: Mutex<Scan>,
+    scanned: watch::Sender<u64>,
+}
+
+/// Every home this process launched OMP sessions for, by history database.
+static HOMES: LazyLock<Mutex<HashMap<PathBuf, Arc<Home>>>> = LazyLock::new(Mutex::default);
+
+impl Home {
+    fn of(home: &Path) -> Arc<Self> {
         let path = home.join("omp-host-tool-history.sqlite3");
-        let timelines = home.join("agent-timelines");
-        roots.sort();
-        roots.dedup();
-        let index = INDEXES
+        HOMES
             .lock()
             .unwrap()
             .entry(path.clone())
-            .or_default()
-            .clone();
-        let shared = index.clone();
-        let target = path.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut slot = shared.lock().unwrap();
-            if slot
-                .as_ref()
-                .is_some_and(|index| index.replaced(&target).unwrap_or(true))
-            {
-                *slot = None;
-            }
-            if slot.is_none() {
-                *slot = Some(Index::new(&target)?);
-            }
-            let index = slot.as_mut().unwrap();
-            match index.update(&timelines, &roots) {
-                Ok(complete) => Ok((index.names.clone(), index.identities.clone(), complete)),
-                Err(error) => {
-                    *slot = None;
-                    Err(error)
+            .or_insert_with(|| {
+                Arc::new(Self {
+                    path,
+                    timelines: home.join("agent-timelines"),
+                    index: Mutex::default(),
+                    snapshot: Mutex::default(),
+                    scan: Mutex::default(),
+                    scanned: watch::Sender::new(0),
+                })
+            })
+            .clone()
+    }
+
+    fn current(&self) -> Snapshot {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        snapshot
+            .get_or_insert_with(|| {
+                stored(&self.path).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "OMP host tool history unreadable; retaining essential catalog until a scan recovers it");
+                    Snapshot::default()
+                })
+            })
+            .clone()
+    }
+
+    /// Adds `roots` to the scanned sources and starts the scanner unless it runs;
+    /// returns the request the scanner reports once it covered it.
+    fn request(self: &Arc<Self>, roots: Vec<PathBuf>) -> u64 {
+        let mut scan = self.scan.lock().unwrap();
+        scan.roots.extend(roots);
+        scan.requested += 1;
+        if !scan.running {
+            scan.running = true;
+            let home = self.clone();
+            tokio::task::spawn_blocking(move || home.run());
+        }
+        scan.requested
+    }
+
+    fn run(&self) {
+        struct Running<'a>(&'a Mutex<Scan>);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.lock().unwrap().running = false;
                 }
             }
-        })
-        .await;
-        let (names, identities, complete) = match result {
-            Ok(Ok(snapshot)) => snapshot,
-            error => {
-                tracing::warn!(
-                    ?error,
-                    "OMP host tool history unavailable; retaining essential catalog until coverage recovers"
-                );
-                (Arc::default(), Arc::default(), false)
+        }
+        let _running = Running(&self.scan);
+        loop {
+            let (roots, served) = {
+                let scan = self.scan.lock().unwrap();
+                (
+                    scan.roots.iter().cloned().collect::<Vec<_>>(),
+                    scan.requested,
+                )
+            };
+            self.scan_once(&roots);
+            self.scanned.send_replace(served);
+            let mut scan = self.scan.lock().unwrap();
+            if scan.requested == served {
+                scan.running = false;
+                return;
             }
-        };
+        }
+    }
+
+    fn scan_once(&self, roots: &[PathBuf]) {
+        let mut slot = self.index.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|index| index.replaced(&self.path).unwrap_or(true))
+        {
+            *slot = None;
+        }
+        let result = (|| -> Result<()> {
+            if slot.is_none() {
+                *slot = Some(Index::new(&self.path)?);
+            }
+            let index = slot.as_mut().unwrap();
+            let (complete, scanned) = index.update(&self.timelines, roots)?;
+            index.save_coverage(complete)?;
+            // Under the snapshot lock, so a call recorded meanwhile is either read
+            // here or added to the snapshot published here.
+            let mut snapshot = self.snapshot.lock().unwrap();
+            index.sync(scanned)?;
+            *snapshot = Some(Snapshot {
+                names: index.names.clone(),
+                identities: index.identities.clone(),
+                complete,
+            });
+            Ok(())
+        })();
+        if let Err(error) = result {
+            *slot = None;
+            tracing::warn!(
+                ?error,
+                "OMP host tool history unavailable; retaining essential catalog until coverage recovers"
+            );
+            let mut snapshot = self.snapshot.lock().unwrap();
+            snapshot.get_or_insert_with(Snapshot::default).complete = false;
+        }
+    }
+
+    fn record(&self, identity: &str) -> Result<()> {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.identities.contains(identity))
+        {
+            return Ok(());
+        }
+        open(&self.path)?.execute(
+            "INSERT OR IGNORE INTO identities(name) VALUES (?1)",
+            [identity],
+        )?;
+        if let Some(snapshot) = snapshot.as_mut() {
+            Arc::make_mut(&mut snapshot.identities).insert(identity.to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// The history a previous scan left in the database. A database without a recorded
+/// complete scan proves nothing about unused tools.
+fn stored(path: &Path) -> Result<Snapshot> {
+    if stamp(path)?.is_none() {
+        return Ok(Snapshot::default());
+    }
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(Duration::from_secs(10))?;
+    let transaction = connection.transaction()?;
+    let (names, _) = additions(
+        &transaction,
+        "SELECT rowid,name FROM names WHERE rowid > ?1 ORDER BY rowid",
+        0,
+    )?;
+    let (identities, _) = additions(
+        &transaction,
+        "SELECT rowid,name FROM identities WHERE rowid > ?1 ORDER BY rowid",
+        0,
+    )?;
+    let recorded: i64 = transaction.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='coverage'",
+        [],
+        |row| row.get(0),
+    )?;
+    let complete = recorded > 0
+        && transaction
+            .query_row("SELECT complete FROM coverage WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .unwrap_or(false);
+    Ok(Snapshot {
+        names: Arc::new(names.into_iter().collect()),
+        identities: Arc::new(identities.into_iter().collect()),
+        complete,
+    })
+}
+
+pub(super) struct History {
+    names: Arc<HashSet<String>>,
+    identities: Arc<HashSet<String>>,
+    complete: bool,
+    home: Arc<Home>,
+}
+
+impl History {
+    /// The history as of the last finished scan, without waiting for one. A scan of
+    /// what changed since then runs in the background for the next launch.
+    pub async fn load(home: &Path, roots: Vec<PathBuf>) -> Self {
+        let home = Home::of(home);
+        let snapshot = Self::current(&home).await;
+        home.request(roots);
+        Self::from(home, snapshot)
+    }
+
+    /// The history once a scan covering `roots` finished.
+    #[cfg(test)]
+    pub async fn settled(home: &Path, roots: Vec<PathBuf>) -> Self {
+        let home = Home::of(home);
+        let request = home.request(roots);
+        home.scanned
+            .subscribe()
+            .wait_for(|served| *served >= request)
+            .await
+            .expect("history scanner stopped");
+        let snapshot = Self::current(&home).await;
+        Self::from(home, snapshot)
+    }
+
+    async fn current(home: &Arc<Home>) -> Snapshot {
+        let home = home.clone();
+        tokio::task::spawn_blocking(move || home.current())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "OMP host tool history read failed; retaining essential catalog");
+                Snapshot::default()
+            })
+    }
+
+    fn from(home: Arc<Home>, snapshot: Snapshot) -> Self {
         Self {
-            path,
-            names,
-            identities,
-            index,
-            complete,
+            names: snapshot.names,
+            identities: snapshot.identities,
+            complete: snapshot.complete,
+            home,
         }
     }
 
     pub async fn record(&self, identity: &str) -> Result<()> {
-        let path = self.path.clone();
-        let shared = self.index.clone();
+        let home = self.home.clone();
         let owned = identity.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut slot = shared.lock().unwrap();
-            if slot
-                .as_ref()
-                .is_some_and(|index| index.replaced(&path).unwrap_or(true))
-            {
-                *slot = None;
-            }
-            if slot.is_none() {
-                *slot = Some(Index::new(&path)?);
-            }
-            let index = slot.as_mut().unwrap();
-            if !index.identities.contains(&owned) {
-                let transaction = index
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute(
-                    "INSERT OR IGNORE INTO identities(name) VALUES (?1)",
-                    [&owned],
-                )?;
-                transaction.commit()?;
-                index.refresh()?;
-            }
-            Ok(())
-        })
-        .await??;
-        Ok(())
+        tokio::task::spawn_blocking(move || home.record(&owned)).await?
     }
 }
 
@@ -239,7 +402,8 @@ fn open(path: &Path) -> Result<Connection> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS names(name TEXT PRIMARY KEY NOT NULL);
          CREATE TABLE IF NOT EXISTS identities(name TEXT PRIMARY KEY NOT NULL);
-         CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL);",
+         CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS coverage(id INTEGER PRIMARY KEY CHECK (id = 1), complete INTEGER NOT NULL);",
     )?;
     Ok(connection)
 }
@@ -287,9 +451,8 @@ struct Source {
     complete: bool,
 }
 
-/// One index per daemon home serializes launches and durable calls, while each
-/// runtime keeps immutable load-mode snapshots. Only metadata is polled: source
-/// bodies and directory listings are revisited when their stamps change.
+/// The scanner's view of one home's history database. Only metadata is polled:
+/// source bodies and directory listings are revisited when their stamps change.
 struct Index {
     connection: Connection,
     names: Arc<HashSet<String>>,
@@ -298,6 +461,8 @@ struct Index {
     identity_row: i64,
     database: Stamp,
     data_version: Option<i64>,
+    /// Whether the last scan covered every source, as stored.
+    coverage: Option<bool>,
     directories: HashMap<PathBuf, Arc<Directory>>,
     sources: HashMap<PathBuf, Source>,
     #[cfg(test)]
@@ -308,14 +473,21 @@ struct Index {
 
 impl Index {
     fn new(path: &Path) -> Result<Self> {
+        let connection = open(path)?;
+        let coverage = connection
+            .query_row("SELECT complete FROM coverage WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
         let mut index = Self {
-            connection: open(path)?,
+            connection,
             database: stamp(path)?.context("OMP host tool history database disappeared")?,
             names: Arc::default(),
             identities: Arc::default(),
             name_row: 0,
             identity_row: 0,
             data_version: None,
+            coverage,
             directories: HashMap::new(),
             sources: HashMap::new(),
             #[cfg(test)]
@@ -372,7 +544,10 @@ impl Index {
         Ok(())
     }
 
-    fn update(&mut self, timelines: &Path, roots: &[PathBuf]) -> Result<bool> {
+    /// Reads every changed source, each in its own transaction so calls recorded
+    /// meanwhile wait for one source at most and a stopped scan keeps its progress.
+    /// Returns whether every source was covered and whether any was read.
+    fn update(&mut self, timelines: &Path, roots: &[PathBuf]) -> Result<(bool, bool)> {
         let mut changed = Vec::new();
         let mut complete = true;
         self.discover(timelines, false, &mut changed, &mut complete);
@@ -381,50 +556,66 @@ impl Index {
         }
         changed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         changed.dedup_by(|left, right| left.0 == right.0);
-        if !changed.is_empty() {
+        let scanned = !changed.is_empty();
+        for (file, stamp) in changed {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut scanned = Vec::with_capacity(changed.len());
-            for (file, stamp) in changed {
-                let result = match file.extension().and_then(|extension| extension.to_str()) {
-                    Some("sqlite3") => scan_timeline(&transaction, &file),
-                    _ => scan_session(&transaction, &file),
-                };
-                let succeeded = result.is_ok();
-                if let Err(error) = result {
-                    complete = false;
-                    tracing::warn!(path = %file.display(), %error, "OMP host tool history is partial; source will be retried");
-                }
-                scanned.push((
-                    file,
-                    Source {
-                        stamp,
-                        complete: succeeded,
-                    },
-                ));
-            }
+            let result = match file.extension().and_then(|extension| extension.to_str()) {
+                Some("sqlite3") => scan_timeline(&transaction, &file),
+                _ => scan_session(&transaction, &file),
+            };
+            // Calls read before a failure stay counted.
             transaction.commit()?;
+            let succeeded = result.is_ok();
+            if let Err(error) = result {
+                complete = false;
+                tracing::warn!(path = %file.display(), %error, "OMP host tool history is partial; source will be retried");
+            }
             #[cfg(test)]
             {
-                self.source_scans += scanned.len();
+                self.source_scans += 1;
             }
-            self.sources.extend(scanned);
-            self.refresh()?;
-        } else {
-            let version: i64 = self
-                .connection
-                .pragma_query_value(None, "data_version", |row| row.get(0))?;
-            if Some(version) != self.data_version {
-                self.refresh()?;
-            }
+            self.sources.insert(
+                file,
+                Source {
+                    stamp,
+                    complete: succeeded,
+                },
+            );
         }
         if !complete {
             tracing::warn!(
                 "OMP host tool history coverage is partial; retaining essential catalog until coverage recovers"
             );
         }
-        Ok(complete)
+        Ok((complete, scanned))
+    }
+
+    /// Reads rows this scan wrote (`scanned`) or another connection committed.
+    fn sync(&mut self, scanned: bool) -> Result<()> {
+        if !scanned {
+            let version: i64 = self
+                .connection
+                .pragma_query_value(None, "data_version", |row| row.get(0))?;
+            if Some(version) == self.data_version {
+                return Ok(());
+            }
+        }
+        self.refresh()
+    }
+
+    /// Stores whether the last scan covered every source, for the first launch
+    /// of the next daemon process.
+    fn save_coverage(&mut self, complete: bool) -> Result<()> {
+        if self.coverage != Some(complete) {
+            self.connection.execute(
+                "INSERT INTO coverage(id,complete) VALUES (1,?1) ON CONFLICT(id) DO UPDATE SET complete=excluded.complete",
+                [complete],
+            )?;
+            self.coverage = Some(complete);
+        }
+        Ok(())
     }
 
     fn discover(
@@ -576,6 +767,10 @@ fn scan_timeline(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
     let mut names = HashSet::new();
     while let Some(row) = rows.next()? {
         let encoded: String = row.get(0)?;
+        // Only tool call rows name tools; most rows are messages and outputs.
+        if !encoded.contains(r#""tool_call""#) {
+            continue;
+        }
         let row: Value = serde_json::from_str(&encoded)?;
         timeline_names(&row["item"], &mut names);
     }
@@ -647,10 +842,14 @@ fn scan_session(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
             partial = true;
             break;
         }
-        match serde_json::from_str::<Value>(&line).context("Invalid OMP session record") {
-            Ok(entry) => session_names(&entry, &mut names),
-            Err(error) => {
-                problem = Some(error);
+        // Only a record with a tool call block can name a tool, and most of the
+        // history is messages and tool output: parse only the records that could.
+        if line.contains(r#""toolCall""#) {
+            match serde_json::from_str::<Value>(&line).context("Invalid OMP session record") {
+                Ok(entry) => session_names(&entry, &mut names),
+                Err(error) => {
+                    problem = Some(error);
+                }
             }
         }
         offset += size as u64;
