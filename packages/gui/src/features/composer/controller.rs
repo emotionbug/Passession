@@ -150,7 +150,9 @@ pub struct Controller {
     pub initialized: bool,
     pub selected: bool,
     pub daemon_config: Value,
-    pub providers: Vec<Value>,
+    /// Shared: the toolbar, the model sheet and control menus read it on every draw, and a
+    /// catalog can hold hundreds of models.
+    pub providers: Rc<[Value]>,
     pub providers_loaded: bool,
     pub profiles: Vec<Value>,
     pub commands: Vec<Value>,
@@ -229,7 +231,7 @@ impl Controller {
             initialized: false,
             selected: true,
             daemon_config: json!({}),
-            providers: Vec::new(),
+            providers: Rc::from([]),
             providers_loaded: false,
             profiles: Vec::new(),
             commands: Vec::new(),
@@ -419,7 +421,7 @@ impl Controller {
             self.requests
                 .retain(|_, tag| !matches!(tag, Tag::Providers));
             self.providers_request_pending = false;
-            self.providers.clear();
+            self.providers = Rc::from([]);
             self.providers_loaded = false;
         }
         self.target = target;
@@ -442,7 +444,7 @@ impl Controller {
             self.uploaded.clear();
         }
         self.initialized = false;
-        self.providers.clear();
+        self.providers = Rc::from([]);
         self.providers_loaded = false;
         self.commands.clear();
         self.draft_features.clear();
@@ -670,7 +672,7 @@ impl Controller {
     }
 
     fn set_providers(&mut self, ui: &mut UiContext, providers: Vec<Value>) {
-        self.providers = providers;
+        self.providers = providers.into();
         self.providers_loaded = true;
         self.resolve_draft_config(ui);
     }

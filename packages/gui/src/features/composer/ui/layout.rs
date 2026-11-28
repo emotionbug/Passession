@@ -1326,7 +1326,10 @@ impl ComposerPanel {
         let body = TextSpec::new(Font::Regular, look.body(), fade(p.muted, alpha));
         let thinking = model.thinking_options();
         let provider = owned(get(&config, "provider"));
-        let provider_svg = owned(get(&model.provider(), "iconSvg"));
+        let provider_svg = model
+            .provider()
+            .map(|entry| owned(get(entry, "iconSvg")))
+            .unwrap_or_default();
         let model_text = short_model_label(&model.selected_model_label(&labels));
         let thinking_text = model.thinking_label(&labels);
         let mode_text = format_agent_mode_label(model.selected_mode().unwrap_or(&Value::Null));

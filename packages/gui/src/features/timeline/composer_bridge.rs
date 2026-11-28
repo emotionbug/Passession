@@ -74,6 +74,7 @@ pub fn model_entry(providers: &[Value], provider: &str, model_id: &str) -> Optio
     composer::controls_model::models_of(entry)
         .into_iter()
         .find(|m| m.get("id").and_then(Value::as_str) == Some(model_id))
+        .cloned()
 }
 
 /// The provider snapshot's icon SVG (`iconSvg`) for ProviderIcon.

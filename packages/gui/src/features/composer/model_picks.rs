@@ -10,6 +10,7 @@
 use super::controls_model::{model_label, models_of};
 use super::json::*;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 /// Client preference holding the per-host favorites and recents.
 pub const MODEL_PICKS_KEY: &str = "modelSelectorPicks";
@@ -24,7 +25,7 @@ pub const QUICK_MAX: usize = 6;
 pub const COLLAPSE_AT: usize = 8;
 
 /// One model of one provider, as the preference stores it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ModelRef {
     pub provider: String,
     pub model: String,
@@ -170,22 +171,23 @@ pub enum Availability {
     Unavailable,
 }
 
-/// A model row of the sheet: the reference, its catalog entries when present.
+/// A model row of the sheet: the reference, its catalog entries when present. The entries are
+/// borrowed from the provider catalog, which a model list reads once per row on every draw.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Pick {
+pub struct Pick<'a> {
     pub r: ModelRef,
-    pub provider: Option<Value>,
-    pub model: Option<Value>,
+    pub provider: Option<&'a Value>,
+    pub model: Option<&'a Value>,
     pub availability: Availability,
 }
 
-impl Pick {
+impl<'a> Pick<'a> {
     /// A catalog model of a ready provider.
-    pub fn ready(provider: &Value, model: &Value) -> Self {
+    pub fn ready(provider: &'a Value, model: &'a Value) -> Self {
         Self {
             r: ModelRef::new(owned(get(provider, "provider")), owned(get(model, "id"))),
-            provider: Some(provider.clone()),
-            model: Some(model.clone()),
+            provider: Some(provider),
+            model: Some(model),
             availability: Availability::Ready,
         }
     }
@@ -196,35 +198,30 @@ impl Pick {
 
     pub fn label(&self) -> String {
         self.model
-            .as_ref()
             .map(model_label)
             .unwrap_or_else(|| self.r.model.clone())
     }
 
-    pub fn provider_label(&self) -> String {
+    pub fn provider_label(&self) -> &str {
         self.provider
-            .as_ref()
-            .map(|p| s_or(get(p, "label"), &self.r.provider).to_owned())
-            .unwrap_or_else(|| self.r.provider.clone())
+            .map(|p| s_or(get(p, "label"), &self.r.provider))
+            .unwrap_or(&self.r.provider)
     }
 
     pub fn provider_icon(&self) -> String {
         self.provider
-            .as_ref()
             .map(|p| owned(get(p, "iconSvg")))
             .unwrap_or_default()
     }
 
     /// Case-insensitive match of a lowercased query on label, id, provider and description.
     fn matches(&self, query: &str) -> bool {
+        let description = self.model.map_or("", |m| s(get(m, "description")));
         [
-            self.label(),
-            self.r.model.clone(),
+            self.label().as_str(),
+            self.r.model.as_str(),
             self.provider_label(),
-            self.model
-                .as_ref()
-                .map(|m| owned(get(m, "description")))
-                .unwrap_or_default(),
+            description,
         ]
         .iter()
         .any(|field| field.to_lowercase().contains(query))
@@ -238,7 +235,7 @@ fn find_provider<'a>(providers: &'a [Value], id: &str) -> Option<(usize, &'a Val
         .find(|(_, p)| s(get(p, "provider")) == id)
 }
 
-fn resolve(providers: &[Value], r: &ModelRef) -> Pick {
+fn resolve<'a>(providers: &'a [Value], r: &ModelRef) -> Pick<'a> {
     let mut pick = Pick {
         r: r.clone(),
         provider: None,
@@ -248,7 +245,7 @@ fn resolve(providers: &[Value], r: &ModelRef) -> Pick {
     let Some((_, provider)) = find_provider(providers, &r.provider) else {
         return pick;
     };
-    pick.provider = Some(provider.clone());
+    pick.provider = Some(provider);
     match provider_state(provider) {
         ProviderState::Loading => pick.availability = Availability::Loading,
         ProviderState::Ready => {
@@ -282,29 +279,29 @@ fn rank(providers: &[Value], pick: &Pick) -> (usize, usize) {
 
 /// One provider of the full list.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Group {
-    pub provider: Value,
+pub struct Group<'a> {
+    pub provider: &'a Value,
     pub state: ProviderState,
-    pub models: Vec<Value>,
+    pub models: Vec<&'a Value>,
 }
 
-impl Group {
+impl Group<'_> {
     pub fn id(&self) -> &str {
-        s(get(&self.provider, "provider"))
+        s(get(self.provider, "provider"))
     }
 
     pub fn label(&self) -> &str {
-        s_or(get(&self.provider, "label"), self.id())
+        s_or(get(self.provider, "label"), self.id())
     }
 }
 
 /// The full list's sections. `favorites` keeps unavailable pins (flagged) after the
 /// available ones in catalog order; `recents` holds only selectable, unpinned models.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Sections {
-    pub favorites: Vec<Pick>,
-    pub recents: Vec<Pick>,
-    pub groups: Vec<Group>,
+pub struct Sections<'a> {
+    pub favorites: Vec<Pick<'a>>,
+    pub recents: Vec<Pick<'a>>,
+    pub groups: Vec<Group<'a>>,
 }
 
 /// Whether `provider` belongs to the sheet: `scope` is the one provider a running agent may
@@ -313,14 +310,18 @@ fn in_scope(scope: Option<&str>, provider: &str) -> bool {
     scope.is_none_or(|only| only == provider)
 }
 
-pub fn sections(providers: &[Value], picks: &ModelPicks, scope: Option<&str>) -> Sections {
+pub fn sections<'a>(
+    providers: &'a [Value],
+    picks: &ModelPicks,
+    scope: Option<&str>,
+) -> Sections<'a> {
     let groups = providers
         .iter()
         .filter(|p| in_scope(scope, s(get(p, "provider"))))
         .map(|provider| {
             let state = provider_state(provider);
             Group {
-                provider: provider.clone(),
+                provider,
                 state,
                 models: if state == ProviderState::Ready {
                     models_of(provider)
@@ -361,7 +362,7 @@ pub enum QuickKind {
 
 /// The root page's one-tap rows: selectable favorites, or recents when no favorite can be
 /// picked; `None` when there is nothing to offer.
-pub fn quick_switch(sections: &Sections) -> Option<(QuickKind, Vec<Pick>)> {
+pub fn quick_switch<'a>(sections: &Sections<'a>) -> Option<(QuickKind, Vec<Pick<'a>>)> {
     let favorites: Vec<Pick> = sections
         .favorites
         .iter()
@@ -377,29 +378,31 @@ pub fn quick_switch(sections: &Sections) -> Option<(QuickKind, Vec<Pick>)> {
 
 /// Cross-provider search: selectable matches, favorites first, then recents, then the rest
 /// in catalog order, each model once. `query` is trimmed and compared case-insensitively.
-pub fn search(
-    providers: &[Value],
+pub fn search<'a>(
+    providers: &'a [Value],
     picks: &ModelPicks,
     scope: Option<&str>,
     query: &str,
-) -> Vec<Pick> {
+) -> Vec<Pick<'a>> {
     let query = query.trim().to_lowercase();
     let sections = sections(providers, picks, scope);
     let mut out: Vec<Pick> = Vec::new();
+    let mut seen = HashSet::new();
     let catalog = sections.groups.iter().flat_map(|group| {
         group
             .models
             .iter()
-            .map(|model| Pick::ready(&group.provider, model))
+            .map(|model| Pick::ready(group.provider, *model))
     });
     let candidates = sections
         .favorites
-        .into_iter()
-        .filter(Pick::selectable)
-        .chain(sections.recents)
+        .iter()
+        .filter(|pick| pick.selectable())
+        .cloned()
+        .chain(sections.recents.iter().cloned())
         .chain(catalog);
     for pick in candidates {
-        if pick.matches(&query) && !out.iter().any(|seen| seen.r == pick.r) {
+        if pick.matches(&query) && seen.insert(pick.r.clone()) {
             out.push(pick);
         }
     }

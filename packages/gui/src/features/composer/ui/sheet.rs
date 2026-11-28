@@ -251,9 +251,9 @@ impl SheetState {
         let config = self.config(ctl);
         let features = ctl.features();
         let modes = self.modes(ctl, &config);
-        let providers = ctl.providers.clone();
+        let providers: &[Value] = &ctl.providers;
         let model = ControlsModel {
-            providers: &providers,
+            providers,
             config: &config,
             modes: &modes,
             features: &features,
@@ -273,7 +273,7 @@ impl SheetState {
         // The model in use counts as recent, so the quick switch is never empty.
         let current = model
             .selected_model()
-            .map(|m| ModelRef::new(owned(get(&config, "provider")), owned(get(&m, "id"))));
+            .map(|m| ModelRef::new(owned(get(&config, "provider")), owned(get(m, "id"))));
         let seeded = picks.clone().seeded(current.as_ref());
         let picks = &seeded;
         let rc = RowCtx {
@@ -312,7 +312,7 @@ impl SheetState {
                 profiles: profiles_supported,
                 section: "search",
             };
-            for pick in search(&providers, picks, scope, &query) {
+            for pick in search(providers, picks, scope, &query) {
                 rows.push(model_row(&rc, &pick, flags));
             }
             if rows.is_empty() {
@@ -330,7 +330,7 @@ impl SheetState {
         match page {
             Page::Root => {
                 let profiles = self.profile_rows(&mut rows, ctl, &config, profiles_supported);
-                let sections = sections(&providers, picks, scope);
+                let sections = sections(providers, picks, scope);
                 if let Some((kind, quick)) = quick_switch(&sections) {
                     if !rows.is_empty() {
                         rows.push(Row::divider());
@@ -363,7 +363,7 @@ impl SheetState {
                 }
             }
             Page::Models => {
-                let sections = sections(&providers, picks, scope);
+                let sections = sections(providers, picks, scope);
                 if sections.groups.is_empty() {
                     if ctl.providers_loaded {
                         view.empty = Some(("bot", t("modelSelector.noProviders")));
@@ -505,7 +505,7 @@ impl SheetState {
         let label = group.label().to_owned();
         let mut header = Row::new(label.clone());
         header.strong = true;
-        header.leading = Leading::Provider(id.clone(), owned(get(&group.provider, "iconSvg")));
+        header.leading = Leading::Provider(id.clone(), owned(get(group.provider, "iconSvg")));
         let mut expanded = true;
         match group.state {
             ProviderState::Ready => {
@@ -562,7 +562,7 @@ impl SheetState {
             let mut row = Row::new(t("modelSelector.providerFailed"));
             row.disabled = true;
             row.leading = Leading::Icon("triangle-alert", None);
-            row.description = display(get(&group.provider, "error"));
+            row.description = display(get(group.provider, "error"));
             rows.push(row);
         }
         if !expanded {
@@ -574,7 +574,7 @@ impl SheetState {
             section: "group",
         };
         for entry in &group.models {
-            rows.push(model_row(rc, &Pick::ready(&group.provider, entry), flags));
+            rows.push(model_row(rc, &Pick::ready(group.provider, entry), flags));
         }
     }
 }
@@ -588,7 +588,13 @@ fn settings_rows(
 ) {
     let provider = owned(get(model.config, "provider"));
     let mut row = Row::new(t("modelSelector.model"));
-    row.leading = Leading::Provider(provider, owned(get(&model.provider(), "iconSvg")));
+    row.leading = Leading::Provider(
+        provider,
+        model
+            .provider()
+            .map(|entry| owned(get(entry, "iconSvg")))
+            .unwrap_or_default(),
+    );
     row.value = model.selected_model_label(labels);
     row.chevron = true;
     row.action = Some(RowAction::OpenModels);

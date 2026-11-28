@@ -11,11 +11,12 @@ pub struct ControlsModel<'a> {
     pub features: &'a [Value],
 }
 
-pub fn models_of(provider: &Value) -> Vec<Value> {
+/// The selectable catalog models of a provider entry, borrowed: catalogs can hold hundreds of
+/// models and every draw reads them.
+pub fn models_of(provider: &Value) -> Vec<&Value> {
     list_ref(get(provider, "models"))
         .iter()
         .filter(|model| model.is_object() && get(model, "isSelectable") != &Value::Bool(false))
-        .cloned()
         .collect()
 }
 
@@ -33,25 +34,23 @@ pub struct ModelLabels<'a> {
 }
 
 impl<'a> ControlsModel<'a> {
-    pub fn provider(&self) -> Value {
+    pub fn provider(&self) -> Option<&'a Value> {
         let provider = get(self.config, "provider");
         self.providers
             .iter()
             .find(|entry| get(entry, "provider") == provider && !provider.is_null())
-            .cloned()
-            .unwrap_or_else(|| json!({}))
     }
 
     /// agent-controls/utils.ts pickSelectedModel.
-    pub fn selected_model(&self) -> Option<Value> {
-        let models = models_of(&self.provider());
-        let id = s(get(self.config, "model")).trim().to_owned();
+    pub fn selected_model(&self) -> Option<&'a Value> {
+        let models = models_of(self.provider()?);
+        let id = s(get(self.config, "model")).trim();
         if id.is_empty() {
             return models
                 .iter()
                 .find(|m| get(m, "isDefault") == &Value::Bool(true))
                 .or_else(|| models.first())
-                .cloned();
+                .copied();
         }
         models
             .iter()
@@ -60,23 +59,28 @@ impl<'a> ControlsModel<'a> {
                 models.iter().find(|m| {
                     list_ref(get(m, "aliases"))
                         .iter()
-                        .any(|a| a.as_str() == Some(id.as_str()))
+                        .any(|a| a.as_str() == Some(id))
                 })
             })
-            .cloned()
+            .copied()
     }
 
     /// provider-selection.ts resolveSelectedModelLabel.
     pub fn selected_model_label(&self, labels: &ModelLabels) -> String {
-        let provider = self.provider();
-        if s(get(self.config, "provider")).trim().is_empty() || !non_empty_obj(&provider) {
-            return labels.select_model.to_owned();
-        }
-        let models = models_of(&provider);
-        if models.is_empty() && s(get(&provider, "status")) == "loading" {
+        let provider = match self.provider() {
+            Some(provider)
+                if !s(get(self.config, "provider")).trim().is_empty()
+                    && non_empty_obj(provider) =>
+            {
+                provider
+            }
+            _ => return labels.select_model.to_owned(),
+        };
+        let models = models_of(provider);
+        if models.is_empty() && s(get(provider, "status")) == "loading" {
             return labels.loading.to_owned();
         }
-        if models.is_empty() && !get(&provider, "error").is_null() {
+        if models.is_empty() && !get(provider, "error").is_null() {
             return labels.error.to_owned();
         }
         let selected_id = s(get(self.config, "model")).trim().to_owned();
@@ -94,13 +98,13 @@ impl<'a> ControlsModel<'a> {
             })
             .or_else(|| models.first());
         model
-            .map(model_label)
+            .map(|m| model_label(m))
             .unwrap_or_else(|| labels.select_model.to_owned())
     }
 
     pub fn thinking_options(&self) -> Vec<Value> {
         self.selected_model()
-            .map(|m| maps(get(&m, "thinkingOptions")))
+            .map(|m| maps(get(m, "thinkingOptions")))
             .unwrap_or_default()
     }
 
