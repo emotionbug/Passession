@@ -102,15 +102,30 @@ impl Terminal {
             .unwrap_or_else(|| default_shell(&options.env));
         let assets = super::shell::prepare(&shell, &options.args, &mut options.env)?;
         let assets = assets.map(Arc::new);
+        // Like the daemon's other owned processes, the shell runs in its own scope.
+        #[cfg(target_os = "linux")]
+        let scoped = paseo_client::process::scoped(&paseo_client::process::CommandSpec {
+            program: shell.clone(),
+            args: options.args.clone(),
+            cwd: Some(options.cwd.clone()),
+            env: options.env.clone(),
+            clear_env: true,
+        });
+        #[cfg(not(target_os = "linux"))]
+        let scoped: Option<paseo_client::process::CommandSpec> = None;
+        let (program, args, env) = match &scoped {
+            Some(spec) => (&spec.program, &spec.args, &spec.env),
+            None => (&shell, &options.args, &options.env),
+        };
         let mut command = super::shell::command(
-            &shell,
-            &options.args,
-            &options.env,
+            program,
+            args,
+            env,
             assets.as_ref().map(|assets| assets.path()),
         )?;
         command.cwd(&options.cwd);
         command.env_clear();
-        for (key, value) in &options.env {
+        for (key, value) in env {
             command.env(key, value);
         }
         let rows = options.rows;

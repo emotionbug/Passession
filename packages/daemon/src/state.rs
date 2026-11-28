@@ -95,6 +95,16 @@ impl AppState {
     async fn initialize(&self, options: &Value) -> Result<()> {
         self.config.initialize_with_overrides(options).await?;
         crate::logging::initialize(&self.config.snapshot()["log"])?;
+        // Under memory pressure systemd-oomd then kills the scope of the process
+        // that caused it, not the daemon with every agent.
+        #[cfg(target_os = "linux")]
+        match paseo_client::process::enable_service_scopes().await {
+            Ok(Some(unit)) => {
+                tracing::info!(%unit, "Owned processes run in their own systemd scopes");
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("Owned processes stay in the daemon's cgroup: {error:#}"),
+        }
         self.starting(TRANSPORT)?;
         self.transport.prepare().await?;
         self.projects.initialize().await?;

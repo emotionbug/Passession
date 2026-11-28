@@ -364,6 +364,16 @@ ExecStart-only drop-in; its original unit file is not replaced. Linux without a
 working user manager, macOS, and Windows start a detached daemon without login
 autostart. On every platform the daemon keeps running when Passession exits.
 
+When the daemon runs as a systemd user service, each agent, terminal and other
+long-running process it starts runs in its own transient scope
+(`paseo-<program>-<daemon pid>-<n>.scope`, in the service's slice) bound to the
+service. Under memory pressure systemd-oomd then kills one scope, usually the
+one causing the pressure such as an agent running a large build, instead of the
+whole service with the daemon and every agent in it. Stopping the service still
+stops every scope.
+Without `systemd-run` or a reachable user manager these processes stay in the
+service's own cgroup.
+
 The daemon shows a tray icon with its version and listen address in a supported
 graphical session. The icon remains after you close Passession and disappears
 when the daemon stops. Its menu can reopen Passession or stop the daemon. Stopping

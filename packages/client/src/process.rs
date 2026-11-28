@@ -26,7 +26,12 @@ mod platform;
 #[cfg(windows)]
 #[path = "process/windows.rs"]
 mod platform;
+#[cfg(target_os = "linux")]
+mod scope;
 mod tail;
+
+#[cfg(target_os = "linux")]
+pub use scope::{enable_service_scopes, scoped};
 
 use tail::Tail;
 
@@ -162,8 +167,10 @@ pub struct ManagedProcess {
 }
 
 impl ManagedProcess {
+    /// On Linux, after [`enable_service_scopes`], the process runs in its own
+    /// transient systemd scope.
     pub async fn spawn(spec: CommandSpec) -> Result<(Arc<Self>, ChildStdout)> {
-        let (process, stdout, _) = Self::spawn_inner(spec, false)?;
+        let (process, stdout, _) = Self::spawn_inner(spec, false, true)?;
         Ok((process, stdout))
     }
 
@@ -173,13 +180,14 @@ impl ManagedProcess {
     pub async fn spawn_with_stderr(
         spec: CommandSpec,
     ) -> Result<(Arc<Self>, ChildStdout, ChildStderr)> {
-        let (process, stdout, stderr) = Self::spawn_inner(spec, true)?;
+        let (process, stdout, stderr) = Self::spawn_inner(spec, true, true)?;
         Ok((process, stdout, stderr.expect("caller-owned stderr")))
     }
 
     fn spawn_inner(
         spec: CommandSpec,
         caller_stderr: bool,
+        isolated: bool,
     ) -> Result<(Arc<Self>, ChildStdout, Option<ChildStderr>)> {
         // Require a runtime before creating a child and registering its owner.
         // As with Tokio process I/O, that runtime must have I/O and time enabled.
@@ -188,6 +196,10 @@ impl ManagedProcess {
         if spec.program.is_empty() {
             bail!("subprocess executable is empty");
         }
+        #[cfg(target_os = "linux")]
+        let spec = isolated.then(|| scoped(&spec)).flatten().unwrap_or(spec);
+        #[cfg(not(target_os = "linux"))]
+        let _ = isolated;
         let command = platform::command(&spec)?;
         let mut owner = platform::Owner::spawn(command).context("failed to spawn subprocess")?;
         let id = owner.id();
@@ -706,7 +718,9 @@ pub async fn run(
     if deadline <= Instant::now() {
         bail!("subprocess command timed out before spawn");
     }
-    let (process, mut stdout) = ManagedProcess::spawn(spec).await?;
+    // Bounded commands stay in the caller's cgroup: a scope per short command
+    // would only add a service-manager round trip.
+    let (process, mut stdout, _) = ManagedProcess::spawn_inner(spec, false, false)?;
     let operation = async {
         process.close_stdin().await?;
         let read = async {
